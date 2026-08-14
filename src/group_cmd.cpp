@@ -141,6 +141,12 @@ uint16_t GroupStatistics::GetNumEngines(EngineID engine) const
 	/* make virtual trains group-neutral */
 	if (HasBit(v->subtype, GVSF_VIRTUAL)) return;
 
+	/* R3R defensive guard: a corrupted owner (>= MAX_COMPANIES) must not index
+	 * the Company pool (it crashes with "index < first_unused" in pool_type.hpp).
+	 * This has been observed during decouple; treat it as an invariant break and
+	 * skip the statistics update instead of crashing. */
+	if (v->owner >= MAX_COMPANIES) return;
+
 	assert(delta == 1 || delta == -1);
 
 	GroupStatistics &stats_all = GroupStatistics::GetAllGroup(v);
@@ -1091,9 +1097,9 @@ void SetTrainGroupID(Train *v, GroupID new_g)
  */
 void UpdateTrainGroupID(Train *v)
 {
-	assert(v->IsFrontEngine() || v->IsFreeWagon());
+	assert(v->IsFrontEngine() || v->IsFreeWagon() || v->IsFrontWagon());
 
-	GroupID new_g = v->IsFrontEngine() ? v->group_id : (GroupID)DEFAULT_GROUP;
+	GroupID new_g = (v->IsFrontEngine() || v->IsFrontWagon()) ? v->group_id : (GroupID)DEFAULT_GROUP;
 	for (Vehicle *u = v; u != nullptr; u = u->Next()) {
 		if (u->IsEngineCountable()) UpdateNumEngineGroup(u, u->group_id, new_g);
 

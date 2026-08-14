@@ -623,6 +623,10 @@ add_files(
     train.h
     train_cmd.cpp
     train_cmd.h
+    couple_score.h
+    couple_score.cpp
+    consist_group.h
+    consist_group.cpp
     train_gui.cpp
     train_settings.h
     train_speed_adaptation.h

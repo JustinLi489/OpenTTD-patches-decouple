@@ -144,6 +144,8 @@ NamedSaveLoadTable GetOrderExtraInfoDescription()
 		NSL("xdata2",           SLE_CONDVAR_X(OrderExtraInfo, xdata2,          SLE_UINT32,            SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_ORDER_EXTRA_DATA, 3))),
 		NSL("dispatch_index",   SLE_CONDVAR_X(OrderExtraInfo, dispatch_index,  SLE_UINT16,            SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_SCHEDULED_DISPATCH, 3))),
 		NSL("colour",           SLE_CONDVAR_X(OrderExtraInfo, colour,           SLE_UINT8,            SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_ORDER_EXTRA_DATA, 2))),
+		NSL("decouple_first_orders",  SLE_CONDVAR_X(OrderExtraInfo, decouple_first_orders,  SLE_UINT8, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_DECOUPLE_ORDERS))),
+		NSL("decouple_second_orders", SLE_CONDVAR_X(OrderExtraInfo, decouple_second_orders, SLE_UINT8, SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_DECOUPLE_ORDERS))),
 	};
 
 	return _order_extra_info_desc;

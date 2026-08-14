@@ -101,4 +101,12 @@ bool YapfTrainCheckDepotReverse(const Train *v, TileIndex forward_depot, TileInd
  */
 bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, bool override_railtype);
 
+/**
+ * Find the track to take when approaching a waiting consist to couple with.
+ * @param v The train to find a track for.
+ * @param dont_reserve Whether to skip making a reservation.
+ * @return The track to take, or #INVALID_TRACK if no path was found.
+ */
+Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve);
+
 #endif /* YAPF_H */

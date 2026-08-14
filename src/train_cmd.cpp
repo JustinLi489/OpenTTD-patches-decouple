@@ -11,6 +11,8 @@
 #include "error.h"
 #include "articulated_vehicles.h"
 #include "command_func.h"
+#include "couple_score.h"
+#include "consist_group.h"
 #include "pathfinder/yapf/yapf.hpp"
 #include "news_func.h"
 #include "company_func.h"
@@ -282,7 +284,7 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 {
 	uint16_t max_speed = UINT16_MAX;
 
-	dbg_assert(this->IsFrontEngine() || this->IsFreeWagon());
+	dbg_assert(this->IsFrontEngine() || this->IsFreeWagon() || this->IsFrontWagon());
 
 	const RailVehicleInfo *rvi_v = RailVehInfo(this->engine_type);
 	EngineID first_engine = this->IsFrontEngine() ? this->engine_type : EngineID::Invalid();
@@ -1265,7 +1267,7 @@ static bool IsTrainOnNonRealisticBrakingTrack(const Train *t)
 /** Update acceleration of the train from the cached power and weight. */
 void Train::UpdateAcceleration()
 {
-	dbg_assert(this->IsFrontEngine() || this->IsFreeWagon());
+	dbg_assert(this->IsFrontEngine() || this->IsFreeWagon() || this->IsFrontWagon());
 
 	uint power = this->gcache.cached_power;
 	uint weight = this->gcache.cached_weight;
@@ -1647,12 +1649,12 @@ static CommandCost CmdBuildRailWagon(TileIndex tile, DoCommandFlags flags, const
  * Move all free vehicles in the depot to the train.
  * @param u The train to move the free vehicles to.
  */
-void NormalizeTrainVehInDepot(const Train *u)
+void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon)
 {
 	assert(u->IsEngine());
 	std::vector<Train *> candidates;
 	for (Train *v = Train::From(GetFirstVehicleOnTile(u->tile, VehicleType::Train)); v != nullptr; v = v->HashTileNext()) {
-		if (v->IsFreeWagon() &&
+		if ((v->IsFreeWagon() || (include_front_wagon && v->IsFrontWagon())) &&
 				v->track == TRACK_BIT_DEPOT &&
 				v->owner == u->owner) {
 			candidates.push_back(v);
@@ -1662,9 +1664,24 @@ void NormalizeTrainVehInDepot(const Train *u)
 		return a->index < b->index;
 	});
 	for (Train *v : candidates) {
+		/* R3 consist-centric semantics: if the wagon chain is an independent consist,
+		 * its schedule belongs to the consist; hand it over to the engine. */
+		OrderList *orders_to_move = nullptr;
+		if (include_front_wagon && v->orders != nullptr) orders_to_move = v->orders;
+
 		if (Command<Commands::MoveRailVehicle>::Do(DoCommandFlag::Execute, v->index, u->index, MoveRailVehicleFlags::MoveChain).Failed()) {
 			break;
 		}
+
+		if (orders_to_move != nullptr) {
+			DeleteVehicleOrders(const_cast<Train *>(u));
+			const_cast<Train *>(u)->orders = orders_to_move;
+			v->orders = nullptr;
+			const_cast<Train *>(u)->cur_real_order_index = 0;
+			const_cast<Train *>(u)->cur_implicit_order_index = 0;
+			InvalidateVehicleOrder(const_cast<Train *>(u), 0);
+		}
+		if (IsConsistGroup(v)) DestroyConsistGroup(v);
 	}
 }
 
@@ -3412,6 +3429,445 @@ CommandCost CmdForceTrainProceed(DoCommandFlags flags, VehicleID veh_id)
 }
 
 /**
+ * Check whether the train can be decoupled at the current location.
+ * @param v %Train to check.
+ * @return True if the train can be decoupled.
+ */
+static bool CanDecouple(const Train *v)
+{
+	if (v->IsInDepot()) return false;
+	if (CountVehiclesInChain(v) < 2) return false;
+	if (v->GetNextUnit() == nullptr) return false;
+	return true;
+}
+
+/**
+ * Automatically determine the number of vehicles to decouple,
+ * based on the consist layout (engines at front/back, wagons in between).
+ * @param v %Train to decouple from.
+ * @return Number of vehicles to decouple.
+ */
+static uint GetDecoupleVehicleAuto(const Train *v)
+{
+	uint engines_front = 0;
+	uint engines_back = 0;
+	uint pos = 1;
+	bool has_wagons = false;
+	bool multihead_front = false;
+	for (const Train *t = v; t != nullptr; t = t->GetNextVehicle(), pos++) {
+		if (t->IsEngine()) {
+			if (t->IsMultiheaded()) {
+				if (multihead_front) return pos;
+				multihead_front = true;
+			}
+			if (has_wagons) {
+				engines_back++;
+			} else {
+				engines_front++;
+			}
+		} else {
+			has_wagons = true;
+		}
+	}
+	if (engines_front > 0 && has_wagons) return engines_front;
+	if (engines_back > 0 && has_wagons) return pos - 1 - engines_back; /* pos counts independent vehicles (articulated parts skipped). */
+	return 1;
+}
+
+/**
+ * Get the vehicle where the decouple point is.
+ * @param v %Train to decouple.
+ * @return The first vehicle of the rear part, or nullptr on failure.
+ */
+static Train *GetDecoupleVehicle(Train *v)
+{
+	const Order *decouple_order = v->GetOrder(v->cur_implicit_order_index + 1);
+	if (decouple_order == nullptr || !decouple_order->IsType(OT_DECOUPLE)) return nullptr;
+	uint num_decouple = decouple_order->GetNumDecouple();
+	if (num_decouple == 0) num_decouple = GetDecoupleVehicleAuto(v);
+	Train *ret = v->GetNextVehicle();
+	bool multihead_front = v->IsMultiheaded();
+	for (uint i = 1; i < num_decouple && ret != nullptr && ret->GetNextVehicle() != nullptr; i++) {
+		if (multihead_front) {
+			if (ret->IsRearDualheaded()) multihead_front = false;
+		} else {
+			if (ret->IsMultiheaded()) multihead_front = true;
+		}
+		ret = ret->GetNextVehicle();
+	}
+	if (multihead_front) return nullptr;
+	return ret;
+}
+
+/**
+ * Try to decouple the rear part of the train, with rollback on failure.
+ * @param v Front part (with engine).
+ * @param u Rear part to decouple.
+ * @return True on success.
+ */
+static bool TryTrainDecouple(Train *v, Train *u)
+{
+	TrainList original_src;
+	MakeTrainBackup(original_src, v);
+	Train *first_param = nullptr;
+	/* Pre-set the decoupled head's type so NormaliseTrainHead's ConsistChanged assertion holds.
+	 * DecoupleTrain will finalise the state (FrontEngine for engines, FreeWagon for wagons). */
+	if (u->IsEngine()) {
+		u->SetFrontEngine();
+	} else {
+		u->SetFreeWagon();
+	}
+	ArrangeTrains(&first_param, nullptr, &v, u, true);
+	bool ok = true;
+	CommandCost ret = ValidateTrains(nullptr, u, v, v, true);
+	ok &= !ret.Failed();
+	u->ConsistChanged(CCF_ARRANGE);
+	v->ConsistChanged(CCF_ARRANGE);
+	if (!ok) {
+		RestoreTrainBackup(original_src);
+		v->ConsistChanged(CCF_ARRANGE);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Decouple the rear part of the train as specified by the DECOUPLE order.
+ * @param v %Train to decouple.
+ * @return The first vehicle of the decoupled rear part, or the original train if decoupling failed.
+ */
+static Train *DecoupleTrain(Train *v)
+{
+	if (!CanDecouple(v)) return v;
+	Train *u = GetDecoupleVehicle(v);
+	if (u == nullptr) return v;
+	if (!TryTrainDecouple(v, u)) return v;
+
+	if (u->IsEngine()) {
+		u->SetFrontEngine();
+		u->vehstatus.Reset(VehState::Stopped);
+	} else {
+		/* R3R: the wagon part becomes a consist: a zero-power locomotive chain.
+		 * Every OpenTTD subsystem then treats it as a normal train front (it can
+		 * hold orders, appears in the vehicle list, etc.), but it has no power,
+		 * so it simply waits until a locomotive couples onto it. */
+		if (CreateConsistGroup(u) == nullptr) {
+			u->SetFreeWagon();
+		} else {
+			u->SetFrontEngine();
+			/* R3R: give the decoupled consist a unit number so it appears as a
+			 * proper train in the list — but allocate it from the consist's OWN
+			 * company pool (u->owner), NOT via GetFreeUnitNumber() which reads the
+			 * global _current_company (invalid during vehicle ticks → crash). */
+			if (u->unitnumber == 0) {
+				u->unitnumber = Company::Get(u->owner)->freeunits[VehicleType::Train].NextID();
+				if (u->unitnumber != UINT16_MAX) Company::Get(u->owner)->freeunits[VehicleType::Train].UseID(u->unitnumber);
+			}
+		}
+		if (v->orders != nullptr) {
+			/* R3R: hand the consist's schedule over to the decoupled consist, and
+			 * restore the locomotive's OWN orders + order position + unit number
+			 * (backed up by Couple) so the locomotive goes back to its pre-coupling
+			 * schedule instead of ending up with an empty order list / number 1. */
+			/* The decouple trigger fires when cur_implicit_order_index+1 is the
+			 * DECOUPLE order (the train is stopped AT the station, its current
+			 * real order is the station, NOT the DECOUPLE) — so the DECOUPLE
+			 * position is implicit+1, not cur_real_order_index. */
+			VehicleOrderID decouple_pos = v->cur_implicit_order_index + 1;
+			OrderList *loco_orders = v->orders_backup;
+			u->orders = v->orders;
+			v->orders = loco_orders;
+			v->orders_backup = nullptr;
+			v->cur_real_order_index = v->orders_backup_real_index;
+			v->cur_implicit_order_index = v->orders_backup_implicit_index;
+			v->orders_backup_real_index = INVALID_VEH_ORDER_ID;
+			v->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
+			v->DeleteUnreachedImplicitOrders();
+			InvalidateVehicleOrder(v, 0);
+			InvalidateVehicleOrder(u, 0);
+			/* Keep the timetable index in sync with the restored order index. */
+			v->cur_timetable_order_index = v->cur_real_order_index;
+			/* R3R: the order the locomotive was executing when it coupled (e.g. its
+			 * first order "go to depot & couple") has already been completed by the
+			 * decouple — advance past it so it continues with the NEXT order instead
+			 * of re-running the completed one (which the GOTO_COUPLE index lock would
+			 * otherwise keep it stuck on forever). */
+			v->IncrementRealOrderIndex();
+			/* R3R: clear the stale current order (the DECOUPLE that was just
+			 * executed) so the next ProcessOrders tick loads the restored order
+			 * at orders_backup_real_index — otherwise the train would sit idle
+			 * forever (ProcessOrders returns false for DECOUPLE). */
+			v->current_order.Free();
+			v->SetDestTile(INVALID_TILE);
+			/* R3R: the decoupled consist continues with the order AFTER the
+			 * DECOUPLE (not jumping back to the first order). If that next order
+			 * is WAIT_COUPLE it parks and waits to be coupled; otherwise it
+			 * proceeds with its own schedule. */
+			u->cur_real_order_index = decouple_pos;
+			u->cur_implicit_order_index = decouple_pos;   // sync implicit — otherwise the order window paints ▶ at the implicit index
+			u->IncrementRealOrderIndex();
+			u->cur_timetable_order_index = u->cur_real_order_index;
+			u->current_order.Free();
+			u->SetDestTile(INVALID_TILE);
+			/* Restore the unit numbers: the consist keeps its own number (the
+			 * locomotive currently holds it), the locomotive gets its own back. */
+			if (v->unitnumber_backup != 0) {
+				u->unitnumber = v->unitnumber;
+				v->unitnumber = v->unitnumber_backup;
+				v->unitnumber_backup = 0;
+			}
+		}
+	}
+	SetTrainGroupID(u, DEFAULT_GROUP);
+	GroupStatistics::CountVehicle(v, -1);
+	GroupStatistics::CountVehicle(v, 1);
+	GroupStatistics::CountVehicle(u, 1);
+	NormaliseTrainHead(u);
+	NormaliseTrainHead(v);
+	InvalidateWindowClassesData(WindowClass::TrainList, 0);
+
+	/* R3R: the waiting consist must hold its path reservation (occupy the track)
+	 * so the signalling system treats it as an obstacle: other trains must not
+	 * run through it, and the coupling locomotive can pathfind to its reserved
+	 * track. Decoupling split the chain — the consist's own reservation is gone. */
+	u->ReserveTrackUnderConsist();
+
+	return u;
+}
+
+static bool CheckReverseTrain(const Train *consist);
+
+/**
+ * Physically couple the front train onto the waiting chain.
+ * @param v Front train (with engine, executing GOTO_COUPLE).
+ * @param u Waiting chain (free wagons) to couple onto.
+ * @return True on success.
+ */
+static bool TryTrainCouple(Train *v, Train *u)
+{
+	/* R3R: refuse invalid input. Both chains must be intact (each argument must
+	 * be its own chain head); otherwise ArrangeTrains would merge corrupted
+	 * chains and later chain traversal (NormaliseSubtypes) would hit the
+	 * "u->First() == this" assertion. */
+	if (v == nullptr || u == nullptr) return false;
+	if (v->First() != v || u->First() != u) return false;
+	if (v->First() == u->First()) return false; // Never couple a chain onto itself.
+
+	TrainList original_src;
+	TrainList original_dst;
+	MakeTrainBackup(original_src, v);
+	MakeTrainBackup(original_dst, u);
+
+	Train *u_head = u;
+	Train *v_last = v->Last();
+	ArrangeTrains(&v, v_last, &u_head, u, true);
+
+	bool ok = CheckTrainAttachment(v).Succeeded();
+	if (!ok) {
+		RestoreTrainBackup(original_src);
+		RestoreTrainBackup(original_dst);
+		v->ConsistChanged(CCF_ARRANGE);
+		u->ConsistChanged(CCF_ARRANGE);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Couple the train onto the waiting consist.
+ * @param v Front train (with engine).
+ * @param u Waiting consist to couple onto.
+ * @param train_u_reversed Whether the consist is facing the opposite direction.
+ */
+static void Couple(Train *v, Train *u)
+{
+	/* R3R: neither the locomotive (v) nor the consist (u) is reversed here.
+	 * The locomotive drives towards the consist nose-first, and the consist
+	 * keeps its heading; both may couple from either end (nose-to-tail or
+	 * nose-to-nose) — the merged chain simply follows the locomotive's
+	 * direction, and any later reversal is handled by realistic reverse. */
+	v->IncrementImplicitOrderIndex();
+	ProcessOrders(v);
+
+	Train *v_last = v->Last();
+
+	if (!TryTrainCouple(v, u)) {
+		if (v->owner == _local_company) {
+			AddVehicleAdviceNewsItem(AdviceType::TrainStuck, GetEncodedString(STR_NEWS_ORDER_COUPLE_FAILED, v->index, u->index), v->index);
+		}
+		return;
+	}
+
+	/* The consist's schedule belongs to the wagon part: hand the orders over to the
+	 * train. The locomotive's OWN orders are backed up on the locomotive itself
+	 * (orders_backup) so a later decouple can restore them. */
+	if (u->orders != nullptr) {
+		v->orders_backup = v->orders;
+		v->orders = u->orders;
+		u->orders = nullptr;
+		/* R3R: preserve the locomotive's own order position and unit number so a
+		 * later decouple can restore them; inherit the consist's unit number so
+		 * the coupled train keeps the consist's identity (e.g. stays "Train 1"). */
+		v->orders_backup_real_index = v->cur_real_order_index;
+		v->orders_backup_implicit_index = v->cur_implicit_order_index;
+		v->unitnumber_backup = v->unitnumber;
+		if (u->unitnumber != 0) {
+			v->unitnumber = u->unitnumber;
+			u->unitnumber = 0;
+		}
+		v->cur_real_order_index = 0;
+		v->cur_implicit_order_index = 0;
+		v->DeleteUnreachedImplicitOrders();
+		InvalidateVehicleOrder(v, 0);
+		/* Drop the stale GOTO_COUPLE current order: ProcessOrders keeps it forever
+		 * (GOTO_COUPLE never advances), which would leave the coupled train stuck.
+		 * With a cleared current order the next ProcessOrders tick advances into
+		 * the consist's schedule (first order). */
+		v->current_order.Free();
+		v->SetDestTile(INVALID_TILE);
+
+		/* R3R: skip any WAIT_COUPLE order at the start of the consist's schedule —
+		 * the consist has just been coupled, so the wait is over; the train must
+		 * proceed to the first real destination instead of parking at WAIT_COUPLE.
+		 * Guard against wrapping around forever when the schedule consists only of
+		 * WAIT_COUPLE orders (e.g. a single WAIT_COUPLE order). */
+		v->UpdateRealOrderIndex();
+		VehicleOrderID skip_start = v->cur_real_order_index;
+		while (v->GetNumOrders() > 0 && v->GetOrder(v->cur_real_order_index)->IsType(OT_WAIT_COUPLE)) {
+			v->IncrementRealOrderIndex();
+			if (v->cur_real_order_index == skip_start) break; // Wrapped around: stop.
+		}
+		/* Keep the timetable index in sync (IncrementRealOrderIndex does not
+		 * update it; a mismatch crashes UpdateVehicleTimetable on station leave:
+		 * "real_timetable_order == real_current_order"). */
+		v->cur_timetable_order_index = v->cur_real_order_index;
+	}
+
+	/* The consist front (zero-power locomotive identity) becomes a normal wagon again. */
+	if (IsConsistGroup(u)) DestroyConsistGroup(u);
+
+	/* We are now part of another train, remove all independent identity. */
+	CloseWindowById(WindowClass::VehicleView, u->index);
+	CloseWindowById(WindowClass::VehicleOrders, u->index);
+	CloseWindowById(WindowClass::VehicleRefit, u->index);
+	CloseWindowById(WindowClass::VehicleDetails, u->index);
+	CloseWindowById(WindowClass::VehicleTimetable, u->index);
+	SetWindowDirty(WindowClass::Company, _current_company);
+
+	SetTrainGroupID(u, DEFAULT_GROUP);
+	u->unitnumber = 0;
+	GroupStatistics::CountVehicle(u, -1);
+
+	v->profit_this_year += u->profit_this_year;
+	v->profit_last_year += u->profit_last_year;
+	u->profit_last_year = 0;
+	u->profit_this_year = 0;
+
+	u->ClearFreeWagon();
+	u->ClearFrontEngine();
+	u->ClearFrontWagon();
+
+	NormaliseTrainHead(v);
+	InvalidateWindowClassesData(WindowClass::TrainList, 0);
+	if (CheckReverseTrain(v)) v->flags.Set(VehicleRailFlag::Reversing);
+
+	/* R3R: force an immediate visual refresh of the whole merged chain, so the
+	 * consist (which just became ordinary wagons again) repaints right away
+	 * instead of keeping its old consist-front look until the next redraw. */
+	v->MarkDirty();
+}
+
+/**
+ * Get the position of the consist to couple onto, if the train has reached it.
+ * @param v %Train executing a GOTO_COUPLE order.
+ * @param reverse Whether the consist is facing the opposite direction.
+ * @return The consist to couple onto, or nullptr if not in coupling position.
+ */
+static Train *GetCouplePosition(Train *v, bool &reverse)
+{
+	Vehicle *other_vehicle = nullptr;
+	FollowTrainReservation(v, &other_vehicle);
+
+	if (other_vehicle == nullptr) return nullptr;
+	if (other_vehicle->First()->index == v->index) return nullptr;
+	Train *u = Train::From(other_vehicle)->First();
+	/* Target: a free wagon chain or a consist (zero-power locomotive chain). */
+	if (!u->IsFreeWagon() && !IsConsistGroup(u)) return nullptr;
+
+	DirDiff dir_diff = DirDifference(v->direction, u->direction);
+	reverse = dir_diff == DirDiff::Same || dir_diff == DirDiff::Right45 || dir_diff == DirDiff::Left45;
+
+	Train *z;
+	if (reverse) {
+		z = u->Last();
+	} else {
+		z = u;
+	}
+	int x_diff = abs(v->x_pos - z->x_pos);
+	int y_diff = abs(v->y_pos - z->y_pos);
+
+	int diff = std::max(x_diff, y_diff);
+
+	uint8_t v_length = v->gcache.cached_veh_length;
+	uint8_t u_length = reverse ? u->Last()->gcache.cached_veh_length : u->gcache.cached_veh_length;
+
+	if (diff == ((v_length + 1) / 2 + (u_length + 1) / 2)) {
+		return u;
+	}
+
+	return nullptr;
+}
+
+/**
+ * Handle a GOTO_COUPLE order: try to couple onto the waiting consist.
+ * @param v %Train executing the order.
+ * @return True if a coupling attempt was made.
+ */
+static bool TrainCoupleHandler(Train *v)
+{
+	if (!v->current_order.IsType(OT_GOTO_COUPLE)) return false;
+	if (v->cur_speed != 0) return false;
+
+	bool reverse = false;
+	Train *u = nullptr;
+	if (v->track == TRACK_BIT_DEPOT) {
+		/* In a depot: scan the depot tile AND the entrance track tile for a waiting
+		 * consist (free wagon or independent consist). The consist often waits just
+		 * outside the depot mouth on the approach track. */
+		TileIndex tiles[2] = { v->tile, v->tile + TileOffsByDiagDir(GetRailDepotDirection(v->tile)) };
+		for (TileIndex tile : tiles) {
+			Vehicle *first = GetFirstVehicleOnTile(tile, VehicleType::Train);
+			for (Train *w = first != nullptr ? Train::From(first) : nullptr; w != nullptr; w = w->HashTileNext()) {
+				if (w->First()->index == v->index) continue; // Skip self.
+				if (w->owner != v->owner) continue;
+				if (w->IsFreeWagon() || IsConsistGroup(w->First())) {
+					u = w->First();
+					break;
+				}
+			}
+			if (u != nullptr) break;
+		}
+	} else {
+		u = GetCouplePosition(v, reverse);
+	}
+	if (u == nullptr) return false;
+
+	/* R6: only couple onto a consist that reaches the minimum programmable score.
+	 * TEMPORARILY DISABLED (2026-08-12): the built-in ruleset gives a consist
+	 * (1 km/h zero-power locomotive) a score of -20, which is always below the
+	 * minimum of 0, so coupling was always rejected. Re-enable once the scoring
+	 * rules are reworked (e.g. exempt consists from speed matching). */
+	//if (EvaluateCoupleScore(u) < _couple_min_score) {
+	//	/* Stop behind the candidate and wait; do not couple onto a low-scoring consist. */
+	//	v->cur_speed = 0;
+	//	return false;
+	//}
+
+	Couple(v, u);
+	return true;
+}
+
+/**
  * Try to find a depot nearby.
  * @param v %Train that wants a depot.
  * @param max_distance Maximal search distance.
@@ -3527,13 +3983,28 @@ static void CheckNextTrainTile(Train *moving_front)
  */
 static bool CheckTrainStayInDepot(Train *v)
 {
+	/* R3R: a GOTO_COUPLE locomotive stays inside its target depot ONLY when it
+	 * has actually reached that depot (GOTO_COUPLE has no arrival handling so
+	 * without this it would drive right back out). A locomotive that is merely
+	 * sitting in its HOME depot while holding a GOTO_COUPLE order for ANOTHER
+	 * depot must still leave and pathfind there.
+	 * IMPORTANT: only call GetDepotIndex(v->tile) when v->tile is actually a
+	 * depot tile — it asserts otherwise, which crashes when CheckTrainStayInDepot
+	 * is called for a consist that decoupled on a station platform. */
+	if (v->current_order.IsType(OT_GOTO_COUPLE) && v->current_order.GetCoupleIsDepot() &&
+			IsRailDepotTile(v->tile) &&
+			v->current_order.GetDestination().ToDepotID() == GetDepotIndex(v->tile)) return true;
+
 	/* bail out if not all wagons are in the same depot or not in a depot at all */
 	for (const Train *u = v; u != nullptr; u = u->Next()) {
 		if (u->track != TRACK_BIT_DEPOT || u->tile != v->tile) return false;
 	}
 
-	/* if the train got no power, then keep it in the depot */
-	if (v->gcache.cached_power == 0) {
+	/* if the train got no power, then keep it in the depot
+	 * (R3R: except a consist — its front keeps the real wagon's engine_type
+	 * with 0 power; without this exemption it would be auto-stopped and could
+	 * never be coupled onto. This is the "1 hp minimum" equivalent.) */
+	if (v->gcache.cached_power == 0 && !IsConsistGroup(v)) {
 		v->vehstatus.Set(VehState::Stopped);
 		SetWindowDirty(WindowClass::VehicleDepot, v->tile.base());
 		return true;
@@ -3543,6 +4014,13 @@ static bool CheckTrainStayInDepot(Train *v)
 		v->HandleWaiting(false, true);
 	}
 	if (v->current_order.IsType(OT_WAITING)) {
+		return true;
+	}
+
+	/* R3R: a WAIT_COUPLE order parks the train in place (it declares "wait here
+	 * to be coupled"), like a normal wait order. Without this the consist would
+	 * keep creeping along (it has a minimal power to avoid the auto-stop check). */
+	if (v->current_order.IsType(OT_WAIT_COUPLE)) {
 		return true;
 	}
 
@@ -4685,6 +5163,13 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	}
 	if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) orders.AdvanceOrdersFromLookahead(lookahead_state);
 
+	/* (R3R) The couple pathfinder (searching for the nearest waiting consist) was
+	 * tried here, but it ignores the player-chosen station/depot of the GOTO_COUPLE
+	 * order and may send the train to a consist elsewhere, causing it to wander.
+	 * Reverted: the train paths normally to its chosen station/depot, and the
+	 * in-station/depot coupling logic (GetCouplePosition / TrainCoupleHandler)
+	 * finds the waiting consist there. */
+
 	if (res_dest.tile != INVALID_TILE && !res_dest.okay) {
 		/* Pathfinders are able to tell that route was only 'guessed'. */
 		bool      path_found = true;
@@ -5055,6 +5540,13 @@ static bool HandlePossibleBreakdowns(Train *v)
  */
 static void TrainEnterStation(Train *consist, StationID station)
 {
+	/* R3R: a waiting consist (WAIT_COUPLE) must NOT run the normal station
+	 * arrival flow — it waits passively to be coupled onto. The normal flow
+	 * would start loading and advance the current order, overwriting the
+	 * WAIT_COUPLE state (observed: the consist then "executes" the first
+	 * order of its schedule again). */
+	if (consist->current_order.IsType(OT_WAIT_COUPLE)) return;
+
 	consist->last_station_visited = station;
 
 	BaseStation *bst = BaseStation::Get(station);
@@ -5089,7 +5581,28 @@ static void TrainEnterStation(Train *consist, StationID station)
 	consist->force_proceed = TFP_NONE;
 	InvalidateWindowData(WindowClass::VehicleView, consist->index);
 
+	/* GOTO_COUPLE: do not stop at the platform edge, keep creeping forward
+	 * until the waiting consist is reached and the coupling handler fires. */
+	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+		/* DEBUG (R3R — remove): log the station arrival of a GOTO_COUPLE train. */
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "SA-GOTO_COUPLE: veh=%d real_idx=%d implicit_idx=%d speed=%d\n",
+						(int)consist->index.base(), (int)consist->cur_real_order_index, (int)consist->cur_implicit_order_index, (int)consist->cur_speed);
+				fclose(dbg);
+			}
+		}
+		if (consist->cur_speed > 20) consist->cur_speed = 20;
+		consist->UpdateTrainSpeedAdaptationLimit(0);
+		return;
+	}
+
 	consist->BeginLoading();
+
+	/* (R3R) DECOUPLE handling moved to TrainLocoHandler so it can trigger from
+	 * any stopped state (station, depot, after WAIT_COUPLE), not only right
+	 * after arriving at a station. */
 
 	TileIndex station_tile = consist->GetStationLoadingVehicle()->tile;
 	TriggerStationRandomisation(st, station_tile, StationRandomTrigger::VehicleArrives);
@@ -5267,7 +5780,25 @@ static uint TrainCrashed(Train *v)
 static uint CheckTrainCollision(Train *v, Train *moving_front)
 {
 	/* not in depot */
-	if (v->track == TRACK_BIT_DEPOT) return 0;
+	if (v->track == TRACK_BIT_DEPOT) {
+		/* R3R: collision-as-couple inside the depot. Strict pairing: the moving
+		 * train must be executing GOTO_COUPLE and the other chain's head must
+		 * declare WAIT_COUPLE. Ordinary trains never carry these orders, so a
+		 * normal rear-end collision inside a depot is still handled as before
+		 * (no crash here; depot collisions are skipped anyway).
+		 * Use First() (chain head = locomotive) as in the open-track branch. */
+		Train *loco = moving_front->First();
+		if (loco->current_order.IsType(OT_GOTO_COUPLE) &&
+				v->First()->current_order.IsType(OT_WAIT_COUPLE) &&
+				loco != v->First()) {
+			DirDiff dir_diff = DirDifference(moving_front->direction, v->First()->direction);
+			bool reverse = dir_diff == DirDiff::Same || dir_diff == DirDiff::Right45 || dir_diff == DirDiff::Left45;
+			Couple(loco, v->First());
+			moving_front->cur_speed = 0;
+			moving_front->progress = 0;
+		}
+		return 0;
+	}
 
 	if (_settings_game.vehicle.no_train_crash_other_company) {
 		/* do not crash into trains of another company. */
@@ -5300,6 +5831,37 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 
 	/* Happens when there is a train under bridge next to bridge head */
 	if (abs(v->z_pos - moving_front->z_pos) > 5) return 0;
+
+	/* R3R: collision-as-couple on open track (YPS semantics). Strict pairing: the
+	 * locomotive (chain head) must be executing GOTO_COUPLE and the other chain's
+	 * head must declare WAIT_COUPLE. Ordinary trains never carry these orders, so
+	 * a normal rear-end collision still crashes as usual.
+	 * NOTE: use First() (chain head = locomotive): while reversing, moving_front
+	 * is the TRAILING wagon whose current_order is not GOTO_COUPLE. */
+	Train *loco = moving_front->First();
+	if (loco->current_order.IsType(OT_GOTO_COUPLE) &&
+			v->First()->current_order.IsType(OT_WAIT_COUPLE) &&
+			loco != v->First()) {
+		DirDiff dir_diff = DirDifference(moving_front->direction, v->First()->direction);
+		bool reverse = dir_diff == DirDiff::Same || dir_diff == DirDiff::Right45 || dir_diff == DirDiff::Left45;
+		Couple(loco, v->First());
+		moving_front->cur_speed = 0;
+		moving_front->progress = 0;
+		return 0;
+	}
+
+	/* DEBUG (R3R — remove after locating the crash): log the coupling-condition
+	 * failure to a file so it is always visible. Open R3R_debug.log after the crash. */
+	{
+		FILE *dbg = fopen("R3R_debug.log", "a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "CRASH: movingFirst_order=%d v_order=%d vFirst_order=%d same_chain=%d speed=%d tile=%d\n",
+					(int)moving_front->First()->current_order.GetType(), (int)v->current_order.GetType(),
+					(int)v->First()->current_order.GetType(), moving_front->First() == v->First(),
+					(int)moving_front->cur_speed, (int)moving_front->tile.base());
+			fclose(dbg);
+		}
+	}
 
 	/* Crash both trains. Two statements required to guarantee execution
 	 * order because RandomRange() is involved. */
@@ -6843,8 +7405,43 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		ReverseTrainDirection(consist);
 	}
 
-	/* exit if train is stopped */
+	/* exit if train is stopped (a stopped locomotive should not keep trying to
+	 * couple: the player stopped it, so give control back for stop/skip/return
+	 * commands instead of parking it in the GOTO_COUPLE state forever). */
 	if (consist->vehstatus.Test(VehState::Stopped) && consist->cur_speed == 0) return true;
+
+	/* If a locomotive is about to leave the depot, automatically couple onto any
+	 * wagon chain (free wagon or independent consist) that waits inside the depot.
+	 * When executing a GOTO_COUPLE order, couple onto the depot's waiting consist directly. */
+	if (consist->track == TRACK_BIT_DEPOT && consist->IsEngine()) {
+		if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+			if (TrainCoupleHandler(consist)) {
+				consist->cur_speed = 0;
+				consist->progress = 0;
+			}
+			/* R3R: a GOTO_COUPLE locomotive that arrived at its target depot stays
+			 * parked inside it. On success the next ProcessOrders tick advances into
+			 * the consist's schedule; on failure it simply waits here and retries
+			 * coupling on the next tick instead of driving out again. */
+			consist->cur_speed = 0;
+			consist->progress = 0;
+			consist->vehstatus.Reset(VehState::Stopped);
+			consist->flags.Reset(VehicleRailFlag::LeavingStation);
+		} else {
+			NormalizeTrainVehInDepot(consist, true);
+		}
+	}
+
+	/* R3R: DECOUPLE triggers from any stopped state (station / depot / after a
+	 * WAIT_COUPLE) whenever the NEXT order is DECOUPLE — it does not have to
+	 * directly follow a station order. */
+	if (consist->cur_speed == 0 &&
+			(IsTileType(consist->tile, TileType::Station) || consist->track == TRACK_BIT_DEPOT)) {
+		const Order *next_order = consist->GetOrder(consist->cur_implicit_order_index + 1);
+		if (next_order != nullptr && next_order->IsType(OT_DECOUPLE)) {
+			DecoupleTrain(consist);
+		}
+	}
 
 	bool valid_order = !consist->current_order.IsType(OT_NOTHING) && consist->current_order.GetType() != OT_CONDITIONAL && !consist->current_order.IsSlotCounterOrder() && !consist->current_order.IsType(OT_LABEL);
 	if (ProcessOrders(consist) && CheckReverseTrain(consist)) {
@@ -6871,6 +7468,11 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	consist->HandleLoading(mode);
 
 	if (consist->current_order.IsType(OT_LOADING)) return true;
+
+	/* R3R: a WAIT_COUPLE order parks the train in place ANYWHERE (station platform
+	 * as well as depot). The CheckTrainStayInDepot-based check only covers depots;
+	 * without this a consist waiting on a platform would keep creeping along. */
+	if (consist->current_order.IsType(OT_WAIT_COUPLE)) return true;
 
 	if (CheckTrainStayInDepot(consist)) return true;
 
@@ -6974,7 +7576,17 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	int adv_spd = moving_front->GetAdvanceDistance();
 	if (j < adv_spd) {
 		/* if the vehicle has speed 0, update the last_speed field. */
-		if (consist->cur_speed == 0) consist->SetLastSpeed();
+		if (consist->cur_speed == 0) {
+			consist->SetLastSpeed();
+			/* R3R: a GOTO_COUPLE locomotive that stopped overlapping the waiting
+			 * consist must still couple. The normal collision check only runs
+			 * inside the movement loop, which a stopped train never enters
+			 * (j < adv_spd) — so a stationary locomotive touching the consist
+			 * would never couple. Run the check here for stopped couplers.
+			 * CheckTrainCollision returns >0 only on a real crash; a successful
+			 * couple returns 0 (and couples the chains). */
+			if (consist->current_order.IsType(OT_GOTO_COUPLE) && CheckTrainCollision(moving_front)) return true;
+		}
 	} else {
 		TrainCheckIfLineEnds(moving_front);
 		moving_front = moving_front->GetMovingFront();
@@ -6983,6 +7595,14 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			j -= adv_spd;
 			TrainController(moving_front, nullptr);
 			moving_front = moving_front->GetMovingFront();
+			/* Couple now? Try to couple onto the waiting consist when executing a GOTO_COUPLE order. */
+			if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+				if (TrainCoupleHandler(consist)) {
+					consist->cur_speed = 0;
+					consist->progress = 0;
+					break;
+				}
+			}
 			/* Don't continue to move if the train crashed. */
 			if (CheckTrainCollision(moving_front)) break;
 			/* Determine distance to next map position */

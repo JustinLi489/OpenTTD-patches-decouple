@@ -84,6 +84,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_BUILD), SetFill(1, 1), SetResize(1, 0),
 		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_CLONE), SetFill(1, 1), SetResize(1, 0),
+		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_SET_AS_FRONT_WAGON), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_SET_AS_FRONT_WAGON, STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_DEPARTURES), SetFill(0, 1), SetStringTip(STR_STATION_VIEW_DEPARTURES_BUTTON, STR_STATION_VIEW_DEPARTURES_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_VEHICLE_LIST), SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1),
 		NWidget(WWT_PUSHIMGBTN, Colours::Grey, WID_D_STOP_ALL), SetSpriteTip(SPR_FLAG_VEH_STOPPED), SetAspect(WidgetDimensions::ASPECT_VEHICLE_FLAG), SetFill(0, 1),
@@ -812,6 +813,20 @@ struct DepotWindow : Window {
 	{
 		switch (widget) {
 			case WID_D_MATRIX: // List
+				if (click_count == 2) {
+					/* Double click on a vehicle: show the vehicle view window. */
+					DepotActionResult result = this->GetVehicleFromDepotWndPt(pt.x, pt.y);
+					if (result.action == DepotGUIAction::DragVehicle && result.vehicle != nullptr) {
+						/* R3R: do not open a window for loose wagons (FreeWagon) —
+						 * double-clicking a non-engine wagon chain in the depot does
+						 * nothing (falls through to the normal selection click). */
+						if (result.vehicle->type == VehicleType::Train && Train::From(result.vehicle)->IsFreeWagon()) break;
+						this->sel = VehicleID::Invalid();
+						ResetObjectToPlace();
+						ShowVehicleViewWindow(result.vehicle);
+						return;
+					}
+				}
 				this->DepotClick(pt.x, pt.y);
 				break;
 
@@ -843,6 +858,17 @@ struct DepotWindow : Window {
 				} else {
 					ScrollMainWindowToTile(TileIndex(this->window_number));
 				}
+				break;
+
+			case WID_D_SET_AS_FRONT_WAGON: // Make consist button
+				this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
+				this->ToggleWidgetLoweredState(WID_D_SET_AS_FRONT_WAGON);
+				if (this->IsWidgetLowered(WID_D_SET_AS_FRONT_WAGON)) {
+					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_VEHICLE, this);
+				} else {
+					ResetObjectToPlace();
+				}
+				SndClickBeep();
 				break;
 
 			case WID_D_RENAME: // Rename button
@@ -950,6 +976,15 @@ struct DepotWindow : Window {
 	 */
 	bool OnVehicleSelect(const Vehicle *v) override
 	{
+		if (this->IsWidgetLowered(WID_D_SET_AS_FRONT_WAGON)) {
+			/* Make consist mode: turn the clicked wagon chain into an independent consist. */
+			this->RaiseWidget(WID_D_SET_AS_FRONT_WAGON);
+			this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
+			ResetObjectToPlace();
+			Command<Commands::SetAsFrontWagon>::Post(STR_ERROR_CAN_T_SET_AS_FRONT_WAGON, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
+			return true;
+		}
+
 		if (_ctrl_pressed) {
 			/* Share-clone, do not open new viewport, and keep tool active */
 			Command<Commands::CloneVehicle>::Post(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying(v->type), _settings_client.gui.open_vehicle_gui_clone_share ? CommandCallback::CloneVehicle : CommandCallback::None, TileIndex(this->window_number), v->index, true);
@@ -1032,6 +1067,10 @@ struct DepotWindow : Window {
 		/* abort clone */
 		this->RaiseWidget(WID_D_CLONE);
 		this->SetWidgetDirty(WID_D_CLONE);
+
+		/* abort make consist */
+		this->RaiseWidget(WID_D_SET_AS_FRONT_WAGON);
+		this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
 
 		/* abort drag & drop */
 		this->sel = VehicleID::Invalid();
@@ -1119,7 +1158,7 @@ struct DepotWindow : Window {
 						} else if (result.wagon == nullptr || result.wagon->index != sel) {
 							this->vehicle_over = VehicleID::Invalid();
 							TrainDepotMoveVehicle(result.wagon, sel, result.vehicle);
-						} else if (result.vehicle != nullptr && result.vehicle->IsFrontEngine()) {
+						} else if (result.vehicle != nullptr && result.vehicle->IsPrimaryVehicle()) {
 							ShowVehicleViewWindow(result.vehicle);
 						}
 					}

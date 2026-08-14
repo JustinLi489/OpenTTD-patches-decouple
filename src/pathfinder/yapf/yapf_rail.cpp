@@ -487,6 +487,85 @@ public:
 	}
 };
 
+/**
+ * Follow class for the "couple pathfinder": standard rail following used to
+ * search for the nearest waiting consist (see CYapfDestinationTrainRailT).
+ */
+template <class Types>
+class CYapfFollowCoupleRailT : public CYapfReserveTrack<Types> {
+public:
+	typedef typename Types::Tpf Tpf;                     ///< the pathfinder class (derived from THIS class)
+	typedef typename Types::TrackFollower TrackFollower;
+	typedef typename Types::NodeList::Item Node;        ///< this will be our node type
+	typedef typename Node::Key Key;                      ///< key to hash tables
+
+protected:
+	/** @copydoc CYapfBaseT::Yapf */
+	inline Tpf &Yapf()
+	{
+		return *static_cast<Tpf *>(this);
+	}
+
+public:
+	/** @copydoc CYapfBaseT::PfFollowNodeFunc */
+	inline void PfFollowNode(Node &old_node)
+	{
+		TrackFollower F(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
+		if (F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
+			Yapf().AddMultipleNodes(&old_node, F);
+		}
+	}
+
+	/** @copydoc CYapfBaseT::TransportTypeCharFunc */
+	inline char TransportTypeChar() const
+	{
+		return 't';
+	}
+
+	static Trackdir stFindNearestCoupleTrain(const Train *v, bool dont_reserve)
+	{
+		/* Create pathfinder instance */
+		Tpf pf1;
+		pf1.DisableCache(true);
+		return pf1.FindNearestCoupleTrain(v, dont_reserve);
+	}
+
+	Trackdir FindNearestCoupleTrain(const Train *v, bool dont_reserve)
+	{
+		PBSTileInfo origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::IgnoreLookahead);
+		/* Set origin and destination. */
+		Yapf().SetOrigin(origin.tile, origin.trackdir);
+		Yapf().SetDestination(v);
+
+		bool path_found = Yapf().FindPath(v);
+		if (!path_found) return INVALID_TRACKDIR;
+
+		/* Found a destination, set as reservation target. */
+		Node *pNode = Yapf().GetBestNode();
+		this->SetReservationTarget(pNode, pNode->GetLastTile(), pNode->GetLastTrackdir());
+
+		/* Walk through the path back to the origin. */
+		Trackdir next_trackdir = INVALID_TRACKDIR;
+		Node *pPrev = nullptr;
+		while (pNode->parent != nullptr) {
+			pPrev = pNode;
+			pNode = pNode->parent;
+
+			if (!this->FindSafePositionOnNode(pPrev)) {
+				return INVALID_TRACKDIR;
+			}
+		}
+
+		next_trackdir = pPrev->GetTrackdir();
+		if (!dont_reserve) {
+			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile());
+			return reserved ? next_trackdir : INVALID_TRACKDIR;
+		}
+
+		return next_trackdir;
+	}
+};
+
 template <class Types>
 class CYapfFollowAnySafeTileRailT : public CYapfReserveTrack<Types> {
 public:
@@ -792,6 +871,9 @@ struct CYapfRailNo90     : CYapfRailBase<CYapfRail_TypesT<CYapfRailNo90    , CFo
 struct CYapfAnyDepotRail     : CYapfRailBase<CYapfRail_TypesT<CYapfAnyDepotRail,     CFollowTrackRail    , CYapfDestinationAnyDepotRailT     , CYapfFollowAnyDepotRailT>> {};
 struct CYapfAnyDepotRailNo90 : CYapfRailBase<CYapfRail_TypesT<CYapfAnyDepotRailNo90, CFollowTrackRailNo90, CYapfDestinationAnyDepotRailT     , CYapfFollowAnyDepotRailT>> {};
 
+struct CYapfCoupleRail     : CYapfRailBase<CYapfRail_TypesT<CYapfCoupleRail,     CFollowTrackRail    , CYapfDestinationTrainRailT, CYapfFollowCoupleRailT>> {};
+struct CYapfCoupleRailNo90 : CYapfRailBase<CYapfRail_TypesT<CYapfCoupleRailNo90, CFollowTrackRailNo90, CYapfDestinationTrainRailT, CYapfFollowCoupleRailT>> {};
+
 struct CYapfAnySafeTileRail     : CYapfRailBase<CYapfRail_TypesT<CYapfAnySafeTileRail    , CFollowTrackFreeRail    , CYapfDestinationAnySafeTileRailT , CYapfFollowAnySafeTileRailT>> {};
 struct CYapfAnySafeTileRailNo90 : CYapfRailBase<CYapfRail_TypesT<CYapfAnySafeTileRailNo90, CFollowTrackFreeRailNo90, CYapfDestinationAnySafeTileRailT , CYapfFollowAnySafeTileRailT>> {};
 
@@ -927,6 +1009,21 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
 	return _settings_game.pf.forbid_90_deg
 		? CYapfAnySafeTileRailNo90::stFindNearestSafeTile(v, tile, td, override_railtype)
 		: CYapfAnySafeTileRail::stFindNearestSafeTile(v, tile, td, override_railtype);
+}
+
+/**
+ * Find the track to take when approaching a waiting consist to couple with.
+ * @param v The train to find a track for.
+ * @param dont_reserve Whether to skip making a reservation.
+ * @return The track to take, or #INVALID_TRACK if no path was found.
+ */
+Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
+{
+	Trackdir ret = _settings_game.pf.forbid_90_deg
+		? CYapfCoupleRailNo90::stFindNearestCoupleTrain(v, dont_reserve)
+		: CYapfCoupleRail::stFindNearestCoupleTrain(v, dont_reserve);
+
+	return (ret != INVALID_TRACKDIR) ? TrackdirToTrack(ret) : INVALID_TRACK;
 }
 
 /** if any track changes, this counter is incremented - that will invalidate segment cost cache */

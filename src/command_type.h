@@ -540,6 +540,7 @@ enum class Commands : uint8_t {
 	BulkTree,                               ///< bulk tree planting
 
 	BuildVehicle,                           ///< build a vehicle
+	SetAsFrontWagon,                        ///< turn a free wagon chain into an independently operating consist
 	SellVehicle,                            ///< sell a vehicle
 	RefitVehicle,                           ///< refit the cargo space of a vehicle
 	SendVehicleToDepot,                     ///< send a vehicle to a depot

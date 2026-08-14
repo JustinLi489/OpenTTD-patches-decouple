@@ -31,6 +31,7 @@ enum DepotWidgets : WidgetID {
 	WID_D_STOP_ALL,        ///< Stop all button.
 	WID_D_START_ALL,       ///< Start all button.
 	WID_D_DEPARTURES,      ///< Departures button.
+	WID_D_SET_AS_FRONT_WAGON, ///< Set selected wagon chain as independent consist (front wagon).
 };
 
 #endif /* WIDGETS_DEPOT_WIDGET_H */

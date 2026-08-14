@@ -107,7 +107,7 @@ void CheckBreakdownFlags(Train *v);
 void GetTrainSpriteSize(EngineID engine, uint &width, uint &height, int &xoffs, int &yoffs, EngineImageType image_type);
 
 bool TrainOnCrossing(TileIndex tile);
-void NormalizeTrainVehInDepot(const Train *u);
+void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon = false);
 
 /** Flags for TrainCache::cached_tflags */
 enum TrainCacheFlags : uint8_t {
@@ -176,6 +176,12 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	// 1 byte gap
 	uint16_t speed_restriction = 0;
 	uint16_t signal_speed_restriction = 0;
+
+	/* 逻辑车组关联（R3R consist group）：
+	 * - 虚拟机车（订单容器）用 consist_front_vehicle 指向真实车底段首车厢
+	 * - 真实车底段首车厢用 virtual_train 指向虚拟机车 */
+	VehicleID consist_front_vehicle = VehicleID::Invalid(); ///< 虚拟机车 → 真实车底段首车厢
+	VehicleID virtual_train = VehicleID::Invalid();         ///< 真实车底段首车厢 → 虚拟机车
 	uint16_t crash_anim_pos = 0; ///< Crash animation counter, also used for realistic braking train brake overheating
 
 	/** Create new Train object. @copydoc GroundVehicle::GroundVehicle */
@@ -189,7 +195,7 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void UpdateDeltaXY() override;
 	ExpensesType GetExpenseType(bool income) const override { return income ? ExpensesType::TrainRevenue : ExpensesType::TrainRun; }
 	void PlayLeaveStationSound(bool force = false) const override;
-	bool IsPrimaryVehicle() const override { return this->IsFrontEngine(); }
+	bool IsPrimaryVehicle() const override { return this->IsFrontEngine() || this->IsFrontWagon(); }
 	void GetImage(Direction direction, EngineImageType image_type, VehicleSpriteSeq *result) const override;
 	int GetDisplaySpeed() const override { return this->gcache.last_speed; }
 	int GetDisplayMaxSpeed() const override { return this->vcache.cached_max_speed; }
@@ -406,6 +412,13 @@ protected: // These functions should not be called outside acceleration code.
 			uint16_t power = GetVehicleProperty(this, PROP_TRAIN_POWER, RailVehInfo(this->engine_type)->power);
 			/* Halve power for multiheaded parts */
 			if (this->IsMultiheaded()) power /= 2;
+			/* R3R: a consist front (wagon-chain promoted to engine) reports at
+			 * least 1 hp. Its real wagon data is untouched, but a 0-power engine
+			 * triggers the "no power" auto-stop and shows 0 hp in the window;
+			 * 1 hp keeps it couplable and shows the intended "1" instead. */
+			if (this->IsEngine() && RailVehInfo(this->engine_type)->railveh_type == RailVehicleType::Wagon) {
+				power = std::max<uint16_t>(power, 1);
+			}
 			return power;
 		}
 

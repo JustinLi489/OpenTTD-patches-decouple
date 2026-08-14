@@ -11,6 +11,7 @@
 #define YAPF_DESTRAIL_HPP
 
 #include "../../train.h"
+#include "../../consist_group.h"
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
 
@@ -219,6 +220,81 @@ public:
 			return dmin * YAPF_TILE_CORNER_LENGTH + (dxy - 1) * (YAPF_TILE_LENGTH / 2);
 		};
 		return std::max<int>(0, calculate_distance_cost(prev_tile, 8) - calculate_distance_cost(cur_tile, 0));
+	}
+};
+
+/**
+ * Destination: a waiting consist (R3R consist-group free-wagon chain).
+ * The pathfinder searches for the nearest platform/depot tile whose reserved
+ * train is a consist waiting to be coupled onto.
+ */
+template <class Types>
+class CYapfDestinationTrainRailT : public CYapfDestinationRailBase {
+public:
+	typedef typename Types::Tpf Tpf;              ///< the pathfinder class (derived from THIS class)
+	typedef typename Types::NodeList::Item Node; ///< this will be our node type
+	typedef typename Node::Key Key;               ///< key to hash tables
+
+protected:
+	Tpf &Yapf()
+	{
+		return *static_cast<Tpf *>(this);
+	}
+
+	TileIndex dest_tile; ///< heuristic destination (the order's station/depot).
+
+public:
+	void SetDestination(const Train *v)
+	{
+		this->CYapfDestinationRailBase::SetDestination(v);
+		this->dest_tile = (v->dest_tile == INVALID_TILE) ? TileIndex{} : v->dest_tile;
+	}
+
+	/** @copydoc CYapfBaseT::PfDetectDestinationFunc */
+	inline bool PfDetectDestination(Node &n)
+	{
+		return this->PfDetectDestination(n.GetLastTile(), n.GetLastTrackdir());
+	}
+
+	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
+	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
+	{
+		/* Only platform or depot tiles qualify. */
+		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) return false;
+
+		TrackdirBits tdb = TrackdirToTrackdirBits(td);
+		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
+		if (!has_res) return false;
+
+		Train *t = GetTrainForReservation(tile, TrackdirToTrack(td));
+		if (t == nullptr) return false;
+		t = t->First();
+
+		/* Target 1: a consist (zero-power locomotive chain) waiting to be coupled. */
+		if (IsConsistGroup(t)) return true;
+
+		/* Target 2: any primary vehicle whose current order declares WAIT_COUPLE
+		 * ("wait here to be coupled"). */
+		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) return true;
+
+		return false;
+	}
+
+	/** @copydoc CYapfBaseT::PfCalcEstimateFunc */
+	inline bool PfCalcEstimate(Node &n)
+	{
+		if (this->PfDetectDestination(n)) {
+			n.estimate = n.cost;
+			return true;
+		}
+		n.estimate = n.cost + OctileDistanceCost(n.GetLastTile(), n.GetLastTrackdir(), this->dest_tile);
+		assert(n.estimate >= n.parent->estimate);
+		return true;
+	}
+
+	inline int TeleportCost(TileIndex cur_tile, TileIndex prev_tile)
+	{
+		return 0;
 	}
 };
 

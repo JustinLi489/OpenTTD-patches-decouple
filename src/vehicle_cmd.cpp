@@ -14,6 +14,7 @@
 #include "command_func.h"
 #include "company_func.h"
 #include "train.h"
+#include "consist_group.h"
 #include "aircraft.h"
 #include "newgrf_text.h"
 #include "vehicle_func.h"
@@ -245,6 +246,43 @@ CommandCost CmdBuildVehicle(DoCommandFlags flags, TileIndex tile, EngineID eid, 
 }
 
 CommandCost CmdSellRailWagon(DoCommandFlags flags, Vehicle *t, bool sell_chain, bool backup_order, ClientID user);
+
+/**
+ * Turn a free wagon chain into an independently operating consist (front wagon).
+ * This is the entry point for the "purchase consist" feature: a bought wagon
+ * chain in a depot can be activated as an independent consist that holds orders.
+ * @param flags Operation to perform.
+ * @param tile tile on which the wagon is located (for validation).
+ * @param veh_id ID of the wagon to convert.
+ * @param client_id Client performing the command.
+ */
+CommandCost CmdSetAsFrontWagon(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
+{
+	Train *t = Train::GetIfValid(veh_id);
+	if (t == nullptr || !t->IsFreeWagon()) return CMD_ERROR;
+	if (!IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		/* R3R: turn the wagon chain into a consist (zero-power locomotive chain):
+		 * it becomes a normal train front, can hold orders and appears in the
+		 * vehicle list. */
+		Train *front = CreateConsistGroup(t);
+		if (front == nullptr) return CMD_ERROR;
+		front->SetFrontEngine();
+		if (front->unitnumber == 0) {
+			front->unitnumber = GetFreeUnitNumber(VehicleType::Train);
+			/* R3R: mark the number as used in the company's freeunits pool, so a
+			 * locomotive bought afterwards does not get the same number (observed:
+			 * consist got number 1, then the purchased loco also got number 1). */
+			if (front->unitnumber != UINT16_MAX) Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
+		}
+		front->group_id = t->group_id;
+		UpdateTrainGroupID(t);
+		GroupStatistics::CountVehicle(t, 1);
+		InvalidateVehicleListWindows(t->type);
+	}
+	return CommandCost();
+}
 
 /**
  * Sell a vehicle.
@@ -1430,6 +1468,15 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			auto veh_id = cost.GetResultData<VehicleID>();
 			if (!veh_id.has_value()) return CMD_ERROR;
 			w = Vehicle::Get(*veh_id);
+
+			/* R3R: cloning a make-consist locomotive (wagon-as-engine). The freshly
+			 * built wagon defaults to a free wagon; promote it back to a consist
+			 * front so the clone is again a couplable consist — otherwise cloning
+			 * a consist "fails" (produces a loose wagon chain, or the copy can't
+			 * be used as a consist). */
+			if (v->type == VehicleType::Train && IsConsistGroup(Train::From(v)) && w->type == VehicleType::Train) {
+				Train::From(w)->SetFrontEngine();
+			}
 
 			if (v->type == VehicleType::Train && Train::From(v)->flags.Test(VehicleRailFlag::Flipped)) {
 				/* Only copy the reverse state if neither old or new vehicle implements reverse-on-build probability callback. */

@@ -940,6 +940,7 @@ STR_NEWS_VEHICLE_UNPROFITABLE_PERIOD                            :{WHITE}{VEHICLE
 STR_NEWS_AIRCRAFT_DEST_TOO_FAR                                  :{WHITE}{VEHICLE} can't get to the next destination because it is out of range
 
 STR_NEWS_ORDER_REFIT_FAILED                                     :{WHITE}{VEHICLE} stopped because an ordered refit failed
+STR_NEWS_ORDER_COUPLE_FAILED                                    :{WHITE}{VEHICLE} was unable to couple onto {VEHICLE}
 STR_NEWS_VEHICLE_AUTORENEW_FAILED                               :{WHITE}Autorenew failed on {VEHICLE}{}{STRING1}
 
 STR_NEWS_NEW_VEHICLE_NOW_AVAILABLE                              :{BIG_FONT}{BLACK}New {STRING} now available!
@@ -4384,6 +4385,8 @@ STR_DEPOT_SHIP_NEW_VEHICLES_TOOLTIP                             :{BLACK}Buy new 
 STR_DEPOT_AIRCRAFT_NEW_VEHICLES_TOOLTIP                         :{BLACK}Buy new aircraft
 
 ###length VEHICLE_TYPES
+STR_DEPOT_SET_AS_FRONT_WAGON                                     :{BLACK}Make consist
+STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP                             :{BLACK}Turn the selected wagon chain into an independently operating consist that can hold orders and be coupled onto by locomotives
 STR_DEPOT_CLONE_TRAIN                                           :{BLACK}Clone Train
 STR_DEPOT_CLONE_ROAD_VEHICLE                                    :{BLACK}Clone Vehicle
 STR_DEPOT_CLONE_SHIP                                            :{BLACK}Clone Ship
@@ -4611,6 +4614,7 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}Profit t
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG})
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG}) {BLACK}Min. performance: {LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}Reliability: {LTBLUE}{COMMA}% (max: {COMMA}%)  {BLACK}Breakdowns since last service: {LTBLUE}{COMMA}
+STR_VEHICLE_INFO_NO_ENGINES                                     :{BLACK}No engine attached — couple onto a locomotive to run
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}Built: {LTBLUE}{NUM}{BLACK} Value: {LTBLUE}{CURRENCY_LONG}
 STR_VEHICLE_INFO_NO_CAPACITY                                    :{BLACK}Capacity: {LTBLUE}None{STRING}
@@ -4704,6 +4708,27 @@ STR_ORDER_INDEX                                                 :{COMMA}:{NBSP}
 
 STR_ORDERS_END_OF_ORDERS                                        :- - End of Orders - -
 STR_ORDERS_END_OF_SHARED_ORDERS                                 :- - End of Shared Orders - -
+
+# Couple / decouple order strings (OpenTTD decouple feature)
+STR_ORDER_DECOUPLE                                              :{BLACK}Decouple
+STR_ORDER_DECOUPLE_BUTTON                                       :{BLACK}Decouple
+STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}Add a decouple order. The train will decouple the given number of vehicles (or minimal decouplable units) at the preceding station or depot
+STR_ORDER_GO_TO_COUPLE                                          :Go to and couple onto consist
+STR_ORDER_GO_TO_COUPLE_STATION                                  :Go to and couple onto consist at {STATION}
+STR_ORDER_GO_TO_COUPLE_DEPOT                                    :Go to and couple onto consist at {DEPOT}
+STR_ORDER_GO_TO_COUPLE_CARGO                                    : (carrying {STRING})
+STR_ORDER_GO_TO_COUPLE_BUTTON                                   :{BLACK}Go to and couple
+STR_ORDER_WAIT_COUPLE                                           :Wait for coupling
+STR_ORDER_WAIT_COUPLE_BUTTON                                    :{BLACK}Wait for coupling
+STR_ORDER_DECOUPLE_DETAILS                                      :Decouple {COMMA} units
+STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :Decouple minimal units
+STR_ORDER_DECOUPLE_KEEP_ORDERS                                  :Keep orders
+STR_ORDER_DECOUPLE_KEEP_ORDERS_NO_LOAD                          :Keep orders, do not load
+STR_ORDER_DECOUPLE_INHERIT_ORDERS                               :Inherit remaining orders
+STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :Wait for coupling
+STR_ORDER_COUPLE_ANY                                            :Couple any
+STR_ORDER_COUPLE_EMPTY                                          :Couple empty
+STR_ORDER_COUPLE_FULL                                           :Couple full
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}Non-stop
@@ -5442,6 +5467,7 @@ STR_ERROR_CAN_T_SEND_AIRCRAFT_TO_HANGAR                         :Can't send airc
 
 ###length VEHICLE_TYPES
 STR_ERROR_CAN_T_BUY_TRAIN                                       :Can't buy railway vehicle...
+STR_ERROR_CAN_T_SET_AS_FRONT_WAGON                              :Can't turn the wagon chain into an independent consist...
 STR_ERROR_CAN_T_BUY_ROAD_VEHICLE                                :Can't buy road vehicle...
 STR_ERROR_CAN_T_BUY_SHIP                                        :Can't buy ship...
 STR_ERROR_CAN_T_BUY_AIRCRAFT                                    :Can't buy aircraft...

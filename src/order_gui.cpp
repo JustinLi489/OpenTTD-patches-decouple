@@ -11,6 +11,8 @@
 #include "command_func.h"
 #include "viewport_func.h"
 #include "depot_map.h"
+#include "train.h"
+#include "consist_group.h"
 #include "roadveh.h"
 #include "timetable.h"
 #include "strings_func.h"
@@ -590,6 +592,9 @@ enum OrderDropDownID {
 	ODDI_CHANGE_COUNTER,
 	ODDI_LABEL_TEXT,
 	ODDI_LABEL_DEPARTURES_VIA,
+	ODDI_DECOUPLE,
+	ODDI_GOTO_COUPLE,
+	ODDI_WAIT_COUPLE,
 };
 
 static const StringID _order_manage_list_dropdown[] = {
@@ -1252,6 +1257,34 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 			break;
 		}
 
+		case OT_DECOUPLE: {
+			if (order->GetNumDecouple() == 0) {
+				AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_AUTO);
+			} else {
+				AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS, order->GetNumDecouple());
+			}
+			break;
+		}
+
+		case OT_GOTO_COUPLE: {
+			StringID load_str = STR_ORDER_COUPLE_ANY + to_underlying(order->GetCoupleLoad());
+			if (order->GetCoupleIsDepot()) {
+				AppendStringInPlace(line, STR_ORDER_GO_TO_COUPLE_DEPOT, v->type, order->GetDestination().ToDepotID());
+			} else {
+				AppendStringInPlace(line, STR_ORDER_GO_TO_COUPLE_STATION, order->GetDestination().ToStationID());
+			}
+			if (order->HasCoupleCargoType()) {
+				AppendStringInPlace(line, STR_ORDER_GO_TO_COUPLE_CARGO, CargoSpec::Get(order->GetCoupleCargoType())->name);
+			} else if (load_str != STR_ORDER_COUPLE_ANY) {
+				AppendStringInPlace(line, load_str);
+			}
+			break;
+		}
+
+		case OT_WAIT_COUPLE:
+			AppendStringInPlace(line, STR_ORDER_WAIT_COUPLE);
+			break;
+
 		case OT_SLOT: {
 			StringID str;
 			switch (order->GetSlotSubType()) {
@@ -1642,6 +1675,7 @@ private:
 	int selected_order = -1;
 	VehicleOrderID order_over = INVALID_VEH_ORDER_ID; ///< Order over which another order is dragged, \c INVALID_VEH_ORDER_ID if none.
 	OrderPlaceObjectState goto_type = OPOS_NONE;
+	bool goto_couple_mode = false; ///< The pick-station tool was started from the "Go to and couple" button.
 	Scrollbar *vscroll = nullptr;
 	bool can_do_refit = false;     ///< Vehicle chain can be refitted in depot.
 	bool can_do_autorefit = false; ///< Vehicle chain can be auto-refitted.
@@ -1862,6 +1896,38 @@ private:
 	{
 		Order order;
 		order.MakeLabel(OLST_TEXT);
+
+		this->InsertNewOrder(order);
+	}
+
+	/**
+	 * Handle the click on the decouple button.
+	 */
+	void OrderClick_Decouple()
+	{
+		Order order;
+		order.MakeDecouple(ODF_DECOUPLE, 0);
+
+		this->InsertNewOrder(order);
+	}
+
+	/**
+	 * Handle the click on the go to couple button.
+	 */
+	void OrderClick_GoToCouple()
+	{
+		/* The consist to couple onto is located at a station: pick one. */
+		this->goto_couple_mode = true;
+		this->OrderClick_Goto(OPOS_GOTO);
+	}
+
+	/**
+	 * Handle the click on the wait for couple button.
+	 */
+	void OrderClick_WaitCouple()
+	{
+		Order order;
+		order.MakeWaitCouple();
 
 		this->InsertNewOrder(order);
 	}
@@ -2354,6 +2420,17 @@ public:
 			this->EnableWidget(WID_O_MGMT_BTN);
 
 			switch (order->GetType()) {
+				case OT_DECOUPLE:
+				case OT_GOTO_COUPLE:
+				case OT_WAIT_COUPLE:
+					/* No bottom-button editing for couple/decouple orders yet (batch 3). */
+					this->DisableWidget(WID_O_NON_STOP);
+					this->DisableWidget(WID_O_FULL_LOAD);
+					this->DisableWidget(WID_O_UNLOAD);
+					this->DisableWidget(WID_O_REFIT_DROPDOWN);
+					this->EnableWidget(WID_O_MGMT_BTN);
+					break;
+
 				case OT_GOTO_STATION:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_LOAD);
@@ -3177,10 +3254,15 @@ public:
 					if (_settings_client.gui.show_adv_tracerestrict_features) {
 						list.push_back(MakeDropDownListStringItem(STR_ORDER_CHANGE_COUNTER_BUTTON, ODDI_CHANGE_COUNTER, false));
 					}
-					list.push_back(MakeDropDownListStringItem(STR_ORDER_LABEL_TEXT_BUTTON, ODDI_LABEL_TEXT, false));
-					list.push_back(MakeDropDownListStringItem(STR_ORDER_LABEL_DEPARTURES_VIA_BUTTON, ODDI_LABEL_DEPARTURES_VIA, false));
+				list.push_back(MakeDropDownListStringItem(STR_ORDER_LABEL_TEXT_BUTTON, ODDI_LABEL_TEXT, false));
+				list.push_back(MakeDropDownListStringItem(STR_ORDER_LABEL_DEPARTURES_VIA_BUTTON, ODDI_LABEL_DEPARTURES_VIA, false));
+				if (this->vehicle->type == VehicleType::Train) {
+					list.push_back(MakeDropDownListStringItem(STR_ORDER_DECOUPLE_BUTTON, ODDI_DECOUPLE, false));
+					list.push_back(MakeDropDownListStringItem(STR_ORDER_GO_TO_COUPLE_BUTTON, ODDI_GOTO_COUPLE, false));
+					list.push_back(MakeDropDownListStringItem(STR_ORDER_WAIT_COUPLE_BUTTON, ODDI_WAIT_COUPLE, false));
+				}
 
-					ShowDropDownList(this, std::move(list), sel, WID_O_GOTO, 0, DropDownOptions{}, DDSF_SHARED);
+				ShowDropDownList(this, std::move(list), sel, WID_O_GOTO, 0, DropDownOptions{}, DDSF_SHARED);
 				}
 				break;
 
@@ -3736,6 +3818,9 @@ public:
 					case ODDI_CHANGE_COUNTER:       this->OrderClick_ChangeCounter(); break;
 					case ODDI_LABEL_TEXT:           this->OrderClick_TextLabel(); break;
 					case ODDI_LABEL_DEPARTURES_VIA: this->OrderClick_Goto(OPOS_DEPARTURE_VIA); break;
+					case ODDI_DECOUPLE:             this->OrderClick_Decouple(); break;
+					case ODDI_GOTO_COUPLE:          this->OrderClick_GoToCouple(); break;
+					case ODDI_WAIT_COUPLE:          this->OrderClick_WaitCouple(); break;
 					default: NOT_REACHED();
 				}
 				break;
@@ -4021,6 +4106,30 @@ public:
 	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
 	{
 		if (this->goto_type == OPOS_GOTO) {
+			if (this->goto_couple_mode) {
+				/* "Go to and couple": the destination is the station or depot the consist waits at. */
+				if (IsTileType(tile, TileType::Station)) {
+					const Station *st = Station::GetByTile(tile);
+					if (st != nullptr && IsInfraUsageAllowed(this->vehicle->type, this->vehicle->owner, st->owner)) {
+						Order order;
+						order.MakeGoToCouple(st->index);
+						if (this->InsertNewOrder(order)) {
+							this->goto_couple_mode = false;
+							ResetObjectToPlace();
+						}
+					}
+				} else if (IsRailDepotTile(tile)) {
+					DepotID depot_id = GetDepotIndex(tile);
+					Order order;
+					order.MakeGoToCouple(depot_id, ODC_ANY, CT_COUPLE_ANY_CARGO, true);
+					if (this->InsertNewOrder(order)) {
+						this->goto_couple_mode = false;
+						ResetObjectToPlace();
+					}
+				}
+				return;
+			}
+
 			const Order cmd = GetOrderCmdFromTile(this->vehicle, tile);
 			if (cmd.IsType(OT_NOTHING)) return;
 
@@ -4069,6 +4178,30 @@ public:
 
 	bool OnVehicleSelect(const Vehicle *v) override
 	{
+		if (this->goto_couple_mode) {
+			/* In "Go to and couple" pick mode, clicking a consist targets the station or depot it waits at. */
+			if (IsTileType(v->tile, TileType::Station)) {
+				const Station *st = Station::GetByTile(v->tile);
+				if (st != nullptr && IsInfraUsageAllowed(this->vehicle->type, this->vehicle->owner, st->owner)) {
+					Order order;
+					order.MakeGoToCouple(st->index);
+					if (this->InsertNewOrder(order)) {
+						this->goto_couple_mode = false;
+						ResetObjectToPlace();
+					}
+				}
+			} else if (IsRailDepotTile(v->tile)) {
+				DepotID depot_id = GetDepotIndex(v->tile);
+				Order order;
+				order.MakeGoToCouple(depot_id, ODC_ANY, CT_COUPLE_ANY_CARGO, true);
+				if (this->InsertNewOrder(order)) {
+					this->goto_couple_mode = false;
+					ResetObjectToPlace();
+				}
+			}
+			return true;
+		}
+
 		if (this->goto_type == OPOS_INSERT_FROM_VEHICLE) {
 			if (Command<Commands::InsertOrdersFromVeh>::Post(STR_ERROR_CAN_T_COPY_ORDER_LIST, CommandCallback::InsertOrdersFromVehicle, this->vehicle->tile, this->vehicle->index, v->index, this->OrderGetSel())) {
 				this->selected_order = -1;
@@ -4132,6 +4265,7 @@ public:
 	void OnPlaceObjectAbort() override
 	{
 		this->goto_type = OPOS_NONE;
+		this->goto_couple_mode = false;
 		this->SetWidgetDirty(WID_O_GOTO);
 		this->SetWidgetDirty(WID_O_COND_AUX_VIA);
 		this->SetWidgetDirty(WID_O_COND_AUX_STATION);

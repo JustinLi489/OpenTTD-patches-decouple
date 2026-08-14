@@ -374,6 +374,21 @@ struct GroundVehicle : public SpecializedVehicle<T, Type, BaseGroundVehicle> {
 	inline void ClearFreeWagon() { ClrBit(this->subtype, GVSF_FREE_WAGON); }
 
 	/**
+	 * Set a vehicle as the front wagon of a consist that can hold orders and operate independently.
+	 */
+	inline void SetFrontWagon() { SetBit(this->subtype, GVSF_FRONT_WAGON); }
+
+	/**
+	 * Clear a vehicle from being a front wagon.
+	 */
+	inline void ClearFrontWagon() { ClrBit(this->subtype, GVSF_FRONT_WAGON); }
+
+	/**
+	 * Check whether a vehicle is the front wagon of a consist.
+	 */
+	inline bool IsFrontWagon() const { return HasBit(this->subtype, GVSF_FRONT_WAGON); }
+
+	/**
 	 * Set a vehicle as a virtual vehicle.
 	 */
 	inline void SetVirtual() { SetBit(this->subtype, GVSF_VIRTUAL); }

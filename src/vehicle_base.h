@@ -81,6 +81,7 @@ enum GroundVehicleSubtypeFlags : uint8_t {
 	GVSF_FREE_WAGON       = 4, ///< First in a wagon chain (in depot) (not used for road vehicles).
 	GVSF_MULTIHEADED      = 5, ///< Engine is multiheaded (not used for road vehicles).
 	GVSF_VIRTUAL          = 6, ///< Used for virtual trains during template design, it is needed to skip checks for tile or depot status
+	GVSF_FRONT_WAGON      = 7, ///< Leading wagon of a consist that holds orders and can operate independently (decouple/couple feature).
 };
 
 /**
@@ -372,6 +373,10 @@ public:
 	Order current_order{};                       ///< The current order (+ status, like: loading)
 
 	OrderList *orders = nullptr;                 ///< Pointer to the order list for this vehicle
+	OrderList *orders_backup = nullptr;          ///< R3R: backup of this vehicle's own orders while it executes a coupled consist's schedule (restored on decouple). NOSAVE.
+	UnitID unitnumber_backup = 0;                ///< R3R: this vehicle's own unit number while it inherits the consist's number (restored on decouple). NOSAVE.
+	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). NOSAVE.
+	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. NOSAVE.
 
 	NO_UNIQUE_ADDRESS NewGRFCache grf_cache{};   ///< Cache of often used calculated NewGRF values
 	Direction cur_image_valid_dir = Direction::Invalid; ///< NOSAVE: direction for which cur_image does not need to be regenerated on the next tick
@@ -989,6 +994,14 @@ private:
 	 */
 	void SkipToNextRealOrderIndex()
 	{
+		/* R3R: a GOTO_COUPLE locomotive must NOT advance its order index until it
+		 * has coupled. Advancing makes current_order and the index diverge
+		 * (observed: the index crept 3→0→1 every tick while entering the platform,
+		 * eventually loading a waypoint order and crashing into the waiting consist).
+		 * Coupling itself re-loads the consist's orders, so this lock is harmless
+		 * after a successful couple. */
+		if (this->type == VehicleType::Train && this->current_order.IsType(OT_GOTO_COUPLE)) return;
+
 		if (this->GetNumManualOrders() > 0) {
 			/* Advance to next real order */
 			do {
@@ -1010,6 +1023,9 @@ public:
 	 */
 	void IncrementImplicitOrderIndex()
 	{
+		/* R3R: lock a GOTO_COUPLE locomotive's implicit index too (see SkipToNextRealOrderIndex). */
+		if (this->type == VehicleType::Train && this->current_order.IsType(OT_GOTO_COUPLE)) return;
+
 		if (this->cur_implicit_order_index == this->cur_real_order_index) {
 			/* Increment real order index as well */
 			this->SkipToNextRealOrderIndex();
@@ -1034,6 +1050,16 @@ public:
 	 */
 	void IncrementRealOrderIndex()
 	{
+		/* DEBUG (R3R — remove): log index advancement for GOTO_COUPLE locomotives. */
+		if (this->type == VehicleType::Train && (this->current_order.IsType(OT_GOTO_COUPLE) ||
+				(this->GetOrder(this->cur_real_order_index) != nullptr && this->GetOrder(this->cur_real_order_index)->IsType(OT_GOTO_COUPLE)))) {
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "ADVANCE: veh=%d order=%d real_before=%d implicit_before=%d\n",
+						(int)this->index.base(), (int)this->current_order.GetType(), (int)this->cur_real_order_index, (int)this->cur_implicit_order_index);
+				fclose(dbg);
+			}
+		}
 		if (this->cur_implicit_order_index == this->cur_real_order_index) {
 			/* Increment both real and implicit order */
 			this->IncrementImplicitOrderIndex();
@@ -1049,6 +1075,9 @@ public:
 	 */
 	void UpdateRealOrderIndex()
 	{
+		/* R3R: keep a GOTO_COUPLE locomotive's order index locked (see SkipToNextRealOrderIndex). */
+		if (this->type == VehicleType::Train && this->current_order.IsType(OT_GOTO_COUPLE)) return;
+
 		/* Make sure the index is valid */
 		if (this->cur_real_order_index >= this->GetNumOrders()) this->cur_real_order_index = 0;
 

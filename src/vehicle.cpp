@@ -1229,6 +1229,12 @@ void Vehicle::PreDestructor()
 
 	this->cargo.Truncate();
 	DeleteVehicleOrders(this);
+	/* R3R: release the backed-up order list (the locomotive's own schedule
+	 * parked here while it was executing a coupled consist's schedule). */
+	if (this->orders_backup != nullptr) {
+		this->orders_backup->FreeChain(false);
+		this->orders_backup = nullptr;
+	}
 	DeleteDepotHighlightOfVehicle(this);
 
 	StopGlobalFollowVehicle(this);

@@ -2442,11 +2442,12 @@ void LoadUnloadStation(Station *st)
 
 	Vehicle *last_loading = nullptr;
 
-	/* Check if anything will be loaded at all. Otherwise we don't need to reserve either. */
+	/* Check if anything will be loaded at all. Otherwise we don't need to reserve either.
+	 * R3R defensive: a stale entry in st->loading_vehicles can have load_unload_ticks
+	 * already decremented to 0 (or current_order changed during decoupling) — skip it. */
 	for (Vehicle *v : st->loading_vehicles) {
-		if (v->vehstatus.Any({VehState::Stopped, VehState::Crashed}) || v->current_order.IsType(OT_LOADING_ADVANCE)) continue;
+		if (v->vehstatus.Any({VehState::Stopped, VehState::Crashed}) || v->current_order.IsType(OT_LOADING_ADVANCE) || v->load_unload_ticks == 0) continue;
 
-		assert(v->load_unload_ticks != 0);
 		if (--v->load_unload_ticks == 0) last_loading = v;
 	}
 
@@ -2460,7 +2461,11 @@ void LoadUnloadStation(Station *st)
 	if (last_loading == nullptr) return;
 
 	for (Vehicle *v : st->loading_vehicles) {
-		if (!v->vehstatus.Any({VehState::Stopped, VehState::Crashed}) && !v->current_order.IsType(OT_LOADING_ADVANCE)) LoadUnloadVehicle(v);
+		/* R3R defensive guard: LoadUnloadVehicle asserts current_order == OT_LOADING.
+		 * Decoupling can change v's current_order before LeaveStation runs, leaving
+		 * a stale entry in st->loading_vehicles. Skip it instead of crashing. */
+		if (v->vehstatus.Any({VehState::Stopped, VehState::Crashed}) || v->current_order.IsType(OT_LOADING_ADVANCE) || !v->current_order.IsType(OT_LOADING)) continue;
+		LoadUnloadVehicle(v);
 		if (v == last_loading) break;
 	}
 

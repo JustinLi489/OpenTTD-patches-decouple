@@ -42,8 +42,9 @@ static const StationID ORDER_NO_VIA_STATION{0xFFFE};
 inline uint32_t OrderDestinationRefcountMapKey(DestinationID dest, CompanyID cid, OrderType order_type, VehicleType veh_type)
 {
 	static_assert(sizeof(dest) == 2);
-	static_assert(OT_END <= 16);
-	return (((uint32_t) dest.base()) << 16) | (((uint32_t) cid.base()) << 8) | (((uint32_t) order_type) << 4) | ((uint32_t) veh_type);
+	static_assert(OT_END <= 32);
+	/* Bit layout: dest (16) | cid (8) | order_type (5) | veh_type (3). */
+	return (((uint32_t) dest.base()) << 20) | (((uint32_t) cid.base()) << 12) | (((uint32_t) order_type) << 7) | ((uint32_t) veh_type);
 }
 
 template <typename F> void IterateOrderRefcountMapForDestinationID(DestinationID dest, F handler)
@@ -96,6 +97,8 @@ struct OrderExtraInfo {
 	uint16_t dispatch_index = 0;              ///< Scheduled dispatch index + 1
 	uint8_t xflags = 0;                       ///< Extra flags
 	uint8_t colour = 0;                       ///< Order colour + 1
+	uint8_t decouple_first_orders = 0;        ///< OrderDecoupleOrdersFlags for the first part after decoupling.
+	uint8_t decouple_second_orders = 0;       ///< OrderDecoupleOrdersFlags for the second part after decoupling.
 };
 
 namespace upstream_sl {
@@ -243,8 +246,8 @@ public:
 		return *this;
 	}
 
-	static constexpr auto GetCmdRefFields() { return std::make_tuple(&Order::type, &Order::flags, &Order::dest); }
-	static constexpr char CMD_TUPLE_FMT[] = "t: {:X}, f: {:X}, d: {}";
+	static constexpr auto GetCmdRefFields() { return std::make_tuple(&Order::type, &Order::flags, &Order::dest, &Order::refit_cargo); }
+	static constexpr char CMD_TUPLE_FMT[] = "t: {:X}, f: {:X}, d: {}, rc: {:X}";
 
 	/**
 	 * Check whether this order is of the given type.
@@ -263,7 +266,7 @@ public:
 	 * Get the type of order of this order.
 	 * @return the order type.
 	 */
-	inline OrderType GetType() const { return (OrderType)GB(this->type, 0, 4); }
+	inline OrderType GetType() const { return (OrderType)GB(this->type, 0, 5); }
 
 	void InvalidateGuiOnRemove();
 	void Free();
@@ -283,6 +286,9 @@ public:
 	void MakeReleaseSlotGroup();
 	void MakeChangeCounter();
 	void MakeLabel(OrderLabelSubType subtype);
+	void MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple);
+	void MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load = ODC_ANY, CargoType cargo = CT_COUPLE_ANY_CARGO, bool depot_target = false);
+	void MakeWaitCouple();
 
 	/**
 	 * Is this a 'goto' order with a real destination?
@@ -290,7 +296,7 @@ public:
 	 */
 	inline bool IsGotoOrder() const
 	{
-		return this->IsType(OT_GOTO_WAYPOINT) || this->IsType(OT_GOTO_DEPOT) || this->IsType(OT_GOTO_STATION);
+		return this->IsType(OT_GOTO_WAYPOINT) || this->IsType(OT_GOTO_DEPOT) || this->IsType(OT_GOTO_STATION) || this->IsType(OT_GOTO_COUPLE);
 	}
 
 	/**
@@ -569,6 +575,95 @@ public:
 	inline void SetDepotExtraFlags(OrderDepotExtraFlags depot_extra_flags) { SB(this->flags, 8, 8, depot_extra_flags.base()); }
 	/** Set waypoint flags. */
 	inline void SetWaypointFlags(OrderWaypointFlags waypoint_flags) { SB(this->flags, 0, 3, waypoint_flags.base()); }
+
+	/* Decouple / couple order parameters (OT_DECOUPLE / OT_GOTO_COUPLE / OT_WAIT_COUPLE).
+	 * These order types are new, so we are free to define their flag bit fields.
+	 * flags bit 0-7 only (flags is saved as 8 bits on disk, see order_sl.cpp). */
+
+	/**
+	 * Get whether the decouple action of this order is enabled.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline OrderDecoupleFlags GetDecouple() const { return (OrderDecoupleFlags)GB(this->flags, 0, 1); }
+	/**
+	 * Get the number of vehicles to decouple. 0 means "minimal decouplable unit" (F1).
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 7); }
+	/**
+	 * Get the load condition of the consist to couple onto.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline OrderCoupleLoadFlags GetCoupleLoad() const { return (OrderCoupleLoadFlags)GB(this->flags, 0, 2); }
+	/**
+	 * Is the destination of this GOTO_COUPLE order a depot rather than a station?
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline bool GetCoupleIsDepot() const { return HasBit(this->flags, 2); }
+	/**
+	 * Does this GOTO_COUPLE order specify a cargo type?
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline bool HasCoupleCargoType() const { return this->refit_cargo != CT_COUPLE_ANY_CARGO; }
+	/**
+	 * Get the cargo type the consist must carry to be coupled.
+	 * @pre IsType(OT_GOTO_COUPLE) && HasCoupleCargoType().
+	 */
+	inline CargoType GetCoupleCargoType() const { return this->refit_cargo; }
+
+	/**
+	 * Set whether the decouple action of this order is enabled.
+	 * @param decouple Whether to decouple.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetDecouple(OrderDecoupleFlags decouple) { SB(this->flags, 0, 1, decouple); }
+	/**
+	 * Set the number of vehicles to decouple. 0 means "minimal decouplable unit" (F1).
+	 * @param num_decouple The number of vehicles to decouple.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetNumDecouple(uint8_t num_decouple) { SB(this->flags, 1, 7, num_decouple); }
+	/**
+	 * Set the load condition of the consist to couple onto.
+	 * @param load The load condition.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetCoupleLoad(OrderCoupleLoadFlags load) { SB(this->flags, 0, 2, load); }
+	/**
+	 * Set whether the destination of this GOTO_COUPLE order is a depot.
+	 * @param depot_target Whether the destination is a depot.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetCoupleIsDepot(bool depot_target) { SB(this->flags, 2, 1, depot_target); }
+	/**
+	 * Set the cargo type the consist must carry to be coupled.
+	 * @param cargo The cargo type, or CT_COUPLE_ANY_CARGO for any.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetCoupleCargoType(CargoType cargo) { this->refit_cargo = cargo; }
+
+	/**
+	 * Get the order strategy for the first part of the train after decoupling.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline OrderDecoupleOrdersFlags GetDecoupleFirstOrdersType() const { return this->extra != nullptr ? (OrderDecoupleOrdersFlags)this->extra->decouple_first_orders : ODOF_KEEP_ORDERS; }
+	/**
+	 * Get the order strategy for the second part of the train after decoupling.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline OrderDecoupleOrdersFlags GetDecoupleSecondOrdersType() const { return this->extra != nullptr ? (OrderDecoupleOrdersFlags)this->extra->decouple_second_orders : ODOF_KEEP_ORDERS; }
+	/**
+	 * Set the order strategy for the first part of the train after decoupling.
+	 * @param orders_type The order strategy.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetDecoupleFirstOrdersType(OrderDecoupleOrdersFlags orders_type) { this->CheckExtraInfoAlloced(); this->extra->decouple_first_orders = to_underlying(orders_type); }
+	/**
+	 * Set the order strategy for the second part of the train after decoupling.
+	 * @param orders_type The order strategy.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetDecoupleSecondOrdersType(OrderDecoupleOrdersFlags orders_type) { this->CheckExtraInfoAlloced(); this->extra->decouple_second_orders = to_underlying(orders_type); }
 
 	/**
 	 * Set variable we have to compare.

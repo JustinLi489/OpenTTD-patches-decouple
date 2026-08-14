@@ -15,6 +15,7 @@
 #include "core/pool_type.hpp"
 #include "station_type.h"
 #include "tracerestrict_id_type.h"
+#include "cargo_type.h"
 
 typedef uint16_t VehicleOrderID;  ///< The index of an order within its current vehicle (not pool related)
 struct OrderIDTag : public PoolIDTraits<uint32_t, 0xFF0000, 0xFFFFFF> {};
@@ -88,10 +89,13 @@ enum OrderType : uint8_t {
 	OT_COUNTER       = 12,
 	OT_LABEL         = 13,
 	OT_SLOT_GROUP    = 14,
+	OT_DECOUPLE      = 15,  ///< Decouple a number of vehicles (or minimal decouplable unit) from the back of the train.
+	OT_GOTO_COUPLE   = 16,  ///< Go to and couple onto a waiting consist (station or depot).
+	OT_WAIT_COUPLE   = 17,  ///< Wait in place to be coupled onto by a locomotive.
 	OT_END
 };
 
-using OrderTypeMask = uint16_t;
+using OrderTypeMask = uint32_t;
 
 enum OrderSlotSubType : uint8_t {
 	OSST_RELEASE               = 0,
@@ -112,6 +116,38 @@ enum OrderLabelSubType : uint8_t {
 enum class OrderLabelError : uint16_t {
 	Default                    = 0,
 	ParseError                 = 1,
+};
+
+/** Cargo sentinel: couple onto a consist of any cargo type. */
+static constexpr CargoType CT_COUPLE_ANY_CARGO{0xFC};
+
+/**
+ * Whether the decouple action is enabled for a #OT_DECOUPLE order.
+ */
+enum OrderDecoupleFlags : uint8_t {
+	ODF_NOTHING  = 0, ///< Decouple disabled.
+	ODF_DECOUPLE = 1, ///< Decouple enabled.
+};
+
+/**
+ * Load state condition for a #OT_GOTO_COUPLE order.
+ */
+enum OrderCoupleLoadFlags : uint8_t {
+	ODC_ANY      = 0, ///< Couple any consist.
+	ODC_IS_EMPTY = 1, ///< Only couple an empty consist.
+	ODC_IS_FULL  = 2, ///< Only couple a full consist.
+	ODC_END
+};
+
+/**
+ * What to do with the orders of the (first/second) part of the train after decoupling.
+ */
+enum OrderDecoupleOrdersFlags : uint8_t {
+	ODOF_KEEP_ORDERS         = 0, ///< Keep the current orders.
+	ODOF_KEEP_ORDERS_NO_LOAD = 1, ///< Keep the current orders, but do not load.
+	ODOF_INHERIT_ORDERS      = 2, ///< Inherit the remaining orders of the original train.
+	ODOF_WAIT_FOR_COUPLE     = 3, ///< Insert a WAIT_COUPLE order.
+	ODOF_END
 };
 
 inline bool IsDestinationOrderLabelSubType(OrderLabelSubType subtype)

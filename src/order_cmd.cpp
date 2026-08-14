@@ -39,6 +39,7 @@
 #include "vehiclelist.h"
 #include "tracerestrict.h"
 #include "train.h"
+#include "consist_group.h"
 #include "date_func.h"
 #include "schdispatch.h"
 #include "timetable_cmd.h"
@@ -287,6 +288,30 @@ void Order::MakeLabel(OrderLabelSubType subtype)
 {
 	this->type = OT_LABEL;
 	this->flags = subtype;
+}
+
+void Order::MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple)
+{
+	this->type = OT_DECOUPLE;
+	this->flags = 0;
+	this->SetDecouple(decouple);
+	this->SetNumDecouple(num_decouple);
+}
+
+void Order::MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load, CargoType cargo, bool depot_target)
+{
+	this->type = OT_GOTO_COUPLE;
+	this->flags = 0;
+	this->dest = dest;
+	this->SetCoupleLoad(load);
+	this->SetCoupleCargoType(cargo);
+	this->SetCoupleIsDepot(depot_target);
+}
+
+void Order::MakeWaitCouple()
+{
+	this->type = OT_WAIT_COUPLE;
+	this->flags = 0;
 }
 
 /**
@@ -705,7 +730,7 @@ CargoMaskedStationIDVector OrderList::GetNextStoppingStation(const Vehicle *v, C
 			});
 			if (invalid) return CargoMaskedStationIDVector(cargo_mask);
 		}
-	} while (next->IsType(OT_GOTO_DEPOT) || next->IsSlotCounterOrder() || next->IsType(OT_DUMMY) || next->IsType(OT_LABEL)
+	} while (next->IsType(OT_GOTO_DEPOT) || next->IsSlotCounterOrder() || next->IsType(OT_DUMMY) || next->IsType(OT_LABEL) || next->IsType(OT_DECOUPLE)
 			|| (next->IsBaseStationOrder() && next->GetDestination() == v->last_station_visited));
 
 	return CargoMaskedStationIDVector(cargo_mask, { next->GetDestination().ToStationID() });
@@ -1206,6 +1231,33 @@ static CommandCost PreInsertOrderCheck(Vehicle *v, const Order &new_order, CmdIn
 			break;
 		}
 
+		case OT_DECOUPLE: {
+			/* Decoupling only makes sense for trains. */
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (new_order.GetDecouple() != ODF_NOTHING && new_order.GetDecouple() != ODF_DECOUPLE) return CMD_ERROR;
+			break;
+		}
+
+		case OT_GOTO_COUPLE: {
+			/* Coupling onto a consist only makes sense for trains. */
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (new_order.GetCoupleLoad() >= ODC_END) return CMD_ERROR;
+			/* The order must carry a valid destination (station or depot); without it the
+			 * train has nowhere to pathfind to and ends up spinning around. */
+			if (new_order.GetCoupleIsDepot()) {
+				if (!Depot::IsValidID(new_order.GetDestination().ToDepotID())) return CMD_ERROR;
+			} else {
+				if (!Station::IsValidID(new_order.GetDestination().ToStationID())) return CMD_ERROR;
+			}
+			break;
+		}
+
+		case OT_WAIT_COUPLE: {
+			/* Waiting to be coupled only makes sense for trains. */
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			break;
+		}
+
 		case OT_CONDITIONAL: {
 			VehicleOrderID skip_to = new_order.GetConditionSkipToOrder();
 			if (skip_to != 0 && skip_to >= v->GetNumOrders() && !insert_flags.Test(CmdInsertOrderIntlFlag::NoConditionTargetCheck)) return CMD_ERROR; // Always allow jumping to the first (even when there is no order).
@@ -1401,6 +1453,20 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
 	if (sel_ord == INVALID_VEH_ORDER_ID) sel_ord = v->GetNumOrders(); // Append to end of list
 
 	if (sel_ord > v->GetNumOrders()) return CMD_ERROR;
+
+	/* R4/G1: A decouple order may only follow a station or depot order
+	 * (uncoupling must happen at a station or a depot, never at a waypoint).
+	 * GOTO_COUPLE carries its own destination, and WAIT_COUPLE declares "wait here
+	 * to be coupled" (e.g. the first order of a consist sitting in a depot/station),
+	 * so both may be placed anywhere. */
+	if (new_order.IsType(OT_DECOUPLE)) {
+		if (sel_ord == 0) return CMD_ERROR; // Cannot be the first order.
+		const Order *prev_order = v->GetOrder(sel_ord - 1);
+		if (prev_order == nullptr) return CMD_ERROR;
+		if (!prev_order->IsType(OT_GOTO_STATION) && !prev_order->IsType(OT_GOTO_DEPOT)) {
+			return CommandCost(STR_ERROR_CAN_T_ADD_ORDER);
+		}
+	}
 
 	if (v->GetNumOrders() >= MAX_VEH_ORDER_ID) return CommandCost(STR_ERROR_TOO_MANY_ORDERS);
 	if (v->orders == nullptr && !OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
@@ -1680,6 +1746,12 @@ CommandCost CmdSkipToOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 		v->cur_implicit_order_index = v->cur_real_order_index = sel_ord;
 		v->UpdateRealOrderIndex();
 		v->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+
+		/* R3R: discard the stale current order (e.g. a skipped GOTO_COUPLE whose
+		 * ProcessOrders never advances) so the next ProcessOrders tick loads the
+		 * newly selected order and updates the destination + vehicle view window. */
+		v->current_order.Free();
+		v->SetDestTile(INVALID_TILE);
 
 		/* Unbunching data is no longer valid. */
 		v->ResetDepotUnbunching();
@@ -4088,6 +4160,16 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 			}
 			break;
 
+		case OT_GOTO_COUPLE:
+			if (order->GetCoupleIsDepot()) {
+				DepotID depot_id = order->GetDestination().ToDepotID();
+				if (!Depot::IsValidID(depot_id)) return false;
+				v->SetDestTile(Depot::Get(depot_id)->xy);
+			} else {
+				v->SetDestTile(v->GetOrderStationLocation(order->GetDestination().ToStationID()));
+			}
+			return true;
+
 		case OT_GOTO_WAYPOINT:
 			v->SetDestTile(Waypoint::Get(order->GetDestination().ToStationID())->xy);
 			return true;
@@ -4223,6 +4305,30 @@ bool ProcessOrders(Vehicle *v)
 		case OT_LEAVESTATION:
 			if (v->type != VehicleType::Aircraft) return false;
 			break;
+
+		case OT_DECOUPLE:
+		case OT_WAIT_COUPLE:
+			/* Decouple orders are consumed by the station arrival logic; wait orders keep the vehicle waiting. */
+			return false;
+
+		case OT_GOTO_COUPLE:
+			/* Coupling onto a consist is handled in the train movement code.
+			 * R3R (reverted to station-entrance target): targeting the consist's
+			 * own tile made the pathfinder "arrive" onto an occupied tile —
+			 * the train never got a proper stop (overspeed message, no arrival
+			 * handling) and never coupled. Target the station entrance instead:
+			 * the train stops/creeps there and couples via movement collision. */
+			UpdateOrderDest(v, &v->current_order);
+			/* DEBUG (R3R — remove): log every GOTO_COUPLE ProcessOrders pass. */
+			{
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+				fprintf(dbg, "PO-GOTO_COUPLE: veh=%d order=%d real_idx=%d implicit_idx=%d\n",
+						(int)v->index.base(), (int)v->current_order.GetType(), (int)v->cur_real_order_index, (int)v->cur_implicit_order_index);
+					fclose(dbg);
+				}
+			}
+			return false;
 
 		default: break;
 	}
@@ -4430,6 +4536,9 @@ const char *GetOrderTypeName(OrderType order_type)
 		"OT_COUNTER",
 		"OT_LABEL",
 		"OT_SLOT_GROUP",
+		"OT_DECOUPLE",
+		"OT_GOTO_COUPLE",
+		"OT_WAIT_COUPLE",
 	};
 	static_assert(lengthof(names) == OT_END);
 	if (order_type < OT_END) return names[order_type];

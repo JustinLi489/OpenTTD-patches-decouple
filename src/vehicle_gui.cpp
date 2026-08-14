@@ -3450,8 +3450,12 @@ struct VehicleDetailsWindow : Window {
 						}
 					}
 					uint8_t total_engines = Train::From(v)->tcache.cached_num_engines;
-					assert(total_engines > 0);
-					DrawString(tr, GetString(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(total_reliability / total_engines), ToPercent16(total_max_reliability / total_engines), total_breakdowns));
+					if (total_engines > 0) {
+						DrawString(tr, GetString(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(total_reliability / total_engines), ToPercent16(total_max_reliability / total_engines), total_breakdowns));
+					} else {
+						/* Unpowered consist (R3 car-only front wagon): no engine reliability to show. */
+						DrawString(tr, GetString(STR_VEHICLE_INFO_NO_ENGINES));
+					}
 				} else {
 					DrawString(tr, GetString(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(v->reliability), ToPercent16(v->GetEngine()->reliability), v->breakdowns_since_last_service));
 				}
@@ -3895,6 +3899,9 @@ void CcStartStopVehicle(const CommandCost &result, VehicleID veh_id, bool evalua
  */
 void StartStopVehicle(const Vehicle *v, bool texteffect)
 {
+	/* R3R: car-only consists (free-wagon chains, no engine) cannot be started/stopped by themselves. */
+	if (v->type == VehicleType::Train && Train::From(v)->IsFreeWagon()) return;
+
 	assert(v->IsPrimaryVehicle());
 	Command<Commands::StartStopVehicle>::Post(_vehicle_msg_translation_table[VCT_CMD_START_STOP][v->type], (texteffect && !IsHeadless()) ? CommandCallback::StartStopVehicle : CommandCallback::None, v->tile, v->index, false);
 }
@@ -4346,6 +4353,32 @@ public:
 
 				case OT_WAITING: {
 					append(STR_VEHICLE_STATUS_TRAIN_WAITING_TIMETABLE);
+					break;
+				}
+
+				case OT_GOTO_COUPLE: {
+					show_order_number();
+					text_colour = TextColour::LightBlue;
+					if (v->current_order.GetCoupleIsDepot()) {
+						auto params = MakeParameters(v->type, v->current_order.GetDestination().ToDepotID(), PackVelocity(v->GetDisplaySpeed(), v->type));
+						append_args(v->vehicle_flags.Test(VehicleFlag::PathfinderLost) ? STR_VEHICLE_STATUS_CANNOT_REACH_DEPOT_VEL : STR_VEHICLE_STATUS_HEADING_FOR_DEPOT_VEL, params);
+					} else {
+						append(v->vehicle_flags.Test(VehicleFlag::PathfinderLost) ? STR_VEHICLE_STATUS_CANNOT_REACH_STATION_VEL : STR_VEHICLE_STATUS_HEADING_FOR_STATION_VEL,
+								v->current_order.GetDestination().ToStationID(), PackVelocity(v->GetDisplaySpeed(), v->type));
+					}
+					break;
+				}
+
+				case OT_WAIT_COUPLE: {
+					append(STR_VEHICLE_STATUS_TRAIN_WAITING_TIMETABLE);
+					break;
+				}
+
+				case OT_DECOUPLE: {
+					show_order_number();
+					text_colour = TextColour::LightBlue;
+					append(STR_VEHICLE_STATUS_HEADING_FOR_STATION_VEL,
+							v->current_order.GetDestination().ToStationID(), PackVelocity(v->GetDisplaySpeed(), v->type));
 					break;
 				}
 
@@ -4801,7 +4834,11 @@ bool VehicleClicked(const Vehicle *v)
 	if (!(_thd.place_mode & HT_VEHICLE)) return false;
 
 	v = v->First();
-	if (!v->IsPrimaryVehicle()) return false;
+	if (!v->IsPrimaryVehicle()) {
+		if (v->type != VehicleType::Train) return false;
+		const Train *t = Train::From(v);
+		if (t == nullptr || !t->IsFreeWagon()) return false;
+	}
 
 	return _thd.GetCallbackWnd()->OnVehicleSelect(v);
 }
