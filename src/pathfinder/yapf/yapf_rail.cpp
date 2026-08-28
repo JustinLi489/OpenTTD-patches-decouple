@@ -706,11 +706,16 @@ public:
 				fclose(dbg);
 			}
 		}
-		this->SetReservationTarget(pNode, pNode->GetLastTile(), pNode->GetLastTrackdir());
+		/* R3R: reserve up to the consist's head car (the coupling point) instead of
+		 * the far end of the platform - reserving the far end routes the loco through
+		 * the consist and extends the reservation past the platform. */
+		const TileIndex res_target_tile = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pNode->GetLastTile();
+		this->SetReservationTarget(pNode, res_target_tile, pNode->GetLastTrackdir());
 
 		/* Walk through the path back to the origin. */
 		Trackdir next_trackdir = INVALID_TRACKDIR;
 		Node *pPrev = nullptr;
+		TileIndex rp_last_tile = INVALID_TILE;
 		while (pNode->parent != nullptr) {
 			pPrev = pNode;
 			pNode = pNode->parent;
@@ -751,7 +756,7 @@ public:
 			if (depth <= 15) {
 				FILE *dbg = fopen("R3R_debug.log", "a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth);
+					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
 					fclose(dbg);
 				}
 			}
@@ -819,12 +824,13 @@ public:
 					if (depth <= 15) {
 						FILE *dbg = fopen("R3R_debug.log", "a");
 						if (dbg != nullptr) {
-							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth);
+							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
 							fclose(dbg);
 						}
 					}
 					if (depth > 512) return false;
 					if (cur == tg) return true;
+					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) rp_last_tile = cur;
 					if (IsRailDepotTile(cur)) return false; /* R3R: do not reserve through a depot. */
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
@@ -835,13 +841,23 @@ public:
 						for (int i = 0; i < 32; ++i) {
 							tt += delta;
 							if (tt == f3.new_tile) break;
-							if (tt == tg) return true;
+							if (tt == tg) {
+								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								}
+								return true;
+							}
 						}
 						tt = cur;
 						for (int i = 0; i < 32; ++i) {
 							tt -= delta;
 							if (tt == f3.new_tile) break;
-							if (tt == tg) return true;
+							if (tt == tg) {
+								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								}
+								return true;
+							}
 						}
 					}
 					TrackdirBits tdb3 = f3.new_td_bits;
@@ -850,6 +866,17 @@ public:
 						if (rp(f3.new_tile, FindFirstTrackdir(tdb3), depth + 1)) {
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+							}
+							/* R3R: also reserve the entry track of the next tile - the loco needs the
+							 * track it drives INTO, not just the one it leaves. Only reserve if the tile
+							 * actually has that track (avoids the pbs.cpp:144 assertion on platforms or
+							 * tiles where cur_td points along a different axis from the next tile). */
+							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
+								Track entry_track = TrackdirToTrack(ReverseTrackdir(cur_td));
+								TrackBits tile_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(f3.new_tile, ::TransportType::TRANSPORT_RAIL, 0));
+								if (tile_tracks & TrackToTrackBits(entry_track)) {
+									TryReserveRailTrack(f3.new_tile, entry_track);
+								}
 							}
 							return true;
 						}
@@ -860,12 +887,25 @@ public:
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
 							}
+							/* R3R: also reserve the entry track of the next tile, but only if
+							 * the tile actually has that track (avoids the pbs.cpp:144 assertion
+							 * on platforms/tiles where cur_td points along a different axis). */
+							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
+								Track entry_track = TrackdirToTrack(ReverseTrackdir(cur_td));
+								TrackBits tile_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(f3.new_tile, ::TransportType::TRANSPORT_RAIL, 0));
+								if (tile_tracks & TrackToTrackBits(entry_track)) {
+									TryReserveRailTrack(f3.new_tile, entry_track);
+								}
+							}
 							return true;
 						}
 					}
 					return false;
 				};
 				rp(st, best_td, 0);
+				if (rp_last_tile != INVALID_TILE) {
+					this->SetReservationTarget(pNode, rp_last_tile, pNode->GetLastTrackdir());
+				}
 			}
 		} else {
 			/* R3R: no reachable departure direction (the only path went through the depot) - wait. */
@@ -879,6 +919,16 @@ public:
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
 							(int)v->index.base(), (int)reserved, (int)next_trackdir);
+					fprintf(dbg, "CHKRES 38,37=0x%x 38,36=0x%x 38,35=0x%x 38,34=0x%x 39,34=0x%x 39,33=0x%x 39,32=0x%x 39,31=0x%x 39,30=0x%x\n",
+							(unsigned)GetReservedTrackbits(TileXY(38, 37)),
+							(unsigned)GetReservedTrackbits(TileXY(38, 36)),
+							(unsigned)GetReservedTrackbits(TileXY(38, 35)),
+							(unsigned)GetReservedTrackbits(TileXY(38, 34)),
+							(unsigned)GetReservedTrackbits(TileXY(39, 34)),
+							(unsigned)GetReservedTrackbits(TileXY(39, 33)),
+							(unsigned)GetReservedTrackbits(TileXY(39, 32)),
+							(unsigned)GetReservedTrackbits(TileXY(39, 31)),
+							(unsigned)GetReservedTrackbits(TileXY(39, 30)));
 					fclose(dbg);
 				}
 			}
@@ -1056,7 +1106,15 @@ public:
 		if (dest != nullptr) *dest = INVALID_TILE;
 
 		/* set origin and destination nodes */
-		PBSTileInfo origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::OkayUnused);
+		PBSTileInfo origin;
+		if (v->current_order.IsType(OT_GOTO_COUPLE)) {
+			/* R3R: when coupling, start the path from the loco itself.
+			 * FollowTrainReservation would walk the consist's platform reservation up
+			 * to its far end, and the path would then extend past the platform. */
+			origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
+		} else {
+			origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::OkayUnused);
+		}
 		Yapf().SetOrigin(origin.tile, origin.trackdir, INVALID_TILE, INVALID_TRACKDIR, 1);
 		Yapf().SetTreatFirstRedTwoWaySignalAsEOL(true);
 		Yapf().SetDestination(v);

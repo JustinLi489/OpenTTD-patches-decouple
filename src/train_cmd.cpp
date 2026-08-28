@@ -4016,6 +4016,22 @@ static bool TrainCoupleHandler(Train *v)
 			}
 			fclose(dbg);
 		}
+		/* R3R (debug): log the reservation state around the waiting loco. */
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				const int lx = TileX(v->tile);
+				const int ly = TileY(v->tile);
+				fprintf(dbg, "RESCHECK v=%d at=%d,%d resAhead 38,37=0x%x 38,36=0x%x 38,35=0x%x 38,34=0x%x 39,34=0x%x\n",
+						(int)v->index.base(), lx, ly,
+						(unsigned)GetReservedTrackbits(TileXY(38, 37)),
+						(unsigned)GetReservedTrackbits(TileXY(38, 36)),
+						(unsigned)GetReservedTrackbits(TileXY(38, 35)),
+						(unsigned)GetReservedTrackbits(TileXY(38, 34)),
+						(unsigned)GetReservedTrackbits(TileXY(39, 34)));
+				fclose(dbg);
+			}
+		}
 		return false;
 	}
 
@@ -5367,8 +5383,16 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		}
 	}
 	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
-		Track path_found = DoTrainCouplePathfind(consist, do_track_reservation);
-		if (path_found != INVALID_TRACK && res_dest.tile == tile) {
+		/* R3R: always reserve the couple path - the loco needs a reservation
+		 * to move, and it must extend right up to the consist. Without this the
+		 * loco only reserves on force_res ticks and then moves without one. */
+		Track path_found = DoTrainCouplePathfind(consist, true);
+		/* R3R: the couple pathfinder starts from the loco itself and always
+		 * returns a valid departure direction, so use it regardless of where
+		 * ExtendTrainReservation ended up (res_dest.tile != tile when the
+		 * consist platform reservation is reached first). Without this the
+		 * loco never moves and never shows a reservation. */
+		if (path_found != INVALID_TRACK) {
 			best_track = path_found;
 		}
 		if (path_found == INVALID_TRACK) {
@@ -5397,6 +5421,12 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 
 	/* A path was found, but could not be reserved. */
 	if (res_dest.tile != INVALID_TILE && !res_dest.okay) {
+		/* R3R: a GOTO_COUPLE loco's couple pathfinder already reserved the
+		 * path up to the consist. ExtendTrainReservation stops at the
+		 * already-reserved consist platform (res_dest.okay == false), and
+		 * freeing the reservation here would wipe the couple reservation,
+		 * leaving the loco without one. Keep it and return. */
+		if (consist->current_order.IsType(OT_GOTO_COUPLE)) return { best_track, result_flags };
 		if (mark_stuck) MarkTrainAsStuck(consist);
 		FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 		return { best_track, result_flags };
@@ -7670,10 +7700,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		const TileIndexDiff delta = TileOffsByAxis(axis);
 		const Track track = AxisToTrack(axis);
 		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t -= delta) {
-			TryReserveRailTrack(t, track);
+			bool ok = TryReserveRailTrack(t, track);
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "PLATRES t=%d,%d trk=%d ok=%d\n", (int)TileX(t), (int)TileY(t), (int)track, (int)ok);
+				fclose(dbg);
+			}
 		}
 		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t += delta) {
-			TryReserveRailTrack(t, track);
+			bool ok = TryReserveRailTrack(t, track);
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "PLATRES t=%d,%d trk=%d ok=%d\n", (int)TileX(t), (int)TileY(t), (int)track, (int)ok);
+				fclose(dbg);
+			}
 		}
 	}
 

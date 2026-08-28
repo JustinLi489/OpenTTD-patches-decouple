@@ -317,9 +317,12 @@ public:
 				fclose(dbg);
 			}
 		}
-		if (!has_res) return false;
+		if (!has_res && !IsRailStationTile(tile)) return false;
 
-		Train *t = GetTrainForReservation(tile, TrackdirToTrack(td));
+		Train *t = nullptr;
+		if (has_res) {
+			t = GetTrainForReservation(tile, TrackdirToTrack(td));
+		}
 		if (t == nullptr && IsRailStationTile(tile)) {
 			/* R3R: the whole-platform reservation may leave reserved tiles that
 			 * have no consist on them (the consist is elsewhere on the platform).
