@@ -672,6 +672,31 @@ public:
 
 		/* Found a destination, set as reservation target. */
 		Node *pNode = Yapf().GetBestNode();
+		/* R3R: route to the consist head car itself instead of the platform dest tile -
+		 * the platform dest may sit on the far side of the consist, making the path
+		 * cut straight through it. */
+		TileIndex consist_head_tile = INVALID_TILE;
+		if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
+			Train *ct = GetTrainForReservation(pNode->GetLastTile(), TrackdirToTrack(pNode->GetLastTrackdir()));
+			if (ct == nullptr) {
+				for (Train *tr : VehiclesOnTile<VehicleType::Train>(pNode->GetLastTile())) {
+					if (tr->IsFrontEngine()) { ct = tr; break; }
+				}
+			}
+			if (ct != nullptr) {
+				Train *h = ct->First();
+				if (h != nullptr) consist_head_tile = h->tile;
+			}
+			{
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d\n",
+							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
+							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile));
+					fclose(dbg);
+				}
+			}
+		}
 		{
 			FILE *dbg = fopen("R3R_debug.log", "a");
 			if (dbg != nullptr) {
@@ -720,7 +745,7 @@ public:
 		 * of any node segment, so TryReservePath does not cover them). */
 		TrackFollower ft(v, Yapf().GetCompatibleRailTypes());
 		TileIndex st = pNode->GetLastTile();
-		TileIndex tg = pPrev->GetLastTile();
+		TileIndex tg = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pPrev->GetLastTile();
 		Trackdir best_td = INVALID_TRACKDIR;
 		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
 			if (depth <= 15) {
@@ -736,6 +761,26 @@ public:
 			if (IsRailDepotTile(cur)) return false;
 			TrackFollower f2(v, Yapf().GetCompatibleRailTypes());
 			if (!f2.Follow(cur, cur_td)) return false;
+			/* R3R: TrackFollower leaps a whole platform in one step, so the
+			 * consist head (tg) lying on that platform stretch would be skipped.
+			 * If tg is on the platform segment between cur and f2.new_tile, treat
+			 * it as reached. */
+			if (IsRailStationTile(f2.new_tile)) {
+				const Axis axis = GetRailStationAxis(f2.new_tile);
+				const TileIndexDiff delta = TileOffsByAxis(axis);
+				TileIndex tt = cur;
+				for (int i = 0; i < 32; ++i) {
+					tt += delta;
+					if (tt == f2.new_tile) break;
+					if (tt == tg) return true;
+				}
+				tt = cur;
+				for (int i = 0; i < 32; ++i) {
+					tt -= delta;
+					if (tt == f2.new_tile) break;
+					if (tt == tg) return true;
+				}
+			}
 			TrackdirBits tdb2 = f2.new_td_bits;
 			if (tdb2 == TRACKDIR_BIT_NONE) return false;
 			if (KillFirstBit(tdb2) == TRACKDIR_BIT_NONE) {
@@ -783,6 +828,22 @@ public:
 					if (IsRailDepotTile(cur)) return false; /* R3R: do not reserve through a depot. */
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
+					if (IsRailStationTile(f3.new_tile)) {
+						const Axis axis = GetRailStationAxis(f3.new_tile);
+						const TileIndexDiff delta = TileOffsByAxis(axis);
+						TileIndex tt = cur;
+						for (int i = 0; i < 32; ++i) {
+							tt += delta;
+							if (tt == f3.new_tile) break;
+							if (tt == tg) return true;
+						}
+						tt = cur;
+						for (int i = 0; i < 32; ++i) {
+							tt -= delta;
+							if (tt == f3.new_tile) break;
+							if (tt == tg) return true;
+						}
+					}
 					TrackdirBits tdb3 = f3.new_td_bits;
 					if (tdb3 == TRACKDIR_BIT_NONE) return false;
 					if (KillFirstBit(tdb3) == TRACKDIR_BIT_NONE) {
