@@ -99,7 +99,85 @@ private:
 		return true;
 	}
 
+
 	/**
+	 * R3R: couple-specific safe-position detector (ported from the pxp-decouple
+	 * patch). Tracks the waiting consist's own reservation so the coupling
+	 * locomotive drives right up to it.
+	 */
+	bool FindSafeCouplePositionProc(TileIndex tile, Trackdir td)
+	{
+		if (IsRailDepotTile(tile)) {
+		FILE *dbg = fopen("R3R_debug.log", "a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "FSCP tile=%d,%d fail=depot\n", (int)TileX(tile), (int)TileY(tile));
+			fclose(dbg);
+		}
+		return false;
+	}
+		TrackdirBits tdb = TrackdirToTrackdirBits(td);
+		TrackBits tracks = TrackdirBitsToTrackBits(tdb);
+		if (HasReservedTracks(tile, tracks)) {
+			Train *best = nullptr;
+			Train *second_best = nullptr;
+			auto check_train_on_tile = [&](TileIndex t) {
+				for (Train *tr : VehiclesOnTile<VehicleType::Train>(t)) {
+					if (tr->vehstatus.Test(VehState::Crashed)) continue;
+					if (tr->track == TRACK_BIT_WORMHOLE || HasBit((TrackBits)tr->track, TrackdirToTrack(td))) {
+						Train *head = tr->First();
+						if (best != nullptr && head->index != best->index) second_best = head;
+						if (best == nullptr || head->index < best->index) best = head;
+					}
+				}
+			};
+			if (IsRailStationTile(tile)) {
+				TileIndexDiff diff = TileOffsByDiagDir(TrackdirToExitdir(ReverseTrackdir(td)));
+				for (TileIndex st_tile = tile + diff; IsCompatibleTrainStationTile(st_tile, tile); st_tile += diff) {
+					check_train_on_tile(st_tile);
+				}
+			}
+			check_train_on_tile(tile);
+			if (best != nullptr) {
+				if (!best->current_order.IsType(OT_WAIT_COUPLE)) {
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "FSCP tile=%d,%d fail=notWC best=%d ord=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType());
+						fclose(dbg);
+					}
+					return false;
+				}
+				if (second_best != nullptr) {
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "FSCP tile=%d,%d fail=2nd best=%d 2nd=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)second_best->index.base());
+						fclose(dbg);
+					}
+					return false;
+				}
+				Vehicle *other_train = nullptr;
+				FollowTrainReservation(best, &other_train);
+				if (other_train != nullptr && other_train != best) {
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "FSCP tile=%d,%d fail=other best=%d other=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)other_train->index.base());
+						fclose(dbg);
+					}
+					return false;
+				}
+			}
+		} else if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
+			if (!TryReserveRailTrack(tile, TrackdirToTrack(td))) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d\n", (int)TileX(tile), (int)TileY(tile), (int)td);
+					fclose(dbg);
+				}
+				return false;
+			}
+			UnreserveRailTrack(tile, TrackdirToTrack(td));
+		}
+		return true;
+	}	/**
 	 * Reserve a railway platform. Tile contains the failed tile on abort.
 	 * @param tile The start tile.
 	 * @param dir The direction to reserve further tiles in.
@@ -207,7 +285,21 @@ public:
 		return false;
 	}
 
-	/** Find a reservation target on the path ending at this node. */
+
+	/**
+	 * R3R: couple-specific node check (ported from pxp-decouple). Uses
+	 * FindSafeCouplePositionProc so the coupling locomotive tracks the waiting
+	 * consist's reservation instead of stopping at an ordinary safe position.
+	 */
+	inline bool CheckSafePositionOnNode(Node *node)
+	{
+		dbg_assert(node->parent != nullptr);
+
+		if (!node->IterateTiles(Yapf().GetVehicle(), Yapf(), *this, &CYapfReserveTrack<Types>::FindSafeCouplePositionProc)) {
+			return false;
+		}
+		return true;
+	}	/** Find a reservation target on the path ending at this node. */
 	void FindSafePositionOnSafePositionNodes()
 	{
 		const auto &safe_position_nodes = CYapfReserveTrackSafePositionNodes<Node>::safe_position_nodes;
@@ -222,7 +314,7 @@ public:
 	 * @param origin Start location of the reservation.
 	 * @return \c true iff the path could be reserved.
 	 */
-	bool TryReservePath(PBSTileInfo *target, TileIndex origin)
+	bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool unsafe_pos = false)
 	{
 		this->res_fail_tile = INVALID_TILE;
 		this->origin_tile = origin;
@@ -236,7 +328,7 @@ public:
 		/* Don't bother if the target is reserved. */
 		PBSWaitingPositionRestrictedSignalState restricted_signal_state;
 		restricted_signal_state.defer_test_if_slot_conditional = true;
-		if (!IsWaitingPositionFree(Yapf().GetVehicle(), this->res_dest_tile, this->res_dest_td, false, &restricted_signal_state)) return false;
+		if (!unsafe_pos && !IsWaitingPositionFree(Yapf().GetVehicle(), this->res_dest_tile, this->res_dest_td, false, &restricted_signal_state)) return false;
 
 		/* The temporary slot state only needs to be pushed to the stack (i.e. activated) on first use */
 		static TraceRestrictSlotTemporaryState temporary_slot_state;
@@ -276,7 +368,7 @@ public:
 
 				return this->ReserveSingleTrack(tile, td);
 			});
-			if (this->res_fail_tile != INVALID_TILE) {
+			if (!unsafe_pos && this->res_fail_tile != INVALID_TILE) {
 				/* Reservation failed, undo. */
 				Node *fail_node = this->res_dest_node;
 				TileIndex stop_tile = this->res_fail_tile;
@@ -510,7 +602,29 @@ public:
 	/** @copydoc CYapfBaseT::PfFollowNodeFunc */
 	inline void PfFollowNode(Node &old_node)
 	{
+		/* R3R: a depot tile is a dead end - never extend a path through it. */
+		{
+			const bool is_depot = IsRailDepotTile(old_node.GetLastTile());
+			if (is_depot || (TileX(old_node.GetLastTile()) == 38 && TileY(old_node.GetLastTile()) == 27)) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "DEPOTCHK t=%d,%d isDepot=%d isRailway=%d parent=%s\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)is_depot, (int)IsTileType(old_node.GetLastTile(), TileType::Railway), old_node.parent != nullptr ? "y" : "n");
+					fclose(dbg);
+				}
+			}
+		}
+		if (IsRailDepotTile(old_node.GetLastTile()) && old_node.parent != nullptr) return;
 		TrackFollower F(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
+		if (Yapf().GetVehicle()->current_order.IsType(OT_GOTO_COUPLE)) {
+			TrackFollower F2(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
+			if (F2.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-FOLLOW from=%d,%d td=%d to=%d,%d tdbits=0x%x\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)old_node.GetLastTrackdir(), (int)TileX(F2.new_tile), (int)TileY(F2.new_tile), (unsigned)F2.new_td_bits);
+					fclose(dbg);
+				}
+			}
+		}
 		if (F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
 			Yapf().AddMultipleNodes(&old_node, F);
 		}
@@ -532,16 +646,41 @@ public:
 
 	Trackdir FindNearestCoupleTrain(const Train *v, bool dont_reserve)
 	{
-		PBSTileInfo origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::IgnoreLookahead);
+		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-ORIGIN veh=%d origin=%d,%d td=%d vehDir=%d vehTd=%d dontReserve=%d\n",
+						(int)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile),
+						(int)origin.trackdir, (int)v->direction, (int)v->GetVehicleTrackdir(), (int)dont_reserve);
+				fclose(dbg);
+			}
+		}
 		/* Set origin and destination. */
 		Yapf().SetOrigin(origin.tile, origin.trackdir);
 		Yapf().SetDestination(v);
 
 		bool path_found = Yapf().FindPath(v);
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-PATHFOUND veh=%d found=%d\n", (int)v->index.base(), (int)path_found);
+				fclose(dbg);
+			}
+		}
 		if (!path_found) return INVALID_TRACKDIR;
 
 		/* Found a destination, set as reservation target. */
 		Node *pNode = Yapf().GetBestNode();
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-BEST veh=%d tile=%d,%d td=%d cost=%d\n",
+						(int)v->index.base(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
+						(int)pNode->GetLastTrackdir(), (int)pNode->cost);
+				fclose(dbg);
+			}
+		}
 		this->SetReservationTarget(pNode, pNode->GetLastTile(), pNode->GetLastTrackdir());
 
 		/* Walk through the path back to the origin. */
@@ -551,14 +690,137 @@ public:
 			pPrev = pNode;
 			pNode = pNode->parent;
 
-			if (!this->FindSafePositionOnNode(pPrev)) {
+			{
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()));
+					fclose(dbg);
+				}
+			}
+			if (!this->CheckSafePositionOnNode(pPrev)) {
+				{
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d\n",
+								(int)v->index.base(), (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()));
+						fclose(dbg);
+					}
+				}
 				return INVALID_TRACKDIR;
 			}
 		}
 
 		next_trackdir = pPrev->GetTrackdir();
+	if (pNode->parent == nullptr && pPrev != nullptr) {
+		/* R3R: single-segment couple path. The target node's GetTrackdir() is
+		 * the consist platform direction (points away from the loco), so the
+		 * departure trackdir would send the loco the wrong way. Trace the rail
+		 * network from the start tile to the consist to get the true departure
+		 * direction, and reserve the tiles along that path (they are not part
+		 * of any node segment, so TryReservePath does not cover them). */
+		TrackFollower ft(v, Yapf().GetCompatibleRailTypes());
+		TileIndex st = pNode->GetLastTile();
+		TileIndex tg = pPrev->GetLastTile();
+		Trackdir best_td = INVALID_TRACKDIR;
+		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+			if (depth <= 15) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth);
+					fclose(dbg);
+				}
+			}
+			if (depth > 512) return false;
+			if (cur == tg) return true;
+			/* R3R: never route the couple loco through a depot. */
+			if (IsRailDepotTile(cur)) return false;
+			TrackFollower f2(v, Yapf().GetCompatibleRailTypes());
+			if (!f2.Follow(cur, cur_td)) return false;
+			TrackdirBits tdb2 = f2.new_td_bits;
+			if (tdb2 == TRACKDIR_BIT_NONE) return false;
+			if (KillFirstBit(tdb2) == TRACKDIR_BIT_NONE) {
+				return reach(f2.new_tile, FindFirstTrackdir(tdb2), depth + 1);
+			}
+			for (TrackdirBits tb = tdb2; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
+				if (reach(f2.new_tile, (Trackdir)FindFirstBit(tb), depth + 1)) return true;
+			}
+			return false;
+		};
+		TrackdirBits tdb;
+		tdb = GetTileTrackdirBits(st, ::TransportType::TRANSPORT_RAIL, 0);
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-TRACE st=%d,%d tdb=0x%x\n", (int)TileX(st), (int)TileY(st), (unsigned)tdb);
+				fclose(dbg);
+			}
+		}
+
+		for (; tdb != TRACKDIR_BIT_NONE; tdb = KillFirstBit(tdb)) {
+			Trackdir td = (Trackdir)FindFirstBit(tdb);
+			if (reach(st, td, 0)) { best_td = td; break; }
+		}
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-TRACE-RESULT st=%d,%d best=%d\n", (int)TileX(st), (int)TileY(st), (int)best_td);
+				fclose(dbg);
+			}
+		}
+		if (best_td != INVALID_TRACKDIR) {
+			next_trackdir = best_td;
+			if (!dont_reserve) {
+				std::function<bool(TileIndex, Trackdir, int)> rp = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+					if (depth <= 15) {
+						FILE *dbg = fopen("R3R_debug.log", "a");
+						if (dbg != nullptr) {
+							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth);
+							fclose(dbg);
+						}
+					}
+					if (depth > 512) return false;
+					if (cur == tg) return true;
+					if (IsRailDepotTile(cur)) return false; /* R3R: do not reserve through a depot. */
+					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
+					if (!f3.Follow(cur, cur_td)) return false;
+					TrackdirBits tdb3 = f3.new_td_bits;
+					if (tdb3 == TRACKDIR_BIT_NONE) return false;
+					if (KillFirstBit(tdb3) == TRACKDIR_BIT_NONE) {
+						if (rp(f3.new_tile, FindFirstTrackdir(tdb3), depth + 1)) {
+							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+							}
+							return true;
+						}
+						return false;
+					}
+					for (TrackdirBits tb = tdb3; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
+						if (rp(f3.new_tile, (Trackdir)FindFirstBit(tb), depth + 1)) {
+							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+							}
+							return true;
+						}
+					}
+					return false;
+				};
+				rp(st, best_td, 0);
+			}
+		} else {
+			/* R3R: no reachable departure direction (the only path went through the depot) - wait. */
+			next_trackdir = INVALID_TRACKDIR;
+		}
+	}
 		if (!dont_reserve) {
-			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile());
+			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
+			{
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
+							(int)v->index.base(), (int)reserved, (int)next_trackdir);
+					fclose(dbg);
+				}
+			}
 			return reserved ? next_trackdir : INVALID_TRACKDIR;
 		}
 
@@ -1019,6 +1281,15 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
  */
 Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 {
+	{
+		FILE *dbg = fopen("R3R_debug.log", "a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "CPL-ENTRY veh=%d tile=%d,%d orderType=%d dontReserve=%d\n",
+					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+					(int)v->current_order.GetType(), (int)dont_reserve);
+			fclose(dbg);
+		}
+	}
 	Trackdir ret = _settings_game.pf.forbid_90_deg
 		? CYapfCoupleRailNo90::stFindNearestCoupleTrain(v, dont_reserve)
 		: CYapfCoupleRail::stFindNearestCoupleTrain(v, dont_reserve);

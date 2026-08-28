@@ -591,6 +591,11 @@ public:
 	 */
 	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 7); }
 	/**
+	 * Get the number of vehicles to couple onto. 0 means "no restriction".
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline uint8_t GetNumCouple() const { return GB(this->flags, 1, 7); }
+	/**
 	 * Get the load condition of the consist to couple onto.
 	 * @pre IsType(OT_GOTO_COUPLE).
 	 */
@@ -610,6 +615,20 @@ public:
 	 * @pre IsType(OT_GOTO_COUPLE) && HasCoupleCargoType().
 	 */
 	inline CargoType GetCoupleCargoType() const { return this->refit_cargo; }
+	/**
+	 * Does this GOTO_COUPLE order specify a trace restrict slot?
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline bool HasCoupleSlot() const { return this->GetCoupleSlot() != TraceRestrictSlotID::Invalid(); }
+	/**
+	 * Get the trace restrict slot the consist must be in to be coupled.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 * @return the slot, or #TraceRestrictSlotID::Invalid() if unrestricted.
+	 */
+	inline TraceRestrictSlotID GetCoupleSlot() const
+	{
+		return TraceRestrictSlotID(this->GetXDataLow());
+	}
 
 	/**
 	 * Set whether the decouple action of this order is enabled.
@@ -624,6 +643,12 @@ public:
 	 */
 	inline void SetNumDecouple(uint8_t num_decouple) { SB(this->flags, 1, 7, num_decouple); }
 	/**
+	 * Set the number of vehicles to couple onto. 0 means "no restriction".
+	 * @param num_couple The number of vehicles to couple onto.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetNumCouple(uint8_t num_couple) { SB(this->flags, 1, 7, num_couple); }
+	/**
 	 * Set the load condition of the consist to couple onto.
 	 * @param load The load condition.
 	 * @pre IsType(OT_GOTO_COUPLE).
@@ -635,6 +660,15 @@ public:
 	 * @pre IsType(OT_GOTO_COUPLE).
 	 */
 	inline void SetCoupleIsDepot(bool depot_target) { SB(this->flags, 2, 1, depot_target); }
+	/**
+	 * Set the trace restrict slot the consist must be in to be coupled.
+	 * @param slot The slot to require, or #TraceRestrictSlotID::Invalid() to clear.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetCoupleSlot(TraceRestrictSlotID slot)
+	{
+		this->SetXDataLow(slot == TraceRestrictSlotID::Invalid() ? 0 : (uint16_t)slot.base());
+	}
 	/**
 	 * Set the cargo type the consist must carry to be coupled.
 	 * @param cargo The cargo type, or CT_COUPLE_ANY_CARGO for any.

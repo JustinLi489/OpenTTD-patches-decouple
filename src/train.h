@@ -105,6 +105,7 @@ void DeleteVisibleTrain(Train *v);
 
 void CheckBreakdownFlags(Train *v);
 void GetTrainSpriteSize(EngineID engine, uint &width, uint &height, int &xoffs, int &yoffs, EngineImageType image_type);
+bool TrainFitStation(const Train *v);
 
 bool TrainOnCrossing(TileIndex tile);
 void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon = false);
@@ -213,6 +214,8 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	ClosestDepot FindClosestDepot() const override;
 
 	void ReserveTrackUnderConsist() const;
+	/** R3R: clear any stale reservation under the consist before re-reserving. */
+	void ClearReservationUnderConsist() const;
 
 	uint16_t GetCurveSpeedLimit() const;
 

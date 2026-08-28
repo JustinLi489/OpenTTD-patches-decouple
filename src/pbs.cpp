@@ -77,6 +77,36 @@ void SetRailStationPlatformReservation(TileIndex start, DiagDirection dir, bool 
 }
 
 /**
+ * Check whether a rail station platform is free (only occupied by \a v itself).
+ * R3R: used when clearing platform reservations — a platform holding a waiting
+ * consist (WAIT_COUPLE) must NOT be unreserved, otherwise the consist loses its
+ * reservation and the coupling locomotive pathfinds straight through it.
+ * @param v     The train to ignore.
+ * @param start Starting tile of the platform.
+ * @param dir   Direction in which to follow the platform.
+ * @return true if no other train occupies the platform.
+ */
+bool IsRailStationPlatformFree(const Train *v, TileIndex start, DiagDirection dir)
+{
+	TileIndex     tile = start;
+	TileIndexDiff diff = TileOffsByDiagDir(dir);
+
+	assert_tile(IsRailStationTile(start), start);
+	assert_tile(GetRailStationAxis(start) == DiagDirToAxis(dir), start);
+
+	do {
+		for (const Vehicle *u : Vehicle::Iterate()) {
+			if (u->type != VehicleType::Train || u->vehstatus.Test(VehState::Crashed)) continue;
+			const Train *t = Train::From(u);
+			if (t->First()->index == v->First()->index) continue;
+			if (t->tile == tile) return false;
+		}
+		tile = TileAdd(tile, diff);
+	} while (IsCompatibleTrainStationTile(tile, start));
+	return true;
+}
+
+/**
  * Try to reserve a specific track on a tile
  * This also sets PBS signals to green if reserving through the facing track direction
  * @param v the train performing the reservation
@@ -230,6 +260,16 @@ void UnreserveRailTrack(TileIndex tile, Track t)
 
 		case TileType::Station:
 			if (HasStationRail(tile)) {
+				/* DEBUG (R3R): log EVERY unreserve of a station platform tile, to
+				 * find who clears the WAIT_COUPLE consist's reservation. */
+				{
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "UNRESERVE-STATION tile=%d,%d\n",
+								(int)TileX(tile), (int)TileY(tile));
+						fclose(dbg);
+					}
+				}
 				SetRailStationReservation(tile, false);
 				MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 			}

@@ -3649,7 +3649,9 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
 		SpriteID image = t->ground.sprite;
 		PaletteID pal  = t->ground.pal;
 		RailTrackOffset overlay_offset;
+		bool used_overlay_branch = false;
 		if (rti != nullptr && rti->UsesOverlay() && SplitGroundSpriteForOverlay(ti, &image, &overlay_offset)) {
+			used_overlay_branch = true;
 			SpriteID ground = GetCustomRailSprite(rti, ti->tile, RailSpriteType::Ground);
 			DrawGroundSprite(image, PAL_NONE);
 			DrawGroundSprite(ground + overlay_offset, PAL_NONE);
@@ -3666,6 +3668,22 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
 			/* PBS debugging, draw reserved tracks darker */
 			if (_game_mode != GameMode::Menu && _settings_client.gui.show_track_reservation && HasStationRail(ti->tile) && HasStationReservation(ti->tile)) {
 				DrawGroundSprite(GetRailStationAxis(ti->tile) == Axis::X ? rti->base_sprites.single_x : rti->base_sprites.single_y, PALETTE_CRASH);
+			}
+		}
+		/* DEBUG (R3R): confirm what the draw code actually sees for a station
+		 * platform tile. Throttled to 1/200 draws, only for tiles that are NOT
+		 * currently reserved, to catch the case where consist stRes is set in
+		 * vehicle code but not visible in the renderer. */
+		if (IsRailStationTile(ti->tile) && !HasStationReservation(ti->tile)) {
+			static uint32_t r3r_draw_n = 0;
+			if ((r3r_draw_n++ % 200) == 0) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "DRAW-STATION-NORES tile=%d,%d overlayBranch=%d showRes=%d\n",
+							(int)TileX(ti->tile), (int)TileY(ti->tile), (int)used_overlay_branch,
+							(int)_settings_client.gui.show_track_reservation);
+					fclose(dbg);
+				}
 			}
 		}
 	}

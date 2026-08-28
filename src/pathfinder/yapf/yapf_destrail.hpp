@@ -12,6 +12,7 @@
 
 #include "../../train.h"
 #include "../../consist_group.h"
+#include "../../vehicle_func.h"
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
 
@@ -243,9 +244,13 @@ protected:
 
 	TileIndex dest_tile; ///< heuristic destination (the order's station/depot).
 
+protected:
+	Order dest_order; ///< Copy of the locomotive's GOTO_COUPLE order (pxp-decouple reference).
+
 public:
 	void SetDestination(const Train *v)
 	{
+		this->dest_order.AssignOrder(v->current_order);
 		this->CYapfDestinationRailBase::SetDestination(v);
 		this->dest_tile = (v->dest_tile == INVALID_TILE) ? TileIndex{} : v->dest_tile;
 	}
@@ -256,6 +261,45 @@ public:
 		return this->PfDetectDestination(n.GetLastTile(), n.GetLastTrackdir());
 	}
 
+	/** Check the load-state requirement from the GOTO_COUPLE order. */
+	bool CheckOrderLoad(const Train *t) const
+	{
+		switch (dest_order.GetCoupleLoad()) {
+			case ODC_ANY: return true;
+			case ODC_IS_EMPTY: return t->cargo.StoredCount() == 0;
+			case ODC_IS_FULL: return t->cargo.StoredCount() == t->cargo_cap;
+			default: NOT_REACHED();
+		}
+	}
+
+	/** Check the cargo-type requirement from the GOTO_COUPLE order. */
+	bool CheckOrderCargoType(const Train *t) const
+	{
+		if (!dest_order.HasCoupleCargoType()) return true;
+		CargoType cargo_type = dest_order.GetCoupleCargoType();
+		for (const Train *v = t; v != nullptr; v = v->Next()) {
+			if (v->cargo_type == cargo_type && v->cargo_cap > 0) return true;
+		}
+		return false;
+	}
+
+	/** Check the wagon-count requirement from the GOTO_COUPLE order. */
+	bool CheckNumberOfWagons(const Train *t) const
+	{
+		if (dest_order.GetNumCouple() == 0) return true;
+		return dest_order.GetNumCouple() == CountVehiclesInChain(t);
+	}
+
+	/** Check the trace-restrict-slot requirement from the GOTO_COUPLE order. */
+	bool CheckOrderSlot(const Train *t) const
+	{
+		TraceRestrictSlotID slot = dest_order.GetCoupleSlot();
+		if (slot == TraceRestrictSlotID::Invalid()) return true;
+		const TraceRestrictSlot *s = TraceRestrictSlot::GetIfValid(slot);
+		if (s == nullptr) return false;
+		return s->IsOccupant(t->index);
+	}
+
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
 	{
@@ -264,18 +308,98 @@ public:
 
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
+		if (IsRailStationTile(tile)) {
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "PFD tile=%d,%d td=%d trackbits=0x%x hasRes=%d\n",
+					(int)TileX(tile), (int)TileY(tile), (int)td,
+					(unsigned)TrackdirBitsToTrackBits(tdb), (int)has_res);
+				fclose(dbg);
+			}
+		}
 		if (!has_res) return false;
 
 		Train *t = GetTrainForReservation(tile, TrackdirToTrack(td));
-		if (t == nullptr) return false;
+		if (t == nullptr && IsRailStationTile(tile)) {
+			/* R3R: the whole-platform reservation may leave reserved tiles that
+			 * have no consist on them (the consist is elsewhere on the platform).
+			 * Scan the rest of the platform for a consist before giving up. */
+			const Track track = TrackdirToTrack(td);
+			const TileIndexDiff delta = TileOffsByAxis(GetRailStationAxis(tile));
+			for (int dir = 0; dir < 2 && t == nullptr; ++dir) {
+				TileIndex st = tile + (dir == 0 ? delta : -delta);
+				while (IsCompatibleTrainStationTile(st, tile)) {
+					if (HasReservedTracks(st, TrackToTrackBits(track))) {
+						t = GetTrainForReservation(st, track);
+						if (t == nullptr) {
+							for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
+								if (tr->IsFrontEngine() && IsConsistGroup(tr)) { t = tr; break; }
+							}
+						}
+						if (t != nullptr) break;
+					}
+					st += (dir == 0 ? delta : -delta);
+				}
+			}
+		}
+		if (t == nullptr && IsRailStationTile(tile)) {
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				const TileIndexDiff delta = TileOffsByAxis(GetRailStationAxis(tile));
+				TileIndex st0 = tile;
+				while (IsCompatibleTrainStationTile(st0, tile)) st0 -= delta;
+				for (TileIndex st = st0 + delta; IsCompatibleTrainStationTile(st, tile); st += delta) {
+					for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
+						fprintf(dbg, "PFD-SCAN tile=%d,%d veh=%d front=%d cg=%d ord=%d\n",
+							(int)TileX(st), (int)TileY(st), (int)tr->index.base(),
+							(int)tr->IsFrontEngine(), (int)IsConsistGroup(tr->First()),
+							(int)tr->current_order.GetType());
+					}
+				}
+				fclose(dbg);
+			}
+		}
+		if (t == nullptr) {
+			if (IsRailStationTile(tile)) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFD tile=%d,%d hasResButNoTrain\n",
+						(int)TileX(tile), (int)TileY(tile));
+					fclose(dbg);
+				}
+			}
+			return false;
+		}
 		t = t->First();
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				bool cg = IsConsistGroup(t);
+				bool wc = t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE);
+				fprintf(dbg, "PFD tile=%d,%d t=%d cg=%d wc=%d ordType=%d fit=%d load=%d cargo=%d wag=%d slot=%d\n",
+					(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
+					(int)cg, (int)wc, (int)t->current_order.GetType(),
+					(int)TrainFitStation(t),
+					(int)CheckOrderLoad(t), (int)CheckOrderCargoType(t),
+					(int)CheckNumberOfWagons(t), (int)CheckOrderSlot(t));
+				fclose(dbg);
+			}
+		}
+
+		/* R3R (pxp-decouple): the consist must fit into its station. */
+		if (!TrainFitStation(t)) return false;
 
 		/* Target 1: a consist (zero-power locomotive chain) waiting to be coupled. */
 		if (IsConsistGroup(t)) return true;
 
-		/* Target 2: any primary vehicle whose current order declares WAIT_COUPLE
-		 * ("wait here to be coupled"). */
-		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) return true;
+		/* Target 2 (pxp-decouple reference): any primary vehicle whose current
+		 * order declares WAIT_COUPLE is a candidate, provided it satisfies all
+		 * requirements of the locomotive's GOTO_COUPLE order (load / cargo type /
+		 * wagon count / trace restrict slot). */
+		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) {
+			return CheckOrderLoad(t) && CheckOrderCargoType(t) &&
+					CheckNumberOfWagons(t) && CheckOrderSlot(t);
+		}
 
 		return false;
 	}

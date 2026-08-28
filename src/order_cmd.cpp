@@ -4320,14 +4320,7 @@ bool ProcessOrders(Vehicle *v)
 			 * the train stops/creeps there and couples via movement collision. */
 			UpdateOrderDest(v, &v->current_order);
 			/* DEBUG (R3R — remove): log every GOTO_COUPLE ProcessOrders pass. */
-			{
-				FILE *dbg = fopen("R3R_debug.log", "a");
-				if (dbg != nullptr) {
-				fprintf(dbg, "PO-GOTO_COUPLE: veh=%d order=%d real_idx=%d implicit_idx=%d\n",
-						(int)v->index.base(), (int)v->current_order.GetType(), (int)v->cur_real_order_index, (int)v->cur_implicit_order_index);
-					fclose(dbg);
-				}
-			}
+			
 			return false;
 
 		default: break;

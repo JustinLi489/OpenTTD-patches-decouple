@@ -493,13 +493,12 @@ static void LoadIntroGame(bool load_newgrfs = true)
 	ResetWindowSystem();
 	SetupColoursAndInitialWindow();
 
-	/* Load the default opening screen savegame */
-	if (SaveOrLoad("opntitle.dat", SaveLoadOperation::Load, DetailedFileType::GameFile, Subdirectory::Baseset) != SaveLoadResult::Ok) {
-		GenerateWorld(GWM_EMPTY, 64, 64); // if failed loading, make empty world.
-		SetLocalCompany(COMPANY_SPECTATOR);
-	} else {
-		SetLocalCompany(CompanyID::Begin());
-	}
+	/* R3R (TEMPORARY DIAGNOSTIC): skip the opening-screen animation.
+	 * The opntitle.dat intro scene currently crashes on load (rail_map.h
+	 * assertion on a TunnelBridge tile during intro script/game init), so
+	 * always generate an empty world for the main-menu background instead. */
+	GenerateWorld(GWM_EMPTY, 64, 64);
+	SetLocalCompany(COMPANY_SPECTATOR);
 
 	FixTitleGameZoom();
 	_pause_mode = {};

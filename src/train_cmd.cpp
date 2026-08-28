@@ -3693,10 +3693,44 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	/* R3R: the waiting consist must hold its path reservation (occupy the track)
 	 * so the signalling system treats it as an obstacle: other trains must not
 	 * run through it, and the coupling locomotive can pathfind to its reserved
-	 * track. Decoupling split the chain — the consist's own reservation is gone. */
+	 * track. Decoupling split the chain — the consist's own reservation is gone.
+	 * Clear any stale reservation first so the re-reservation is accurate. */
+	u->ClearReservationUnderConsist();
 	u->ReserveTrackUnderConsist();
 
 	return u;
+}
+
+/**
+ * R3R (pxp-decouple): check that a consist fits into the station platform it
+ * is standing on. Used by the couple pathfinder (CYapfDestinationTrainRailT)
+ * to reject waiting consists that overhang the platform.
+ * @param v Any vehicle of the consist.
+ * @return \c true if the consist fits the platform (or is not on a station).
+ */
+bool TrainFitStation(const Train *v)
+{
+	TileIndex tile = v->tile;
+	if (!IsRailStationTile(tile)) return true;
+
+	const Station *st = Station::Get(GetStationIndex(tile));
+	if (st == nullptr) return true;
+
+	/* Count consecutive platform tiles of this station along the platform axis. */
+	Axis axis = GetRailStationAxis(tile);
+	uint platform_tiles = 0;
+	TileIndex tmp = tile;
+	while (IsRailStationTile(tmp) && GetStationIndex(tmp) == st->index) {
+		platform_tiles++;
+		tmp = (axis == Axis::X) ? TileAddXY(tmp, -1, 0) : TileAddXY(tmp, 0, -1);
+	}
+	tmp = (axis == Axis::X) ? TileAddXY(tile, 1, 0) : TileAddXY(tile, 0, 1);
+	while (IsRailStationTile(tmp) && GetStationIndex(tmp) == st->index) {
+		platform_tiles++;
+		tmp = (axis == Axis::X) ? TileAddXY(tmp, 1, 0) : TileAddXY(tmp, 0, 1);
+	}
+
+	return v->gcache.cached_total_length <= platform_tiles * TILE_SIZE;
 }
 
 static bool CheckReverseTrain(const Train *consist);
@@ -4593,6 +4627,17 @@ static Track DoTrainPathfind(const Train *v, TileIndex tile, DiagDirection enter
 }
 
 /**
+ * Find the track to take when going to couple with another train.
+ * @param v The train.
+ * @param do_track_reservation Whether to reserve the path.
+ * @return The track to take, or #INVALID_TRACK if no path was found.
+ */
+static Track DoTrainCouplePathfind(const Train *v, bool do_track_reservation)
+{
+	return YapfTrainCoupleTrack(v, !do_track_reservation);
+}
+
+/**
  * Extend a train path as far as possible. Stops on encountering a safe tile,
  * another reservation or a track choice.
  * @param v The train.
@@ -5296,12 +5341,44 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	}
 	if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) orders.AdvanceOrdersFromLookahead(lookahead_state);
 
-	/* (R3R) The couple pathfinder (searching for the nearest waiting consist) was
-	 * tried here, but it ignores the player-chosen station/depot of the GOTO_COUPLE
-	 * order and may send the train to a consist elsewhere, causing it to wander.
-	 * Reverted: the train paths normally to its chosen station/depot, and the
-	 * in-station/depot coupling logic (GetCouplePosition / TrainCoupleHandler)
-	 * finds the waiting consist there. */
+	/* When going to couple with another train, use the couple pathfinder to
+	 * follow the waiting train's reservation. This lets the locomotive reserve
+	 * up to the consist's own reservation (which the normal pathfinder treats
+	 * as an obstacle and fails on). The couple destination
+	 * (CYapfDestinationTrainRailT) only accepts a consist whose current order is
+	 * WAIT_COUPLE and which satisfies the GOTO_COUPLE order requirements, so the
+	 * locomotive does not wander to an arbitrary consist. */
+	{
+		bool ct_dbg = false;
+		if (consist->orders != nullptr) {
+			for (VehicleOrderID i = 0; i < consist->GetNumOrders(); ++i) {
+				if (consist->GetOrder(i)->IsType(OT_GOTO_COUPLE)) { ct_dbg = true; break; }
+			}
+		}
+		if (ct_dbg) {
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CT veh=%d tile=%d,%d curType=%d real=%d stuck=%d\n",
+					(int)consist->index.base(), (int)TileX(tile), (int)TileY(tile),
+					(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
+					(int)consist->flags.Test(VehicleRailFlag::Stuck));
+				fclose(dbg);
+			}
+		}
+	}
+	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+		Track path_found = DoTrainCouplePathfind(consist, do_track_reservation);
+		if (path_found != INVALID_TRACK && res_dest.tile == tile) {
+			best_track = path_found;
+		}
+		if (path_found == INVALID_TRACK) {
+			if (mark_stuck) MarkTrainAsStuck(consist);
+			FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
+			if (changed_signal != INVALID_TRACKDIR) MarkSingleSignalDirty(tile, changed_signal);
+			return { FindFirstTrack(tracks), result_flags };
+		}
+		result_flags |= CTTRF_RESERVATION_MADE;
+	}
 
 	if (res_dest.tile != INVALID_TILE && !res_dest.okay) {
 		/* Pathfinders are able to tell that route was only 'guessed'. */
@@ -5826,6 +5903,7 @@ static TrainMovedChangeSignalEnum TrainMovedChangeSignal(Train *consist, TileInd
 /** Tries to reserve track under whole train consist. */
 void Train::ReserveTrackUnderConsist() const
 {
+	FILE *dbg = fopen("R3R_debug.log", "a");
 	for (const Train *u = this; u != nullptr; u = u->Next()) {
 		if (u->track & TRACK_BIT_WORMHOLE) {
 			if (IsRailCustomBridgeHeadTile(u->tile)) {
@@ -5838,8 +5916,40 @@ void Train::ReserveTrackUnderConsist() const
 				TryReserveRailTrack(u->tile, DiagDirToDiagTrack(GetTunnelBridgeDirection(u->tile)));
 			}
 		} else if (u->track != TRACK_BIT_DEPOT) {
-			TryReserveRailTrack(u->tile, TrackBitsToTrack(u->track));
+			TrackBits bits = u->track;
+			bool fallback = false;
+			if (bits == TRACK_BIT_NONE) {
+				/* R3R: an articulated part may not have its track bits synced
+				 * after a decouple/couple split; fall back to the tile's actual
+				 * rail bits so its platform track still gets reserved. */
+				bits = GetTrackBits(u->tile);
+				fallback = true;
+				if (bits == TRACK_BIT_NONE) {
+					if (dbg != nullptr) {
+						fprintf(dbg, "RESERVECONSIST veh=%d tile=%d,%d track=0x%X fb=1 RES_NONE skip\n",
+							(int)u->index.base(), (int)TileX(u->tile), (int)TileY(u->tile), (uint)u->track);
+					}
+					continue;
+				}
+			}
+			bool ok = TryReserveRailTrack(u->tile, TrackBitsToTrack(bits));
+			if (dbg != nullptr) {
+				fprintf(dbg, "RESERVECONSIST veh=%d tile=%d,%d track=0x%X fb=%d bits=0x%X ok=%d resNow=%d\n",
+					(int)u->index.base(), (int)TileX(u->tile), (int)TileY(u->tile), (uint)u->track,
+					(int)fallback, (uint)bits, (int)ok,
+					(int)(HasReservedTracks(u->tile, bits) ? 1 : 0));
+			}
 		}
+	}
+	if (dbg != nullptr) fclose(dbg);
+}
+
+/** R3R: clear any stale reservation under the consist before re-reserving. */
+void Train::ClearReservationUnderConsist() const
+{
+	for (const Train *u = this; u != nullptr; u = u->Next()) {
+		if (u->track == TRACK_BIT_NONE) continue;
+		ClearPathReservation(u, u->tile, u->GetVehicleTrackdir(), true);
 	}
 }
 
@@ -7549,6 +7659,24 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		ReverseTrainDirection(consist);
 	}
 
+	/* R3R: a consist waiting on a platform keeps its track reserved so the
+	 * locomotive's couple pathfinder can detect it (PfDetectDestination's
+	 * HasReservedTracks gate). Arrival at the station released it; restore it.
+	 * Also reserve the entire platform along its axis so the couple pathfinder
+	 * sees a fully-reserved path right up to the consist. */
+	if (IsConsistGroup(consist) && consist->cur_speed == 0 && IsTileType(consist->tile, TileType::Station)) {
+		consist->ReserveTrackUnderConsist();
+		const Axis axis = GetRailStationAxis(consist->tile);
+		const TileIndexDiff delta = TileOffsByAxis(axis);
+		const Track track = AxisToTrack(axis);
+		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t -= delta) {
+			TryReserveRailTrack(t, track);
+		}
+		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t += delta) {
+			TryReserveRailTrack(t, track);
+		}
+	}
+
 	/* exit if train is stopped (a stopped locomotive should not keep trying to
 	 * couple: the player stopped it, so give control back for stop/skip/return
 	 * commands instead of parking it in the GOTO_COUPLE state forever). */
@@ -7629,9 +7757,11 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				int dbg_destTy = dbg_destValid ? (int)TileY(dbg_dest) : -1;
 				int dbg_depotDir = dbg_destDepot ? (int)GetRailDepotDirection(dbg_dest) : -1;
 				int dbg_enterDir = (int)TrackdirToExitdir(consist->GetVehicleTrackdir());
-				fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d\n",
+				fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) curType=%d stuck=%d tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d\n",
 					(int)consist->index.base(), (int)consist->cur_speed,
 					(int)consist->cur_real_order_index, (int)(consist->GetOrder(consist->cur_real_order_index) ? consist->GetOrder(consist->cur_real_order_index)->GetType() : -1),
+					(int)consist->current_order.GetType(),
+					(int)consist->flags.Test(VehicleRailFlag::Stuck),
 					(int)tile_is_depot, (int)TileX(consist->tile), (int)TileY(consist->tile),
 					dbg_destTx, dbg_destTy, (int)dbg_destDepot, (int)dbg_destResv, (int)dbg_tileEqDest,
 					dbg_depotDir, dbg_enterDir);
@@ -7689,6 +7819,26 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					}
 				}
 				DecoupleTrain(consist, true);
+				{
+					FILE *dbg = fopen("R3R_debug.log", "a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "LOCO-AFTER-DECOUPLE veh=%d curType=%d real=%d tile=%d,%d\n",
+							(int)consist->index.base(), (int)consist->current_order.GetType(),
+							(int)consist->cur_real_order_index, (int)TileX(consist->tile), (int)TileY(consist->tile));
+						if (consist->orders != nullptr) {
+							for (VehicleOrderID i = 0; i < consist->GetNumOrders(); ++i) {
+								const Order *o = consist->GetOrder(i);
+								fprintf(dbg, "  L-ORD %d type=%d dest=%d", (int)i, (int)(o ? o->GetType() : -1), (int)(o ? o->GetDestination().base() : -1));
+							if (o != nullptr && o->IsType(OT_CONDITIONAL)) {
+								fprintf(dbg, " condVar=%d condCmp=%d condVal=%d skipTo=%d", (int)o->GetConditionVariable(), (int)o->GetConditionComparator(), (int)o->GetConditionValue(), (int)o->GetConditionSkipToOrder());
+							}
+							fprintf(dbg, "\n");
+							}
+						}
+						fclose(dbg);
+					}
+				}
+
 			}
 		}
 	}
