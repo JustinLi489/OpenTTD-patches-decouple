@@ -8,3 +8,12 @@ docs/source/*
 /out
 /vcpkg_installed
 *.tmp
+
+# Local analysis cache (not part of source)
+/cache/
+
+# Local backups
+/r3r_backup_*/
+
+# Compiler debug database
+*.pdb
