@@ -3069,6 +3069,19 @@ static bool IsWholeTrainInsideDepot(const Train *v)
  */
 static void ReverseTrainDirection(Train *consist)
 {
+	{
+		FILE *dbg = fopen("R3R_debug.log", "a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "REVERSEDIR veh=%d tile=%d,%d dir=%d order=%d spd=%d nv=%d rev=%d stuck=%d db=%d\n",
+					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+					(int)consist->direction, (int)consist->current_order.GetType(), (int)consist->cur_speed,
+					(int)CountVehiclesInChain(consist),
+					(int)consist->flags.Test(VehicleRailFlag::Reversing),
+					(int)consist->flags.Test(VehicleRailFlag::Stuck),
+					(int)consist->vehicle_flags.Test(VehicleFlag::DrivingBackwards));
+			fclose(dbg);
+		}
+	}
 	Train *moving_front = consist->GetMovingFront();
 	if (IsRailDepotTile(moving_front->tile)) {
 		if (IsWholeTrainInsideDepot(consist)) return;
@@ -3794,6 +3807,30 @@ static void Couple(Train *v, Train *u)
 		return;
 	}
 
+	/* R3R: after a successful merge the train still holds the loco's stale lookahead.
+	 * During the whole GOTO_COUPLE run the couple pathfinder starts from the loco
+	 * itself (yapf_rail.cpp ChooseRailTrack), so FillTrainReservationLookAhead is
+	 * never called and the lookahead keeps pointing at the pre-couple reservation end
+	 * (often the depot the loco came out of, i.e. BEHIND the loco). With realistic
+	 * braking FollowTrainReservation() would start the first post-merge pathfind from
+	 * that stale end tile, reversing the train (REVERSEDIR) and stranding it. Drop
+	 * the lookahead so the next pathfind starts from the loco itself. */
+	v->lookahead.reset();
+	u->lookahead.reset();
+
+	/* R3R: the consist may couple nose-to-nose (it kept its own heading while
+	 * waiting), leaving the merged chain with mixed directions (e.g. loco SE,
+	 * consist NW). The JGR flip logic (ReverseTrainSwapVeh) derives the flipped
+	 * heading from the LAST vehicle's direction, which is only valid when the
+	 * whole chain shares one heading; with a mixed heading a realistic reverse
+	 * computes the same wrong heading (SE again) and the train strands right
+	 * after flipping (REVERSEDIR -> CRT found=0). Unify the consist's heading
+	 * to the locomotive's so the chain is coherent. */
+	for (Train *w = u; w != nullptr; w = w->Next()) {
+		w->direction = v->direction;
+		w->UpdateViewport(false, false);
+	}
+
 	/* The consist's schedule belongs to the wagon part: hand the orders over to the
 	 * train. The locomotive's OWN orders are backed up on the locomotive itself
 	 * (orders_backup) so a later decouple can restore them. */
@@ -3877,6 +3914,7 @@ static void Couple(Train *v, Train *u)
 	NormaliseTrainHead(v);
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
 	if (CheckReverseTrain(v)) v->flags.Set(VehicleRailFlag::Reversing);
+	else v->flags.Reset(VehicleRailFlag::Reversing);
 
 	/* R3R: force an immediate visual refresh of the whole merged chain, so the
 	 * consist (which just became ordinary wagons again) repaints right away

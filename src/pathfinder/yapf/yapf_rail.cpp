@@ -1121,6 +1121,15 @@ public:
 
 		/* find the best path */
 		path_found = Yapf().FindPath(v);
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CRT veh=%d order=%d dir=%d origin=%d,%d td=%d found=%d\n",
+						(int)v->index.base(), (int)v->current_order.GetType(), (int)v->direction,
+						(int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir, (int)path_found);
+				fclose(dbg);
+			}
+		}
 
 		/* if path not found - return INVALID_TRACKDIR */
 		Trackdir next_trackdir = INVALID_TRACKDIR;
@@ -1306,6 +1315,30 @@ bool YapfTrainCheckReverse(const Train *v)
 	TileIndex tile = moving_front->tile;
 	TileIndex tile_rev = moving_back->tile;
 
+	/* R3R: after a nose-to-nose coupling the consist can sit spatially folded -
+	 * its "back" vehicle is physically in FRONT of the locomotive (several
+	 * vehicles share one tile). The reverse heuristic compares the forward path
+	 * from the front origin with the backward path from the back origin; a
+	 * folded chain misleads it into recommending a flip onto a heading that
+	 * cannot reach the destination (REVERSEDIR then CRT found=0, train stranded).
+	 * Detect the fold: the back wagon lies ahead of the front vehicle along the
+	 * front vehicle's facing direction -> never suggest reversing in that state. */
+	if (moving_front->track != TRACK_BIT_DEPOT && moving_back->track != TRACK_BIT_DEPOT) {
+		const TileIndexDiffC delta = TileIndexDiffCByDir(moving_front->direction);
+		const int rel_x = TileX(tile_rev) - TileX(tile);
+		const int rel_y = TileY(tile_rev) - TileY(tile);
+		if (rel_x * delta.x + rel_y * delta.y > 0) {
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\n",
+						(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)moving_front->direction,
+						(int)TileX(tile_rev), (int)TileY(tile_rev), rel_x, rel_y,
+						rel_x * delta.x + rel_y * delta.y);
+				fclose(dbg);
+			}
+			return false;
+		}
+	}
 	int reverse_penalty = 0;
 
 	/* Consider whether the train might back up at reduced speed. */
