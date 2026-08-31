@@ -685,7 +685,20 @@ public:
 			}
 			if (ct != nullptr) {
 				Train *h = ct->First();
-				if (h != nullptr) consist_head_tile = h->tile;
+				Train *t = ct->Last();
+				if (h != nullptr && t != nullptr) {
+					/* R3R: couple to whichever end of the consist the loco approaches.
+					 * Targeting the head car unconditionally routes a loco coming from the
+					 * consist's tail end straight through the consist (no path found,
+					 * reservation cutting through the consist). */
+					if (DistanceManhattan(v->tile, t->tile) < DistanceManhattan(v->tile, h->tile)) {
+						consist_head_tile = t->tile;
+					} else {
+						consist_head_tile = h->tile;
+					}
+				} else if (h != nullptr) {
+					consist_head_tile = h->tile;
+				}
 			}
 			{
 				FILE *dbg = fopen("R3R_debug.log", "a");
@@ -837,6 +850,7 @@ public:
 					if (IsRailStationTile(f3.new_tile)) {
 						const Axis axis = GetRailStationAxis(f3.new_tile);
 						const TileIndexDiff delta = TileOffsByAxis(axis);
+						const Track plat_track = AxisToTrack(axis);
 						TileIndex tt = cur;
 						for (int i = 0; i < 32; ++i) {
 							tt += delta;
@@ -844,6 +858,18 @@ public:
 							if (tt == tg) {
 								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								}
+								/* R3R: also reserve the platform tiles between the loco and
+								 * the consist - the loco must drive over them to reach the
+								 * coupling point. Normally the consist holds a
+								 * whole-platform reservation, in which case these tiles are
+								 * already reserved (TryReserveRailTrack fails harmlessly);
+								 * when it does not, this keeps the loco's own path
+								 * contiguous so it can still reach the consist. */
+								for (TileIndex p = cur; p != tt;) {
+									p += delta;
+									if (p == tt || p == f3.new_tile) break;
+									TryReserveRailTrack(p, plat_track);
 								}
 								return true;
 							}
@@ -855,6 +881,11 @@ public:
 							if (tt == tg) {
 								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								}
+								for (TileIndex p = cur; p != tt;) {
+									p -= delta;
+									if (p == tt || p == f3.new_tile) break;
+									TryReserveRailTrack(p, plat_track);
 								}
 								return true;
 							}
