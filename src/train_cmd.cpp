@@ -5442,8 +5442,12 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		result_flags |= CTTRF_RESERVATION_MADE;
 	}
 
-	if (res_dest.tile != INVALID_TILE && !res_dest.okay) {
-		/* Pathfinders are able to tell that route was only 'guessed'. */
+	if (res_dest.tile != INVALID_TILE && !res_dest.okay && !consist->current_order.IsType(OT_GOTO_COUPLE)) {
+		/* Pathfinders are able to tell that route was only 'guessed'.
+		 * R3R: a GOTO_COUPLE locomotive's route is chosen and reserved by the
+		 * couple pathfinder (CPL) above. The normal pathfinder treats the
+		 * waiting consist as an obstacle and fails with "no route", which
+		 * calls HandlePathfindingResult(false) and leaves the loco stuck. */
 		bool      path_found = true;
 		TileIndex new_tile = res_dest.tile;
 
@@ -7731,27 +7735,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * locomotive's couple pathfinder can detect it (PfDetectDestination's
 	 * HasReservedTracks gate). Arrival at the station released it; restore it.
 	 * Also reserve the entire platform along its axis so the couple pathfinder
-	 * sees a fully-reserved path right up to the consist. */
+	 * sees a fully-reserved path right up to the consist: a coupling
+	 * locomotive finds and reaches the waiting consist precisely through this
+	 * whole-platform reservation (it drives over the platform tiles in front
+	 * of the consist, which only the consist reserves). */
 	if (IsConsistGroup(consist) && consist->cur_speed == 0 && IsTileType(consist->tile, TileType::Station)) {
 		consist->ReserveTrackUnderConsist();
 		const Axis axis = GetRailStationAxis(consist->tile);
 		const TileIndexDiff delta = TileOffsByAxis(axis);
 		const Track track = AxisToTrack(axis);
 		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t -= delta) {
-			bool ok = TryReserveRailTrack(t, track);
-			FILE *dbg = fopen("R3R_debug.log", "a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "PLATRES t=%d,%d trk=%d ok=%d\n", (int)TileX(t), (int)TileY(t), (int)track, (int)ok);
-				fclose(dbg);
-			}
+			TryReserveRailTrack(t, track);
 		}
 		for (TileIndex t = consist->tile; IsCompatibleTrainStationTile(t, consist->tile); t += delta) {
-			bool ok = TryReserveRailTrack(t, track);
-			FILE *dbg = fopen("R3R_debug.log", "a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "PLATRES t=%d,%d trk=%d ok=%d\n", (int)TileX(t), (int)TileY(t), (int)track, (int)ok);
-				fclose(dbg);
-			}
+			TryReserveRailTrack(t, track);
 		}
 	}
 
