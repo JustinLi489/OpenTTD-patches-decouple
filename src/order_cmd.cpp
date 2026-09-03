@@ -2039,15 +2039,15 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 	} else {
 		switch (order->GetType()) {
 			case OT_GOTO_STATION:
-				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_DEPOT:
-				if (mof != MOF_NON_STOP && mof != MOF_DEPOT_ACTION) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_DEPOT_ACTION && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_WAYPOINT:
-				if (mof != MOF_NON_STOP && mof != MOF_WAYPOINT_FLAGS && mof != MOF_RV_TRAVEL_DIR) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_WAYPOINT_FLAGS && mof != MOF_RV_TRAVEL_DIR && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
 				break;
 
 			case OT_CONDITIONAL:
@@ -2348,6 +2348,11 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (data != (data & OrderWaypointFlags(OrderWaypointFlag::Reverse).base())) return CMD_ERROR;
 			break;
 
+		case MOF_REVERSE_AT_STATION:
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (data > 1) return CMD_ERROR;
+			break;
+
 		case MOF_SLOT:
 			if (data != INVALID_TRACE_RESTRICT_SLOT_ID) {
 				const TraceRestrictSlot *slot = TraceRestrictSlot::GetIfValid(data);
@@ -2421,6 +2426,16 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 
 			case MOF_STOP_LOCATION:
 				order->SetStopLocation(static_cast<OrderStopLocation>(data));
+				break;
+
+			case MOF_REVERSE_AT_STATION:
+				if (order->GetType() == OT_GOTO_DEPOT) {
+					order->SetReverseAtDepot(data != 0);
+				} else if (order->GetType() == OT_GOTO_WAYPOINT) {
+					order->SetReverseAtWaypoint(data != 0);
+				} else {
+					order->SetReverseAtStation(data != 0);
+				}
 				break;
 
 			case MOF_UNLOAD:
@@ -4339,8 +4354,13 @@ bool ProcessOrders(Vehicle *v)
 	v->vehicle_flags.Reset(VehicleFlag::ConditionalOrderWait);
 
 	/* Check if we've reached a 'via' destination. */
+	/* R3R: a waypoint order with the "reverse on arrival" flag is a stopping
+	 * order, not a drive-through 'via' destination. It must stay the current
+	 * order until the consist has actually stopped on the waypoint, so that
+	 * TrainEnterStation() can spot the flag and turn the consist around. */
 	if (((v->current_order.IsType(OT_GOTO_STATION) && (v->current_order.GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) ||
-			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train))) &&
+			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train) &&
+					!v->current_order.HasReverseAtWaypoint())) &&
 			IsTileType(moving_front->tile, TileType::Station) &&
 			v->current_order.GetDestination() == GetStationIndex(moving_front->tile)) {
 		v->DeleteUnreachedImplicitOrders();
@@ -4426,7 +4446,13 @@ bool Order::UseOccupancyValueForAverage() const
  */
 bool Order::ShouldStopAtStation(StationID last_station_visited, StationID station, bool waypoint) const
 {
-	if (waypoint) return this->IsType(OT_GOTO_WAYPOINT) && this->dest == station && this->IsWaitTimetabled();
+	/* R3R: a waypoint order with the reverse-at-waypoint flag set is treated as a
+	 * stopping point too, so the look-ahead brakes the consist to a stop on the
+	 * waypoint tile and it can be turned around in place there. The JGR
+	 * "drive-through reverse" waypoint flag takes precedence: while set, the
+	 * consist keeps driving through the waypoint and reverses after it. */
+	if (waypoint) return this->IsType(OT_GOTO_WAYPOINT) && this->dest == station &&
+			(this->IsWaitTimetabled() || (this->HasReverseAtWaypoint() && !this->GetWaypointFlags().Test(OrderWaypointFlag::Reverse)));
 	if (this->IsType(OT_LOADING_ADVANCE) && this->dest == station) return true;
 	bool is_dest_station = this->IsType(OT_GOTO_STATION) && this->dest == station;
 

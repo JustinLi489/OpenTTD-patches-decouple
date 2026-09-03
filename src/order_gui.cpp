@@ -2353,6 +2353,7 @@ public:
 		/* First row. */
 		this->RaiseWidget(WID_O_FULL_LOAD);
 		this->RaiseWidget(WID_O_UNLOAD);
+		if (this->vehicle->IsGroundVehicle()) this->RaiseWidget(WID_O_REVERSE_AT_STATION);
 
 		/* Selection widgets. */
 		/* Train or road vehicle. */
@@ -2409,6 +2410,8 @@ public:
 				right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 				this->DisableWidget(WID_O_NON_STOP);
 				this->RaiseWidget(WID_O_NON_STOP);
+				this->DisableWidget(WID_O_REVERSE_AT_STATION);
+				this->RaiseWidget(WID_O_REVERSE_AT_STATION);
 			}
 			this->DisableWidget(WID_O_FULL_LOAD);
 			this->DisableWidget(WID_O_UNLOAD);
@@ -2428,6 +2431,7 @@ public:
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
+					if (this->vehicle->IsGroundVehicle()) this->DisableWidget(WID_O_REVERSE_AT_STATION);
 					this->EnableWidget(WID_O_MGMT_BTN);
 					break;
 
@@ -2441,6 +2445,12 @@ public:
 						right_sel->SetDisplayedPlane(DP_RIGHT_REFIT);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
+						/* R3R: reverse-on-arrival. Only for trains that actually stop at the destination. */
+						this->EnableWidget(WID_O_REVERSE_AT_STATION);
+						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION,
+								this->vehicle->type != VehicleType::Train || (order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION) != 0);
+						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtStation());
+						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_STATION_TOOLTIP);
 					}
 					this->SetWidgetLoweredState(WID_O_FULL_LOAD, order->GetLoadType() == OrderLoadType::FullLoadAny);
 					this->SetWidgetLoweredState(WID_O_UNLOAD, order->GetUnloadType() == OrderUnloadType::Unload);
@@ -2465,7 +2475,12 @@ public:
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
 						this->EnableWidget(WID_O_REVERSE);
 						this->SetWidgetLoweredState(WID_O_REVERSE, order->GetWaypointFlags().Test(OrderWaypointFlag::Reverse));
-					}
+						/* R3R: stop-on-waypoint reverse. Trains only, and only for waypoints (rail-only). */
+						this->EnableWidget(WID_O_REVERSE_AT_STATION);
+						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION, this->vehicle->type != VehicleType::Train);
+						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtWaypoint());
+						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_WAYPOINT_TOOLTIP);
+						}
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
 					break;
@@ -2480,8 +2495,13 @@ public:
 						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
-					}
-					/* Disable refit button if the order is no 'always go' order.
+						/* R3R: reverse the consist in the depot of this depot order. Trains only. */
+						this->EnableWidget(WID_O_REVERSE_AT_STATION);
+						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION, this->vehicle->type != VehicleType::Train);
+						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtDepot());
+						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_DEPOT_TOOLTIP);
+						}
+						/* Disable refit button if the order is no 'always go' order.
 					 * However, keep the service button enabled for refit-orders to allow clearing refits (without knowing about ctrl). */
 					this->SetWidgetDisabledState(WID_O_REFIT,
 							order->GetDepotOrderType().Test(OrderDepotTypeFlag::Service) || (order->GetDepotActionType() & ODATFB_HALT) ||
@@ -2649,6 +2669,7 @@ public:
 						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
 						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 						this->DisableWidget(WID_O_NON_STOP);
+						this->DisableWidget(WID_O_REVERSE_AT_STATION);
 					}
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
@@ -3423,6 +3444,20 @@ public:
 				if (order == nullptr) break;
 
 				this->ModifyOrder(sel_ord, MOF_WAYPOINT_FLAGS, order->GetWaypointFlags().Flip(OrderWaypointFlag::Reverse).base());
+				break;
+			}
+
+			case WID_O_REVERSE_AT_STATION: {
+				VehicleOrderID sel_ord = this->OrderGetSel();
+				const Order *order = this->vehicle->GetOrder(sel_ord);
+
+				if (order == nullptr) break;
+
+				/* R3R: this button toggles the reverse flag of the selected order,
+				 * which is a station order, a depot order or a waypoint order. */
+				const bool is_on = (order->GetType() == OT_GOTO_DEPOT) ? order->HasReverseAtDepot() :
+						(order->GetType() == OT_GOTO_WAYPOINT) ? order->HasReverseAtWaypoint() : order->HasReverseAtStation();
+				this->ModifyOrder(sel_ord, MOF_REVERSE_AT_STATION, is_on ? 0 : 1);
 				break;
 			}
 
@@ -4393,27 +4428,30 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_ROW_GROUNDVEHICLE),
 			NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
-				NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_NON_STOP), SetMinimalSize(93, 12), SetFill(1, 0),
-															SetStringTip(STR_ORDER_NON_STOP, STR_ORDER_TOOLTIP_NON_STOP), SetResize(1, 0),
+				NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_NON_STOP), SetMinimalSize(60, 12), SetFill(1, 0),
+														SetStringTip(STR_ORDER_NON_STOP, STR_ORDER_TOOLTIP_NON_STOP), SetResize(1, 0),
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_LEFT),
-					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_FULL_LOAD), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_FULL_LOAD), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_TOGGLE_FULL_LOAD, STR_ORDER_TOOLTIP_FULL_LOAD), SetResize(1, 0),
-					NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_O_REFIT), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_O_REFIT), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_REFIT, STR_ORDER_REFIT_TOOLTIP), SetResize(1, 0),
-					NWidget(WWT_TEXTBTN, Colours::Grey, WID_O_REVERSE), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(WWT_TEXTBTN, Colours::Grey, WID_O_REVERSE), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_TOOLTIP), SetResize(1, 0),
 				EndContainer(),
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_MIDDLE),
-					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_UNLOAD), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_UNLOAD), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_TOGGLE_UNLOAD, STR_ORDER_TOOLTIP_UNLOAD), SetResize(1, 0),
-					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_DEPOT_ACTION), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_DEPOT_ACTION), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetResize(1, 0),
 				EndContainer(),
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_RIGHT),
-					NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(93, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
-					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_REFIT_DROPDOWN), SetMinimalSize(93, 12), SetFill(1, 0),
+					NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(60, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_REFIT_DROPDOWN), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_REFIT_AUTO, STR_ORDER_REFIT_AUTO_TOOLTIP), SetResize(1, 0),
 				EndContainer(),
+				/* R3R: reverse the consist on arrival at a station order. Only enabled for GOTO_STATION orders of trains. */
+				NWidget(WWT_TEXTBTN, Colours::Grey, WID_O_REVERSE_AT_STATION), SetMinimalSize(60, 12), SetFill(1, 0),
+														SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_STATION_TOOLTIP), SetResize(1, 0),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 				NWidget(WWT_DROPDOWN, Colours::Grey, WID_O_COND_VARIABLE), SetMinimalSize(124, 12), SetFill(1, 0),

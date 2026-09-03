@@ -541,6 +541,8 @@ enum class Commands : uint8_t {
 
 	BuildVehicle,                           ///< build a vehicle
 	SetAsFrontWagon,                        ///< turn a free wagon chain into an independently operating consist
+	MakeSegment,                            ///< turn an independent train/consist into a decouplable segment (R3R)
+	DemoteSegment,                          ///< turn an independent segment back into a consist, or a consist into a free wagon chain (R3R)
 	SellVehicle,                            ///< sell a vehicle
 	RefitVehicle,                           ///< refit the cargo space of a vehicle
 	SendVehicleToDepot,                     ///< send a vehicle to a depot

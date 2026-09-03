@@ -561,6 +561,81 @@ public:
 	 * @param stop_location The location to stop at.
 	 */
 	inline void SetStopLocation(OrderStopLocation stop_location) { SB(this->type, 4, 2, to_underlying(stop_location)); }
+
+	/**
+	 * R3R: Get whether the consist must reverse at this station order.
+	 * When the consist arrives at this station it is turned around before
+	 * departing, so it leaves the platform facing the other way. This lets
+	 * a locomotive approach a coupling point (OT_GOTO_COUPLE) nose-first
+	 * instead of backing up to couple.
+	 * Stored in bit 0 of xdata2 (which is only used by OT_CONDITIONAL
+	 * orders for their via-station, so it is free for station orders).
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline bool HasReverseAtStation() const
+	{
+		return (this->GetXData2Low() & 1) != 0;
+	}
+
+	/**
+	 * R3R: Set whether the consist must reverse at this station order.
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline void SetReverseAtStation(bool value)
+	{
+		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
+	}
+
+	/**
+	 * R3R: Get whether the consist must turn around in the depot of this
+	 * depot order. When the whole consist has entered the depot it is turned,
+	 * so it drives out facing the opposite way; a drive-through depot can
+	 * thus be used as a turning point.
+	 * Stored in bit 0 of xdata2, same slot as HasReverseAtStation() (the two
+	 * can never be set at once since the order types differ).
+	 * @pre IsType(OT_GOTO_DEPOT).
+	 */
+	inline bool HasReverseAtDepot() const
+	{
+		return (this->GetXData2Low() & 1) != 0;
+	}
+
+	/**
+	 * R3R: Set whether the consist must turn around in the depot of this
+	 * depot order.
+	 * @pre IsType(OT_GOTO_DEPOT).
+	 */
+	inline void SetReverseAtDepot(bool value)
+	{
+		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
+	}
+
+	/**
+	 * R3R: Get whether the consist must reverse at this waypoint order.
+	 * When the consist reaches the waypoint it is stopped and turned around
+	 * in place (the waypoint tile is treated as a stopping point for this
+	 * one order), so it drives back out the way it came; a waypoint can then
+	 * be used as a turning point without needing the consist to fully pass it.
+	 * This is the "stop-on-waypoint" counterpart to the stock JGR waypoint
+	 * reverse flag, which drives the whole consist past the waypoint first.
+	 * Stored in bit 0 of xdata2, same slot as HasReverseAtStation() and
+	 * HasReverseAtDepot() (they can never be set at once since the order
+	 * types differ).
+	 * @pre IsType(OT_GOTO_WAYPOINT).
+	 */
+	inline bool HasReverseAtWaypoint() const
+	{
+		return (this->GetXData2Low() & 1) != 0;
+	}
+
+	/**
+	 * R3R: Set whether the consist must reverse at this waypoint order.
+	 * @pre IsType(OT_GOTO_WAYPOINT).
+	 */
+	inline void SetReverseAtWaypoint(bool value)
+	{
+		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
+	}
 	/**
 	 * Set the cause to go to the depot.
 	 * @param depot_order_type The reason to go to the depot.
@@ -586,7 +661,12 @@ public:
 	 */
 	inline OrderDecoupleFlags GetDecouple() const { return (OrderDecoupleFlags)GB(this->flags, 0, 1); }
 	/**
-	 * Get the number of vehicles to decouple. 0 means "minimal decouplable unit" (F1).
+	 * R3R: Get the number of trailing coupled-on segments to decouple.
+	 * 0 means "auto" and decouples a single segment (the last coupled-on
+	 * segment). A segment is a powered chain that was coupled onto this train
+	 * (its front vehicle carries the SegmentFront marker). When the train has
+	 * no coupled-on segments, the decouple falls back to the native
+	 * minimal-decouplable-unit heuristic.
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 7); }
@@ -637,8 +717,9 @@ public:
 	 */
 	inline void SetDecouple(OrderDecoupleFlags decouple) { SB(this->flags, 0, 1, decouple); }
 	/**
-	 * Set the number of vehicles to decouple. 0 means "minimal decouplable unit" (F1).
-	 * @param num_decouple The number of vehicles to decouple.
+	 * R3R: Set the number of trailing coupled-on segments to decouple.
+	 * 0 means "auto" and decouples a single segment.
+	 * @param num_decouple The number of segments to decouple.
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline void SetNumDecouple(uint8_t num_decouple) { SB(this->flags, 1, 7, num_decouple); }

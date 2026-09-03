@@ -32,6 +32,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_DEPOT_ACTION,              ///< Dropdown to select the depot action (stop, service if needed, unbunch).
 	WID_O_REFIT_DROPDOWN,            ///< Open refit options.
 	WID_O_REVERSE,                   ///< Select waypoint reverse type
+	WID_O_REVERSE_AT_STATION,        ///< Toggle reversing the consist on arrival at this station order (R3R)
 	WID_O_COND_VARIABLE,             ///< Choose condition variable.
 	WID_O_COND_COMPARATOR,           ///< Choose condition type.
 	WID_O_COND_VALUE,                ///< Choose condition value.

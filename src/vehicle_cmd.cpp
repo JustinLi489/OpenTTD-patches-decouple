@@ -29,6 +29,7 @@
 #include "group_cmd.h"
 #include "order_backup.h"
 #include "order_cmd.h"
+#include "order_func.h"
 #include "infrastructure_func.h"
 #include "ship.h"
 #include "newgrf.h"
@@ -280,6 +281,104 @@ CommandCost CmdSetAsFrontWagon(DoCommandFlags flags, TileIndex tile, VehicleID v
 		UpdateTrainGroupID(t);
 		GroupStatistics::CountVehicle(t, 1);
 		InvalidateVehicleListWindows(t->type);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R: mark an independent chain as a decouplable segment.
+ *
+ * The chain (a zero-power consist or a locomotive-hauled train) keeps its
+ * standalone identity and schedule. What changes is its depot behaviour: the
+ * whole chain is treated like an articulated unit (moved/sold as one), and
+ * once it is coupled onto another train (or dragged onto one in the depot)
+ * its SegmentFront boundary stays in place so it can later be split off as a
+ * whole by a DECOUPLE order or by a depot drag.
+ * @param flags Operation to perform.
+ * @param tile tile on which the chain is located (for validation).
+ * @param veh_id ID of any vehicle of the chain to convert.
+ * @param client_id Client performing the command.
+ */
+CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
+{
+	Train *t = Train::GetIfValid(veh_id);
+	if (t == nullptr || !IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+
+	/* Resolve the clicked vehicle to its independent chain front. */
+	while (t->Previous() != nullptr) t = t->Previous();
+
+	if (!t->IsEngine() || !t->IsFrontEngine()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
+	if (!t->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		t->SetSegmentFront();
+		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R: demote an independent chain by one level of coupling identity.
+ *
+ * - An independent segment (its front carries the SegmentFront marker) becomes
+ *   a plain consist / train again: the boundary marker is cleared, so it can
+ *   be freely rearranged in the depot and is no longer split off as a unit.
+ * - An independent consist (zero-power wagon group) is dissolved into a plain
+ *   free wagon chain: the fake locomotive identity is removed, its schedule is
+ *   deleted and it becomes loose wagons that wait in the depot for an engine.
+ *
+ * A segment that is still coupled onto a train cannot be demoted in place;
+ * drag it onto an empty row in the depot first.
+ * @param flags Operation to perform.
+ * @param tile tile on which the chain is located (for validation).
+ * @param veh_id ID of any vehicle of the chain to demote.
+ * @param client_id Client performing the command.
+ */
+CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
+{
+	Train *t = Train::GetIfValid(veh_id);
+	if (t == nullptr || !IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+
+	/* Look for a segment boundary on the clicked vehicle or before it. */
+	Train *seg = nullptr;
+	for (Train *p = t; p != nullptr; p = p->Previous()) {
+		if (p->IsSegmentFront()) {
+			seg = p;
+			break;
+		}
+	}
+
+	if (seg != nullptr) {
+		/* Only a standalone (independent) segment can be demoted here. */
+		if (seg->Previous() != nullptr || !seg->IsEngine()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+		if (!seg->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+
+		if (flags.Test(DoCommandFlag::Execute)) {
+			seg->ClearSegmentFront();
+			InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
+		}
+		return CommandCost();
+	}
+
+	/* No segment marker: dissolve an independent consist into loose wagons. */
+	Train *front = t;
+	while (front->Previous() != nullptr) front = front->Previous();
+
+	if (!IsConsistGroup(front)) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+	if (!front->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		/* A free wagon chain cannot hold a schedule. */
+		if (front->orders != nullptr) DeleteVehicleOrders(front);
+		/* Release the unit number back into the company pool. */
+		if (front->unitnumber != 0) Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber);
+		front->unitnumber = 0;
+		GroupStatistics::CountVehicle(front, -1);
+		front->ClearSegmentFront();
+		DestroyConsistGroup(front);
+		UpdateTrainGroupID(front);
+		InvalidateVehicleListWindows(VehicleType::Train);
+		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 	}
 	return CommandCost();
 }

@@ -160,31 +160,10 @@ public:
 
 		Yapf().PfSetStartupNodes();
 
-		if (v != nullptr && v->type == ::VehicleType::Train && v->current_order.IsType(OT_GOTO_COUPLE)) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-FP numSteps=%d bestOpen=%s\n",
-						(int)this->num_steps,
-						this->nodes.GetBestOpenNode() != nullptr ? "yes" : "null");
-				fclose(dbg);
-			}
-		}
-
 		for (;;) {
 			this->num_steps++;
 			Node *best_open_node = this->nodes.GetBestOpenNode();
 			if (best_open_node == nullptr) break;
-
-			if (this->num_steps == 1 && v != nullptr && v->type == ::VehicleType::Train && v->current_order.IsType(OT_GOTO_COUPLE)) {
-				bool cpl_pfd_ret = Yapf().PfDetectDestination(*best_open_node);
-				FILE *dbg = fopen("R3R_debug.log", "a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-PFD tile=%d,%d td=%d ret=%d\n",
-							(int)TileX(best_open_node->GetLastTile()), (int)TileY(best_open_node->GetLastTile()),
-							(int)best_open_node->GetLastTrackdir(), (int)cpl_pfd_ret);
-					fclose(dbg);
-				}
-			}
 
 			if (Yapf().PfDetectDestination(*best_open_node)) {
 				this->best_dest_node = best_open_node;
@@ -193,20 +172,6 @@ public:
 
 			this->nodes.DequeueBestOpenNode();
 			Yapf().PfFollowNode(*best_open_node);
-
-			if (v != nullptr && v->type == ::VehicleType::Train && v->current_order.IsType(OT_GOTO_COUPLE) && this->num_steps <= 25) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-STEP step=%d cur=%d,%d td=%d parent=%d,%d openCnt=%d closed=%d\n",
-							(int)this->num_steps,
-							(int)TileX(best_open_node->GetLastTile()), (int)TileY(best_open_node->GetLastTile()),
-							(int)best_open_node->GetLastTrackdir(),
-							best_open_node->parent != nullptr ? (int)TileX(best_open_node->parent->GetLastTile()) : -1,
-							best_open_node->parent != nullptr ? (int)TileY(best_open_node->parent->GetLastTile()) : -1,
-							(int)this->nodes.OpenCount(), (int)this->nodes.ClosedCount());
-					fclose(dbg);
-				}
-			}
 
 			if (this->max_search_nodes == 0 || this->nodes.ClosedCount() < this->max_search_nodes) {
 				this->nodes.PopAlreadyDequeuedOpenNode(best_open_node->GetKey());

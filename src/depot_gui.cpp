@@ -84,17 +84,23 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_BUILD), SetFill(1, 1), SetResize(1, 0),
 		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_CLONE), SetFill(1, 1), SetResize(1, 0),
-		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_SET_AS_FRONT_WAGON), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_SET_AS_FRONT_WAGON, STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_DEPARTURES), SetFill(0, 1), SetStringTip(STR_STATION_VIEW_DEPARTURES_BUTTON, STR_STATION_VIEW_DEPARTURES_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_VEHICLE_LIST), SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1),
 		NWidget(WWT_PUSHIMGBTN, Colours::Grey, WID_D_STOP_ALL), SetSpriteTip(SPR_FLAG_VEH_STOPPED), SetAspect(WidgetDimensions::ASPECT_VEHICLE_FLAG), SetFill(0, 1),
 		NWidget(WWT_PUSHIMGBTN, Colours::Grey, WID_D_START_ALL), SetSpriteTip(SPR_FLAG_VEH_RUNNING), SetAspect(WidgetDimensions::ASPECT_VEHICLE_FLAG), SetFill(0, 1),
 		NWidget(WWT_RESIZEBOX, Colours::Grey),
 	EndContainer(),
+	NWidget(NWID_SELECTION, Colours::Invalid, WID_D_SHOW_SEGMENT_TOOLS),
+		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
+			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_SET_AS_FRONT_WAGON), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_SET_AS_FRONT_WAGON, STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP),
+			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_MAKE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_MAKE_SEGMENT, STR_DEPOT_MAKE_SEGMENT_TOOLTIP),
+			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_DEMOTE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_DEMOTE_SEGMENT, STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP),
+		EndContainer(),
+	EndContainer(),
 };
 
 static WindowDesc _train_depot_desc(__FILE__, __LINE__,
-	WindowPosition::Automatic, "depot_train", 362, 123,
+	WindowPosition::Automatic, "depot_train", 362, 138,
 	WindowClass::VehicleDepot, WindowClass::None,
 	{},
 	_nested_train_depot_widgets
@@ -138,6 +144,77 @@ void CcCloneVehicle(const CommandCost &result)
 	ShowVehicleViewWindow(v);
 }
 
+/**
+ * R3R: find the coupled-on segment (a run of vehicles that was attached by a
+ * Couple order and whose front carries the SegmentFront marker) a train vehicle
+ * belongs to. Vehicles in front of the first segment boundary (e.g. the leading
+ * locomotive) and chains that were never coupled on do not belong to a segment.
+ * @param v The clicked/dragged train vehicle.
+ * @return The front of the vehicle's segment, or nullptr when not inside one.
+ */
+static const Train *TrainDepotGetSegmentFront(const Train *v)
+{
+	if (v == nullptr) return nullptr;
+	for (const Train *t = v; t != nullptr; t = t->Previous()) {
+		if (t->IsSegmentFront()) return t;
+	}
+	return nullptr;
+}
+
+/**
+ * R3R: cut a whole coupled-on segment out of its chain. Any vehicles trailing
+ * the segment (behind its last vehicle, which is the chain end or the next
+ * segment boundary) are re-attached to the original chain first, leaving the
+ * segment as a standalone chain that can then be moved, dropped on an empty
+ * row or sold as a whole.
+ * @param seg First vehicle of the segment (carries SegmentFront).
+ */
+static void TrainDepotDetachSegment(const Train *seg)
+{
+	/* Last vehicle of the segment: up to the chain end or the next segment boundary. */
+	const Train *tail = seg;
+	while (tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
+
+	const Train *rest = tail->Next();     ///< Vehicles trailing the segment (may be nullptr).
+	const Train *anchor = seg->Previous(); ///< Last vehicle that stays on the original chain (may be nullptr).
+
+	if (rest != nullptr && anchor != nullptr) {
+		/* A segment in the middle of its chain: re-attach the trailing vehicles
+		 * to the original chain first, so the segment itself becomes a standalone
+		 * chain that can then be dropped at the requested position. */
+		Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, seg->tile, rest->index, anchor->index, MoveRailVehicleFlags::MoveChain);
+	}
+}
+
+/**
+ * R3R: drag a whole coupled-on segment to a drop position. The segment
+ * [front .. tail] is first cut off from any vehicles that follow it in the
+ * chain (those stay attached to the original chain), then the segment is
+ * dropped like a normal MoveRailVehicle drag. A separated zero-power segment
+ * (a former consist wagon group) is turned back into a consist.
+ * @param front First vehicle of the segment (carries SegmentFront).
+ * @param wagon The drop position already resolved in the "put after this vehicle"
+ *              sense; nullptr means an empty row / the depot list end.
+ */
+static void TrainDepotMoveSegment(const Train *front, const Vehicle *wagon)
+{
+	const Train *seg = front;
+	TrainDepotDetachSegment(seg);
+
+	TileIndex tile = seg->tile;
+	VehicleID dest = (wagon == nullptr) ? VehicleID::Invalid() : wagon->index;
+
+	/* Move the segment itself. */
+	Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, tile, seg->index, dest, MoveRailVehicleFlags::MoveChain);
+
+	if (dest == VehicleID::Invalid() && !seg->IsEngine()) {
+		/* A zero-power segment (a consist wagon group whose fake locomotive was
+		 * removed when it was coupled on) ends up as a free wagon chain: restore
+		 * its consist identity so it can again be scheduled and coupled by R3R. */
+		Command<Commands::SetAsFrontWagon>::Post(STR_ERROR_CAN_T_SET_AS_FRONT_WAGON, tile, seg->index, INVALID_CLIENT_ID);
+	}
+}
+
 static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Vehicle *head)
 {
 	const Vehicle *v = Vehicle::Get(sel);
@@ -152,6 +229,15 @@ static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Veh
 	}
 
 	if (wagon == v) return;
+
+	/* R3R: dragging a vehicle that belongs to a coupled-on segment moves the
+	 * whole segment — the segment is the operationally meaningful unit (it was
+	 * attached by a Couple order and will later be split off again as a whole). */
+	const Train *seg_front = (v->type == VehicleType::Train) ? TrainDepotGetSegmentFront(Train::From(v)) : nullptr;
+	if (seg_front != nullptr) {
+		TrainDepotMoveSegment(seg_front, wagon);
+		return;
+	}
 
 	Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, v->tile, v->index, wagon == nullptr ? VehicleID::Invalid() : wagon->index, _ctrl_pressed ? MoveRailVehicleFlags::MoveChain : MoveRailVehicleFlags::None);
 }
@@ -305,6 +391,7 @@ struct DepotWindow : Window {
 		if (type == VehicleType::Train) this->GetWidget<NWidgetCore>(WID_D_MATRIX)->SetMatrixDimension(1, 0 /* auto-scale */);
 		this->GetWidget<NWidgetStacked>(WID_D_SHOW_H_SCROLL)->SetDisplayedPlane(type == VehicleType::Train ? 0 : SZSP_HORIZONTAL);
 		this->GetWidget<NWidgetStacked>(WID_D_SHOW_SELL_CHAIN)->SetDisplayedPlane(type == VehicleType::Train ? 0 : SZSP_NONE);
+		this->GetWidget<NWidgetStacked>(WID_D_SHOW_SEGMENT_TOOLS)->SetDisplayedPlane(type == VehicleType::Train ? 0 : SZSP_NONE);
 		this->SetupWidgetData(type);
 		this->FinishInitNested(tile.base());
 
@@ -609,7 +696,10 @@ struct DepotWindow : Window {
 				} else if (v != nullptr) {
 					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
 					SetMouseCursorVehicle(v, EIT_IN_DEPOT);
-					_cursor.vehchain = _ctrl_pressed;
+					/* R3R: dragging a vehicle inside a coupled-on segment always drags
+					 * the whole segment, so show the chain cursor regardless of ctrl. */
+					const Train *seg_front = (v->type == VehicleType::Train) ? TrainDepotGetSegmentFront(Train::From(v)) : nullptr;
+					_cursor.vehchain = _ctrl_pressed || seg_front != nullptr;
 
 					this->sel = v->index;
 					this->SetDirty();
@@ -861,15 +951,26 @@ struct DepotWindow : Window {
 				break;
 
 			case WID_D_SET_AS_FRONT_WAGON: // Make consist button
-				this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
-				this->ToggleWidgetLoweredState(WID_D_SET_AS_FRONT_WAGON);
-				if (this->IsWidgetLowered(WID_D_SET_AS_FRONT_WAGON)) {
+			case WID_D_MAKE_SEGMENT:       // Make segment button (R3R)
+			case WID_D_DEMOTE_SEGMENT: {    // Demote segment button (R3R)
+				/* The three consist/segment tools share the object-placement slot: raising
+				 * one raises the others first. */
+				for (WidgetID w : { WID_D_SET_AS_FRONT_WAGON, WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
+					if (w != widget && this->IsWidgetLowered(w)) {
+						this->RaiseWidget(w);
+						this->SetWidgetDirty(w);
+					}
+				}
+				this->SetWidgetDirty(widget);
+				this->ToggleWidgetLoweredState(widget);
+				if (this->IsWidgetLowered(widget)) {
 					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_VEHICLE, this);
 				} else {
 					ResetObjectToPlace();
 				}
 				SndClickBeep();
 				break;
+			}
 
 			case WID_D_RENAME: // Rename button
 				ShowQueryString(GetString(STR_DEPOT_NAME, this->type, Depot::GetByTile(TileIndex(this->window_number))->index), STR_DEPOT_RENAME_DEPOT_CAPTION,
@@ -984,6 +1085,22 @@ struct DepotWindow : Window {
 			Command<Commands::SetAsFrontWagon>::Post(STR_ERROR_CAN_T_SET_AS_FRONT_WAGON, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
 			return true;
 		}
+		if (this->IsWidgetLowered(WID_D_MAKE_SEGMENT)) {
+			/* Make segment mode (R3R): turn the clicked consist/train into an independent segment. */
+			this->RaiseWidget(WID_D_MAKE_SEGMENT);
+			this->SetWidgetDirty(WID_D_MAKE_SEGMENT);
+			ResetObjectToPlace();
+			Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
+			return true;
+		}
+		if (this->IsWidgetLowered(WID_D_DEMOTE_SEGMENT)) {
+			/* Demote segment mode (R3R): independent segment -> consist/train, consist -> free wagon chain. */
+			this->RaiseWidget(WID_D_DEMOTE_SEGMENT);
+			this->SetWidgetDirty(WID_D_DEMOTE_SEGMENT);
+			ResetObjectToPlace();
+			Command<Commands::DemoteSegment>::Post(STR_ERROR_CAN_T_DEMOTE_SEGMENT, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
+			return true;
+		}
 
 		if (_ctrl_pressed) {
 			/* Share-clone, do not open new viewport, and keep tool active */
@@ -1068,9 +1185,13 @@ struct DepotWindow : Window {
 		this->RaiseWidget(WID_D_CLONE);
 		this->SetWidgetDirty(WID_D_CLONE);
 
-		/* abort make consist */
-		this->RaiseWidget(WID_D_SET_AS_FRONT_WAGON);
-		this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
+		/* abort make consist / segment tools */
+		for (WidgetID w : { WID_D_SET_AS_FRONT_WAGON, WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
+			if (this->IsWidgetLowered(w)) {
+				this->RaiseWidget(w);
+				this->SetWidgetDirty(w);
+			}
+		}
 
 		/* abort drag & drop */
 		this->sel = VehicleID::Invalid();
@@ -1178,9 +1299,23 @@ struct DepotWindow : Window {
 				this->sel = VehicleID::Invalid();
 				this->SetDirty();
 
+				VehicleID sell_id = v->index;
 				SellVehicleFlags sell_flags = SellVehicleFlags::BackupOrder;
-				if (v->type == VehicleType::Train && (widget == WID_D_SELL_CHAIN || _ctrl_pressed)) sell_flags |= SellVehicleFlags::SellChain;
-				Command<Commands::SellVehicle>::Post(GetCmdSellVehMsg(v->type), v->tile, v->index, sell_flags, INVALID_CLIENT_ID);
+				if (v->type == VehicleType::Train) {
+					if (widget == WID_D_SELL_CHAIN || _ctrl_pressed) sell_flags |= SellVehicleFlags::SellChain;
+					/* R3R: a coupled-on segment is an operational unit — selling any
+					 * of its vehicles sells the whole segment. Cut it out of its
+					 * chain first (so trailing vehicles / later segments stay on the
+					 * original chain) and then sell the now standalone segment as a
+					 * chain. */
+					const Train *seg_front = TrainDepotGetSegmentFront(Train::From(v));
+					if (seg_front != nullptr) {
+						TrainDepotDetachSegment(seg_front);
+						sell_id = seg_front->index;
+						sell_flags |= SellVehicleFlags::SellChain;
+					}
+				}
+				Command<Commands::SellVehicle>::Post(GetCmdSellVehMsg(v->type), v->tile, sell_id, sell_flags, INVALID_CLIENT_ID);
 				break;
 			}
 

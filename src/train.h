@@ -27,7 +27,7 @@ enum ClientID : uint32_t;
 enum class VehicleRailFlag : uint8_t {
 	Reversing                 = 0,  ///< Train is slowing down to reverse.
 	WaitingRestriction        = 1,  ///< Train is waiting due to a routing restriction, only valid when VehicleRailFlag::Stuck is also set.
-	/* gap, was VRF_HAVE_SLOT */
+	SegmentFront              = 2,  ///< R3R: this vehicle is the front of a coupled-on segment (decouplable unit). Formerly VRF_HAVE_SLOT.
 	PoweredWagon              = 3,  ///< Wagon is powered.
 	Flipped                   = 4,  ///< Reverse the visible direction of the vehicle.
 	HasHitRoadVehicle         = 5,  ///< Train has hit road vehicle
@@ -154,6 +154,14 @@ struct TrainCache {
 struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	TrackBits track{}; ///< On which track the train currently is.
 	VehicleRailFlags flags{};
+
+	/** Whether this vehicle is the front of a coupled-on (powered) segment. */
+	bool IsSegmentFront() const { return this->flags.Test(VehicleRailFlag::SegmentFront); }
+	/** Mark this vehicle as the front of a coupled-on segment. */
+	void SetSegmentFront() { this->flags.Set(VehicleRailFlag::SegmentFront); }
+	/** Clear the segment-front marker (the vehicle is no longer part of a coupled chain boundary). */
+	void ClearSegmentFront() { this->flags.Reset(VehicleRailFlag::SegmentFront); }
+
 	TrainCache tcache{};
 
 	/** Link between the two ends of a multiheaded engine. */

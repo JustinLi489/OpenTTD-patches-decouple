@@ -322,6 +322,11 @@ public:
 		Train *t = nullptr;
 		if (has_res) {
 			t = GetTrainForReservation(tile, TrackdirToTrack(td));
+			/* R3R: the coupling loco's own reservation may cover the consist's
+			 * platform tile, making GetTrainForReservation return the loco itself
+			 * and mask the consist (couple pathfinder found=0 right next to it).
+			 * The consist is never GOTO_COUPLE - ignore such reservations. */
+			if (t != nullptr && t->IsPrimaryVehicle() && t->current_order.IsType(OT_GOTO_COUPLE)) t = nullptr;
 		}
 		if (t == nullptr && IsRailStationTile(tile)) {
 			/* R3R: the whole-platform reservation may leave reserved tiles that
@@ -334,9 +339,14 @@ public:
 				while (IsCompatibleTrainStationTile(st, tile)) {
 					if (HasReservedTracks(st, TrackToTrackBits(track))) {
 						t = GetTrainForReservation(st, track);
+						if (t != nullptr && t->IsPrimaryVehicle() && t->current_order.IsType(OT_GOTO_COUPLE)) t = nullptr;
 						if (t == nullptr) {
 							for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
-								if (tr->IsFrontEngine() && IsConsistGroup(tr)) { t = tr; break; }
+								Train *first = tr->First();
+								if (tr->IsFrontEngine() && (IsConsistGroup(first) ||
+										(first->IsPrimaryVehicle() && first->current_order.IsType(OT_WAIT_COUPLE)))) {
+									t = first; break;
+								}
 							}
 						}
 						if (t != nullptr) break;

@@ -4387,6 +4387,10 @@ STR_DEPOT_AIRCRAFT_NEW_VEHICLES_TOOLTIP                         :{BLACK}Buy new 
 ###length VEHICLE_TYPES
 STR_DEPOT_SET_AS_FRONT_WAGON                                     :{BLACK}Make consist
 STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP                             :{BLACK}Turn the selected wagon chain into an independently operating consist that can hold orders and be coupled onto by locomotives
+STR_DEPOT_MAKE_SEGMENT                                           :{BLACK}Make segment
+STR_DEPOT_MAKE_SEGMENT_TOOLTIP                                   :{BLACK}Turn the selected consist or train into an independent segment. A segment is kept as one whole in the depot (dragged or sold together) and keeps its boundary once coupled onto a train, so it can be split off again as one unit by a decouple order or by dragging it out in a depot
+STR_DEPOT_DEMOTE_SEGMENT                                         :{BLACK}Demote
+STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP                                 :{BLACK}Lower the selected unit by one level. An independent segment becomes a plain consist/train again. A consist is dissolved back into a loose free wagon chain and loses its schedule
 STR_DEPOT_CLONE_TRAIN                                           :{BLACK}Clone Train
 STR_DEPOT_CLONE_ROAD_VEHICLE                                    :{BLACK}Clone Vehicle
 STR_DEPOT_CLONE_SHIP                                            :{BLACK}Clone Ship
@@ -4712,7 +4716,7 @@ STR_ORDERS_END_OF_SHARED_ORDERS                                 :- - End of Shar
 # Couple / decouple order strings (OpenTTD decouple feature)
 STR_ORDER_DECOUPLE                                              :{BLACK}Decouple
 STR_ORDER_DECOUPLE_BUTTON                                       :{BLACK}Decouple
-STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}Add a decouple order. The train will decouple the given number of vehicles (or minimal decouplable units) at the preceding station or depot
+STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}Add a decouple order. The train will decouple the last coupled-on segment (the group it was coupled to) at the preceding station or depot
 STR_ORDER_GO_TO_COUPLE                                          :Go to and couple onto consist
 STR_ORDER_GO_TO_COUPLE_STATION                                  :Go to and couple onto consist at {STATION}
 STR_ORDER_GO_TO_COUPLE_DEPOT                                    :Go to and couple onto consist at {DEPOT}
@@ -4720,8 +4724,8 @@ STR_ORDER_GO_TO_COUPLE_CARGO                                    : (carrying {STR
 STR_ORDER_GO_TO_COUPLE_BUTTON                                   :{BLACK}Go to and couple
 STR_ORDER_WAIT_COUPLE                                           :Wait for coupling
 STR_ORDER_WAIT_COUPLE_BUTTON                                    :{BLACK}Wait for coupling
-STR_ORDER_DECOUPLE_DETAILS                                      :Decouple {COMMA} units
-STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :Decouple minimal units
+STR_ORDER_DECOUPLE_DETAILS                                      :Decouple {COMMA} segments
+STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :Decouple rear segment
 STR_ORDER_DECOUPLE_KEEP_ORDERS                                  :Keep orders
 STR_ORDER_DECOUPLE_KEEP_ORDERS_NO_LOAD                          :Keep orders, do not load
 STR_ORDER_DECOUPLE_INHERIT_ORDERS                               :Inherit remaining orders
@@ -4729,6 +4733,11 @@ STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :Wait for coupli
 STR_ORDER_COUPLE_ANY                                            :Couple any
 STR_ORDER_COUPLE_EMPTY                                          :Couple empty
 STR_ORDER_COUPLE_FULL                                           :Couple full
+
+# R3R "reverse on arrival" strings
+STR_ORDER_REVERSE_AT_STATION_TOOLTIP                             :{BLACK}Reverse the consist in place when it arrives at this station, so it departs facing the other way. Useful before a "Go to and couple" order to approach the coupling point nose-first.
+STR_ORDER_REVERSE_AT_DEPOT_TOOLTIP                               :{BLACK}Reverse the consist inside this depot order's depot, so it drives out facing the other way. A drive-through depot then acts as a turning point.
+STR_ORDER_REVERSE_AT_WAYPOINT_TOOLTIP                            :{BLACK}Stop the consist on this waypoint and reverse it in place, so it drives back out the way it came. Lets a waypoint act as a turning point without the consist having to fully pass it.
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}Non-stop
@@ -5468,6 +5477,8 @@ STR_ERROR_CAN_T_SEND_AIRCRAFT_TO_HANGAR                         :Can't send airc
 ###length VEHICLE_TYPES
 STR_ERROR_CAN_T_BUY_TRAIN                                       :Can't buy railway vehicle...
 STR_ERROR_CAN_T_SET_AS_FRONT_WAGON                              :Can't turn the wagon chain into an independent consist...
+STR_ERROR_CAN_T_MAKE_SEGMENT                                    :Can't turn the vehicle into an independent segment...
+STR_ERROR_CAN_T_DEMOTE_SEGMENT                                  :Can't demote the unit...
 STR_ERROR_CAN_T_BUY_ROAD_VEHICLE                                :Can't buy road vehicle...
 STR_ERROR_CAN_T_BUY_SHIP                                        :Can't buy ship...
 STR_ERROR_CAN_T_BUY_AIRCRAFT                                    :Can't buy aircraft...

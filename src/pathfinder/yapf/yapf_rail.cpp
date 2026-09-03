@@ -718,8 +718,17 @@ public:
 						(int)pNode->GetLastTrackdir(), (int)pNode->cost);
 				fclose(dbg);
 			}
-		}
-		/* R3R: reserve up to the consist's head car (the coupling point) instead of
+			}
+			if (pNode->parent == nullptr) {
+			/* R3R: zero-length couple path - the best node is the origin itself
+			 * (the locomotive already shares a tile with the waiting consist's
+			 * coupling end). There is no path segment to walk back or reserve;
+			 * report no track so ChooseTrainTrack parks the locomotive and the
+			 * collision/couple handlers perform the physical join. Without this
+			 * guard pPrev stays nullptr and the walk-back below dereferences it. */
+			return INVALID_TRACKDIR;
+			}
+			/* R3R: reserve up to the consist's head car (the coupling point) instead of
 		 * the far end of the platform - reserving the far end routes the loco through
 		 * the consist and extends the reservation past the platform. */
 		const TileIndex res_target_tile = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pNode->GetLastTile();

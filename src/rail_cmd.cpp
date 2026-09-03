@@ -4863,8 +4863,18 @@ static VehicleEnterTileStates VehicleEnterTile_Rail(Vehicle *u, TileIndex tile, 
 		if (v->GetMovingNext() == nullptr) {
 			Train *consist = v->First();
 			/* Whether the train should always leave in the forward direction. */
-			const bool reset_reverse = !_settings_game.vehicle.drive_through_train_depot ||
+			bool reset_reverse = !_settings_game.vehicle.drive_through_train_depot ||
 					(_settings_game.difficulty.train_flip_reverse_allowed != TrainFlipReversingAllowed::None && !consist->Last()->CanLeadTrain());
+			/* R3R: a depot order with the "reverse at depot" flag turns the consist
+			 * around inside the depot by taking the opposite of the default decision.
+			 * A drive-through depot is then used as a turning point (the consist
+			 * drives out facing the other way); an ordinary dead-end depot keeps its
+			 * normal behaviour. The whole consist is inside the depot wormhole here,
+			 * so only the Reversed / DrivingBackwards state matters — there is no
+			 * track geometry to fix up. */
+			if (consist->current_order.IsType(OT_GOTO_DEPOT) && consist->current_order.HasReverseAtDepot()) {
+				reset_reverse = !reset_reverse;
+			}
 			if (reset_reverse) {
 				/* Clear reversed flag, drive out of depot in forward direction. */
 				consist->flags.Reset(VehicleRailFlag::Reversed);
