@@ -467,7 +467,7 @@ public:
 
 				if (this->GetVehicleFromDepotWndPt(pt.x - nwi->pos_x, pt.y - nwi->pos_y, &v, &gdvp) == MODE_DRAG_VEHICLE && sel != VehicleID::Invalid()) {
 					if (gdvp.wagon != nullptr && gdvp.wagon->index == sel && _ctrl_pressed) {
-						Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, CommandCallback::VirtualTrainWagonsMoved, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true);
+						Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, CommandCallback::VirtualTrainWagonsMoved, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true, false);
 					} else if (gdvp.wagon == nullptr || gdvp.wagon->index != sel) {
 						this->vehicle_over = VehicleID::Invalid();
 						TrainDepotMoveVehicle(gdvp.wagon, sel, gdvp.head);

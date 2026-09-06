@@ -47,6 +47,9 @@ enum class VehicleRailFlag : uint8_t {
 	ConsistSpeedReduction     = 20, ///< One or more vehicles in this consist may be in a depot or on a bridge (may be false positive but not false negative).
 	PendingSpeedRestriction   = 21, ///< This vehicle has one or more pending speed restriction changes.
 	SpeedAdaptationExempt     = 22, ///< This vehicle is exempt from train speed adaptation.
+	ForceFlipReverse          = 23, ///< R3R: player pressed the turn-around button; the train must end-swap (first/last swap) rather than back up.
+	ArticGroupHead            = 24, ///< R3R: head (parent) role of a de-articulated group; real artic groups derive this from subtype and never carry this bit.
+	ArticGroupMember          = 25, ///< R3R: member (part) role of a de-articulated group; real artic parts derive this from subtype and never carry this bit.
 };
 using VehicleRailFlags = EnumBitSet<VehicleRailFlag, uint32_t>;
 
@@ -161,6 +164,48 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void SetSegmentFront() { this->flags.Set(VehicleRailFlag::SegmentFront); }
 	/** Clear the segment-front marker (the vehicle is no longer part of a coupled chain boundary). */
 	void ClearSegmentFront() { this->flags.Reset(VehicleRailFlag::SegmentFront); }
+
+	/**
+	 * R3R group-role view: is this vehicle an articulated-group *member* (part role)?
+	 * Real artic parts derive the role from the subtype bit; de-articulated groups
+	 * carry an explicit ArticGroupMember flag. The two forms share one semantic layer.
+	 */
+	inline bool IsArticGroupMember() const override
+	{
+		return this->IsArticulatedPart() || this->flags.Test(VehicleRailFlag::ArticGroupMember);
+	}
+
+	/**
+	 * R3R group-role view: is this vehicle the *head* (parent role) of an articulated group?
+	 * A real artic group head is the parent vehicle (no subtype bit, next vehicle is a part);
+	 * a de-articulated group head carries an explicit ArticGroupHead flag.
+	 */
+	inline bool IsArticGroupHead() const override
+	{
+		return (!this->IsArticulatedPart() && this->Next() != nullptr && this->Next()->IsArticGroupMember())
+			|| this->flags.Test(VehicleRailFlag::ArticGroupHead);
+	}
+
+	/** R3R: is this vehicle inside an articulated-group semantic (head or member)? */
+	inline bool InArticGroup() const override { return this->IsArticGroupHead() || this->IsArticGroupMember(); }
+
+	/** Mark this vehicle as the head (parent role) of a de-articulated group. */
+	void SetArticGroupHead() { this->flags.Set(VehicleRailFlag::ArticGroupHead); }
+	/** Clear the de-articulated group head role. */
+	void ClearArticGroupHead() { this->flags.Reset(VehicleRailFlag::ArticGroupHead); }
+	/** Mark this vehicle as a member (part role) of a de-articulated group. */
+	void SetArticGroupMember() { this->flags.Set(VehicleRailFlag::ArticGroupMember); }
+	/** Clear the de-articulated group member role. */
+	void ClearArticGroupMember() { this->flags.Reset(VehicleRailFlag::ArticGroupMember); }
+
+	/* R3R de-articulated-group baked overrides. UINT16_MAX means "no override" (fall
+	 * back to the vehicle record / normal rules). Set by DearticulateChainWithSnapshot
+	 * to keep consist statistics conserved after an artic group is split into real
+	 * vehicles; cleared again on re-articulation. Overrides are read *before* any
+	 * engine/wagon identity gating (GetWeightWithoutCargo / GetPower / max-speed). */
+	uint16_t weight_override = UINT16_MAX;
+	uint16_t power_override = UINT16_MAX;
+	uint16_t max_speed_override = UINT16_MAX;
 
 	TrainCache tcache{};
 
@@ -344,6 +389,18 @@ public:
 	}
 
 	/**
+	 * R3R: snapshot of the power this vehicle provides, reachable outside the
+	 * acceleration code. Mirrors #GetPower (which is guarded to the acceleration
+	 * code), so the de-articulation bake in vehicle_cmd can record the exact
+	 * articulated-parent power before the group is split into real vehicles.
+	 * @return Power value from the engine in HP.
+	 */
+	inline uint16_t GetPowerSnapshot() const
+	{
+		return this->GetPower();
+	}
+
+	/**
 	 * Allows to know the weight value that this vehicle will use (excluding cargo).
 	 * @return Weight value from the engine in tonnes.
 	 */
@@ -351,8 +408,12 @@ public:
 	{
 		uint16_t weight = 0;
 
-		/* Vehicle weight is not added for articulated parts. */
-		if (!this->IsArticulatedPart()) {
+		/* R3R: de-articulated-group baked override takes precedence over the vehicle
+		 * record; the override value is exact (conservation baked at de-articulation). */
+		if (this->weight_override != UINT16_MAX) {
+			weight += this->weight_override;
+		} else if (!this->IsArticulatedPart()) {
+			/* Vehicle weight is not added for articulated parts. */
 			weight += GetVehicleProperty(this, PROP_TRAIN_WEIGHT, RailVehInfo(this->engine_type)->weight);
 		}
 
@@ -418,6 +479,10 @@ protected: // These functions should not be called outside acceleration code.
 	 */
 	inline uint16_t GetPower() const
 	{
+		/* R3R: de-articulated-group baked override takes precedence. 0 is a legitimate
+		 * baked value (the split consist may be unpowered), so INVALID = UINT16_MAX. */
+		if (this->power_override != UINT16_MAX) return this->power_override;
+
 		/* Power is not added for articulated parts */
 		if (!this->IsArticulatedPart() && (this->IsVirtual() || HasPowerOnRail(this->railtypes, GetRailTypeByTrackBit(this->tile, this->track)))) {
 			uint16_t power = GetVehicleProperty(this, PROP_TRAIN_POWER, RailVehInfo(this->engine_type)->power);

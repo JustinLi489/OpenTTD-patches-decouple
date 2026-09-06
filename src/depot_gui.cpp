@@ -1275,7 +1275,7 @@ struct DepotWindow : Window {
 				if (this->type == VehicleType::Train) {
 					if (result.action == DepotGUIAction::DragVehicle && sel != VehicleID::Invalid()) {
 						if (result.wagon != nullptr && result.wagon->index == sel && _ctrl_pressed) {
-							Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true);
+							Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true, false);
 						} else if (result.wagon == nullptr || result.wagon->index != sel) {
 							this->vehicle_over = VehicleID::Invalid();
 							TrainDepotMoveVehicle(result.wagon, sel, result.vehicle);

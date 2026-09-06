@@ -1897,7 +1897,7 @@ static void ReserveConsist(Station *st, Vehicle *u, CargoArray *consist_capleft,
 		/* Exclude various ways in which the vehicle might not be the head of an equivalent of
 		 * "articulated chain". Also don't do the reservation if the vehicle is going to refit
 		 * to a different cargo and hasn't tried to do so, yet. */
-		if (!v->IsArticulatedPart() &&
+		if (!v->IsArticGroupMember() &&
 				(v->type != VehicleType::Train || !Train::From(v)->IsRearDualheaded()) &&
 				(v->type != VehicleType::Aircraft || Aircraft::From(v)->IsNormalAircraft()) &&
 				(must_reserve || u->current_order.GetRefitCargo() == v->cargo_type)) {

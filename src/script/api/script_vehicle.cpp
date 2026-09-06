@@ -241,7 +241,7 @@
 
 	switch (::Vehicle::Get(vehicle_id)->type) {
 		case ::VehicleType::Road: return ScriptObject::Command<Commands::TurnRoadVehicle>::Do(vehicle_id);
-		case ::VehicleType::Train: return ScriptObject::Command<Commands::ReverseTrainDirection>::Do(vehicle_id, false);
+		case ::VehicleType::Train: return ScriptObject::Command<Commands::ReverseTrainDirection>::Do(vehicle_id, false, false);
 		default: NOT_REACHED();
 	}
 }

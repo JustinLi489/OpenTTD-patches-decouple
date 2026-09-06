@@ -4143,7 +4143,7 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 					v->current_order.SetDestination(closest_depot.destination);
 
 					/* If there is no depot in front, reverse automatically (trains only) */
-					if (v->type == VehicleType::Train && closest_depot.reverse) Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, v->index, false);
+					if (v->type == VehicleType::Train && closest_depot.reverse) Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, v->index, false, false);
 
 					if (v->type == VehicleType::Aircraft) {
 						Aircraft *a = Aircraft::From(v);

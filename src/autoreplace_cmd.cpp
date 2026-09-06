@@ -541,7 +541,7 @@ static CommandCost BuildReplacementVehicle(const Vehicle *old_veh, Vehicle **new
 		/* Only copy the reverse state if neither old or new vehicle implements reverse-on-build probability callback. */
 		if (!TestVehicleBuildProbability(old_veh, BuildProbabilityType::Reversed).has_value() &&
 			!TestVehicleBuildProbability(new_veh, BuildProbabilityType::Reversed).has_value()) {
-			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, new_veh->index, true);
+			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, new_veh->index, true, false);
 		}
 	}
 

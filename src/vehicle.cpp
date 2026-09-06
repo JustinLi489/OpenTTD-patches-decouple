@@ -1040,7 +1040,7 @@ bool Vehicle::IsEngineCountable() const
 	switch (this->type) {
 		case VehicleType::Aircraft: return Aircraft::From(this)->IsNormalAircraft(); // don't count plane shadows and helicopter rotors
 		case VehicleType::Train:
-			return !this->IsArticulatedPart() && // tenders and other articulated parts
+			return !this->IsArticGroupMember() && // tenders, articulated parts and de-articulated group members
 					!Train::From(this)->IsRearDualheaded(); // rear parts of multiheaded engines
 		case VehicleType::Road: return RoadVehicle::From(this)->IsFrontEngine();
 		case VehicleType::Ship: return Ship::From(this)->IsPrimaryVehicle();
@@ -3140,9 +3140,9 @@ LiveryScheme GetEngineLiveryScheme(EngineID engine_type, EngineID parent_engine_
 	switch (e->type) {
 		default: NOT_REACHED();
 		case VehicleType::Train:
-			if (v != nullptr && parent_engine_type != EngineID::Invalid() && (UsesWagonOverride(v) || (v->IsArticulatedPart() && e->VehInfo<RailVehicleInfo>().railveh_type != RailVehicleType::Wagon))) {
+			if (v != nullptr && parent_engine_type != EngineID::Invalid() && (UsesWagonOverride(v) || (v->IsArticGroupMember() && e->VehInfo<RailVehicleInfo>().railveh_type != RailVehicleType::Wagon))) {
 				/* Wagonoverrides use the colour scheme of the front engine.
-				 * Articulated parts use the colour scheme of the first part. (Not supported for articulated wagons) */
+				 * Articulated parts (real or de-articulated group members) use the colour scheme of the first part. (Not supported for articulated wagons) */
 				engine_type = parent_engine_type;
 				e = Engine::Get(engine_type);
 				/* Note: Luckily cargo_type is not needed for engines */
@@ -4146,7 +4146,7 @@ CommandCost Vehicle::SendToDepot(DoCommandFlags flags, DepotCommandFlags command
 
 		/* If there is no depot in front and the train is not already reversing, reverse automatically (trains only) */
 		if (this->type == VehicleType::Train && (closest_depot.reverse != Train::From(this)->flags.Test(VehicleRailFlag::Reversing))) {
-			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, this->index, false);
+			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, this->index, false, false);
 		}
 
 		if (this->type == VehicleType::Aircraft) {
@@ -4910,7 +4910,7 @@ void GetVehicleSet(VehicleSet &set, Vehicle *v, uint8_t num_vehicles)
 				if (u->IsMultiheaded()) include(set, u->other_multiheaded_part->index);
 
 				u = u->Next();
-			} while (u != nullptr && u->IsArticulatedPart());
+			} while (u != nullptr && u->IsArticGroupMember());
 		}
 	}
 }

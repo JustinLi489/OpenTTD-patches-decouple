@@ -345,7 +345,7 @@ void CmdSetTrainUnitDirectionFromTemplate(Train *t, const TemplateVehicle *tv, D
 	while (t != nullptr && tv != nullptr) {
 		/* Refit t as tv */
 		if (t->flags.Test(VehicleRailFlag::Flipped) != HasBit(tv->ctrl_flags, TVCF_REVERSED)) {
-			Command<Commands::ReverseTrainDirection>::Do(flags, t->index, true);
+			Command<Commands::ReverseTrainDirection>::Do(flags, t->index, true, false);
 		}
 
 		t = t->GetNextUnit();

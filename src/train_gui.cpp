@@ -138,7 +138,7 @@ void DrawTrainImage(const Train *v, const Rect &r, VehicleID selection, EngineIm
 				seq.Draw(px + (rtl ? -offset.x : offset.x), y + offset.y, pal, v->vehstatus.Test(VehState::Crashed));
 			}
 
-			if (!v->IsArticulatedPart()) sel_articulated = false;
+			if (!v->IsArticGroupMember()) sel_articulated = false;
 
 			if (v->index == selection) {
 				/* Set the highlight position */
@@ -360,8 +360,8 @@ static void GetCargoSummaryOfArticulatedVehicle(const Train *v, CargoSummary &su
 
 		item->capacity += v->cargo_cap;
 		item->amount += v->cargo.StoredCount();
-		if (item->source == StationID::Invalid()) item->source = v->cargo.GetFirstStation();
-	} while ((v = v->Next()) != nullptr && v->IsArticulatedPart());
+		if (item->source == StationID::Invalid()) 		item->source = v->cargo.GetFirstStation();
+	} while ((v = v->Next()) != nullptr && v->IsArticGroupMember());
 }
 
 /**
@@ -375,7 +375,7 @@ static uint GetLengthOfArticulatedVehicle(const Train *v)
 
 	do {
 		length += v->GetDisplayImageWidth();
-	} while ((v = v->Next()) != nullptr && v->IsArticulatedPart());
+	} while ((v = v->Next()) != nullptr && v->IsArticGroupMember());
 
 	return length;
 }
@@ -462,7 +462,7 @@ void DrawTrainDetails(const Train *v, const Rect &r, int vscroll_pos, uint16_t v
 				px += rtl ? -width : width;
 				dx += width;
 				u = u->Next();
-			} while (u != nullptr && u->IsArticulatedPart());
+			} while (u != nullptr && u->IsArticGroupMember());
 
 			bool separate_sprite_row = (dx > (uint)ScaleSpriteTrad(TRAIN_DETAILS_MAX_INDENT));
 			if (separate_sprite_row) {

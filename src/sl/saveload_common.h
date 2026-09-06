@@ -435,6 +435,8 @@ enum SaveLoadVersion : uint16_t {
 	SLV_DRIVE_BACKWARDS,                    ///< 365  PR#15379 Trains can drive backwards.
 	SLV_DEPOTS_UNDER_BRIDGES,               ///< 366  PR#15836 Allow depots under bridges.
 
+	SLV_R3R_ARTIC_OVERRIDE,                 ///< R3R: per-train baked weight/power/max-speed overrides for de-articulated groups.
+
 	SL_MAX_VERSION,                         ///< Highest possible saveload version
 
 	SL_SPRING_2013_v2_0_102 = 220,
@@ -462,7 +464,7 @@ enum SaveLoadVersion : uint16_t {
 	SL_CHILLPP_233 = 233,
 };
 
-static constexpr SaveLoadVersion SAVEGAME_VERSION = SLV_CUSTOM_SUBSIDY_DURATION;                    ///< Current savegame version of OpenTTD.
+static constexpr SaveLoadVersion SAVEGAME_VERSION = SLV_R3R_ARTIC_OVERRIDE;                          ///< Current savegame version of OpenTTD (R3R branch).
 static constexpr SaveLoadVersion MAX_LOAD_SAVEGAME_VERSION = (SaveLoadVersion)(SL_MAX_VERSION - 1); ///< Max loadable savegame version of OpenTTD.
 static constexpr SaveLoadVersion SL_UPSTREAM_VERSION = MAX_LOAD_SAVEGAME_VERSION;                   ///< Savegame version to save/load in XSLFI_UPSTREAM_VERSION sub-chunk
 

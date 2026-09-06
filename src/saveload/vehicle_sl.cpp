@@ -206,6 +206,9 @@ public:
 		 SLE_CONDVAR(Train, flags,               SLE_FILE_U16 | SLE_VAR_U32, SLV_100, SL_MAX_VERSION),
 		 SLE_CONDVAR(Train, wait_counter,        SLE_UINT16,                 SLV_136, SL_MAX_VERSION),
 		 SLE_CONDVAR(Train, gv_flags,            SLE_UINT16,                 SLV_139, SL_MAX_VERSION),
+		 SLE_CONDVAR(Train, weight_override,     SLE_UINT16,   SLV_R3R_ARTIC_OVERRIDE, SL_MAX_VERSION),
+		 SLE_CONDVAR(Train, power_override,      SLE_UINT16,   SLV_R3R_ARTIC_OVERRIDE, SL_MAX_VERSION),
+		 SLE_CONDVAR(Train, max_speed_override,  SLE_UINT16,   SLV_R3R_ARTIC_OVERRIDE, SL_MAX_VERSION),
 	};
 	static inline const SaveLoadCompatTable compat_description = _vehicle_train_sl_compat;
 

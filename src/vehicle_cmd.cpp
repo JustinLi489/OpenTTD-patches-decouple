@@ -21,6 +21,7 @@
 #include "string_func.h"
 #include "depot_map.h"
 #include "vehiclelist.h"
+#include "engine_base.h"
 #include "engine_func.h"
 #include "articulated_vehicles.h"
 #include "autoreplace_cmd.h"
@@ -286,6 +287,172 @@ CommandCost CmdSetAsFrontWagon(DoCommandFlags flags, TileIndex tile, VehicleID v
 }
 
 /**
+ * R3R: get the last real (non-articulated) vehicle of a chain.
+ * @param head Chain head.
+ * @return The last real vehicle of the chain.
+ */
+static Train *GetLastChainVehicle(Train *head)
+{
+	Train *v = head;
+	for (;;) {
+		while (v->HasArticulatedPart()) v = v->GetNextArticulatedPart();
+		if (v->Next() == nullptr) return v;
+		v = v->Next();
+	}
+}
+
+/**
+ * R3R: split every articulated group of a (stopped, depot) chain into real
+ * vehicles, baking the group's engine-record statistics onto each vehicle.
+ *
+ * A real articulated group reports its whole weight / power / speed through
+ * the head vehicle (articulated parts contribute nothing). Once the group is
+ * split, every vehicle would read the same engine record, so the chain would
+ * report the values N times. To keep the statistics conserved, the head's
+ * values are snapshotted first and distributed evenly across the group via
+ * per-vehicle overrides (weight_override / power_override /
+ * max_speed_override; the integer remainder rides on the head).
+ *
+ * Each split vehicle additionally receives an explicit group role
+ * (ArticGroupHead on the former parent, ArticGroupMember on the former parts)
+ * so GRF callbacks and group semantics (position in consist, cargo overlay,
+ * moving units, refit sharing, ...) keep treating the group as a single
+ * articulated unit even though the vehicles are now independent.
+ *
+ * The subtype bits are independent, so a member is converted from "articulated
+ * part only" to a plain engine/wagon recorded from its engine record before
+ * its role flag is raised.
+ * @param head Chain head of the (whole, independent) chain being upgraded.
+ */
+static void DearticulateChainWithSnapshot(Train *head)
+{
+	for (Train *v = head; v != nullptr;) {
+		/* Only *real* articulated groups (derived from the subtype bit) are split;
+		 * running this on an already-de-articulated chain is a no-op. The check
+		 * must look at the subtype bit directly: HasArticulatedPart() now speaks
+		 * the group-role layer (next = group member), which would also match
+		 * de-articulated groups and re-bake them a second time. */
+		if (v->Next() == nullptr || !v->Next()->IsArticulatedPart()) {
+			v = v->Next();
+			continue;
+		}
+
+		/* Snapshot the group statistics while the chain is still articulated. */
+		const uint16_t total_weight = v->GetWeightWithoutCargo();
+		const uint16_t total_power = v->GetPowerSnapshot();
+		const uint16_t max_speed = GetVehicleProperty(v, PROP_TRAIN_SPEED, RailVehInfo(v->engine_type)->max_speed);
+		const bool wagon_type = RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
+
+		/* Count the contiguous parts and remember the vehicle after the group. */
+		Train *part = v->GetNextArticulatedPart();
+		Train *nxt = part;
+		uint n_total = 1;
+		for (; nxt != nullptr && nxt->IsArticulatedPart(); nxt = nxt->Next()) n_total++;
+
+		const uint16_t w_q = total_weight / n_total;
+		const uint16_t w_r = total_weight % n_total;
+		const uint16_t p_q = total_power / n_total;
+		const uint16_t p_r = total_power % n_total;
+
+		/* The former parent keeps its real-vehicle identity; it gains the group
+		 * role and its baked share (the integer remainder rides on the head). */
+		v->SetArticGroupHead();
+		v->weight_override = w_q + w_r;
+		v->power_override = p_q + p_r;
+		v->max_speed_override = max_speed;
+
+		/* Split every part into a real vehicle with a baked share. */
+		for (Train *p = part; p != nxt; p = p->Next()) {
+			p->ClearArticulatedPart();
+			if (wagon_type) {
+				p->SetWagon();
+			} else {
+				p->SetEngine();
+			}
+			p->SetArticGroupMember();
+			p->weight_override = w_q;
+			p->power_override = p_q;
+			p->max_speed_override = max_speed;
+		}
+
+		v = nxt;
+	}
+}
+
+/**
+ * R3R: undo #DearticulateChainWithSnapshot for every de-articulated group on a
+ * (stopped, depot) chain: clear the baked overrides and group-role flags, and
+ * turn the members back into real articulated parts.
+ *
+ * The head (former parent) keeps its real-vehicle identity; it only loses its
+ * role flag. Tail fake-engine identities granted by the segment upgrade
+ * (#SetSegmentTailFakeEngine) must already have been undone by the caller
+ * (#ClearSegmentTailFakeEngine), so demoted members are plain wagons again
+ * before they are turned back into articulated parts.
+ *
+ * Members are matched by their explicit role flag only (never by the semantic
+ * IsArticGroupMember predicate): genuine articulated parts still derive the
+ * role from their subtype bit and must not be touched by a demotion.
+ * @param head Chain head of the (whole, independent) chain being demoted.
+ */
+static void RearticulateChain(Train *head)
+{
+	for (Train *v = head; v != nullptr; v = v->Next()) {
+		if (v->flags.Test(VehicleRailFlag::ArticGroupHead)) {
+			v->ClearArticGroupHead();
+		} else if (v->flags.Test(VehicleRailFlag::ArticGroupMember)) {
+			v->ClearEngine();
+			v->ClearWagon();
+			v->ClearFreeWagon();
+			v->SetArticulatedPart();
+			v->ClearArticGroupMember();
+		} else {
+			continue;
+		}
+
+		v->weight_override = UINT16_MAX;
+		v->power_override = UINT16_MAX;
+		v->max_speed_override = UINT16_MAX;
+	}
+}
+
+/**
+ * R3R: grant the tail wagon of a segment the same fake-engine identity (engine
+ * subtype over the real wagon engine_type) its head carries.
+ *
+ * A segment is end-swapped as a whole by the flip logic; making both ends
+ * engine-capable lets the reversed end take over as the leading vehicle of the
+ * chain afterwards. Loose (non-segment) car chains keep only the Make-consist
+ * fake engine on the first car.
+ * @param seg Chain head of the segment.
+ */
+static void SetSegmentTailFakeEngine(Train *seg)
+{
+	Train *last = GetLastChainVehicle(seg);
+	/* A single-vehicle chain has no distinct tail to promote; a tail that is
+	 * already an engine (e.g. a second real locomotive) is left untouched. */
+	if (last == seg || last->IsEngine()) return;
+	last->SetEngine();
+	last->ClearWagon();
+	last->ClearFreeWagon();
+}
+
+/**
+ * R3R: undo the tail fake-engine identity granted by #SetSegmentTailFakeEngine.
+ * @param seg Chain head of the segment.
+ */
+static void ClearSegmentTailFakeEngine(Train *seg)
+{
+	Train *last = GetLastChainVehicle(seg);
+	if (last == seg) return;
+	/* Only the fake-engine identity (engine subtype grafted onto a wagon
+	 * engine_type) is undone; real engines at the tail are never demoted. */
+	if (!last->IsEngine() || RailVehInfo(last->engine_type)->railveh_type != RailVehicleType::Wagon) return;
+	last->ClearEngine();
+	last->SetWagon();
+}
+
+/**
  * R3R: mark an independent chain as a decouplable segment.
  *
  * The chain (a zero-power consist or a locomotive-hauled train) keeps its
@@ -311,7 +478,18 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 	if (!t->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		/* R3R segment upgrade rule: first split the chain's articulated groups
+		 * into real vehicles (statistics conserved via baked overrides plus
+		 * group-role flags), so the segment can afterwards be rearranged
+		 * vehicle-by-vehicle while GRF callbacks still treat each group as one
+		 * articulated unit. */
+		DearticulateChainWithSnapshot(t);
 		t->SetSegmentFront();
+		/* R3R segment upgrade rule: when a car-only chain is promoted to a
+		 * segment, mirror the fake-engine identity onto the tail wagon as well,
+		 * so both ends of the segment can lead after an end swap. */
+		SetSegmentTailFakeEngine(t);
+		t->ConsistChanged(CCF_ARRANGE);
 		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 	}
 	return CommandCost();
@@ -355,6 +533,13 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 
 		if (flags.Test(DoCommandFlag::Execute)) {
 			seg->ClearSegmentFront();
+			/* R3R segment demotion rule: undo the tail fake-engine identity that
+			 * was granted when the chain was promoted to a segment. */
+			ClearSegmentTailFakeEngine(seg);
+			/* R3R: re-articulate any de-articulated groups of the chain (clear
+			 * baked overrides and group roles, restore the articulated subtype). */
+			RearticulateChain(seg);
+			seg->ConsistChanged(CCF_ARRANGE);
 			InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 		}
 		return CommandCost();
@@ -552,7 +737,7 @@ static CommandCost RefitVehicle(Vehicle *v, bool only_this, uint8_t num_vehicles
 	uint8_t actual_subtype = new_subtype;
 	for (; v != nullptr; v = (only_this ? nullptr : v->Next())) {
 		/* Reset actual_subtype for every new vehicle */
-		if (!v->IsArticulatedPart()) actual_subtype = new_subtype;
+		if (!v->IsArticGroupMember()) actual_subtype = new_subtype;
 
 		if (v->type == VehicleType::Train && std::ranges::find(vehicles_to_refit, v->index) == vehicles_to_refit.end() && !only_this) continue;
 

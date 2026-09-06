@@ -732,6 +732,7 @@ public:
 
 	void SetNext(Vehicle *next);
 	inline void SetFirst(Vehicle *f) { this->first = f; }
+	inline void SetLast(Vehicle *l) { this->last = l; }
 
 	/**
 	 * Get the next vehicle of this vehicle.
@@ -1147,12 +1148,39 @@ public:
 	}
 
 	/**
+	 * R3R group-role view (generic default): is this vehicle an articulated-group
+	 * *member* (part role)? Defaults to the real subtype bit. Virtual so generic
+	 * code (0x4D position, consist statistics, overlays, ...) sees de-articulated
+	 * Train groups (ArticGroupMember flag) through the same semantic layer.
+	 */
+	virtual bool IsArticGroupMember() const
+	{
+		return this->IsArticulatedPart();
+	}
+
+	/**
+	 * R3R group-role view (generic default): is this vehicle the *head* (parent
+	 * role) of an articulated group? Defaults to the real parent-vehicle pattern;
+	 * Train overrides this to also cover de-articulated groups carrying the
+	 * ArticGroupHead flag.
+	 */
+	virtual bool IsArticGroupHead() const
+	{
+		return !this->IsArticulatedPart() && this->Next() != nullptr && this->Next()->IsArticGroupMember();
+	}
+
+	/** R3R: is this vehicle inside an articulated-group semantic (head or member)? */
+	virtual bool InArticGroup() const { return this->IsArticGroupHead() || this->IsArticGroupMember(); }
+
+	/**
 	 * Check if an engine has an articulated part.
+	 * @note The group-role view is used here (next vehicle is a group member), so
+	 * de-articulated groups are traversed as one unit exactly like real ones.
 	 * @return True if the engine has an articulated part.
 	 */
 	inline bool HasArticulatedPart() const
 	{
-		return this->Next() != nullptr && this->Next()->IsArticulatedPart();
+		return this->Next() != nullptr && this->Next()->IsArticGroupMember();
 	}
 
 	/**
@@ -1168,6 +1196,9 @@ public:
 
 	inline uint GetEnginePartsCount() const
 	{
+		/* Real articulated parts only: GroundVehicle::CargoChanged distributes the
+		 * group weight over this count, which must stay 1 for de-articulated
+		 * members (they carry their baked share already). */
 		uint count = 1;
 		const Vehicle *v = this->Next();
 		while (v != nullptr && v->IsArticulatedPart()) {
@@ -1184,7 +1215,7 @@ public:
 	inline Vehicle *GetFirstEnginePart()
 	{
 		Vehicle *v = this;
-		while (v->IsArticulatedPart()) v = v->Previous();
+		while (v->IsArticGroupMember()) v = v->Previous();
 		return v;
 	}
 
@@ -1195,7 +1226,7 @@ public:
 	inline const Vehicle *GetFirstEnginePart() const
 	{
 		const Vehicle *v = this;
-		while (v->IsArticulatedPart()) v = v->Previous();
+		while (v->IsArticGroupMember()) v = v->Previous();
 		return v;
 	}
 
@@ -1230,7 +1261,7 @@ public:
 	inline Vehicle *GetPrevVehicle() const
 	{
 		Vehicle *v = this->Previous();
-		while (v != nullptr && v->IsArticulatedPart()) v = v->Previous();
+		while (v != nullptr && v->IsArticGroupMember()) v = v->Previous();
 
 		return v;
 	}

@@ -386,11 +386,11 @@ bool ShowCargoIconOverlay()
 void AddCargoIconOverlay(std::vector<CargoIconOverlay> &overlays, int x, int width, const Vehicle *v)
 {
 	bool rtl = _current_text_dir == TD_RTL;
-	if (!v->IsArticulatedPart() || v->cargo_type != v->Previous()->cargo_type) {
+	if (!v->IsArticGroupMember() || v->cargo_type != v->Previous()->cargo_type) {
 		/* Add new overlay slot. */
 		overlays.emplace_back(rtl ? x - width : x, rtl ? x : x + width, v->cargo_type, v->cargo_cap);
 	} else {
-		/* This is an articulated part with the same cargo type, adjust left or right of last overlay slot. */
+		/* This is an articulated part (real or de-articulated group member) with the same cargo type, adjust left or right of last overlay slot. */
 		if (rtl) {
 			overlays.back().left -= width;
 		} else {
@@ -3438,18 +3438,24 @@ struct VehicleDetailsWindow : Window {
 
 				/* Draw breakdown & reliability */
 				if (v->type == VehicleType::Train) {
-					/* we want to draw the average reliability and total number of breakdowns */
+					/* we want to draw the average reliability and total number of breakdowns.
+					 * R3R: count the engines while summing instead of dividing by the (chain
+					 * head) cached count — a consist whose tail wagon also carries the fake
+					 * engine identity, or an engine that was just (de)promoted in the depot,
+					 * may otherwise leave the cache behind the traversal and overflow the
+					 * ToPercent16 range (assert i < 65536). */
 					uint32_t total_reliability = 0;
 					uint32_t total_max_reliability = 0;
 					uint16_t total_breakdowns  = 0;
+					uint32_t total_engines = 0;
 					for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
 						if (Train::From(w)->IsEngine() || Train::From(w)->IsMultiheaded()) {
 							total_reliability += w->reliability;
 							total_max_reliability += w->GetEngine()->reliability;
 							total_breakdowns += w->breakdowns_since_last_service;
+							total_engines++;
 						}
 					}
-					uint8_t total_engines = Train::From(v)->tcache.cached_num_engines;
 					if (total_engines > 0) {
 						DrawString(tr, GetString(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(total_reliability / total_engines), ToPercent16(total_max_reliability / total_engines), total_breakdowns));
 					} else {
@@ -4559,7 +4565,10 @@ public:
 				if (v->type == VehicleType::Road) {
 					Command<Commands::TurnRoadVehicle>::Post(_vehicle_msg_translation_table[VCT_CMD_TURN_AROUND][v->type], v->tile, v->index);
 				} else {
-					Command<Commands::ReverseTrainDirection>::Post(_vehicle_msg_translation_table[VCT_CMD_TURN_AROUND][v->type], v->tile, v->index, false);
+					/* R3R: the vehicle-view turn-around button must force a physical
+					 * first/last end-swap instead of backing up or flipping only the
+					 * driving direction. */
+					Command<Commands::ReverseTrainDirection>::Post(_vehicle_msg_translation_table[VCT_CMD_TURN_AROUND][v->type], v->tile, v->index, false, true);
 				}
 				break;
 			case WID_VV_FORCE_PROCEED: // force proceed
