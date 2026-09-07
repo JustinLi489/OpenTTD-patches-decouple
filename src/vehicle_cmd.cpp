@@ -43,6 +43,8 @@
 #include "tbtr_template_vehicle_func.h"
 #include "scope.h"
 
+#include <cstdio>
+
 #include "table/strings.h"
 
 #include "safeguards.h"
@@ -301,6 +303,44 @@ static Train *GetLastChainVehicle(Train *head)
 	}
 }
 
+/** R3R debug: dump one train chain's identities (subtype bits + railflags) for
+ *  the segment-upgrade diagnosis. Real articulated parts show up as the
+ *  subtype "artic" bit; de-articulated groups carry ArticGroupHead/Member
+ *  railflags instead (subtype artic bit cleared). */
+static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
+{
+	FILE *dbg = fopen("R3R_debug.log", "a");
+	if (dbg == nullptr) return;
+	if (head == nullptr) {
+		fprintf(dbg, "MAKESEG %s head=NULL\n", tag);
+		fclose(dbg);
+		return;
+	}
+	fprintf(dbg, "MAKESEG %s head=%d\n", tag, (int)head->index.base());
+	int i = 0;
+	for (const Train *w = head; w != nullptr; w = w->Next()) {
+		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d flip=%d) eng=%d\n",
+			tag,
+			(int)w->index.base(),
+			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
+			w->Next() != nullptr ? (int)w->Next()->index.base() : -1,
+			w->subtype,
+			HasBit(w->subtype, GVSF_FRONT) ? 1 : 0,
+			HasBit(w->subtype, GVSF_WAGON) ? 1 : 0,
+			HasBit(w->subtype, GVSF_ENGINE) ? 1 : 0,
+			HasBit(w->subtype, GVSF_FREE_WAGON) ? 1 : 0,
+			HasBit(w->subtype, GVSF_ARTICULATED_PART) ? 1 : 0,
+			w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
+			w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
+			w->flags.Test(VehicleRailFlag::SegmentFront) ? 1 : 0,
+			w->flags.Test(VehicleRailFlag::ForceFlipReverse) ? 1 : 0,
+			(int)w->engine_type.base());
+		if (++i > 60) break;
+	}
+	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
+	fclose(dbg);
+}
+
 /**
  * R3R: split every articulated group of a (stopped, depot) chain into real
  * vehicles, baking the group's engine-record statistics onto each vehicle.
@@ -474,6 +514,16 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 	/* Resolve the clicked vehicle to its independent chain front. */
 	while (t->Previous() != nullptr) t = t->Previous();
 
+	/* R3R debug probe: log the command receipt and every validation result. */
+	FILE *dbg = fopen("R3R_debug.log", "a");
+	if (dbg != nullptr) {
+		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d nxt=%d\n",
+			(int)veh_id.base(), tile.base(), flags.Test(DoCommandFlag::Execute) ? 1 : 0,
+			(int)t->index.base(), t->IsEngine() ? 1 : 0, t->IsFrontEngine() ? 1 : 0, t->IsStoppedInDepot() ? 1 : 0,
+			t->Next() != nullptr ? (int)t->Next()->index.base() : -1);
+		fclose(dbg);
+	}
+
 	if (!t->IsEngine() || !t->IsFrontEngine()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
 	if (!t->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
 
@@ -483,6 +533,7 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 		 * group-role flags), so the segment can afterwards be rearranged
 		 * vehicle-by-vehicle while GRF callbacks still treat each group as one
 		 * articulated unit. */
+		R3RDumpUpgradeDbg(t, "UPGRADE-BEFORE-SPLIT");
 		DearticulateChainWithSnapshot(t);
 		t->SetSegmentFront();
 		/* R3R segment upgrade rule: when a car-only chain is promoted to a
@@ -490,6 +541,7 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 		 * so both ends of the segment can lead after an end swap. */
 		SetSegmentTailFakeEngine(t);
 		t->ConsistChanged(CCF_ARRANGE);
+		R3RDumpUpgradeDbg(t, "UPGRADE-AFTER-SPLIT");
 		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 	}
 	return CommandCost();

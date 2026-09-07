@@ -4229,8 +4229,16 @@ static SaveLoadResult DoLoad(std::shared_ptr<LoadFilter> reader, bool load_check
 
 			if (_sl_version >= SLV_SAVELOAD_LIST_LENGTH) {
 				if (_sl_is_ext_version) {
-					Debug(sl, 0, "Got an extended savegame version with a base version in the upstream mode range, giving up");
-					SlError(STR_GAME_SAVELOAD_ERROR_TOO_NEW_SAVEGAME);
+					/* R3R branch: SAVEGAME_VERSION is SLV_R3R_ARTIC_OVERRIDE (in the R3R-defined extension
+					 * range, past the upstream mode range), so R3R extended savegames legitimately carry
+					 * a base version here. Anything else in the upstream range with the EXT flag is
+					 * contradictory and must be rejected. */
+					if (_sl_version >= SLV_R3R_ARTIC_OVERRIDE && _sl_version <= MAX_LOAD_SAVEGAME_VERSION) {
+						Debug(sl, 1, "Loading R3R extended savegame version {}", _sl_version);
+					} else {
+						Debug(sl, 0, "Got an extended savegame version with a base version in the upstream mode range, giving up");
+						SlError(STR_GAME_SAVELOAD_ERROR_TOO_NEW_SAVEGAME);
+					}
 				} else {
 					_sl_upstream_mode = true;
 				}

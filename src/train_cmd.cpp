@@ -448,6 +448,17 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	this->tcache.cached_max_curve_speed = this->GetCurveSpeedLimit();
 
 	if (driving_backwards && !this->Last()->CanLeadTrain()) {
+		/* R3R DEBUG: capture the exact state that sets the 32 km/h no-cab limit. */
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "NOCAB-SET this=%d db=%d last=%d lastSub=0x%02X lastEng=%d lastLead=%d\n",
+						(int)this->index.base(), (int)driving_backwards,
+						(int)this->Last()->index.base(), (int)this->Last()->subtype,
+						(int)this->Last()->IsEngine(), (int)this->Last()->CanLeadTrain());
+				fclose(dbg);
+			}
+		}
 		this->tcache.cached_tflags |= TCF_NO_DRIVING_CAB;
 	}
 
@@ -1129,6 +1140,26 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 
 	/* If the train is going backwards, without a leading cab, restrict its speed. */
 	if (this->tcache.cached_tflags & TCF_NO_DRIVING_CAB) {
+		/* R3R DEBUG: log the no-cab limit once per driving-backwards state, so a
+		 * stale flag (db already 0 but NO_CAB lingering) is distinguishable from
+		 * a genuine driving-backwards restriction. */
+		{
+			static bool db0_logged = false;
+			static bool db1_logged = false;
+			const bool db = this->IsDrivingBackwards();
+			bool &logged = db ? db1_logged : db0_logged;
+			if (!logged) {
+				logged = true;
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "NOCAB-LIMIT this=%d db=%d spd=%d last=%d lastLead=%d order=%d\n",
+							(int)this->index.base(), (int)db, (int)this->cur_speed,
+							(int)this->Last()->index.base(), (int)this->Last()->CanLeadTrain(),
+							(int)this->current_order.GetType());
+					fclose(dbg);
+				}
+			}
+		}
 		constexpr int BACKWARDS_NO_CAB_SPEED_LIMIT = 32;
 		max_speed = std::min<int>(max_speed, BACKWARDS_NO_CAB_SPEED_LIMIT);
 	}
@@ -3756,8 +3787,26 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * the locomotive's OWN orders + order position + unit number (backed up by
 	 * Couple) so the locomotive goes back to its pre-coupling schedule instead
 	 * of ending up with an empty order list / number 1. This applies to both a
-	 * wagon consist and a powered (engine) segment that was decoupled. */
-	if (v->orders != nullptr) {
+	 * wagon consist and a powered (engine) segment that was decoupled.
+	 *
+	 * R7 (restore guard mirrors Couple's hand-over guard): Couple writes
+	 * orders_backup under "consist has orders" (u->orders != nullptr) and
+	 * moves that schedule onto v. A scheduled locomotive coupling onto a
+	 * schedule-less consist skips the hand-over entirely, so orders_backup
+	 * stays null while v->orders still holds the locomotive's OWN schedule.
+	 * Guarding this restore on v->orders != nullptr then robbed the
+	 * locomotive: loco_orders was null, its own schedule was handed to the
+	 * decoupled part u and the locomotive was left with no schedule. With
+	 * v->orders_backup != nullptr the block runs exactly when a real hand-over
+	 * happened — and because Couple writes the backup and the move together,
+	 * u->orders = v->orders inside always picks up the moved consist schedule
+	 * (never the locomotive's own). In the no-hand-over case the locomotive
+	 * keeps its schedule and the schedule-less part waits on its own, exactly
+	 * as it did before the couple. (The fresh unit-number allocation for a
+	 * schedule-less wagon part above still runs first; the restore then swaps
+	 * the real numbers back, leaking one pool ID per decouple — harmless in
+	 * practice, noted here rather than adding undo complexity.) */
+	if (v->orders_backup != nullptr) {
 		OrderList *loco_orders = v->orders_backup;
 		u->orders = v->orders;
 		/* R3R: remember which schedule index held the DECOUPLE we just ran, so the
@@ -3980,13 +4029,20 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
 }
 
 /**
- * R3R (实验): 就地反转一条链上所有车辆的方向(direction),车辆位置不动。
- * 逻辑翻链的回滚专用:链序交给 RestoreTrainBackup 恢复,方向需要单独翻回。
+ * R3R (裁决 2026-09-07 / 图像方向 memo): 就地反转一条链上所有车辆的方向
+ * (direction),车辆位置不动。逻辑翻转(R3RFlipChainBySegments 第1步)与回滚
+ * (R3RUndoLogicalFlip)成对共用:每次 direction 反转同时 Flip
+ * VehicleRailFlag::Flipped —— 渲染方向 = ReverseDir(direction) × Flipped,
+ * 净图像方向不变:逻辑翻转只是运行账目(让等待链按反侧挂上机车),玩家看不到
+ * 链在轨道上原地翻面;回滚再翻一次恰好复原,不漂移。链序交给
+ * RestoreTrainBackup 恢复(它只重建 SetNext,不碰 direction/flags),★/组角色
+ * 由 R3RUndoLogicalFlip 单独还原。
  */
 static void R3RReverseChainDirections(Train *chain)
 {
 	for (Train *w = chain; w != nullptr; w = w->Next()) {
 		w->direction = ReverseDir(w->direction);
+		w->flags.Flip(VehicleRailFlag::Flipped);
 	}
 }
 
@@ -4004,14 +4060,44 @@ static std::vector<Train *> R3RCollectSegmentFronts(Train *chain)
 	return segs;
 }
 
+/** R3R: 一辆车上的 de-articulated 组角色位快照条目(head/member 二选一或全无)。 */
+struct R3RArticRoleState {
+	Train *veh = nullptr;
+	bool head = false;   // ArticGroupHead
+	bool member = false; // ArticGroupMember
+};
+
+/**
+ * R3R: 快照一条链上所有 de-articulated 组的角色位分布(仅录带角色位的车)。
+ * 真 artic 组不带角色位,快照为空;空快照在撤销时等价于"全链清除角色位"。
+ * @param chain 链头。
+ * @return 按链序的角色位记录。
+ */
+static std::vector<R3RArticRoleState> R3RCaptureArticRoles(Train *chain)
+{
+	std::vector<R3RArticRoleState> roles;
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		bool head = w->flags.Test(VehicleRailFlag::ArticGroupHead);
+		bool member = w->flags.Test(VehicleRailFlag::ArticGroupMember);
+		if (head || member) roles.push_back({w, head, member});
+	}
+	return roles;
+}
+
 /**
  * R3R: 撤销一次 R3RFlipChainBySegments。调用方必须先 RestoreTrainBackup
- * 恢复链序(本函数假定 chain 已是原链头),这里只把方向翻回,并把段标记
- * 还原为翻转前的分布。
+ * 恢复链序(本函数假定 chain 已是原链头),这里把方向翻回、段标记还原为
+ * 翻转前的分布,并把 de-articulated 组的角色位也按快照还原。
+ * 角色位必须还原的原因:R3RFlipChainBySegments 第 4b 步会把组角色迁移到
+ * 反转后的组首,回滚若不还原,翻转前的链头(现处组内)会残留 ArticGroupMember
+ * 且 Previous() 为空 —— NewGRF 变量 0x4D("articulated 组内位置")等沿
+ * Previous() 回走的代码会对空指针调用虚函数,机车刚碰上车厢即卡死崩溃。
  * @param chain          已恢复链序的原链头。
  * @param old_seg_fronts 翻转前收集的段首车辆(R3RCollectSegmentFronts 的结果)。
+ * @param old_roles      翻转前收集的组角色位(R3RCaptureArticRoles 的结果)。
  */
-static void R3RUndoLogicalFlip(Train *chain, const std::vector<Train *> &old_seg_fronts)
+static void R3RUndoLogicalFlip(Train *chain, const std::vector<Train *> &old_seg_fronts,
+                               const std::vector<R3RArticRoleState> &old_roles)
 {
 	assert(chain != nullptr && chain->First() == chain);
 
@@ -4020,6 +4106,16 @@ static void R3RUndoLogicalFlip(Train *chain, const std::vector<Train *> &old_seg
 	/* 清除逻辑反转期间新标/迁移的 ★,再恢复原段首。 */
 	for (Train *w = chain; w != nullptr; w = w->Next()) w->ClearSegmentFront();
 	for (Train *w : old_seg_fronts) w->SetSegmentFront();
+
+	/* 角色位先全清(去掉翻转期间迁移/新设的位),再按快照逐车原样还原。 */
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		w->ClearArticGroupHead();
+		w->ClearArticGroupMember();
+	}
+	for (const R3RArticRoleState &r : old_roles) {
+		if (r.head) r.veh->SetArticGroupHead();
+		if (r.member) r.veh->SetArticGroupMember();
+	}
 }
 
 /** Debug dump of a train chain structure for hang diagnosis. */
@@ -4044,6 +4140,40 @@ static void R3RDumpChainDbg(const Train *head, const char *tag)
 		if (++i > 60) break;
 	}
 	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
+	fclose(dbg);
+}
+
+/** R3R debug: dump per-vehicle identity (subtype bits + group-role flags) of a
+ *  fold-fix participant chain. Distinguishes real articulated parts (subtype
+ *  artic bit) from de-articulated groups (ArticGroupHead/Member railflags,
+ *  artic bit cleared by the segment upgrade). */
+static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
+{
+	FILE *dbg = fopen("R3R_debug.log", "a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "IDENT %s head=%d\n", tag, head != nullptr ? (int)head->index.base() : -1);
+	if (head != nullptr) {
+		int i = 0;
+		for (const Train *w = head; w != nullptr; w = w->Next()) {
+			fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x(front=%d eng=%d wagon=%d freeW=%d artic=%d) AH=%d AM=%d SF=%d dir=%d x=%d y=%d engType=%d\n",
+				tag,
+				(int)w->index.base(),
+				w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
+				w->Next() != nullptr ? (int)w->Next()->index.base() : -1,
+				w->subtype,
+				HasBit(w->subtype, GVSF_FRONT) ? 1 : 0,
+				HasBit(w->subtype, GVSF_ENGINE) ? 1 : 0,
+				HasBit(w->subtype, GVSF_WAGON) ? 1 : 0,
+				HasBit(w->subtype, GVSF_FREE_WAGON) ? 1 : 0,
+				HasBit(w->subtype, GVSF_ARTICULATED_PART) ? 1 : 0,
+				w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
+				w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
+				w->IsSegmentFront() ? 1 : 0,
+				(int)w->direction, (int)w->x_pos, (int)w->y_pos, (int)w->engine_type.base());
+			if (++i > 60) break;
+		}
+	}
+	fprintf(dbg, "IDENT-END %s\n", tag);
 	fclose(dbg);
 }
 
@@ -4221,8 +4351,64 @@ static Train *R3RFlipChainBySegments(Train *chain)
 }
 
 /**
+ * R3R 换端重排身份迁移(用户决策 2026-09-07 / 规范 31054337):逻辑翻 v 可能让
+ * 合并链的链头从原机车对象 from 移走、to 成为新链头(真引擎多节列车翻 v 后
+ * 新链头 = 原链尾引擎)。列车 primary 身份(orders / 订单位置 / 车号 /
+ * current_order / profit / 服役间隔 / 窗口)只挂在链头上,须整体迁往 to,
+ * from 则降为链内普通引擎。调用时机:TryTrainCouple 成功提交前。
+ * @param from 原链头(仍为 FrontEngine 的旧机车对象)。
+ * @param to   新链头(from 所在链逻辑翻转后的链头)。
+ */
+static void R3RRelocateFrontIdentity(Train *from, Train *to)
+{
+	assert(from->IsFrontEngine());
+	assert(to != nullptr && to->First() == to);
+
+	/* 随列车身份迁移的窗口。 */
+	CloseWindowById(WindowClass::VehicleView, from->index);
+	CloseWindowById(WindowClass::VehicleOrders, from->index);
+	CloseWindowById(WindowClass::VehicleRefit, from->index);
+	CloseWindowById(WindowClass::VehicleDetails, from->index);
+	CloseWindowById(WindowClass::VehicleTimetable, from->index);
+	CloseWindowById(WindowClass::ScheduledDispatchSlots, from->index);
+	CloseWindowById(WindowClass::VehicleOrderImportErrors, from->index);
+	DeleteNewGRFInspectWindow(GrfSpecFeature::Trains, from->index.base());
+	SetWindowDirty(WindowClass::Company, from->owner);
+
+	/* orders 与订单位置。机车 orders 独有、不与他人共享,Couple 的 orders 交接
+	 * 同为指针直搬(见 Couple ~4637);若未来出现共享 orders 需先退出共享链。 */
+	to->orders = from->orders;
+	from->orders = nullptr;
+	to->orders_backup = from->orders_backup;
+	from->orders_backup = nullptr;
+	to->orders_backup_real_index = from->orders_backup_real_index;
+	to->orders_backup_implicit_index = from->orders_backup_implicit_index;
+	to->cur_real_order_index = from->cur_real_order_index;
+	to->cur_implicit_order_index = from->cur_implicit_order_index;
+	to->cur_timetable_order_index = from->cur_timetable_order_index;
+	from->cur_real_order_index = 0;
+	from->cur_implicit_order_index = 0;
+	from->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+
+	/* 车号 / current_order / dest_tile / profit / 服役间隔 / timetable 标志:
+	 * 复用官方"新车头取代旧头"的复制逻辑(顺带把 from 的车号清零)。 */
+	to->CopyVehicleConfigAndStatistics(from);
+
+	/* 预置新链头 subtype(FrontEngine / FreeWagon)并清掉链内其余车辆(含旧链头
+	 * from)的 front 位 —— 与 DecoupleTrain 3690-3696 的预置同款,Couple 尾
+	 * NormaliseTrainHead(v) 的 ConsistChanged assert 才能通过。 */
+	NormaliseSubtypes(to);
+
+	/* 非链头引擎不再持有的列车级数据。 */
+	from->dispatch_records.clear();
+	if (!_settings_game.vehicle.non_leading_engines_keep_name) from->name.clear();
+}
+
+/**
  * Physically couple the front train onto the waiting chain.
- * @param v Front train (with engine, executing GOTO_COUPLE).
+ * @param v Front train (with engine, executing GOTO_COUPLE). 成功返回时若折叠
+ *          修正逻辑翻 v 使链头离开原机车对象,v 被更新为合并链的新链头对象
+ *         (身份已迁往新链头),调用方(Couple)一律从 v 读取列车身份。
  * @param u Waiting chain (free wagons) to couple onto.
  * @param[out] merged_first 成功时被置为"拼进合并链的车组部分的链头对象":
  *             (普通拼接路径下恒等于 u;逻辑翻转路径下是原链头段反转后的
@@ -4230,7 +4416,7 @@ static Train *R3RFlipChainBySegments(Train *chain)
  *             调用方(Couple)用它作为方向统一循环与段标记 ★ 的起点。
  * @return True on success.
  */
-static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
+static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 {
 	/* R3R: refuse invalid input. Both chains must be intact (each argument must
 	 * be its own chain head); otherwise ArrangeTrains would merge corrupted
@@ -4264,7 +4450,13 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 	bool u_flipped = false;
 	bool v_flipped = false;
 	std::vector<Train *> u_old_seg_fronts;
+	std::vector<Train *> v_old_seg_fronts;
+	std::vector<R3RArticRoleState> u_old_roles;
+	std::vector<R3RArticRoleState> v_old_roles;
 	Train *u_merged_head = u;
+	/* 合并链当前链头对象。普通拼接/只翻 u 时恒等于 v;逻辑翻 v 使链头离开
+	 * v 对象时更新为翻 v 后的新链头(Arrangement/折叠检查/最终检查一律用它)。 */
+	Train *head = v;
 	if (ChainFolded(v, "COUPLE")) {
 		/* R3R: the first splice attempt folded — the end of the consist that
 		 * the locomotive's rear was spliced onto (the consist's chain head)
@@ -4285,30 +4477,44 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 		 * ORIGINAL head segment (only the whole-chain equivalent for a
 		 * single-segment chain). Rollback needs only RestoreTrainBackup
 		 * (chain pointers) plus R3RUndoLogicalFlip (directions + segment
-		 * markers) — no physical mirroring back and forth. A real-engine
-		 * locomotive (v) must NOT be logically flipped (the engine would lose
-		 * the head of the chain), so v keeps physical
-		 * ReverseTrainSwapVehicles in the third attempt. */
+		 * markers) — no physical mirroring back and forth. The locomotive
+		 * chain v is also flipped logically (用户修订 2026-09-07): a logical
+		 * flip of v only keeps the engine at the chain head when v is a
+		 * single block (pure engine, or engine + its articulated parts);
+		 * otherwise (engine towing plain wagons) the flip is rolled back and
+		 * the candidate is dropped — v is never mirrored geometrically. */
 		RestoreTrainBackup(original_src);
 		RestoreTrainBackup(original_dst);
 		R3RRefreshChainCaches(v);
 		R3RRefreshChainCaches(u);
 		u_old_seg_fronts = R3RCollectSegmentFronts(u);
+		u_old_roles = R3RCaptureArticRoles(u);
 		{
 			FILE *dbg = fopen("R3R_debug.log", "a");
 			if (dbg != nullptr) { fprintf(dbg, "FOLD-CATCHUP START\n"); fclose(dbg); }
 		}
+		/* R3R identity probe: dump both participants' per-vehicle identity so the
+		 * fold-fix scenario can be classified (real artic bits vs de-articulated
+		 * group roles). */
+		R3RDumpCoupleIdentity(v, "FOLD-V");
+		R3RDumpCoupleIdentity(u, "FOLD-U");
 
-		/* R3R (用户方案 2026-09-05:"谁反就翻谁"追平): A1 直接拼接折叠后
-		 * 不再按僵化的"翻 u → 双翻"顺序走,而是逐候选判定:哪条链仍处于
-		 * 反(错误)向就只翻哪条 —— 只有 u 反 → 候选1 只逻辑翻 u;只有 v 反
-		 * → 候选2 只物理翻 v(旧序列从不单独翻 v,是 (v反,u正)/(v正,u反)
-		 * 死锁的根因);两条都反 → 候选3 双翻(物理翻 v + 逻辑翻 u)。
+		/* R3R (用户方案 2026-09-05:"谁反就翻谁"追平;2026-09-07 修订:v 一律
+		 * 逻辑翻、不物理 SWAP): A1 直接拼接折叠后不再按僵化的"翻 u → 双翻"
+		 * 顺序走,而是逐候选判定:哪条链仍处于反(错误)向就只翻哪条 ——
+		 * 只有 u 反 → 候选1 只逻辑翻 u;只有 v 反 → 候选2 只逻辑翻 v
+		 * (旧序列从不单独翻 v,是 (v反,u正)/(v正,u反) 死锁的根因);
+		 * 两条都反 → 候选3 双翻(逻辑翻 v + 逻辑翻 u)。
 		 * 每个候选翻转后重拼做 ChainFolded 检查:通过即保留该翻转跳出;
 		 * 失败则必须把该候选自己的翻转完整撤销(链序 RestoreTrainBackup +
-		 * 方向/★ 用 R3RUndoLogicalFlip 或 SWAP 镜像撤销)再试下一候选,
-		 * 候选状态不叠加。全候选折叠 → 回滚到原状 return false
-		 * (下 tick 重试,与旧行为一致)。 */
+		 * 方向/★ R3RUndoLogicalFlip)再试下一候选,候选状态不叠加。
+		 * 逻辑翻 v 只有当翻转后链头仍是引擎时才有意义:单 artic 块(纯机车或
+		 * 机车+artic parts)翻后链头仍留在原机车;多节真引擎链翻后新链头 =
+		 * 原链尾引擎 —— 同样接受,primary 身份在成功提交点随 head != v 迁往
+		 * 新链头(R3RRelocateFrontIdentity,换端重排 31054337)。v 拖着普通
+		 * 车厢时翻后链头是车厢、机车失去链头,该候选直接失败回滚(不做几何
+		 * 镜像)。全候选折叠 → 回滚到原状 return false(下 tick 重试,与旧
+		 * 行为一致)。 */
 
 		/* 候选1:只逻辑翻 u(u 反)。 */
 		{
@@ -4332,7 +4538,7 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 			/* 候选1 失败:撤销只翻 u(u 回原样后进候选2)。 */
 			RestoreTrainBackup(original_src);
 			RestoreTrainBackup(original_dst);
-			R3RUndoLogicalFlip(u, u_old_seg_fronts);
+			R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
 			u_flipped = false;
 			R3RRefreshChainCaches(v);
 			R3RRefreshChainCaches(u);
@@ -4341,29 +4547,50 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 				if (dbg != nullptr) { fprintf(dbg, "A2-ROLLBACK-DONE\n"); fclose(dbg); }
 			}
 
-			/* 候选2:只物理翻 v(u 保持原样)。机车停在车底头端但尾巴背向
+			/* 候选2:只逻辑翻 v(u 保持原样)。机车停在车底头端但尾巴背向
 			 * 车底(单侧朝向错误)时,单翻 v 即可让机车尾贴上 u_head。 */
 			{
 				FILE *dbg = fopen("R3R_debug.log", "a");
 				if (dbg != nullptr) { fprintf(dbg, "A3-FLIP-V-ONLY\n"); fclose(dbg); }
 			}
-			ReverseTrainSwapVehicles(v);
+			v_old_seg_fronts = R3RCollectSegmentFronts(v);
+			v_old_roles = R3RCaptureArticRoles(v);
+			Train *v_flip_head = R3RFlipChainBySegments(v);
 			v_flipped = true;
 			{
 				FILE *dbg = fopen("R3R_debug.log", "a");
-				if (dbg != nullptr) { fprintf(dbg, "A3-SWAPV-DONE\n"); fclose(dbg); }
+				if (dbg != nullptr) { fprintf(dbg, "A3-FLIPV-DONE head=%d\n", (int)v_flip_head->index.base()); fclose(dbg); }
+			}
+			if (v_flip_head != v && !v_flip_head->IsEngine()) {
+				/* 逻辑翻 v 使链头离开原机车对象:仅当新链头仍是引擎(真引擎列车
+				 * 翻后新链头 = 原链尾引擎,primary 身份随成功提交迁往新链头)才
+				 * 接受;v 拖着普通车厢(翻后链头是车厢、机车失去链头)时候选2/
+				 * 候选3 都不可行,完整回滚并放弃本次折叠修正(下次触发重头试)。 */
+				RestoreTrainBackup(original_src);
+				RestoreTrainBackup(original_dst);
+				R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+				v_flipped = false;
+				R3RRefreshChainCaches(v);
+				R3RRefreshChainCaches(u);
+				v->ConsistChanged(CCF_ARRANGE);
+				u->ConsistChanged(CCF_ARRANGE);
+				return false;
 			}
 
+			/* 接受翻 v:v 链真头可能已离开 v 对象(多节真引擎),把合并链当前
+			 * 链头更新为 v_flip_head(v_flip_head == v 的单块场景无副作用)。 */
+			head = v_flip_head;
+			u_merged_head = u;
 			u_head = u;
 			v_last = R3RTrainTail(v);
 			R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
 			R3RDumpChainDbg(u, "A3-ARR-BEFORE-U");
-			ArrangeTrains(&v, v_last, &u_head, u, true);
-			if (ChainFolded(v, "COUPLE-FLIP-V")) {
-				/* 候选2 失败:撤销只翻 v(SWAP 镜像翻回)。 */
+			ArrangeTrains(&head, v_last, &u_head, u, true);
+			if (ChainFolded(head, "COUPLE-FLIP-V")) {
+				/* 候选2 失败:撤销只翻 v(逻辑翻回原状)。 */
 				RestoreTrainBackup(original_src);
 				RestoreTrainBackup(original_dst);
-				ReverseTrainSwapVehicles(v);
+				R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
 				v_flipped = false;
 				R3RRefreshChainCaches(v);
 				R3RRefreshChainCaches(u);
@@ -4372,14 +4599,15 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 					if (dbg != nullptr) { fprintf(dbg, "A3-ROLLBACK-DONE\n"); fclose(dbg); }
 				}
 
-				/* 候选3:双翻 —— 机车与车底都处于错误朝向。机车物理反转 +
+				/* 候选3:双翻 —— 机车与车底都处于错误朝向。机车逻辑反转 +
 				 * 车组逻辑反转后两链同向,原"机车鼻顶车组尾"的相邻点恰好
 				 * 变成"机车链尾顶车组链头",一次即可拼成。 */
 				{
 					FILE *dbg = fopen("R3R_debug.log", "a");
-					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-SWAPV\n"); fclose(dbg); }
+					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-FLIPV\n"); fclose(dbg); }
 				}
-				ReverseTrainSwapVehicles(v);
+				v_old_seg_fronts = R3RCollectSegmentFronts(v);
+				head = R3RFlipChainBySegments(v);
 				v_flipped = true;
 				u_flip_head = R3RFlipChainBySegments(u);
 				u_flipped = true;
@@ -4393,17 +4621,17 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 				v_last = R3RTrainTail(v);
 				R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
 				R3RDumpChainDbg(u_flip_head, "A3-ARR-BEFORE-U");
-				ArrangeTrains(&v, v_last, &u_head, u_flip_head, true);
+				ArrangeTrains(&head, v_last, &u_head, u_flip_head, true);
 				{
 					FILE *dbg = fopen("R3R_debug.log", "a");
 					if (dbg != nullptr) { fprintf(dbg, "A3-ARRANGE-DONE\n"); fclose(dbg); }
 				}
-				if (ChainFolded(v, "COUPLE-FLIP-BOTH")) {
+				if (ChainFolded(head, "COUPLE-FLIP-BOTH")) {
 					/* 彻底失败:把两条链都翻回原状再报错(下次触发会重头试)。 */
 					RestoreTrainBackup(original_src);
 					RestoreTrainBackup(original_dst);
-					ReverseTrainSwapVehicles(v);
-					R3RUndoLogicalFlip(u, u_old_seg_fronts);
+					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+					R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
 					v_flipped = false;
 					u_flipped = false;
 					R3RRefreshChainCaches(v);
@@ -4416,17 +4644,34 @@ static bool TryTrainCouple(Train *v, Train *u, Train *&merged_first)
 		}
 	}
 
-	bool ok = CheckTrainAttachment(v).Succeeded();
+	bool ok = CheckTrainAttachment(head).Succeeded();
 	if (!ok) {
 		RestoreTrainBackup(original_src);
 		RestoreTrainBackup(original_dst);
-		if (v_flipped) ReverseTrainSwapVehicles(v);
-		if (u_flipped) R3RUndoLogicalFlip(u, u_old_seg_fronts);
+		if (v_flipped) R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+		if (u_flipped) R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
 		R3RRefreshChainCaches(v);
 		R3RRefreshChainCaches(u);
 		v->ConsistChanged(CCF_ARRANGE);
 		u->ConsistChanged(CCF_ARRANGE);
 		return false;
+	}
+	/* R3R 换端重排:逻辑翻 v 后合并链头可能不再是原机车对象 v(head != v,
+	 * 仅发生在"多节真引擎 v 翻 v 后新链头 = 原链尾引擎"且成功拼合的路径)。
+	 * 把列车 primary 身份整体迁往新链头,并把 v 更新为新链头对象 —— Couple
+	 * 从 TryTrainCouple 报告的新链头读取全部身份(orders 交接 / group / 车号 /
+	 * NormaliseTrainHead),原机车对象降为链内普通引擎。 */
+	if (head != v) {
+		R3RRelocateFrontIdentity(v, head);
+		v = head;
+
+		/* 新链头(原链尾引擎)在本次 tick 建立车辆 tick 缓存时只是链内普通引擎,
+		 * 不在 _tick_train_front_cache 里;旧链头对象(原机车 v)反而还在缓存中,
+		 * 但它已被 NormaliseSubtypes 清掉 FrontEngine 位。若不重建缓存,合并后
+		 * 真正的前端永远不会作为链头被 Tick,列车会从此静止(调度全停)。强制
+		 * 重建使新链头从下一 tick 起被正常驱动;本 tick 内旧链头对象经
+		 * Train::Tick / TrainLocoHandler 的 IsFrontEngine 保护安全退出。 */
+		InvalidateVehicleTickCaches();
 	}
 	/* The merged-on group is headed by u itself on the plain splice, and by
 	 * the logically reversed former tail after a fold-fix flip. Callers use
@@ -4485,25 +4730,54 @@ static void Couple(Train *v, Train *u)
 	 * pre-flip head) now sits at the far end of the merged-on group; starting
 	 * from u would only touch that single vehicle. On plain splices
 	 * merged_first == u, so this covers both paths. */
+	/* R3R (裁决 2026-09-07 / 图像方向 memo): direction 统一到机车方向是运行语义
+	 * 需要(整列同向、moving-* 不撕裂),但 nose-to-nose 拼入段等待时保持了自己的
+	 * 朝向,图像不应随 direction 原地翻面 —— 对被改写的节同步翻转
+	 * VehicleRailFlag::Flipped(渲染方向 = ReverseDir(direction) = 统一前原朝向),
+	 * 拼入段保持等待姿态(倒退)被拖走。用 != 而非无条件 Flip,兼容拼入段已有
+	 * Flipped 初值(造车概率/单节 reverse),保持其原渲染结果。折叠修正路径
+	 * (修正后拼入段 direction 已与机车同向)不触发。 */
 	for (Train *w = merged_first; w != nullptr; w = w->Next()) {
+		if (w->direction != v->direction) w->flags.Flip(VehicleRailFlag::Flipped);
 		w->direction = v->direction;
 		w->UpdateViewport(false, false);
 	}
 
 	/* The consist's schedule belongs to the wagon part: hand the orders over to the
 	 * train. The locomotive's OWN orders are backed up on the locomotive itself
-	 * (orders_backup) so a later decouple can restore them. */
+	 * (orders_backup) so a later decouple can restore them.
+	 *
+	 * R3R (identity hand-over invariant, R6): TryTrainCouple returns with the
+	 * merged train head in v. A fold-fix logical flip of u keeps the consist
+	 * identity (orders / order position / unit number) on the original
+	 * consist-front object u: plain splices keep u at the head of the
+	 * merged-on part, and fold-fix flips relocate u to the far end of that part
+	 * WITHOUT migrating identity off it (R3RFlipChainBySegments only re-links
+	 * directions / ★ marks / de-articulated group roles). merged_first is the
+	 * merged-on group's geometric head — equal to u except after a logical flip
+	 * of u — so it anchors the direction-unify loop and the ★ placement below,
+	 * while the identity reads here stay anchored on u. A fold-fix logical
+	 * flip of v (multi-engine loco chain) may move the merged head off the
+	 * original locomotive object: TryTrainCouple then migrates the train
+	 * identity to the flipped chain's NEW head and updates v to point at it,
+	 * so v is always the merged head holding the train identity here. */
 	if (u->orders != nullptr) {
 		v->orders_backup = v->orders;
 		v->orders = u->orders;
 		u->orders = nullptr;
-		/* R3R: preserve the locomotive's own order position and unit number so a
-		 * later decouple can restore them; inherit the consist's unit number so
-		 * the coupled train keeps the consist's identity (e.g. stays "Train 1"). */
+		/* R3R: preserve the locomotive's own order position so a later decouple
+		 * can restore them; inherit the consist's unit number so the coupled
+		 * train keeps the consist's identity (e.g. stays "Train 1"). The unit
+		 * number backup is taken only when a number is actually inherited:
+		 * DecoupleTrain swaps numbers only when v->unitnumber_backup != 0, so
+		 * an unconditional backup would later hand the locomotive's OWN number
+		 * to the decoupled part and give that same number back to v (duplicate
+		 * unit numbers) whenever the consist carried no number of its own. */
 		v->orders_backup_real_index = v->cur_real_order_index;
 		v->orders_backup_implicit_index = v->cur_implicit_order_index;
-		v->unitnumber_backup = v->unitnumber;
+		v->unitnumber_backup = 0;
 		if (u->unitnumber != 0) {
+			v->unitnumber_backup = v->unitnumber;
 			v->unitnumber = u->unitnumber;
 			u->unitnumber = 0;
 		}
@@ -4596,6 +4870,53 @@ static void Couple(Train *v, Train *u)
 	if (u_was_consist || TrainHasEngine(merged_first)) merged_first->SetSegmentFront();
 
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
+
+	/* R3R: a locomotive that reached the coupling point driving backwards (it
+	 * backed up nose-first to the consist) carries VehicleFlag::DrivingBackwards
+	 * into the merged chain, making GetMovingFront() the far (wagon) end even
+	 * though the direction-unify loop above set the whole chain to the
+	 * locomotive's heading. Departure would then start from the wagon end and
+	 * the train slides the wrong way until an automatic REVERSEDIR corrects it
+	 * (observed: CRT-FOLD + CheckReverseTrain found=0 + stranding at the end of
+	 * line). Undo the stale backing-up state here so the locomotive end leads.
+	 * This mirrors ReverseTrainDirection's backup branch, but runs at the
+	 * coupling point where the current order has just been freed: the full
+	 * reversal machinery (path reservation etc.) must not fire yet, the next
+	 * ProcessOrders tick drives departure with the corrected head. It touches
+	 * no physical vehicle order, positions, directions, or images. */
+	/* R3R DEBUG probe: report whether the coupled-on chain carried the stale
+	 * backing-up state and whether a no-cab speed flag was lingering. */
+	if (v->vehicle_flags.Test(VehicleFlag::DrivingBackwards)) {
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "DB-CLEAR head=%d staleNocab=%d last=%d lastLead=%d\n",
+						(int)v->index.base(),
+						(int)((v->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0),
+						(int)v->Last()->index.base(), (int)v->Last()->CanLeadTrain());
+				fclose(dbg);
+			}
+		}
+		for (Train *u = v; u != nullptr; u = u->Next()) {
+			u->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
+
+			/* Invert going up/down, as ReverseTrainDirection does. */
+			if (HasBit(u->gv_flags, GVF_GOINGUP_BIT) || HasBit(u->gv_flags, GVF_GOINGDOWN_BIT)) {
+				ToggleBit(u->gv_flags, GVF_GOINGDOWN_BIT);
+				ToggleBit(u->gv_flags, GVF_GOINGUP_BIT);
+			}
+			UpdateStatusAfterSwap(u, false);
+		}
+
+		/* The no-cab speed flag was computed while DrivingBackwards was still
+		 * set; recompute the cached train flags now that the chain drives
+		 * forwards, mirroring the ConsistChanged(CCF_TRACK) that
+		 * ReverseTrainDirection issues after flipping DrivingBackwards.
+		 * Without this the 32 km/h no-driving-cab limit lingers on a
+		 * forward-driving train until the next ConsistChanged. */
+		v->ConsistChanged(CCF_TRACK);
+	}
+
 	if (CheckReverseTrain(v)) v->flags.Set(VehicleRailFlag::Reversing);
 	else v->flags.Reset(VehicleRailFlag::Reversing);
 
@@ -8576,7 +8897,21 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * wagon chain (free wagon or independent consist) that waits inside the depot.
 	 * When executing a GOTO_COUPLE order, couple onto the depot's waiting consist directly. */
 	if (consist->track == TRACK_BIT_DEPOT && consist->IsEngine()) {
-		if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+		/* R3R: the depot GOTO_COUPLE block below must only apply when the couple
+		 * order's target IS this depot. A locomotive that merely sits in its HOME
+		 * depot (e.g. after a GOTO_DEPOT stop) while holding a GOTO_COUPLE order
+		 * for a station platform or ANOTHER depot must keep driving out and couple
+		 * there. The previous unconditional park (cur_speed = 0 every tick) locked
+		 * such a locomotive inside its HOME depot forever: COUPLE-FAIL retried each
+		 * tick because the depot-internal couple scan only checks the depot tile and
+		 * the tile in front of the door, while the waiting consist sat elsewhere.
+		 * The destination check mirrors CheckTrainStayInDepot (IsRailDepotTile +
+		 * GetDepotIndex). */
+		const bool couple_targets_this_depot = consist->current_order.IsType(OT_GOTO_COUPLE) &&
+				consist->current_order.GetCoupleIsDepot() &&
+				IsRailDepotTile(consist->tile) &&
+				consist->current_order.GetDestination().ToDepotID() == GetDepotIndex(consist->tile);
+		if (couple_targets_this_depot) {
 			if (TrainCoupleHandler(consist)) {
 				consist->cur_speed = 0;
 				consist->progress = 0;
@@ -8589,7 +8924,18 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			consist->progress = 0;
 			consist->vehstatus.Reset(VehState::Stopped);
 			consist->flags.Reset(VehicleRailFlag::LeavingStation);
-		} else {
+
+			/* R3R: the depot GOTO_COUPLE coupling above may have handed the train
+			 * identity over to a new head (TryTrainCouple head != v relocation after a
+			 * logical flip of a multi-engine locomotive chain). `consist` is then a
+			 * mid-chain engine, not the front engine any more, and must not run the
+			 * rest of this front-engine handler: its cached_weight was cleared by
+			 * ConsistChanged(CCF_LENGTH) and the UpdateSpeed below would divide by
+			 * zero in GroundVehicle::GetAcceleration (crash C0000094). Bail out; the
+			 * new head takes over from the next tick (TryTrainCouple already
+			 * invalidated the vehicle tick cache). */
+			if (!consist->IsFrontEngine()) return true;
+		} else if (!consist->current_order.IsType(OT_GOTO_COUPLE)) {
 			NormalizeTrainVehInDepot(consist, true);
 		}
 	}
@@ -9044,6 +9390,15 @@ bool Train::Tick()
 		this->current_order_time++;
 
 		if (!TrainLocoHandler(this, false)) return false;
+
+		/* R3R: TryTrainCouple 的换端重排(head != v → R3RRelocateFrontIdentity)
+		 * 可能在本次 tick 第一次 handler(mode=false)内把列车身份迁往新链头
+		 * (多节真引擎机车逻辑翻 v 的场景),本对象已降为链内普通引擎:它的
+		 * 重量缓存被 ConsistChanged(CCF_LENGTH) 清除,若再以旧前端身份跑第二
+		 * 次 handler,会在 UpdateSpeed → GetAcceleration 里对 cached_weight == 0
+		 * 除零崩溃(C0000094)。跳过本次 tick,由下一 tick(缓存已重建)的新链头
+		 * 接管。 */
+		if (!this->IsFrontEngine()) return true;
 
 		return TrainLocoHandler(this, true);
 	} else if (this->IsFreeWagon() && this->vehstatus.Test(VehState::Crashed)) {

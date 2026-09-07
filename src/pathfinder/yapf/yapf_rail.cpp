@@ -784,8 +784,10 @@ public:
 			}
 			if (depth > 512) return false;
 			if (cur == tg) return true;
-			/* R3R: never route the couple loco through a depot. */
-			if (IsRailDepotTile(cur)) return false;
+			/* R3R: never route the couple loco through a depot - but allow the
+			 * start tile, which may itself be the depot the loco is leaving
+			 * (cur == st only occurs at the first call, at depth 0). */
+			if (IsRailDepotTile(cur) && cur != st) return false;
 			TrackFollower f2(v, Yapf().GetCompatibleRailTypes());
 			if (!f2.Follow(cur, cur_td)) return false;
 			/* R3R: TrackFollower leaps a whole platform in one step, so the
@@ -853,7 +855,10 @@ public:
 					if (depth > 512) return false;
 					if (cur == tg) return true;
 					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) rp_last_tile = cur;
-					if (IsRailDepotTile(cur)) return false; /* R3R: do not reserve through a depot. */
+					/* R3R: do not reserve through a depot - but allow the start tile,
+					 * which may itself be the depot the loco is leaving (cur == st
+					 * only occurs at the first call, at depth 0). */
+					if (IsRailDepotTile(cur) && cur != st) return false;
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
 					if (IsRailStationTile(f3.new_tile)) {
