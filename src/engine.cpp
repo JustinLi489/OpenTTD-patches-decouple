@@ -14,7 +14,7 @@
 #include "aircraft.h"
 #include "newgrf.h"
 #include "newgrf_engine.h"
-#include "consist_group.h"
+
 #include "strings_func.h"
 #include "core/random_func.hpp"
 #include "window_func.h"
@@ -894,10 +894,6 @@ void StartupEngines()
 	for (Engine *e : Engine::Iterate()) {
 		CalcEngineReliability(e, false);
 	}
-
-	/* R3R: ensure the dedicated consist-group (zero-power locomotive) engine exists
-	 * after every NewGRF config rebuild; it backs all car-only consists. */
-	CreateConsistGroupEngine();
 
 	/* Update the bitmasks for the vehicle lists */
 	for (Company *c : Company::Iterate()) {

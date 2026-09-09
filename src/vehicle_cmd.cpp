@@ -14,7 +14,6 @@
 #include "command_func.h"
 #include "company_func.h"
 #include "train.h"
-#include "consist_group.h"
 #include "aircraft.h"
 #include "newgrf_text.h"
 #include "vehicle_func.h"
@@ -252,40 +251,36 @@ CommandCost CmdBuildVehicle(DoCommandFlags flags, TileIndex tile, EngineID eid, 
 CommandCost CmdSellRailWagon(DoCommandFlags flags, Vehicle *t, bool sell_chain, bool backup_order, ClientID user);
 
 /**
- * Turn a free wagon chain into an independently operating consist (front wagon).
- * This is the entry point for the "purchase consist" feature: a bought wagon
- * chain in a depot can be activated as an independent consist that holds orders.
- * @param flags Operation to perform.
- * @param tile tile on which the wagon is located (for validation).
- * @param veh_id ID of the wagon to convert.
- * @param client_id Client performing the command.
+ * R3R: promote a loose free wagon chain to an independent train front, giving
+ * its head the fake-engine car-only formation identity plus a unit number so
+ * the chain can hold orders, appear in the vehicle list and be coupled onto.
+ * This is the first half of the one-step "make segment" upgrade; CmdMakeSegment
+ * then adds the SegmentFront boundary marker and the tail fake engine.
+ * @param t Front (first, FreeWagon) vehicle of a loose wagon chain in a depot.
+ * @return True when the chain was promoted.
  */
-CommandCost CmdSetAsFrontWagon(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
+static bool R3RPromoteFreeWagonChainToFront(Train *t)
 {
-	Train *t = Train::GetIfValid(veh_id);
-	if (t == nullptr || !t->IsFreeWagon()) return CMD_ERROR;
-	if (!IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+	if (t == nullptr || !t->IsFreeWagon()) return false;
 
-	if (flags.Test(DoCommandFlag::Execute)) {
-		/* R3R: turn the wagon chain into a consist (zero-power locomotive chain):
-		 * it becomes a normal train front, can hold orders and appears in the
-		 * vehicle list. */
-		Train *front = CreateConsistGroup(t);
-		if (front == nullptr) return CMD_ERROR;
-		front->SetFrontEngine();
-		if (front->unitnumber == 0) {
-			front->unitnumber = GetFreeUnitNumber(VehicleType::Train);
-			/* R3R: mark the number as used in the company's freeunits pool, so a
-			 * locomotive bought afterwards does not get the same number (observed:
-			 * consist got number 1, then the purchased loco also got number 1). */
-			if (front->unitnumber != UINT16_MAX) Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
-		}
-		front->group_id = t->group_id;
-		UpdateTrainGroupID(t);
-		GroupStatistics::CountVehicle(t, 1);
-		InvalidateVehicleListWindows(t->type);
+	/* R3R: turn the wagon chain into a car-only formation (zero-power train
+	 * front): it becomes a normal train front, can hold orders and appears in
+	 * the vehicle list. */
+	Train *front = R3RCreateCarOnlyFormation(t);
+	if (front == nullptr) return false;
+	front->SetFrontEngine();
+	if (front->unitnumber == 0) {
+		front->unitnumber = GetFreeUnitNumber(VehicleType::Train);
+		/* R3R: mark the number as used in the company's freeunits pool, so a
+		 * locomotive bought afterwards does not get the same number (observed:
+		 * consist got number 1, then the purchased loco also got number 1). */
+		if (front->unitnumber != UINT16_MAX) Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
 	}
-	return CommandCost();
+	front->group_id = t->group_id;
+	UpdateTrainGroupID(t);
+	GroupStatistics::CountVehicle(t, 1);
+	InvalidateVehicleListWindows(t->type);
+	return true;
 }
 
 /**
@@ -301,6 +296,32 @@ static Train *GetLastChainVehicle(Train *head)
 		if (v->Next() == nullptr) return v;
 		v = v->Next();
 	}
+}
+
+/**
+ * R3R: stop a chain that is fully parked in its depot (IsChainInDepot verified
+ * by the caller) but still running, as part of a depot identity tool
+ * (MakeSegment / DemoteSegment). The caller relaxed its check from
+ * IsStoppedInDepot() to IsChainInDepot() so an in-depot chain that was left
+ * "started" no longer needs a manual stop first; this mirrors the stop half of
+ * CmdStartStopVehicle's execute path.
+ * @param t Independent chain front (already resolved).
+ */
+static void R3RStopChainInDepot(Train *t)
+{
+	if (t->vehstatus.Test(VehState::Stopped)) return;
+
+	t->StopSeparation();
+	t->vehstatus.Set(VehState::Stopped);
+	/* Prevent any attempt to update the timetable for the current order now
+	 * that the chain is stopped in its depot (same guard as CmdStartStopVehicle). */
+	t->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+
+	t->MarkDirty();
+	SetWindowWidgetDirty(WindowClass::VehicleView, t->index, WID_VV_START_STOP);
+	SetWindowDirty(WindowClass::VehicleDepot, t->GetMovingFront()->tile.base());
+	DirtyVehicleListWindowForVehicle(t);
+	InvalidateWindowData(WindowClass::VehicleView, t->index);
 }
 
 /** R3R debug: dump one train chain's identities (subtype bits + railflags) for
@@ -517,17 +538,27 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 	/* R3R debug probe: log the command receipt and every validation result. */
 	FILE *dbg = fopen("R3R_debug.log", "a");
 	if (dbg != nullptr) {
-		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d nxt=%d\n",
+		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d chainInDepot=%d nxt=%d\n",
 			(int)veh_id.base(), tile.base(), flags.Test(DoCommandFlag::Execute) ? 1 : 0,
-			(int)t->index.base(), t->IsEngine() ? 1 : 0, t->IsFrontEngine() ? 1 : 0, t->IsStoppedInDepot() ? 1 : 0,
+			(int)t->index.base(), t->IsEngine() ? 1 : 0, t->IsFrontEngine() ? 1 : 0, t->IsStoppedInDepot() ? 1 : 0, t->IsChainInDepot() ? 1 : 0,
 			t->Next() != nullptr ? (int)t->Next()->index.base() : -1);
 		fclose(dbg);
 	}
 
-	if (!t->IsEngine() || !t->IsFrontEngine()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
-	if (!t->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
+	if (!t->IsFreeWagon() && (!t->IsEngine() || !t->IsFrontEngine())) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
+	/* A chain fully parked inside a depot qualifies even when it was left
+	 * running; it is auto-stopped in the execute phase below. Only a chain that
+	 * is outside the depot (or still moving into it) is rejected here. */
+	if (!t->IsChainInDepot()) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3RStopChainInDepot(t);
+		if (t->IsFreeWagon()) {
+			/* One-step upgrade from loose wagons (R3R): give the chain a front
+			 * identity (fake-engine consist + unit number) first, so it can hold
+			 * a schedule and be demoted straight back into loose wagons later. */
+			if (!R3RPromoteFreeWagonChainToFront(t)) return CMD_ERROR;
+		}
 		/* R3R segment upgrade rule: first split the chain's articulated groups
 		 * into real vehicles (statistics conserved via baked overrides plus
 		 * group-role flags), so the segment can afterwards be rearranged
@@ -548,14 +579,33 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 }
 
 /**
+ * R3R: does an independent chain contain at least one real (non-wagon) engine?
+ * Used by DemoteSegment to decide whether a segment demotes into a plain train
+ * (it still has real traction) or straight back into loose free wagons.
+ * @param seg Front of the chain whose vehicles (up to the next segment
+ *            boundary or the chain end) are scanned.
+ * @return True when the segment contains a real locomotive.
+ */
+static bool R3RChainHasRealLocomotive(const Train *seg)
+{
+	for (const Train *v = seg; v != nullptr; v = v->Next()) {
+		if (v != seg && v->IsSegmentFront()) break; /* Only scan this segment. */
+		if (v->IsEngine() && RailVehInfo(v->engine_type)->railveh_type != RailVehicleType::Wagon) return true;
+	}
+	return false;
+}
+
+/**
  * R3R: demote an independent chain by one level of coupling identity.
  *
- * - An independent segment (its front carries the SegmentFront marker) becomes
- *   a plain consist / train again: the boundary marker is cleared, so it can
- *   be freely rearranged in the depot and is no longer split off as a unit.
- * - An independent consist (zero-power wagon group) is dissolved into a plain
- *   free wagon chain: the fake locomotive identity is removed, its schedule is
- *   deleted and it becomes loose wagons that wait in the depot for an engine.
+ * - An independent segment containing only wagons is demoted straight back to a
+ *   loose free wagon chain: the SegmentFront marker, both fake-engine
+ *   identities (head and tail), the schedule and the unit number are removed.
+ * - An independent segment containing a real locomotive becomes a plain train
+ *   again: only the segment boundary (marker and tail fake engine) is removed,
+ *   and the train keeps its schedule and number.
+ * - An independent consist (zero-power wagon group created internally by the
+ *   R3R decouple machinery) is dissolved into a plain free wagon chain.
  *
  * A segment that is still coupled onto a train cannot be demoted in place;
  * drag it onto an empty row in the depot first.
@@ -581,9 +631,11 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 	if (seg != nullptr) {
 		/* Only a standalone (independent) segment can be demoted here. */
 		if (seg->Previous() != nullptr || !seg->IsEngine()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
-		if (!seg->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+		/* In-depot running chains are auto-stopped in the execute phase. */
+		if (!seg->IsChainInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
 
 		if (flags.Test(DoCommandFlag::Execute)) {
+			R3RStopChainInDepot(seg);
 			seg->ClearSegmentFront();
 			/* R3R segment demotion rule: undo the tail fake-engine identity that
 			 * was granted when the chain was promoted to a segment. */
@@ -591,20 +643,39 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 			/* R3R: re-articulate any de-articulated groups of the chain (clear
 			 * baked overrides and group roles, restore the articulated subtype). */
 			RearticulateChain(seg);
-			seg->ConsistChanged(CCF_ARRANGE);
+			if (R3RChainHasRealLocomotive(seg)) {
+				/* A segment with real traction becomes a plain train: it keeps its
+				 * schedule and number and can be run as a normal service. */
+				seg->ConsistChanged(CCF_ARRANGE);
+			} else {
+				/* One-step demotion of a wagon-only segment: straight back to a
+				 * loose free wagon chain (a free wagon chain cannot hold a
+				 * schedule or a number). */
+				if (seg->orders != nullptr) DeleteVehicleOrders(seg);
+				if (seg->unitnumber != 0) Company::Get(seg->owner)->freeunits[VehicleType::Train].ReleaseID(seg->unitnumber);
+				seg->unitnumber = 0;
+				GroupStatistics::CountVehicle(seg, -1);
+				R3RDestroyCarOnlyFormation(seg);
+				UpdateTrainGroupID(seg);
+				seg->ConsistChanged(CCF_ARRANGE);
+				InvalidateVehicleListWindows(VehicleType::Train);
+			}
 			InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 		}
 		return CommandCost();
 	}
 
-	/* No segment marker: dissolve an independent consist into loose wagons. */
+	/* No segment marker: dissolve an independent car-only formation into loose
+	 * wagons. */
 	Train *front = t;
 	while (front->Previous() != nullptr) front = front->Previous();
 
-	if (!IsConsistGroup(front)) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
-	if (!front->IsStoppedInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+	if (!R3RIsCarOnlyFormation(front)) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
+	/* In-depot running chains are auto-stopped in the execute phase. */
+	if (!front->IsChainInDepot()) return CommandCost(STR_ERROR_CAN_T_DEMOTE_SEGMENT);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3RStopChainInDepot(front);
 		/* A free wagon chain cannot hold a schedule. */
 		if (front->orders != nullptr) DeleteVehicleOrders(front);
 		/* Release the unit number back into the company pool. */
@@ -612,7 +683,7 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 		front->unitnumber = 0;
 		GroupStatistics::CountVehicle(front, -1);
 		front->ClearSegmentFront();
-		DestroyConsistGroup(front);
+		R3RDestroyCarOnlyFormation(front);
 		UpdateTrainGroupID(front);
 		InvalidateVehicleListWindows(VehicleType::Train);
 		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
@@ -1805,12 +1876,12 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			if (!veh_id.has_value()) return CMD_ERROR;
 			w = Vehicle::Get(*veh_id);
 
-			/* R3R: cloning a make-consist locomotive (wagon-as-engine). The freshly
-			 * built wagon defaults to a free wagon; promote it back to a consist
-			 * front so the clone is again a couplable consist — otherwise cloning
-			 * a consist "fails" (produces a loose wagon chain, or the copy can't
-			 * be used as a consist). */
-			if (v->type == VehicleType::Train && IsConsistGroup(Train::From(v)) && w->type == VehicleType::Train) {
+			/* R3R: cloning a car-only formation front (wagon-as-engine). The
+			 * freshly built wagon defaults to a free wagon; promote it back to a
+			 * formation front so the clone is again a couplable formation —
+			 * otherwise cloning one "fails" (produces a loose wagon chain, or the
+			 * copy can't be used as a waiting formation). */
+			if (v->type == VehicleType::Train && R3RIsCarOnlyFormation(Train::From(v)) && w->type == VehicleType::Train) {
 				Train::From(w)->SetFrontEngine();
 			}
 

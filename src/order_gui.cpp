@@ -12,7 +12,7 @@
 #include "viewport_func.h"
 #include "depot_map.h"
 #include "train.h"
-#include "consist_group.h"
+
 #include "roadveh.h"
 #include "timetable.h"
 #include "strings_func.h"
@@ -85,6 +85,24 @@ StringID GetSlotGroupWarning(TraceRestrictSlotGroupID slot_group, Owner owner);
 static bool ModifyOrder(const Vehicle *v, VehicleOrderID order_id, ModifyOrderFlags mof, uint16_t data, bool error_msg = true)
 {
 	return Command<Commands::ModifyOrder>::Post(error_msg ? STR_ERROR_CAN_T_MODIFY_THIS_ORDER : (StringID)0, v->tile, v->index, order_id, mof, data, {}, {});
+}
+
+/**
+ * R3R: Count the coupled-on segments of a train. A segment is a powered chain
+ * coupled onto the train whose front carries the SegmentFront marker; the
+ * train's own front is not a segment. Used to build the decouple-boundary
+ * choices for a #OT_DECOUPLE order.
+ * @param v The order window's vehicle (any type; only trains have segments).
+ * @return Number of coupled-on segments.
+ */
+static uint CountCoupleSegments(const Vehicle *v)
+{
+	if (v == nullptr || v->type != VehicleType::Train) return 0;
+	uint count = 0;
+	for (const Train *t = Train::From(v)->First()->GetNextVehicle(); t != nullptr; t = t->GetNextVehicle()) {
+		if (t->IsSegmentFront()) count++;
+	}
+	return count;
 }
 
 struct CargoTypeOrdersWindow : public Window {
@@ -1258,10 +1276,21 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		}
 
 		case OT_DECOUPLE: {
-			if (order->GetNumDecouple() == 0) {
-				AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_AUTO);
-			} else {
-				AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS, order->GetNumDecouple());
+			switch (order->GetDecoupleBoundaryMode()) {
+				case DecoupleBoundaryMode::Auto:
+					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_AUTO);
+					break;
+
+				case DecoupleBoundaryMode::TailSegments:
+					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS, order->GetNumDecouple());
+					break;
+
+				case DecoupleBoundaryMode::HeadBoundary:
+					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_HEAD, order->GetNumDecouple(), order->GetNumDecouple() + 1);
+					break;
+
+				case DecoupleBoundaryMode::End:
+					NOT_REACHED();
 			}
 			break;
 		}
@@ -1680,6 +1709,11 @@ private:
 	bool can_do_refit = false;     ///< Vehicle chain can be refitted in depot.
 	bool can_do_autorefit = false; ///< Vehicle chain can be auto-refitted.
 	int query_text_widget = -1;    ///< widget which most recently called ShowQueryString
+	/** R3R: sentinel values for the numeric decouple-boundary input queries. */
+	enum DecoupleBoundaryQueryType : int {
+		DECOUPLE_QUERY_TAIL = -10, ///< Numeric query: number of trailing segments to release.
+		DECOUPLE_QUERY_HEAD = -11, ///< Numeric query: head segment to split after.
+	};
 	std::array<int, 4> current_aux_planes{};
 	int current_value_plane = 0;
 	int current_mgmt_plane = 0;
@@ -1909,6 +1943,79 @@ private:
 		order.MakeDecouple(ODF_DECOUPLE, 0);
 
 		this->InsertNewOrder(order);
+	}
+
+	/**
+	 * R3R: Show the segment-boundary choices for the selected decouple order.
+	 *
+	 * The list offers the automatic split plus the two count-based modes.
+	 * Choosing either count-based mode opens a numeric input query, so the
+	 * player types the segment count himself. The choice must not be derived
+	 * from the consist's current segment count: more coupled-on segments can
+	 * be gained (by earlier couple orders) after this order is edited and
+	 * before it fires.
+	 */
+	void OrderClick_DecoupleBoundary()
+	{
+		VehicleOrderID sel_ord = this->OrderGetSel();
+		const Order *order = this->vehicle->GetOrder(sel_ord);
+		if (order == nullptr || !order->IsType(OT_DECOUPLE)) return;
+
+		DropDownList list;
+		list.push_back(MakeDropDownListStringItem(STR_ORDER_DECOUPLE_DETAILS_AUTO, 0, false));
+		list.push_back(MakeDropDownListDividerItem());
+		list.push_back(MakeDropDownListStringItem(STR_ORDER_DECOUPLE_QUERY_TAIL, 1, false));
+		list.push_back(MakeDropDownListStringItem(STR_ORDER_DECOUPLE_QUERY_HEAD, 2, false));
+
+		int selected = 0;
+		switch (order->GetDecoupleBoundaryMode()) {
+			case DecoupleBoundaryMode::TailSegments:
+				selected = 1;
+				break;
+
+			case DecoupleBoundaryMode::HeadBoundary:
+				selected = 2;
+				break;
+
+			case DecoupleBoundaryMode::Auto:
+			case DecoupleBoundaryMode::End:
+				break;
+		}
+
+		ShowDropDownList(this, std::move(list), selected, WID_O_REFIT_DROPDOWN, 0, DropDownOptions{}, DDSF_SHARED);
+	}
+
+	/**
+	 * R3R: Apply a decouple-boundary choice picked from the drop down list.
+	 *
+	 * Index 0 applies the automatic split.  Index 1 ("release last N segments")
+	 * and index 2 ("split after head segment N") open a numeric query in which
+	 * the player types the count; the query is prefilled with the currently
+	 * stored count when that mode is already active.
+	 * @param index The selected list index.
+	 */
+	void OrderClick_DecoupleBoundarySelected(int index)
+	{
+		VehicleOrderID sel_ord = this->OrderGetSel();
+		const Order *order = this->vehicle->GetOrder(sel_ord);
+		if (order == nullptr || !order->IsType(OT_DECOUPLE)) return;
+
+		if (index <= 0) {
+			if (order->GetDecoupleBoundaryMode() == DecoupleBoundaryMode::Auto) return;
+			this->ModifyOrder(sel_ord, MOF_DECOUPLE_BOUNDARY, (uint16_t)static_cast<uint8_t>(DecoupleBoundaryMode::Auto) << 8);
+			return;
+		}
+
+		const bool head = (index >= 2);
+		const DecoupleBoundaryMode mode = head ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
+
+		uint cur = 1;
+		if (order->GetDecoupleBoundaryMode() == mode) cur = std::max<uint>(order->GetNumDecouple(), 1);
+
+		this->query_text_widget = head ? DECOUPLE_QUERY_HEAD : DECOUPLE_QUERY_TAIL;
+		ShowQueryString(GetString(STR_JUST_INT, cur),
+				head ? STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION : STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION,
+				2, this, CS_NUMERAL, {});
 	}
 
 	/**
@@ -2423,14 +2530,37 @@ public:
 			this->EnableWidget(WID_O_MGMT_BTN);
 
 			switch (order->GetType()) {
-				case OT_DECOUPLE:
+				case OT_DECOUPLE: {
+					/* R3R: decouple orders expose their segment-boundary choice on
+					 * the (repurposed) refit drop-down button. Pin the top-row slot
+					 * planes so the drop-down is always visible for a decouple row
+					 * regardless of the previously selected order (right slot stays
+					 * on its stale plane otherwise and the control disappears). */
+					if (row_sel != nullptr) {
+						row_sel->SetDisplayedPlane(DP_ROW_EMPTY);
+					} else {
+						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
+						left_sel->SetDisplayedPlane(DP_LEFT_LOAD);
+						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
+						right_sel->SetDisplayedPlane(DP_RIGHT_REFIT);
+					}
+					this->RaiseWidget(WID_O_NON_STOP);
+					this->DisableWidget(WID_O_NON_STOP);
+					this->DisableWidget(WID_O_FULL_LOAD);
+					this->DisableWidget(WID_O_UNLOAD);
+					this->DisableWidget(WID_O_REFIT);
+					this->EnableWidget(WID_O_REFIT_DROPDOWN);
+					this->EnableWidget(WID_O_MGMT_BTN);
+					break;
+				}
+
 				case OT_GOTO_COUPLE:
 				case OT_WAIT_COUPLE:
-					/* No bottom-button editing for couple/decouple orders yet (batch 3). */
 					this->DisableWidget(WID_O_NON_STOP);
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
+					this->DisableWidget(WID_O_REFIT);
 					if (this->vehicle->IsGroundVehicle()) this->DisableWidget(WID_O_REVERSE_AT_STATION);
 					this->EnableWidget(WID_O_MGMT_BTN);
 					break;
@@ -2676,6 +2806,15 @@ public:
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
 					break;
 			}
+		}
+
+		/* R3R: the refit drop-down doubles as the segment-boundary selector of a
+		 * decouple order; keep its label/tooltip in sync with the selection. */
+		const Order *sel_order = this->vehicle->GetOrder(this->OrderGetSel());
+		if (sel_order != nullptr && sel_order->IsType(OT_DECOUPLE)) {
+			this->GetWidget<NWidgetCore>(WID_O_REFIT_DROPDOWN)->SetStringTip(STR_ORDER_DECOUPLE_BOUNDARY, STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP);
+		} else {
+			this->GetWidget<NWidgetCore>(WID_O_REFIT_DROPDOWN)->SetStringTip(STR_ORDER_REFIT_AUTO, STR_ORDER_REFIT_AUTO_TOOLTIP);
 		}
 
 		this->GetWidget<NWidgetStacked>(WID_O_SEL_SHARED)->SetDisplayedPlane(_ctrl_pressed ? DP_SHARED_VEH_GROUP : DP_SHARED_LIST);
@@ -3312,13 +3451,18 @@ public:
 						WID_O_DEPOT_ACTION, 0, _settings_client.gui.show_depot_sell_gui ? 0 : (1 << DA_SELL), 0, DDSF_SHARED);
 				break;
 
-			case WID_O_REFIT_DROPDOWN:
-				if (this->GetWidget<NWidgetLeaf>(widget)->ButtonHit(pt)) {
+			case WID_O_REFIT_DROPDOWN: {
+				const Order *o = this->vehicle->GetOrder(this->OrderGetSel());
+				if (o != nullptr && o->IsType(OT_DECOUPLE)) {
+					/* R3R: the decouple-boundary drop down. */
+					this->OrderClick_DecoupleBoundary();
+				} else if (this->GetWidget<NWidgetLeaf>(widget)->ButtonHit(pt)) {
 					this->OrderClick_Refit(0, true);
 				} else {
 					ShowDropDownMenu(this, _order_refit_action_dropdown, 0, WID_O_REFIT_DROPDOWN, 0, 0, 0, DDSF_SHARED);
 				}
 				break;
+			}
 
 			case WID_O_COND_SLOT: {
 				int selected;
@@ -3775,6 +3919,25 @@ public:
 			Command<Commands::ModifyOrder>::Post(STR_ERROR_CAN_T_MODIFY_THIS_ORDER, this->vehicle->tile, this->vehicle->index, this->OrderGetSel(), MOF_LABEL_TEXT, {}, {}, *str);
 		}
 
+		/* R3R: numeric input for the decouple segment boundary. The player types
+		 * the count himself; it is not derived from the consist's current segment
+		 * count (more segments may be coupled on by the time the order fires). */
+		if ((this->query_text_widget == DECOUPLE_QUERY_TAIL || this->query_text_widget == DECOUPLE_QUERY_HEAD) && str.has_value() && !str->empty()) {
+			auto try_value = ParseInteger<uint>(*str);
+			if (!try_value.has_value()) return;
+
+			VehicleOrderID sel = this->OrderGetSel();
+			const Order *order = this->vehicle->GetOrder(sel);
+			if (order == nullptr || !order->IsType(OT_DECOUPLE)) return;
+
+			const DecoupleBoundaryMode mode = (this->query_text_widget == DECOUPLE_QUERY_HEAD) ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
+			const uint8_t value = Clamp<uint>(*try_value, 1, 63);
+			if (order->GetDecoupleBoundaryMode() == mode && order->GetNumDecouple() == value) return;
+
+			const uint16_t data = (uint16_t)(((uint16_t)static_cast<uint8_t>(mode) << 8) | value);
+			this->ModifyOrder(sel, MOF_DECOUPLE_BOUNDARY, data);
+		}
+
 		if (!str.has_value() || str->empty()) return;
 
 		auto create_slot_counter = [&](ModifyOrderFlags mof, bool counter) {
@@ -3864,9 +4027,16 @@ public:
 				this->OrderClick_Service(index);
 				break;
 
-			case WID_O_REFIT_DROPDOWN:
-				this->OrderClick_Refit(index, true);
+			case WID_O_REFIT_DROPDOWN: {
+				const Order *o = this->vehicle->GetOrder(this->OrderGetSel());
+				if (o != nullptr && o->IsType(OT_DECOUPLE)) {
+					/* R3R: a decouple-boundary choice was picked. */
+					this->OrderClick_DecoupleBoundarySelected(index);
+				} else {
+					this->OrderClick_Refit(index, true);
+				}
 				break;
+			}
 
 			case WID_O_COND_VARIABLE:
 				this->ModifyOrder(this->OrderGetSel(), MOF_COND_VARIABLE, index);

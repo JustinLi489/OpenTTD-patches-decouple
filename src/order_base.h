@@ -653,7 +653,13 @@ public:
 
 	/* Decouple / couple order parameters (OT_DECOUPLE / OT_GOTO_COUPLE / OT_WAIT_COUPLE).
 	 * These order types are new, so we are free to define their flag bit fields.
-	 * flags bit 0-7 only (flags is saved as 8 bits on disk, see order_sl.cpp). */
+	 * flags bit 0-7 only (flags is saved as 8 bits on disk, see order_sl.cpp).
+	 * OT_DECOUPLE flag layout:
+	 *  bit 0    : decouple enabled (OrderDecoupleFlags).
+	 *  bits 1-6 : boundary value. 0 = auto (no explicit boundary).
+	 *  bit 7    : the boundary is counted from the head (split after segment N)
+	 *             instead of from the rear (release the last N segments); only
+	 *             meaningful when bits 1-6 are non-zero. */
 
 	/**
 	 * Get whether the decouple action of this order is enabled.
@@ -661,15 +667,34 @@ public:
 	 */
 	inline OrderDecoupleFlags GetDecouple() const { return (OrderDecoupleFlags)GB(this->flags, 0, 1); }
 	/**
-	 * R3R: Get the number of trailing coupled-on segments to decouple.
-	 * 0 means "auto" and decouples a single segment (the last coupled-on
-	 * segment). A segment is a powered chain that was coupled onto this train
-	 * (its front vehicle carries the SegmentFront marker). When the train has
-	 * no coupled-on segments, the decouple falls back to the native
-	 * minimal-decouplable-unit heuristic.
+	 * R3R: Get the segment boundary value of a decouple order.
+	 * 0 means "auto" and releases the last coupled-on segment. A segment is a
+	 * powered chain that was coupled onto this train (its front vehicle carries
+	 * the SegmentFront marker). When the train has no coupled-on segments, the
+	 * decouple falls back to the native minimal-decouplable-unit heuristic.
+	 * With #GetDecoupleFromHeadBoundary() clear the value is the number of
+	 * trailing segments to release; with it set, the value is the head segment
+	 * index n and the train is split between segment n and n + 1.
 	 * @pre IsType(OT_DECOUPLE).
 	 */
-	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 7); }
+	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 6); }
+	/**
+	 * R3R: Whether the decouple boundary of this order is measured from the head
+	 * (split after segment n) instead of from the rear (release the last n
+	 * segments). Only meaningful when #GetNumDecouple() is non-zero.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline bool GetDecoupleFromHeadBoundary() const { return HasBit(this->flags, 7); }
+	/**
+	 * R3R: Resolve the boundary mode of this decouple order.
+	 * @return The mode; the boundary value is available via #GetNumDecouple().
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline DecoupleBoundaryMode GetDecoupleBoundaryMode() const
+	{
+		if (this->GetNumDecouple() == 0) return DecoupleBoundaryMode::Auto;
+		return this->GetDecoupleFromHeadBoundary() ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
+	}
 	/**
 	 * Get the number of vehicles to couple onto. 0 means "no restriction".
 	 * @pre IsType(OT_GOTO_COUPLE).
@@ -717,12 +742,48 @@ public:
 	 */
 	inline void SetDecouple(OrderDecoupleFlags decouple) { SB(this->flags, 0, 1, decouple); }
 	/**
-	 * R3R: Set the number of trailing coupled-on segments to decouple.
-	 * 0 means "auto" and decouples a single segment.
-	 * @param num_decouple The number of segments to decouple.
+	 * R3R: Set the raw segment boundary value of a decouple order.
+	 * 0 means "auto"; otherwise the value is a trailing segment count or a head
+	 * boundary index as selected by #SetDecoupleBoundary.
+	 * @param num_decouple The boundary value (0..63).
 	 * @pre IsType(OT_DECOUPLE).
 	 */
-	inline void SetNumDecouple(uint8_t num_decouple) { SB(this->flags, 1, 7, num_decouple); }
+	inline void SetNumDecouple(uint8_t num_decouple) { SB(this->flags, 1, 6, num_decouple); }
+	/**
+	 * R3R: Select which side of the train the decouple boundary is counted from.
+	 * @param from_head True when the boundary splits the train after segment
+	 *        `value` counted from the head; false when it releases the last
+	 *        `value` segments counted from the rear.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetDecoupleFromHeadBoundary(bool from_head) { SB(this->flags, 7, 1, from_head ? 1 : 0); }
+	/**
+	 * R3R: Set the segment boundary of this decouple order.
+	 * @param mode  The boundary mode; `value` is ignored for Auto.
+	 * @param value The boundary value: trailing segment count (TailSegments) or
+	 *        head segment index n, split between segment n and n + 1
+	 *        (HeadBoundary). Valid range 1..63.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline void SetDecoupleBoundary(DecoupleBoundaryMode mode, uint8_t value)
+	{
+		switch (mode) {
+			case DecoupleBoundaryMode::Auto:
+				this->SetDecoupleFromHeadBoundary(false);
+				this->SetNumDecouple(0);
+				break;
+			case DecoupleBoundaryMode::TailSegments:
+				this->SetDecoupleFromHeadBoundary(false);
+				this->SetNumDecouple(value);
+				break;
+			case DecoupleBoundaryMode::HeadBoundary:
+				this->SetDecoupleFromHeadBoundary(true);
+				this->SetNumDecouple(value);
+				break;
+			case DecoupleBoundaryMode::End:
+				break;
+		}
+	}
 	/**
 	 * Set the number of vehicles to couple onto. 0 means "no restriction".
 	 * @param num_couple The number of vehicles to couple onto.

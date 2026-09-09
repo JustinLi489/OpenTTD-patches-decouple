@@ -4388,9 +4388,9 @@ STR_DEPOT_AIRCRAFT_NEW_VEHICLES_TOOLTIP                         :{BLACK}Buy new 
 STR_DEPOT_SET_AS_FRONT_WAGON                                     :{BLACK}Make consist
 STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP                             :{BLACK}Turn the selected wagon chain into an independently operating consist that can hold orders and be coupled onto by locomotives
 STR_DEPOT_MAKE_SEGMENT                                           :{BLACK}Make segment
-STR_DEPOT_MAKE_SEGMENT_TOOLTIP                                   :{BLACK}Turn the selected consist or train into an independent segment. A segment is kept as one whole in the depot (dragged or sold together) and keeps its boundary once coupled onto a train, so it can be split off again as one unit by a decouple order or by dragging it out in a depot
+STR_DEPOT_MAKE_SEGMENT_TOOLTIP                                   :{BLACK}Turn the selected loose wagon chain, consist or train into an independent segment. A segment is kept as one whole in the depot (dragged or sold together) and keeps its boundary once coupled onto a train, so it can be split off again as one unit by a decouple order or by dragging it out in a depot
 STR_DEPOT_DEMOTE_SEGMENT                                         :{BLACK}Demote
-STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP                                 :{BLACK}Lower the selected unit by one level. An independent segment becomes a plain consist/train again. A consist is dissolved back into a loose free wagon chain and loses its schedule
+STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP                                 :{BLACK}Demote the selected unit. A wagon-only segment goes straight back to a loose free wagon chain in the depot (its schedule and number are removed); a segment with a real locomotive becomes a plain train again. A consist is dissolved into a loose free wagon chain
 STR_DEPOT_CLONE_TRAIN                                           :{BLACK}Clone Train
 STR_DEPOT_CLONE_ROAD_VEHICLE                                    :{BLACK}Clone Vehicle
 STR_DEPOT_CLONE_SHIP                                            :{BLACK}Clone Ship
@@ -4716,7 +4716,7 @@ STR_ORDERS_END_OF_SHARED_ORDERS                                 :- - End of Shar
 # Couple / decouple order strings (OpenTTD decouple feature)
 STR_ORDER_DECOUPLE                                              :{BLACK}Decouple
 STR_ORDER_DECOUPLE_BUTTON                                       :{BLACK}Decouple
-STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}Add a decouple order. The train will decouple the last coupled-on segment (the group it was coupled to) at the preceding station or depot
+STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}Add a decouple order. The train decouples at the preceding station or depot. Select the order afterwards to choose the segment boundary: automatic (last coupled-on segment), release a number of trailing segments, or split between two numbered segments (releasing everything behind them)
 STR_ORDER_GO_TO_COUPLE                                          :Go to and couple onto consist
 STR_ORDER_GO_TO_COUPLE_STATION                                  :Go to and couple onto consist at {STATION}
 STR_ORDER_GO_TO_COUPLE_DEPOT                                    :Go to and couple onto consist at {DEPOT}
@@ -4724,8 +4724,11 @@ STR_ORDER_GO_TO_COUPLE_CARGO                                    : (carrying {STR
 STR_ORDER_GO_TO_COUPLE_BUTTON                                   :{BLACK}Go to and couple
 STR_ORDER_WAIT_COUPLE                                           :Wait for coupling
 STR_ORDER_WAIT_COUPLE_BUTTON                                    :{BLACK}Wait for coupling
-STR_ORDER_DECOUPLE_DETAILS                                      :Decouple {COMMA} segments
+STR_ORDER_DECOUPLE_DETAILS                                      :Release last {COMMA} segments
 STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :Decouple rear segment
+STR_ORDER_DECOUPLE_DETAILS_HEAD                                 :Split between segment {COMMA} and {COMMA}
+STR_ORDER_DECOUPLE_BOUNDARY                                     :{BLACK}Decouple boundary
+STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP                             :{BLACK}Choose where this decouple order cuts the train: automatic (release the last coupled-on segment), release the last N segments, or split between segment n and segment n+1 (releasing everything behind it)
 STR_ORDER_DECOUPLE_KEEP_ORDERS                                  :Keep orders
 STR_ORDER_DECOUPLE_KEEP_ORDERS_NO_LOAD                          :Keep orders, do not load
 STR_ORDER_DECOUPLE_INHERIT_ORDERS                               :Inherit remaining orders
@@ -6099,3 +6102,7 @@ STR_BADGE_CONFIG_FILTERS                                        :{WHITE}Badge Fi
 STR_BADGE_CONFIG_PREVIEW                                        :Preview Image
 STR_BADGE_CONFIG_NAME                                           :Name
 STR_BADGE_FILTER_ANY_LABEL                                      :Any {STRING}
+STR_ORDER_DECOUPLE_QUERY_TAIL                                  :Release last N segments...
+STR_ORDER_DECOUPLE_QUERY_HEAD                                  :Split between segment N and segment N+1...
+STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :Number of trailing segments to release
+STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :Head segment to split after

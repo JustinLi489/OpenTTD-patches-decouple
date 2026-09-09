@@ -12,7 +12,6 @@
 #include "articulated_vehicles.h"
 #include "command_func.h"
 #include "couple_score.h"
-#include "consist_group.h"
 #include "pathfinder/yapf/yapf.hpp"
 #include "news_func.h"
 #include "company_func.h"
@@ -1695,8 +1694,8 @@ void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon)
 		return a->index < b->index;
 	});
 	for (Train *v : candidates) {
-		/* R3 consist-centric semantics: if the wagon chain is an independent consist,
-		 * its schedule belongs to the consist; hand it over to the engine. */
+		/* R3: if the grabbed wagon chain is an independent car-only formation, its
+		 * schedule belongs to the formation; hand it over to the engine. */
 		OrderList *orders_to_move = nullptr;
 		if (include_front_wagon && v->orders != nullptr) orders_to_move = v->orders;
 
@@ -1712,8 +1711,68 @@ void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon)
 			const_cast<Train *>(u)->cur_implicit_order_index = 0;
 			InvalidateVehicleOrder(const_cast<Train *>(u), 0);
 		}
-		if (IsConsistGroup(v)) DestroyConsistGroup(v);
+		if (R3RIsCarOnlyFormation(v)) R3RDestroyCarOnlyFormation(v);
 	}
+}
+
+/* R3R car-only formation helpers (the former "consist group"): a wagon-only
+ * chain is promoted into an independent zero-power train front so every OpenTTD
+ * subsystem treats it as a normal train (it can hold orders, appears in the
+ * vehicle list, etc.), but it has no traction, so it just waits in a
+ * depot/station until a locomotive couples onto it. */
+
+/**
+ * Turn a wagon-only chain into an independent car-only formation: give its front
+ * the (zero-power) locomotive identity WITHOUT replacing its engine, so the real
+ * wagon's engine_type (appearance, capacity, stats) is preserved.
+ * @param front_wagon First vehicle of the wagon-only chain.
+ * @return The formation front (now an engine), or nullptr on failure.
+ */
+Train *R3RCreateCarOnlyFormation(Train *front_wagon)
+{
+	if (front_wagon == nullptr) return nullptr;
+
+	/* The formation is recognised by R3RIsCarOnlyFormation() (front engine whose
+	 * rail vehicle type is Wagon). Its cached power is 0; CheckTrainStayInDepot
+	 * has an exemption so it is not auto-stopped (equivalent to a 1 hp minimum). */
+	front_wagon->SetEngine();
+	front_wagon->ClearWagon();
+	front_wagon->ClearFreeWagon();
+	front_wagon->SetFrontEngine();
+	front_wagon->ConsistChanged(CCF_ARRANGE);
+	return front_wagon;
+}
+
+/**
+ * Remove the (zero-power locomotive) formation identity from a chain front,
+ * turning it back into an ordinary free wagon.
+ * @param front The formation front.
+ */
+void R3RDestroyCarOnlyFormation(Train *front)
+{
+	if (front == nullptr) return;
+
+	front->ClearFrontEngine();
+	front->ClearEngine();
+	front->SetWagon();
+	front->SetFreeWagon();
+	/* NOTE: no ConsistChanged() here! After ArrangeTrains merged the formation
+	 * into the locomotive's chain, `front` is no longer a chain head, and
+	 * ConsistChanged requires `this` to be the head (assertion at
+	 * train_cmd.cpp:325). The caller (Couple) refreshes the merged chain via
+	 * NormaliseTrainHead(v) on the locomotive head afterwards. */
+}
+
+/**
+ * Whether a train front is a car-only formation (front engine whose rail
+ * vehicle type is a Wagon: no real traction, waits to be coupled onto).
+ * @param v The train front.
+ * @return True when it is such a formation.
+ */
+bool R3RIsCarOnlyFormation(const Train *v)
+{
+	if (v == nullptr || !v->IsEngine()) return false;
+	return RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
 }
 
 static void AddRearEngineToMultiheadedTrain(Train *v)
@@ -3626,6 +3685,37 @@ static Train *GetSegmentHeadFromRear(Train *v, uint num_segments)
 }
 
 /**
+ * R3R: Get the first vehicle released when splitting a coupled train between
+ * segment n and n + 1, counted from the head (segment 1 is the coupled-on
+ * segment right behind the train's own front).
+ *
+ * The boundary value n is clamped into the available range: when the train now
+ * has fewer segments than the order requests (e.g. the consist changed since
+ * the order was written), the split is reduced to the last segment boundary so
+ * at least one segment stays behind. Returns nullptr when the train has no
+ * usable boundary (no coupled-on segments, or only a single segment), letting
+ * the caller fall back to the auto heuristic.
+ * @param v               %Train to decouple from.
+ * @param boundary_segments Head segment index n (split after segment n).
+ * @return The first vehicle of the rear part, or nullptr on failure.
+ */
+static Train *GetSegmentBoundaryFromHead(Train *v, uint boundary_segments)
+{
+	std::vector<Train *> segment_heads;
+	for (Train *t = v->GetNextVehicle(); t != nullptr; t = t->GetNextVehicle()) {
+		if (t->IsSegmentFront()) segment_heads.push_back(t);
+	}
+	const uint seg_count = (uint)segment_heads.size();
+	if (seg_count < 2) return nullptr; /* Nothing to split off while keeping the front part. */
+
+	/* Clamp n into [1, seg_count - 1]: the deepest split is after the last
+	 * segment, releasing exactly the last coupled-on segment. */
+	uint n = std::min(boundary_segments, seg_count - 1);
+	if (n == 0) n = 1;
+	return segment_heads[n];
+}
+
+/**
  * Automatically determine the number of vehicles to decouple,
  * based on the consist layout (engines at front/back, wagons in between).
  * @param v %Train to decouple from.
@@ -3683,13 +3773,23 @@ static Train *GetDecoupleVehicle(Train *v)
 	}
 	if (decouple_order == nullptr || !decouple_order->IsType(OT_DECOUPLE)) return nullptr;
 
-	/* R3R: GetNumDecouple() is now the number of trailing coupled-on segments
-	 * to decouple (0 = auto = a single segment). Prefer splitting at the last
-	 * coupled-on segment boundary, so a 4+5 coupled train decouples back into
-	 * its original 4 and 5 units. Fall back to the native per-vehicle
-	 * heuristic only when the train has no coupled-on segments (an ordinary
-	 * locomotive + wagons consist). */
-	Train *seg = GetSegmentHeadFromRear(v, decouple_order->GetNumDecouple());
+	/* R3R: the decouple order's boundary selects where to split:
+	 *  - auto (value 0): release the last coupled-on segment. Prefer the last
+	 *    segment boundary so a 4+5 coupled train decouples back into its
+	 *    original 4 and 5 units.
+	 *  - tail count (value N): release the last N coupled-on segments.
+	 *  - head boundary (value n): split between segment n and n + 1, releasing
+	 *    every segment behind segment n.
+	 * Fall back to the native per-vehicle heuristic only when the train has no
+	 * coupled-on segments (an ordinary locomotive + wagons consist). */
+	Train *seg = nullptr;
+	if (decouple_order->GetNumDecouple() == 0) {
+		seg = GetSegmentHeadFromRear(v, 1);
+	} else if (!decouple_order->GetDecoupleFromHeadBoundary()) {
+		seg = GetSegmentHeadFromRear(v, decouple_order->GetNumDecouple());
+	} else {
+		seg = GetSegmentBoundaryFromHead(v, decouple_order->GetNumDecouple());
+	}
 	if (seg != nullptr) return seg;
 
 	uint num_decouple = GetDecoupleVehicleAuto(v);
@@ -3726,9 +3826,19 @@ static bool TryTrainDecouple(Train *v, Train *u)
 		u->SetFreeWagon();
 	}
 	ArrangeTrains(&first_param, nullptr, &v, u, true);
-	bool ok = true;
+
+	/* R3R: the automatic DECOUPLE order runs from the vehicle tick, where
+	 * _current_company is not a valid company (no command context).
+	 * CheckNewTrain -> GetFreeUnitNumber reads Company::Get(_current_company)
+	 * and asserts (pool index out of range) whenever the decoupled rear head is
+	 * an engine (e.g. an EMU/DMU set), which counts as a new train. Scope the
+	 * check to the chain's actual owner, mirroring command-context behaviour. */
+	const CompanyID old_company = _current_company;
+	_current_company = v->owner;
 	CommandCost ret = ValidateTrains(nullptr, u, v, v, true);
-	ok &= !ret.Failed();
+	_current_company = old_company;
+
+	bool ok = !ret.Failed();
 	u->ConsistChanged(CCF_ARRANGE);
 	v->ConsistChanged(CCF_ARRANGE);
 	if (!ok) {
@@ -3764,16 +3874,16 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		u->SetFrontEngine();
 		u->vehstatus.Reset(VehState::Stopped);
 	} else {
-		/* R3R: the wagon part becomes a consist: a zero-power locomotive chain.
-		 * Every OpenTTD subsystem then treats it as a normal train front (it can
-		 * hold orders, appears in the vehicle list, etc.), but it has no power,
-		 * so it simply waits until a locomotive couples onto it. */
-		if (CreateConsistGroup(u) == nullptr) {
+		/* R3R: the wagon part becomes a car-only formation: a zero-power train
+		 * front. Every OpenTTD subsystem then treats it as a normal train front
+		 * (it can hold orders, appears in the vehicle list, etc.), but it has no
+		 * power, so it simply waits until a locomotive couples onto it. */
+		if (R3RCreateCarOnlyFormation(u) == nullptr) {
 			u->SetFreeWagon();
 		} else {
 			u->SetFrontEngine();
-			/* R3R: give the decoupled consist a unit number so it appears as a
-			 * proper train in the list — but allocate it from the consist's OWN
+			/* R3R: give the decoupled formation a unit number so it appears as a
+			 * proper train in the list — but allocate it from the formation's OWN
 			 * company pool (u->owner), NOT via GetFreeUnitNumber() which reads the
 			 * global _current_company (invalid during vehicle ticks → crash). */
 			if (u->unitnumber == 0) {
@@ -3868,8 +3978,8 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		{
 			FILE *dbg = fopen("R3R_debug.log", "a");
 			if (dbg != nullptr) {
-				fprintf(dbg, "DECOUPLE-DONE u=%d isCG=%d real=%d tx=%d ty=%d x=%d y=%d\n",
-					(int)u->index.base(), (int)IsConsistGroup(u),
+				fprintf(dbg, "DECOUPLE-DONE u=%d co=%d real=%d tx=%d ty=%d x=%d y=%d\n",
+					(int)u->index.base(), (int)R3RIsCarOnlyFormation(u),
 					(int)u->cur_real_order_index, (int)TileX(u->tile), (int)TileY(u->tile), (int)u->x_pos, (int)u->y_pos);
 				if (u->orders != nullptr) {
 					for (VehicleOrderID i = 0; i < u->GetNumOrders(); ++i) {
@@ -3909,6 +4019,14 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * Clear any stale reservation first so the re-reservation is accurate. */
 	u->ClearReservationUnderConsist();
 	u->ReserveTrackUnderConsist();
+
+	/* R3R: after the split both newly-independent parts must refresh their
+	 * images once, otherwise they keep sprites/caches that still reflect the
+	 * combined train (e.g. the freed head/tail connection point and consist
+	 * look). MarkDirty() repaints the whole chain of each part — mirrors the
+	 * couple success path and the depot drag-split code. */
+	v->MarkDirty();
+	u->MarkDirty();
 
 	return u;
 }
@@ -4681,6 +4799,20 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	return true;
 }
 
+/* R3R: edge-triggered throttle for the "unable to couple" advice news.
+ * A GOTO_COUPLE locomotive that reaches a consist it cannot couple onto (e.g. a
+ * NewGRF "can attach wagon" rejection) is parked and retries every tick; without
+ * throttling Couple() would push one advice news per tick. Record locomotives for
+ * which the news has already been shown during the current failure episode; clear
+ * the entry as soon as the locomotive leaves that episode (moves off, succeeds,
+ * or drops the GOTO_COUPLE order), so a NEW failure episode may report again.
+ * Deliberately a plain bool rather than a per-vehicle counter or cooldown:
+ * a persistent (permanently rejected) failure must only annoy the player once.
+ * Static only for this translation unit; a stale entry for a deleted VehicleID
+ * merely suppresses one future report and is cleared as soon as that (or any)
+ * locomotive with the same index moves again. */
+static btree::btree_map<VehicleID, bool> _r3r_couple_fail_news_shown;
+
 /**
  * Couple the train onto the waiting consist.
  * @param v Front train (with engine).
@@ -4689,6 +4821,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
  */
 static void Couple(Train *v, Train *u)
 {
+	/* R3R: remember the original coupling locomotive. A fold-fix logical flip of a
+	 * multi-engine chain may migrate the train identity (and thus v) onto a new
+	 * head; the news-throttle entry must be keyed on the locomotive that actually
+	 * tried (and failed) the coupling. */
+	const VehicleID couple_loco_id = v->index;
 	/* R3R: neither the locomotive (v) nor the consist (u) is reversed here.
 	 * The locomotive drives towards the consist nose-first, and the consist
 	 * keeps its heading; both may couple from either end (nose-to-tail or
@@ -4700,7 +4837,15 @@ static void Couple(Train *v, Train *u)
 	Train *merged_first = nullptr;
 	if (!TryTrainCouple(v, u, merged_first)) {
 		if (v->owner == _local_company) {
-			AddVehicleAdviceNewsItem(AdviceType::TrainStuck, GetEncodedString(STR_NEWS_ORDER_COUPLE_FAILED, v->index, u->index), v->index);
+			/* R3R: edge-triggered report. A stationary GOTO_COUPLE locomotive that
+			 * cannot couple (e.g. NewGRF "can attach wagon" refusal) retries every
+			 * tick; show the news only once per continuous failure episode. The
+			 * entry is cleared when the locomotive moves/succeeds/drops the order,
+			 * so a fresh episode can warn again. */
+			if (_r3r_couple_fail_news_shown.find(couple_loco_id) == _r3r_couple_fail_news_shown.end()) {
+				_r3r_couple_fail_news_shown[couple_loco_id] = true;
+				AddVehicleAdviceNewsItem(AdviceType::TrainStuck, GetEncodedString(STR_NEWS_ORDER_COUPLE_FAILED, couple_loco_id, u->index), couple_loco_id);
+			}
 		}
 		return;
 	}
@@ -4810,9 +4955,9 @@ static void Couple(Train *v, Train *u)
 			FILE *dbg = fopen("R3R_debug.log", "a");
 			if (dbg != nullptr) {
 				const Order *co = (v->GetNumOrders() > 0) ? v->GetOrder(v->cur_real_order_index) : nullptr;
-				fprintf(dbg, "COUPLE-OK loco=%d rear=%d consist=%d isCG=%d real=%d type=%d tx=%d ty=%d x=%d y=%d\n",
+				fprintf(dbg, "COUPLE-OK loco=%d rear=%d consist=%d co=%d real=%d type=%d tx=%d ty=%d x=%d y=%d\n",
 					(int)v->index.base(), (int)(v->Last()->index.base()),
-					(int)u->index.base(), (int)IsConsistGroup(u),
+					(int)u->index.base(), (int)R3RIsCarOnlyFormation(u),
 					(int)v->cur_real_order_index, (int)(co ? co->GetType() : -1),
 					(int)TileX(v->tile), (int)TileY(v->tile), (int)v->x_pos, (int)v->y_pos);
 				for (const Train *w = v; w != nullptr; w = w->Next()) {
@@ -4825,12 +4970,12 @@ static void Couple(Train *v, Train *u)
 		}
 	}
 
-	/* The consist front (zero-power locomotive identity) becomes a normal wagon again.
-	 * R3R: remember that the coupled-on chain carried a consist identity BEFORE the
+	/* The formation front (zero-power locomotive identity) becomes a normal wagon again.
+	 * R3R: remember that the coupled-on chain carried a formation identity BEFORE the
 	 * fake engine is destroyed, so a pure wagon group can still be marked as a
 	 * decouplable segment below. */
-	bool u_was_consist = IsConsistGroup(u);
-	if (IsConsistGroup(u)) DestroyConsistGroup(u);
+	bool u_was_caronly = R3RIsCarOnlyFormation(u);
+	if (R3RIsCarOnlyFormation(u)) R3RDestroyCarOnlyFormation(u);
 
 	/* We are now part of another train, remove all independent identity. */
 	CloseWindowById(WindowClass::VehicleView, u->index);
@@ -4861,13 +5006,13 @@ static void Couple(Train *v, Train *u)
 	 * logical flip merged_first is the reversed former tail, which is where
 	 * the merged-on group now starts inside the train. Every chain that was
 	 * coupled on is marked, whether it carried a real engine or was a
-	 * zero-power consist group (its fake front was turned back into a wagon
+	 * car-only formation (its fake front was turned back into a wagon
 	 * above): a trailing wagon group must remain identifiable by its
 	 * SegmentFront so a later decouple/depot drag can split it off as a whole.
 	 * TrainHasEngine is tested from merged_first so it scans the whole
 	 * merged-on group (after a logical flip the fake engine head of the
-	 * consist sits at the far end of the group). */
-	if (u_was_consist || TrainHasEngine(merged_first)) merged_first->SetSegmentFront();
+	 * formation sits at the far end of the group). */
+	if (u_was_caronly || TrainHasEngine(merged_first)) merged_first->SetSegmentFront();
 
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
 
@@ -4940,8 +5085,13 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
 	if (other_vehicle == nullptr) return nullptr;
 	if (other_vehicle->First()->index == v->index) return nullptr;
 	Train *u = Train::From(other_vehicle)->First();
-	/* Target: a free wagon chain or a consist (zero-power locomotive chain). */
-	if (!u->IsFreeWagon() && !IsConsistGroup(u)) return nullptr;
+	/* Target: a car-only formation (zero-power train front: engine bit with a
+	 * wagon rail vehicle type), or a plain primary train holding a WAIT_COUPLE
+	 * order (the pxp-decouple flavour, which never becomes a formation). P7: a
+	 * bare (non-segment) free wagon chain is NOT a valid couple target — it must
+	 * first be turned into a segment (waiting formation) via MakeSegment. */
+	if (!R3RIsCarOnlyFormation(u) &&
+			!(u->IsPrimaryVehicle() && u->current_order.IsType(OT_WAIT_COUPLE))) return nullptr;
 
 	DirDiff dir_diff = DirDifference(v->direction, u->direction);
 	reverse = dir_diff == DirDiff::Same || dir_diff == DirDiff::Right45 || dir_diff == DirDiff::Left45;
@@ -4974,8 +5124,20 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
  */
 static bool TrainCoupleHandler(Train *v)
 {
-	if (!v->current_order.IsType(OT_GOTO_COUPLE)) return false;
-	if (v->cur_speed != 0) return false;
+	if (!v->current_order.IsType(OT_GOTO_COUPLE)) {
+		/* R3R: no longer executing a GOTO_COUPLE order (player skipped it / the
+		 * schedule moved on) — any couple-failure news throttle episode is over;
+		 * allow a fresh failure to report again. */
+		_r3r_couple_fail_news_shown.erase(v->index);
+		return false;
+	}
+	if (v->cur_speed != 0) {
+		/* R3R: the locomotive is moving again, so a previous continuous failure
+		 * episode (if any) has ended; clear the throttle so a later stationary
+		 * attempt that fails again can report once more. */
+		_r3r_couple_fail_news_shown.erase(v->index);
+		return false;
+	}
 
 	bool reverse = false;
 	Train *u = nullptr;
@@ -4989,17 +5151,18 @@ static bool TrainCoupleHandler(Train *v)
 			for (Train *w = first != nullptr ? Train::From(first) : nullptr; w != nullptr; w = w->HashTileNext()) {
 				if (w->First()->index == v->index) continue; // Skip self.
 				if (w->owner != v->owner) continue;
-				/* R3R: also accept an ordinary WAIT_COUPLE consist. The open-track
-				 * branch (below) already couples plain WAIT_COUPLE consists via its
+				/* R3R: also accept an ordinary WAIT_COUPLE train. The open-track
+				 * branch (below) already couples plain WAIT_COUPLE trains via its
 				 * 8-neighbour scan, but the depot branch only looked at FreeWagon /
-				 * ConsistGroup. A consist that has never been decoupled (e.g. the
-				 * very first round, started fresh in the depot) is a plain train
-				 * with a WAIT_COUPLE order and matches neither FreeWagon nor
-				 * ConsistGroup, so the loco could never couple it inside a depot —
-				 * it would instead drive off to wherever the open-track scan found
-				 * it (often the wrong station). Align both branches on the same
-				 * "waiting to be coupled" semantics. */
-				if (w->IsFreeWagon() || IsConsistGroup(w->First()) || w->First()->current_order.IsType(OT_WAIT_COUPLE)) {
+				 * car-only formations. A wagon set that has never been decoupled
+				 * (e.g. the very first round, started fresh in the depot) is a
+				 * plain train with a WAIT_COUPLE order and matches neither
+				 * FreeWagon nor R3RIsCarOnlyFormation, so the loco could never
+				 * couple it inside a depot — it would instead drive off to
+				 * wherever the open-track scan found it (often the wrong station).
+				 * Align both branches on the same "waiting to be coupled"
+				 * semantics. */
+				if (R3RIsCarOnlyFormation(w->First()) || w->First()->current_order.IsType(OT_WAIT_COUPLE)) {
 					u = w->First();
 					break;
 				}
@@ -5028,8 +5191,8 @@ static bool TrainCoupleHandler(Train *v)
 						Train *w = Train::From(fv);
 						if (w->First()->index == v->index) continue; // Skip self.
 						if (w->owner != v->owner) continue;
-						if (!w->IsFreeWagon() && !IsConsistGroup(w->First())) continue;
-						if (!w->First()->current_order.IsType(OT_WAIT_COUPLE)) continue;
+						if (!R3RIsCarOnlyFormation(w->First()) &&
+								!(w->First()->IsPrimaryVehicle() && w->First()->current_order.IsType(OT_WAIT_COUPLE))) continue;
 						Train *z = w->First();
 						int x_diff = abs(v->x_pos - z->x_pos);
 						int y_diff = abs(v->y_pos - z->y_pos);
@@ -5226,10 +5389,10 @@ static bool CheckTrainStayInDepot(Train *v)
 	}
 
 	/* if the train got no power, then keep it in the depot
-	 * (R3R: except a consist — its front keeps the real wagon's engine_type
-	 * with 0 power; without this exemption it would be auto-stopped and could
-	 * never be coupled onto. This is the "1 hp minimum" equivalent.) */
-	if (v->gcache.cached_power == 0 && !IsConsistGroup(v)) {
+	 * (R3R: except a car-only formation — its front keeps the real wagon's
+	 * engine_type with 0 power; without this exemption it would be auto-stopped
+	 * and could never be coupled onto. This is the "1 hp minimum" equivalent.) */
+	if (v->gcache.cached_power == 0 && !R3RIsCarOnlyFormation(v)) {
 		v->vehstatus.Set(VehState::Stopped);
 		SetWindowDirty(WindowClass::VehicleDepot, v->tile.base());
 		return true;
@@ -8862,8 +9025,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * sees a fully-reserved path right up to the consist: a coupling
 	 * locomotive finds and reaches the waiting consist precisely through this
 	 * whole-platform reservation (it drives over the platform tiles in front
-	 * of the consist, which only the consist reserves). */
-	if (IsConsistGroup(consist) && consist->cur_speed == 0 && IsTileType(consist->tile, TileType::Station)) {
+	 * of the formation, which only the formation reserves).
+	 * The gate must cover not only car-only formations but also plain primary
+	 * trains parked on a platform whose current order is WAIT_COUPLE (the
+	 * pxp-decouple flavour: the decoupled part keeps its own schedule and
+	 * waits with a WAIT_COUPLE order, it never becomes a formation). Without
+	 * the every-tick re-reservation the platform under the waiting formation
+	 * is left unreserved once the locomotive that carried it departs (it
+	 * owned the whole-train reservation and releases it as it leaves) — the
+	 * couple pathfinder's HasReservedTracks gate then never finds the
+	 * formation and the locomotive loops "waiting for free track" /
+	 * COUPLE-FAIL forever. */
+	bool r3r_platform_waiter = R3RIsCarOnlyFormation(consist) ||
+			(consist->IsPrimaryVehicle() && consist->current_order.IsType(OT_WAIT_COUPLE));
+	if (r3r_platform_waiter && consist->cur_speed == 0 && IsTileType(consist->tile, TileType::Station)) {
 		consist->ReserveTrackUnderConsist();
 		const Axis axis = GetRailStationAxis(consist->tile);
 		const TileIndexDiff delta = TileOffsByAxis(axis);

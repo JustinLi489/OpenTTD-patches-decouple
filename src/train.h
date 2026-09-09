@@ -230,12 +230,6 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	// 1 byte gap
 	uint16_t speed_restriction = 0;
 	uint16_t signal_speed_restriction = 0;
-
-	/* 逻辑车组关联（R3R consist group）：
-	 * - 虚拟机车（订单容器）用 consist_front_vehicle 指向真实车底段首车厢
-	 * - 真实车底段首车厢用 virtual_train 指向虚拟机车 */
-	VehicleID consist_front_vehicle = VehicleID::Invalid(); ///< 虚拟机车 → 真实车底段首车厢
-	VehicleID virtual_train = VehicleID::Invalid();         ///< 真实车底段首车厢 → 虚拟机车
 	uint16_t crash_anim_pos = 0; ///< Crash animation counter, also used for realistic braking train brake overheating
 
 	/** Create new Train object. @copydoc GroundVehicle::GroundVehicle */
@@ -670,5 +664,15 @@ int GetTrainRealisticAccelerationAtSpeed(const int speed, const int mass, const 
 int GetTrainEstimatedMaxAchievableSpeed(const Train *train, int mass, const int speed_cap);
 int64_t GetTrainPowerToWeightRatio(const Train *train, int mass);
 int64_t GetTrainMaxTractiveEffortToWeightRatio(const Train *train, int mass);
+
+/* R3R car-only formation helpers (the former "consist group"): a wagon-only
+ * chain can be promoted into an independent zero-power train front (engine
+ * identity bit on a wagon) so it can hold a schedule and wait to be coupled
+ * onto. R3RIsCarOnlyFormation must be tested on the chain front (the promoted
+ * wagon keeps the engine bit while merged mid-chain, so it can also return
+ * true there after a couple, until R3RDestroyCarOnlyFormation runs). */
+Train *R3RCreateCarOnlyFormation(Train *front_wagon);
+void R3RDestroyCarOnlyFormation(Train *front);
+bool R3RIsCarOnlyFormation(const Train *v);
 
 #endif /* TRAIN_H */

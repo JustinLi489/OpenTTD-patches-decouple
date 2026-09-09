@@ -24,7 +24,6 @@ enum class SellVehicleFlags : uint8_t {
 DECLARE_ENUM_AS_BIT_SET(SellVehicleFlags)
 
 DEF_CMD_TUPLE    (Commands::BuildVehicle,             CmdBuildVehicle,              CMD_CLIENT_ID, CommandType::VehicleConstruction, CmdDataT<EngineID, bool, CargoType, ClientID>)
-DEF_CMD_TUPLE    (Commands::SetAsFrontWagon,          CmdSetAsFrontWagon,           CMD_CLIENT_ID, CommandType::VehicleManagement,   CmdDataT<VehicleID, ClientID>)
 DEF_CMD_TUPLE    (Commands::MakeSegment,              CmdMakeSegment,               CMD_CLIENT_ID, CommandType::VehicleManagement,   CmdDataT<VehicleID, ClientID>)
 DEF_CMD_TUPLE    (Commands::DemoteSegment,            CmdDemoteSegment,             CMD_CLIENT_ID, CommandType::VehicleManagement,   CmdDataT<VehicleID, ClientID>)
 DEF_CMD_TUPLE    (Commands::SellVehicle,              CmdSellVehicle,               CMD_CLIENT_ID, CommandType::VehicleConstruction, CmdDataT<VehicleID, SellVehicleFlags, ClientID>)

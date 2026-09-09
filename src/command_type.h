@@ -540,9 +540,8 @@ enum class Commands : uint8_t {
 	BulkTree,                               ///< bulk tree planting
 
 	BuildVehicle,                           ///< build a vehicle
-	SetAsFrontWagon,                        ///< turn a free wagon chain into an independently operating consist
-	MakeSegment,                            ///< turn an independent train/consist into a decouplable segment (R3R)
-	DemoteSegment,                          ///< turn an independent segment back into a consist, or a consist into a free wagon chain (R3R)
+	MakeSegment,                            ///< turn a loose wagon chain, consist or train into an independent segment (R3R)
+	DemoteSegment,                          ///< demote an independent segment back to loose wagons or a plain train (R3R)
 	SellVehicle,                            ///< sell a vehicle
 	RefitVehicle,                           ///< refit the cargo space of a vehicle
 	SendVehicleToDepot,                     ///< send a vehicle to a depot

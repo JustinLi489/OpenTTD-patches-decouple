@@ -416,6 +416,15 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
  * @param consecutive whether to look at the whole chain or the vehicles
  *                    with the same 'engine type'.
  * @return the position in the chain from front and tail and chain length.
+ *
+ * R3R (position-in-segment rule): a train may be composed of several
+ * coupled-on segments (each segment front carries the SegmentFront marker,
+ * set by the R3R couple operation / Make-Segment). For such trains the
+ * position/length variables are reported INSIDE the vehicle's own segment
+ * instead of across the whole physical chain, so a NewGRF that selects
+ * sprites from "position in consist" keeps every segment's head/tail faces
+ * stable when a consist is coupled on. Chains without any SegmentFront
+ * marker keep the original whole-chain semantics.
  */
 static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 {
@@ -423,12 +432,28 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 	uint8_t chain_before = 0;
 	uint8_t chain_after  = 0;
 
-	for (u = v->First(); u != v; u = u->Next()) {
+	/* R3R: locate the front of the segment this vehicle belongs to: walk back
+	 * while the current vehicle is not itself a SegmentFront (each marker
+	 * opens a new segment that starts AT the marked vehicle) and while there
+	 * is a predecessor; otherwise the segment front is the physical head. */
+	const Vehicle *seg_front = v;
+	if (v->type == VehicleType::Train) {
+		const Vehicle *w = v;
+		while (w->Previous() != nullptr && !static_cast<const Train *>(w)->IsSegmentFront()) {
+			w = w->Previous();
+		}
+		seg_front = w;
+	}
+
+	for (u = seg_front; u != v; u = u->Next()) {
 		chain_before++;
 		if (consecutive && u->engine_type != v->engine_type) chain_before = 0;
 	}
 
 	while (u->Next() != nullptr && (!consecutive || u->Next()->engine_type == v->engine_type)) {
+		/* R3R: stop at the next segment boundary (the next SegmentFront is the
+		 * first vehicle of the following segment, so it is not counted). */
+		if (u->Next()->type == VehicleType::Train && static_cast<const Train *>(u->Next())->IsSegmentFront()) break;
 		chain_after++;
 		u = u->Next();
 	}

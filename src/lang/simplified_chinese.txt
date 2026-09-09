@@ -4370,9 +4370,9 @@ STR_DEPOT_AIRCRAFT_NEW_VEHICLES_TOOLTIP                         :{BLACK}购买�
 STR_DEPOT_SET_AS_FRONT_WAGON                                    :{BLACK}设为前车
 STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP                            :{BLACK}将选定的车厢链转为可独立运行的编组（consist）。编组可以携带调度订单并等待被机车挂接
 STR_DEPOT_MAKE_SEGMENT                                          :{BLACK}设为段
-STR_DEPOT_MAKE_SEGMENT_TOOLTIP                                  :{BLACK}将选定的编组或列车转为独立段。段在车库中始终整链拖动/出售；挂到其他列车上后仍保留段边界，可被解挂订单或在车库中整体解出
+STR_DEPOT_MAKE_SEGMENT_TOOLTIP                                  :{BLACK}将选定的松散车厢链、编组或列车一步转为独立段。段在车库中始终整链拖动/出售；挂到其他列车上后仍保留段边界，可被解挂订单或在车库中整体解出
 STR_DEPOT_DEMOTE_SEGMENT                                        :{BLACK}降级
-STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP                                :{BLACK}将选定的单元降低一级：独立段恢复为普通编组/列车；编组则解散为车库中的松散车厢链（其调度订单会被移除）
+STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP                                :{BLACK}降低选定的单元：仅含车厢的段直接解散为车库中的松散车厢链（其调度与编号被移除）；含真机车的段恢复为普通列车。编组解散为松散车厢链
 
 ###length VEHICLE_TYPES
 STR_DEPOT_CLONE_TRAIN                                           :{BLACK}克隆列车
@@ -4699,7 +4699,7 @@ STR_ORDERS_END_OF_SHARED_ORDERS                                 :- - 共享调�
 # 挂接/解挂命令字符串 (解挂特性)
 STR_ORDER_DECOUPLE                                              :{BLACK}解挂
 STR_ORDER_DECOUPLE_BUTTON                                       :{BLACK}解挂
-STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}添加解挂命令。列车将在到达前一车站或车库时解下最后一段耦合段（耦合时挂上的那一组）
+STR_ORDER_DECOUPLE_TOOLTIP                                      :{BLACK}添加解挂命令。列车将在前一车站或车库解挂。之后选中该命令可设置解挂段边界：自动（解下最后一段耦合段）、解挂尾部若干段，或在第 n 段与第 n+1 段之间切开（将其后段全部解走）
 STR_ORDER_GO_TO_COUPLE                                          :前往并挂接车组
 STR_ORDER_GO_TO_COUPLE_STATION                                  :前往 {STATION} 并挂接车组
 STR_ORDER_GO_TO_COUPLE_DEPOT                                    :前往 {DEPOT} 并挂接车组
@@ -4707,8 +4707,11 @@ STR_ORDER_GO_TO_COUPLE_CARGO                                    : (载有 {STRIN
 STR_ORDER_GO_TO_COUPLE_BUTTON                                   :{BLACK}前往并挂接
 STR_ORDER_WAIT_COUPLE                                           :等待挂接
 STR_ORDER_WAIT_COUPLE_BUTTON                                    :{BLACK}等待挂接
-STR_ORDER_DECOUPLE_DETAILS                                      :解挂 {COMMA} 段
+STR_ORDER_DECOUPLE_DETAILS                                      :解挂尾部 {COMMA} 段
 STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :解挂尾部段
+STR_ORDER_DECOUPLE_DETAILS_HEAD                                 :在第 {COMMA} 段与第 {COMMA} 段之间解挂
+STR_ORDER_DECOUPLE_BOUNDARY                                     :{BLACK}解挂边界
+STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP                             :{BLACK}选择该解挂命令的切割位置：自动 / 解挂尾部 N 段 / 在第 n 段与第 n+1 段之间切开（将其后段全部解走）
 STR_ORDER_DECOUPLE_KEEP_ORDERS                                  :保留命令
 STR_ORDER_DECOUPLE_KEEP_ORDERS_NO_LOAD                          :保留命令, 不装货
 STR_ORDER_DECOUPLE_INHERIT_ORDERS                               :继承剩余命令
@@ -6071,3 +6074,7 @@ STR_BADGE_CONFIG_FILTERS                                        :{WHITE}筛选�
 STR_BADGE_CONFIG_PREVIEW                                        :预览图
 STR_BADGE_CONFIG_NAME                                           :名称
 STR_BADGE_FILTER_ANY_LABEL                                      :{STRING}：所有
+STR_ORDER_DECOUPLE_QUERY_TAIL                                  :解挂尾部 N 段…
+STR_ORDER_DECOUPLE_QUERY_HEAD                                  :在第 N 段与第 N+1 段之间解挂…
+STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :要解挂的尾部段数
+STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :从车头数起在第几段后切开

@@ -39,7 +39,7 @@
 #include "vehiclelist.h"
 #include "tracerestrict.h"
 #include "train.h"
-#include "consist_group.h"
+
 #include "date_func.h"
 #include "schdispatch.h"
 #include "timetable_cmd.h"
@@ -2076,6 +2076,10 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				}
 				break;
 
+			case OT_DECOUPLE:
+				if (mof != MOF_DECOUPLE_BOUNDARY) return CMD_ERROR;
+				break;
+
 			default:
 				return CMD_ERROR;
 		}
@@ -2405,6 +2409,12 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				return CMD_ERROR;
 			}
 			break;
+
+		case MOF_DECOUPLE_BOUNDARY:
+			if (!order->IsType(OT_DECOUPLE)) return CMD_ERROR;
+			if (static_cast<DecoupleBoundaryMode>(GB(data, 8, 8)) >= DecoupleBoundaryMode::End) return CMD_ERROR;
+			if (GB(data, 0, 8) > 63) return CMD_ERROR;
+			break;
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -2501,6 +2511,11 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					default:
 						NOT_REACHED();
 				}
+				break;
+			}
+
+			case MOF_DECOUPLE_BOUNDARY: {
+				order->SetDecoupleBoundary(static_cast<DecoupleBoundaryMode>(GB(data, 8, 8)), GB(data, 0, 8));
 				break;
 			}
 

@@ -138,7 +138,16 @@ private:
 			}
 			check_train_on_tile(tile);
 			if (best != nullptr) {
-				if (!best->current_order.IsType(OT_WAIT_COUPLE)) {
+				/* R3R: the tile may be occupied by the pathfinding locomotive's
+				 * own consist (it is still standing on the first segment of its
+				 * path, e.g. straddling a depot door or the rail in front of it).
+				 * That train drives away, so its occupied tile is not an obstacle
+				 * for the couple path - treat it as passable. Without this the
+				 * back-walk's CheckSafePositionOnNode fails on the loco's own
+				 * first tile (FSCP ... fail=notWC best=<self>) and the locomotive
+				 * is locked forever: no track, speed 0, COUPLE-FAIL every tick. */
+				if (best->index == Yapf().GetVehicle()->index) return true;
+				if (!R3RIsCarOnlyFormation(best) && !best->current_order.IsType(OT_WAIT_COUPLE)) {
 					FILE *dbg = fopen("R3R_debug.log", "a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "FSCP tile=%d,%d fail=notWC best=%d ord=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType());

@@ -31,10 +31,9 @@ enum DepotWidgets : WidgetID {
 	WID_D_STOP_ALL,        ///< Stop all button.
 	WID_D_START_ALL,       ///< Start all button.
 	WID_D_DEPARTURES,      ///< Departures button.
-	WID_D_SET_AS_FRONT_WAGON, ///< Set selected wagon chain as independent consist (front wagon).
-	WID_D_MAKE_SEGMENT,    ///< Turn the selected consist/train into an independent segment (R3R).
-	WID_D_DEMOTE_SEGMENT,  ///< Demote the selected segment/consist by one level (R3R).
-	WID_D_SHOW_SEGMENT_TOOLS, ///< Show the consist/segment tool row (R3R, trains only).
+	WID_D_MAKE_SEGMENT,    ///< Turn the selected loose wagon chain/consist/train into an independent segment (R3R).
+	WID_D_DEMOTE_SEGMENT,  ///< Demote the selected segment back to loose wagons or a plain train (R3R).
+	WID_D_SHOW_SEGMENT_TOOLS, ///< Show the segment tool row (R3R, trains only).
 };
 
 #endif /* WIDGETS_DEPOT_WIDGET_H */

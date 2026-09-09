@@ -9,7 +9,7 @@
 
 #include "stdafx.h"
 #include "train.h"
-#include "consist_group.h"
+
 #include "vehicle_func.h"
 #include "vehiclelist.h"
 #include "vehiclelist_func.h"

@@ -11,7 +11,6 @@
 #define YAPF_DESTRAIL_HPP
 
 #include "../../train.h"
-#include "../../consist_group.h"
 #include "../../vehicle_func.h"
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
@@ -290,14 +289,37 @@ public:
 		return dest_order.GetNumCouple() == CountVehiclesInChain(t);
 	}
 
-	/** Check the trace-restrict-slot requirement from the GOTO_COUPLE order. */
+	/** Check the trace-restrict-slot requirement from the GOTO_COUPLE order.
+	 * The couple-slot selector is a purely optional user restriction. Nothing
+	 * in the game sets it on GOTO_COUPLE orders (there is no SetCoupleSlot
+	 * caller and no order-window UI for it yet), so an unset order reads back
+	 * slot id 0 (the default xdata value), NOT the Invalid() sentinel 0xFFFF.
+	 * Slot 0 typically does not exist in the pool, so GetIfValid() returns
+	 * null and every candidate would be rejected. Treat an unset/0 slot and any
+	 * slot id that no longer resolves as "no restriction". A slot that exists
+	 * but holds no occupants cannot discriminate either — the decouple flow
+	 * never registers the waiting WAIT_COUPLE consist into the coupler's slot
+	 * automatically (occupancy only appears if the map's trace-restrict setup
+	 * adds it), so an empty slot must accept the sole waiting consist instead
+	 * of making every station pick-up impossible. The slot only rejects a
+	 * candidate when it genuinely holds some other consist. */
 	bool CheckOrderSlot(const Train *t) const
 	{
 		TraceRestrictSlotID slot = dest_order.GetCoupleSlot();
-		if (slot == TraceRestrictSlotID::Invalid()) return true;
+		if (slot == TraceRestrictSlotID::Invalid() || slot == TraceRestrictSlotID(0)) return true;
 		const TraceRestrictSlot *s = TraceRestrictSlot::GetIfValid(slot);
-		if (s == nullptr) return false;
-		return s->IsOccupant(t->index);
+		if (s == nullptr) return true;
+		if (s->IsOccupant(t->index)) return true;
+		if (s->occupants.empty()) return true;
+		{
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "COUPLE-SLOT-REJ u=%d slotRaw=%u nOcc=%zu\n",
+					(int)t->index.base(), (unsigned)slot.base(), s->occupants.size());
+				fclose(dbg);
+			}
+		}
+		return false;
 	}
 
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
@@ -343,7 +365,7 @@ public:
 						if (t == nullptr) {
 							for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
 								Train *first = tr->First();
-								if (tr->IsFrontEngine() && (IsConsistGroup(first) ||
+								if (tr->IsFrontEngine() && (R3RIsCarOnlyFormation(first) ||
 										(first->IsPrimaryVehicle() && first->current_order.IsType(OT_WAIT_COUPLE)))) {
 									t = first; break;
 								}
@@ -363,9 +385,9 @@ public:
 				while (IsCompatibleTrainStationTile(st0, tile)) st0 -= delta;
 				for (TileIndex st = st0 + delta; IsCompatibleTrainStationTile(st, tile); st += delta) {
 					for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
-						fprintf(dbg, "PFD-SCAN tile=%d,%d veh=%d front=%d cg=%d ord=%d\n",
+						fprintf(dbg, "PFD-SCAN tile=%d,%d veh=%d front=%d co=%d ord=%d\n",
 							(int)TileX(st), (int)TileY(st), (int)tr->index.base(),
-							(int)tr->IsFrontEngine(), (int)IsConsistGroup(tr->First()),
+							(int)tr->IsFrontEngine(), (int)R3RIsCarOnlyFormation(tr->First()),
 							(int)tr->current_order.GetType());
 					}
 				}
@@ -387,11 +409,11 @@ public:
 		{
 			FILE *dbg = fopen("R3R_debug.log", "a");
 			if (dbg != nullptr) {
-				bool cg = IsConsistGroup(t);
+				bool co = R3RIsCarOnlyFormation(t);
 				bool wc = t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE);
-				fprintf(dbg, "PFD tile=%d,%d t=%d cg=%d wc=%d ordType=%d fit=%d load=%d cargo=%d wag=%d slot=%d\n",
+				fprintf(dbg, "PFD tile=%d,%d t=%d co=%d wc=%d ordType=%d fit=%d load=%d cargo=%d wag=%d slot=%d\n",
 					(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
-					(int)cg, (int)wc, (int)t->current_order.GetType(),
+					(int)co, (int)wc, (int)t->current_order.GetType(),
 					(int)TrainFitStation(t),
 					(int)CheckOrderLoad(t), (int)CheckOrderCargoType(t),
 					(int)CheckNumberOfWagons(t), (int)CheckOrderSlot(t));
@@ -399,11 +421,12 @@ public:
 			}
 		}
 
-		/* R3R (pxp-decouple): the consist must fit into its station. */
+		/* R3R (pxp-decouple): the waiting formation must fit into its station. */
 		if (!TrainFitStation(t)) return false;
 
-		/* Target 1: a consist (zero-power locomotive chain) waiting to be coupled. */
-		if (IsConsistGroup(t)) return true;
+		/* Target 1: a car-only formation (zero-power train front) waiting to be
+		 * coupled. */
+		if (R3RIsCarOnlyFormation(t)) return true;
 
 		/* Target 2 (pxp-decouple reference): any primary vehicle whose current
 		 * order declares WAIT_COUPLE is a candidate, provided it satisfies all

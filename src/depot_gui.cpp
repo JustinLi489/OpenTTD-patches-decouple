@@ -92,7 +92,6 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 	EndContainer(),
 	NWidget(NWID_SELECTION, Colours::Invalid, WID_D_SHOW_SEGMENT_TOOLS),
 		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
-			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_SET_AS_FRONT_WAGON), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_SET_AS_FRONT_WAGON, STR_DEPOT_SET_AS_FRONT_WAGON_TOOLTIP),
 			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_MAKE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_MAKE_SEGMENT, STR_DEPOT_MAKE_SEGMENT_TOOLTIP),
 			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_DEMOTE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_DEMOTE_SEGMENT, STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP),
 		EndContainer(),
@@ -208,10 +207,11 @@ static void TrainDepotMoveSegment(const Train *front, const Vehicle *wagon)
 	Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, tile, seg->index, dest, MoveRailVehicleFlags::MoveChain);
 
 	if (dest == VehicleID::Invalid() && !seg->IsEngine()) {
-		/* A zero-power segment (a consist wagon group whose fake locomotive was
-		 * removed when it was coupled on) ends up as a free wagon chain: restore
-		 * its consist identity so it can again be scheduled and coupled by R3R. */
-		Command<Commands::SetAsFrontWagon>::Post(STR_ERROR_CAN_T_SET_AS_FRONT_WAGON, tile, seg->index, INVALID_CLIENT_ID);
+		/* A zero-power group (a segment/wagon group whose fake locomotive was
+		 * removed when it was coupled on) ends up as a free wagon chain: promote
+		 * it straight to an independent segment. R3R now has only two levels -
+		 * loose free wagons and segments - so this is the one-step upgrade. */
+		Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, tile, seg->index, INVALID_CLIENT_ID);
 	}
 }
 
@@ -950,12 +950,11 @@ struct DepotWindow : Window {
 				}
 				break;
 
-			case WID_D_SET_AS_FRONT_WAGON: // Make consist button
 			case WID_D_MAKE_SEGMENT:       // Make segment button (R3R)
 			case WID_D_DEMOTE_SEGMENT: {    // Demote segment button (R3R)
-				/* The three consist/segment tools share the object-placement slot: raising
-				 * one raises the others first. */
-				for (WidgetID w : { WID_D_SET_AS_FRONT_WAGON, WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
+				/* The two segment tools share the object-placement slot: raising
+				 * one raises the other first. */
+				for (WidgetID w : { WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
 					if (w != widget && this->IsWidgetLowered(w)) {
 						this->RaiseWidget(w);
 						this->SetWidgetDirty(w);
@@ -1077,16 +1076,9 @@ struct DepotWindow : Window {
 	 */
 	bool OnVehicleSelect(const Vehicle *v) override
 	{
-		if (this->IsWidgetLowered(WID_D_SET_AS_FRONT_WAGON)) {
-			/* Make consist mode: turn the clicked wagon chain into an independent consist. */
-			this->RaiseWidget(WID_D_SET_AS_FRONT_WAGON);
-			this->SetWidgetDirty(WID_D_SET_AS_FRONT_WAGON);
-			ResetObjectToPlace();
-			Command<Commands::SetAsFrontWagon>::Post(STR_ERROR_CAN_T_SET_AS_FRONT_WAGON, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
-			return true;
-		}
 		if (this->IsWidgetLowered(WID_D_MAKE_SEGMENT)) {
-			/* Make segment mode (R3R): turn the clicked consist/train into an independent segment. */
+			/* Make segment mode (R3R): loose wagon chains, consists and trains all
+			 * upgrade straight to an independent segment (one-step). */
 			this->RaiseWidget(WID_D_MAKE_SEGMENT);
 			this->SetWidgetDirty(WID_D_MAKE_SEGMENT);
 			ResetObjectToPlace();
@@ -1094,7 +1086,8 @@ struct DepotWindow : Window {
 			return true;
 		}
 		if (this->IsWidgetLowered(WID_D_DEMOTE_SEGMENT)) {
-			/* Demote segment mode (R3R): independent segment -> consist/train, consist -> free wagon chain. */
+			/* Demote segment mode (R3R): wagon-only segment -> loose free wagon chain,
+			 * locomotive segment -> plain train, consist -> loose free wagon chain. */
 			this->RaiseWidget(WID_D_DEMOTE_SEGMENT);
 			this->SetWidgetDirty(WID_D_DEMOTE_SEGMENT);
 			ResetObjectToPlace();
@@ -1185,8 +1178,8 @@ struct DepotWindow : Window {
 		this->RaiseWidget(WID_D_CLONE);
 		this->SetWidgetDirty(WID_D_CLONE);
 
-		/* abort make consist / segment tools */
-		for (WidgetID w : { WID_D_SET_AS_FRONT_WAGON, WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
+		/* abort the segment tools */
+		for (WidgetID w : { WID_D_MAKE_SEGMENT, WID_D_DEMOTE_SEGMENT }) {
 			if (this->IsWidgetLowered(w)) {
 				this->RaiseWidget(w);
 				this->SetWidgetDirty(w);

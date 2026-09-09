@@ -130,6 +130,22 @@ enum OrderDecoupleFlags : uint8_t {
 };
 
 /**
+ * How the boundary of a #OT_DECOUPLE order is measured.
+ *
+ * A coupled train is a chain of segments (a segment is a powered chain that
+ * was coupled on and whose front carries the SegmentFront marker; the train's
+ * own front is not a segment). A decouple order can either leave the choice to
+ * the auto heuristic (release the last coupled-on segment), or pick an explicit
+ * boundary that is counted either from the rear or from the head.
+ */
+enum class DecoupleBoundaryMode : uint8_t {
+	Auto,          ///< No explicit boundary: release the last coupled-on segment (legacy default).
+	TailSegments,  ///< Release the last N coupled-on segments (count from the rear).
+	HeadBoundary,  ///< Split between segment n and n + 1 counted from the head, releasing the segments behind it.
+	End,
+};
+
+/**
  * Load state condition for a #OT_GOTO_COUPLE order.
  */
 enum OrderCoupleLoadFlags : uint8_t {
@@ -334,6 +350,7 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_COLOUR,          ///< Change the colour value
 	MOF_LABEL_TEXT,      ///< Change the label text value
 	MOF_DEPARTURES_SUBTYPE, ///< Change the label departures subtype
+	MOF_DECOUPLE_BOUNDARY, ///< R3R: change the segment boundary of a decouple order.
 	MOF_END
 };
 
