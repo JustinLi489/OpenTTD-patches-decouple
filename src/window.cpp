@@ -8,6 +8,7 @@
 /** @file window.cpp Windowing system, widgets and events. */
 
 #include "stdafx.h"
+#include "r3r_perf.h"
 #include "company_func.h"
 #include "gfx_func.h"
 #include "console_func.h"
@@ -2663,8 +2664,14 @@ static EventState HandleViewportScroll()
 
 	if (_last_scroll_window == GetMainWindow() && _last_scroll_window->viewport->follow_vehicle != VehicleID::Invalid()) {
 		/* If the main window is following a vehicle, then first let go of it! */
-		const Vehicle *veh = Vehicle::Get(_last_scroll_window->viewport->follow_vehicle)->GetMovingFront();
-		ScrollMainWindowTo(veh->x_pos, veh->y_pos, veh->z_pos, true); // This also resets follow_vehicle
+		const Vehicle *veh = Vehicle::Get(_last_scroll_window->viewport->follow_vehicle);
+		if (veh != nullptr) {
+			veh = veh->GetMovingFront();
+			ScrollMainWindowTo(veh->x_pos, veh->y_pos, veh->z_pos, true); // This also resets follow_vehicle
+		} else {
+			/* The followed vehicle is gone; defensively stop following it. */
+			_last_scroll_window->viewport->CancelFollow(*_last_scroll_window);
+		}
 		return ES_NOT_HANDLED;
 	}
 
@@ -3402,6 +3409,10 @@ void UpdateWindows()
 
 	PerformanceMeasurer framerate(PFE_DRAWING);
 	PerformanceAccumulator::Reset(PFE_DRAWWORLD);
+
+	/* R3R perf probe (KI-14): once per rendered frame, dumps an aggregate line
+	 * to R3R_perf.log every 128 frames. */
+	R3RPerfFrameTick(delta_ms);
 
 	ProcessPendingPerformanceMeasurements();
 

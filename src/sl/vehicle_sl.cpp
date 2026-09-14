@@ -20,6 +20,7 @@
 #include "../company_func.h"
 #include "../disaster_vehicle.h"
 #include "../scope_info.h"
+#include "../r3r_perf.h"
 #include "../string_func.h"
 #include "../error.h"
 #include "../strings_func.h"
@@ -489,6 +490,12 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 				if (t->IsFrontEngine() || t->IsFreeWagon()) {
 					t->gcache.last_speed = t->cur_speed; // update displayed train speed
 					t->ConsistChanged(CCF_SAVELOAD);
+					/* R3R: the couple-priority/borrow state is runtime-only, so a load
+					 * leaves it at its defaults and decouples would take the legacy
+					 * hand-over path (KI-02/KI-05). Rebuild it from the order-list
+					 * pointers. Only on a real load: a NewGRF reload runs this same
+					 * pass with live state that must not be disturbed. */
+					if (part_of_load) R3RRebuildCouplePriorities(t);
 				}
 				break;
 			}
@@ -532,6 +539,38 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 				break;
 
 			default: break;
+		}
+	}
+
+	/* R3R (TEMPORARY DIAGNOSTIC): unconditional load census. Written on every call
+	 * so that "savegame not loaded" can be told apart from "loaded but no bad
+	 * vehicle". Reports every train with an unresolved visual effect wherever it
+	 * sits in the chain (not only at chain heads), plus its chain head identity. */
+	{
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "=== LOADCENSUS-ENTER part_of_load=%d ===\n", (int)part_of_load);
+			unsigned int ntot = 0, nbad = 0;
+			for (const Vehicle *w : Vehicle::Iterate()) {
+				if (w->type != VehicleType::Train) continue;
+				ntot++;
+				const bool bad = !HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
+						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT;
+				if (!bad) continue;
+				nbad++;
+				const Train *wt = Train::From(w);
+				const Vehicle *hd = w->First();
+				fprintf(dbg, "LOADCENSUS-BAD idx=%d cv=%02X st=%02X et=%u prev=%d next=%d first=%d FE=%d FW=%d FWG=%d ENG=%d VIRT=%d ART=%d\n",
+						(int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype,
+						(unsigned int)w->engine_type.base(),
+						(int)(w->Previous() != nullptr ? w->Previous()->index.base() : -1),
+						(int)(w->Next() != nullptr ? w->Next()->index.base() : -1),
+						(int)(hd != nullptr ? hd->index.base() : -1),
+						(int)wt->IsFrontEngine(), (int)wt->IsFreeWagon(), (int)wt->IsFrontWagon(),
+						(int)wt->IsEngine(), (int)wt->IsVirtual(), (int)wt->IsArticGroupMember());
+			}
+			fprintf(dbg, "=== LOADCENSUS-LEAVE total=%u bad=%u ===\n", ntot, nbad);
+			fclose(dbg);
 		}
 	}
 
@@ -632,6 +671,23 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 		v->UpdatePosition();
 		if (v->type != VehicleType::Ship || v->Previous() == nullptr) v->UpdateViewport(false);
 		v->cargo.AssertCountConsistency();
+	}
+
+	/* R3R (TEMPORARY DIAGNOSTIC): second sampling point, after the virtual-vehicle
+	 * cleanup above, to catch chains (re)linked after the ConsistChanged() calls at
+	 * the top of this function. */
+	{
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			unsigned int nbad = 0;
+			for (const Vehicle *w : Vehicle::Iterate()) {
+				if (w->type != VehicleType::Train) continue;
+				if (!HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
+						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT) nbad++;
+			}
+			fprintf(dbg, "=== LOADCENSUS-PHASE2END bad=%u ===\n", nbad);
+			fclose(dbg);
+		}
 	}
 }
 

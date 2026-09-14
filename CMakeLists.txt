@@ -536,6 +536,17 @@ if(OPTION_NO_TAGGED_PTRS)
     add_definitions(-DNO_TAGGED_PTRS)
 endif()
 
+# R3R: allow the compile-time probe default to be forced from the command line.
+# R3R_release_build.cmd passes -DR3R_PROBES_DEFAULT=0 so the published exe has
+# the R3R performance/logging probes compiled out (see src/r3r_perf.h, KI-28).
+# Without this block CMake would only warn "Manually-specified variables were
+# not used by the project" and the define would never reach build.ninja, so the
+# [5d] hard gate in R3R_release_build.cmd aborts with EXIT_CODE=94.
+if(DEFINED R3R_PROBES_DEFAULT)
+    add_definitions(-DR3R_PROBES_DEFAULT=${R3R_PROBES_DEFAULT})
+    message(STATUS "R3R probes default override -- -DR3R_PROBES_DEFAULT=${R3R_PROBES_DEFAULT}")
+endif()
+
 enable_testing()
 
 add_subdirectory(regression)

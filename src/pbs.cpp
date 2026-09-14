@@ -17,6 +17,7 @@
 #include "newgrf_newsignals.h"
 #include "train_speed_adaptation.h"
 #include "bridge_signal_map.h"
+#include "r3r_perf.h"
 
 #include "table/strings.h"
 
@@ -263,7 +264,7 @@ void UnreserveRailTrack(TileIndex tile, Track t)
 				/* DEBUG (R3R): log EVERY unreserve of a station platform tile, to
 				 * find who clears the WAIT_COUPLE consist's reservation. */
 				{
-					FILE *dbg = fopen("R3R_debug.log", "a");
+					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "UNRESERVE-STATION tile=%d,%d\n",
 								(int)TileX(tile), (int)TileY(tile));

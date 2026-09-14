@@ -1098,6 +1098,22 @@ void ConPrintFramerate()
 }
 
 /**
+ * R3R (KI-26 step 3): current "GL train ticks" average, in ms per frame.
+ *
+ * Exactly the number the in-game 'framerates' command prints for the train
+ * element, from the same _pf_data entry, so a Release run can log it next to the
+ * R3R probes and the "trains line" comparison no longer needs a Debug build nor
+ * an OCR of the framerate window.
+ * @return ms per frame, or -1.0 when no measurement has been taken yet.
+ */
+double R3RGetTrainsMs()
+{
+	auto &pf = _pf_data[PFE_GL_TRAINS];
+	if (pf.num_valid == 0) return -1.0;
+	return pf.GetAverageDurationMilliseconds(NUM_FRAMERATE_POINTS / 4);
+}
+
+/**
  * This drains the PFE_SOUND measurement data queue into _pf_data.
  * PFE_SOUND measurements are made by the mixer thread and so cannot be stored
  * into _pf_data directly, because this would not be thread safe and would violate

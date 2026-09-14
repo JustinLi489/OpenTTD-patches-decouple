@@ -3476,6 +3476,20 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
 
 	extern void UpdateDeparturesWindowVehicleFilter(const OrderList *order_list, bool remove);
 
+	/* R3R (couple priority, route A): this vehicle is executing a schedule that is
+	 * BORROWED from another segment of its consist (the consist's command owner).
+	 * The owner still holds the pointer and the borrow is deliberately not a shared
+	 * order list, so IsOrderListShared() is false here -- freeing v->orders would
+	 * destroy the owner's schedule and leave it dangling. Give the borrow back and
+	 * delete this vehicle's own schedule instead. */
+	if (v->r3r_orders_borrowed) {
+		v->orders = v->orders_backup;
+		v->orders_backup = nullptr;
+		v->r3r_orders_borrowed = false;
+		v->orders_backup_real_index = INVALID_VEH_ORDER_ID;
+		v->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
+	}
+
 	if (v->IsOrderListShared()) {
 		/* Remove ourself from the shared order list. */
 		UpdateDeparturesWindowVehicleFilter(v->orders, false);

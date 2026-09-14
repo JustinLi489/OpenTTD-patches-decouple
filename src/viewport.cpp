@@ -4541,6 +4541,13 @@ void UpdateNextViewportPosition(Window *w, uint32_t delta_ms)
 {
 	const Viewport *vp = w->viewport;
 
+	/* Guard: the followed vehicle's pool slot may already have been freed (e.g. a
+	 * vehicle-view window whose train lost its primary identity was sold without
+	 * the window being closed). Drop the follow instead of dereferencing null. */
+	if (w->viewport->follow_vehicle != VehicleID::Invalid() && Vehicle::Get(w->viewport->follow_vehicle) == nullptr) {
+		w->viewport->CancelFollow(*w);
+	}
+
 	if (w->viewport->follow_vehicle != VehicleID::Invalid()) {
 		const Vehicle *veh = Vehicle::Get(w->viewport->follow_vehicle)->GetMovingFront();
 		Point pt = MapXYZToViewport(vp, veh->x_pos, veh->y_pos, veh->z_pos);

@@ -8,6 +8,7 @@
 /** @file newgrf_engine.cpp NewGRF handling of engines. */
 
 #include "stdafx.h"
+#include "r3r_perf.h"
 #include "debug.h"
 #include "train.h"
 #include "roadveh.h"
@@ -428,6 +429,14 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
  */
 static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 {
+	/* R3R perf probe (KI-14): this runs on the sprite path, so its cost is a
+	 * frame-rate cost. pos_steps is the interesting one: the segment walk is
+	 * O(n) per vehicle, i.e. O(n^2) per chain whenever the NewGRF cache is
+	 * invalidated. */
+	R3RPerfCounters &r3rp = R3RP();
+	r3rp.pos_helper++;
+	R3RPerfTimer r3r_pos_timer(&r3rp.pos_ns);
+
 	const Vehicle *u;
 	uint8_t chain_before = 0;
 	uint8_t chain_after  = 0;
@@ -457,6 +466,10 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 		chain_after++;
 		u = u->Next();
 	}
+
+	const uint64_t r3r_steps = (uint64_t)chain_before + chain_after;
+	r3rp.pos_steps += r3r_steps;
+	if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
 
 	return chain_before | chain_after << 8 | (chain_before + chain_after + consecutive) << 16;
 }

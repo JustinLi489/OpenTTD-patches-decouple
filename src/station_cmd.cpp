@@ -66,6 +66,7 @@
 #include "landscape_cmd.h"
 #include "rail_cmd.h"
 #include "tile_cmd.h"
+#include "r3r_perf.h"
 #include "road_layout_func.h"
 
 #include "widgets/station_widget.h"
@@ -3677,7 +3678,7 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
 		if (IsRailStationTile(ti->tile) && !HasStationReservation(ti->tile)) {
 			static uint32_t r3r_draw_n = 0;
 			if ((r3r_draw_n++ % 200) == 0) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "DRAW-STATION-NORES tile=%d,%d overlayBranch=%d showRes=%d\n",
 							(int)TileX(ti->tile), (int)TileY(ti->tile), (int)used_overlay_branch,

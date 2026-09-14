@@ -41,6 +41,7 @@
 #include "tbtr_template_vehicle_cmd.h"
 #include "tbtr_template_vehicle_func.h"
 #include "scope.h"
+#include "r3r_perf.h"
 
 #include <cstdio>
 
@@ -330,7 +331,7 @@ static void R3RStopChainInDepot(Train *t)
  *  railflags instead (subtype artic bit cleared). */
 static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 {
-	FILE *dbg = fopen("R3R_debug.log", "a");
+	FILE *dbg = R3RFopenDbg("a");
 	if (dbg == nullptr) return;
 	if (head == nullptr) {
 		fprintf(dbg, "MAKESEG %s head=NULL\n", tag);
@@ -536,7 +537,7 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 	while (t->Previous() != nullptr) t = t->Previous();
 
 	/* R3R debug probe: log the command receipt and every validation result. */
-	FILE *dbg = fopen("R3R_debug.log", "a");
+	FILE *dbg = R3RFopenDbg("a");
 	if (dbg != nullptr) {
 		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d chainInDepot=%d nxt=%d\n",
 			(int)veh_id.base(), tile.base(), flags.Test(DoCommandFlag::Execute) ? 1 : 0,

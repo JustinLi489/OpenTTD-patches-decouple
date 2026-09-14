@@ -675,4 +675,8 @@ Train *R3RCreateCarOnlyFormation(Train *front_wagon);
 void R3RDestroyCarOnlyFormation(Train *front);
 bool R3RIsCarOnlyFormation(const Train *v);
 
+/* R3R couple priority (route A): the priority/borrow state of a consist is
+ * runtime-only, so it is rebuilt from the order-list pointers after a load. */
+void R3RRebuildCouplePriorities(Train *chain);
+
 #endif /* TRAIN_H */

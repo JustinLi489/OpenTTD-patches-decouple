@@ -13,6 +13,7 @@
 #include "../../core/bitmath_func.hpp"
 #include "../../tile_type.h"
 #include "../../track_type.h"
+#include "../../r3r_perf.h"
 
 /** YAPF origin provider base class - used when origin is one tile / multiple trackdirs */
 template <class Types>
@@ -105,7 +106,7 @@ public:
 	void PfSetStartupNodes()
 	{
 		if (this->origin_tile == TileXY(38, 35)) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-STARTUP origin=%d,%d td=%d revTile=%d,%d revTd=%d\n",
 						(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),

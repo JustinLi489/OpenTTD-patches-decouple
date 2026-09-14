@@ -19,6 +19,7 @@
 #include "../../tracerestrict.h"
 #include "../../debug.h"
 #include "../../misc/dbg_helpers.h"
+#include "../../r3r_perf.h"
 
 #include "../../safeguards.h"
 
@@ -108,7 +109,7 @@ private:
 	bool FindSafeCouplePositionProc(TileIndex tile, Trackdir td)
 	{
 		if (IsRailDepotTile(tile)) {
-		FILE *dbg = fopen("R3R_debug.log", "a");
+		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
 			fprintf(dbg, "FSCP tile=%d,%d fail=depot\n", (int)TileX(tile), (int)TileY(tile));
 			fclose(dbg);
@@ -148,7 +149,7 @@ private:
 				 * is locked forever: no track, speed 0, COUPLE-FAIL every tick. */
 				if (best->index == Yapf().GetVehicle()->index) return true;
 				if (!R3RIsCarOnlyFormation(best) && !best->current_order.IsType(OT_WAIT_COUPLE)) {
-					FILE *dbg = fopen("R3R_debug.log", "a");
+					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "FSCP tile=%d,%d fail=notWC best=%d ord=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType());
 						fclose(dbg);
@@ -156,7 +157,7 @@ private:
 					return false;
 				}
 				if (second_best != nullptr) {
-					FILE *dbg = fopen("R3R_debug.log", "a");
+					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "FSCP tile=%d,%d fail=2nd best=%d 2nd=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)second_best->index.base());
 						fclose(dbg);
@@ -166,7 +167,7 @@ private:
 				Vehicle *other_train = nullptr;
 				FollowTrainReservation(best, &other_train);
 				if (other_train != nullptr && other_train != best) {
-					FILE *dbg = fopen("R3R_debug.log", "a");
+					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "FSCP tile=%d,%d fail=other best=%d other=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)other_train->index.base());
 						fclose(dbg);
@@ -176,7 +177,7 @@ private:
 			}
 		} else if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
 			if (!TryReserveRailTrack(tile, TrackdirToTrack(td))) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d\n", (int)TileX(tile), (int)TileY(tile), (int)td);
 					fclose(dbg);
@@ -615,7 +616,7 @@ public:
 		{
 			const bool is_depot = IsRailDepotTile(old_node.GetLastTile());
 			if (is_depot || (TileX(old_node.GetLastTile()) == 38 && TileY(old_node.GetLastTile()) == 27)) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "DEPOTCHK t=%d,%d isDepot=%d isRailway=%d parent=%s\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)is_depot, (int)IsTileType(old_node.GetLastTile(), TileType::Railway), old_node.parent != nullptr ? "y" : "n");
 					fclose(dbg);
@@ -627,7 +628,7 @@ public:
 		if (Yapf().GetVehicle()->current_order.IsType(OT_GOTO_COUPLE)) {
 			TrackFollower F2(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
 			if (F2.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-FOLLOW from=%d,%d td=%d to=%d,%d tdbits=0x%x\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)old_node.GetLastTrackdir(), (int)TileX(F2.new_tile), (int)TileY(F2.new_tile), (unsigned)F2.new_td_bits);
 					fclose(dbg);
@@ -657,7 +658,7 @@ public:
 	{
 		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-ORIGIN veh=%d origin=%d,%d td=%d vehDir=%d vehTd=%d dontReserve=%d\n",
 						(int)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile),
@@ -671,7 +672,7 @@ public:
 
 		bool path_found = Yapf().FindPath(v);
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-PATHFOUND veh=%d found=%d\n", (int)v->index.base(), (int)path_found);
 				fclose(dbg);
@@ -710,7 +711,7 @@ public:
 				}
 			}
 			{
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d\n",
 							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
@@ -720,7 +721,7 @@ public:
 			}
 		}
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-BEST veh=%d tile=%d,%d td=%d cost=%d\n",
 						(int)v->index.base(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
@@ -752,7 +753,7 @@ public:
 			pNode = pNode->parent;
 
 			{
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()));
 					fclose(dbg);
@@ -760,7 +761,7 @@ public:
 			}
 			if (!this->CheckSafePositionOnNode(pPrev)) {
 				{
-					FILE *dbg = fopen("R3R_debug.log", "a");
+					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d\n",
 								(int)v->index.base(), (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()));
@@ -785,7 +786,7 @@ public:
 		Trackdir best_td = INVALID_TRACKDIR;
 		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
 			if (depth <= 15) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
 					fclose(dbg);
@@ -832,7 +833,7 @@ public:
 		TrackdirBits tdb;
 		tdb = GetTileTrackdirBits(st, ::TransportType::TRANSPORT_RAIL, 0);
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-TRACE st=%d,%d tdb=0x%x\n", (int)TileX(st), (int)TileY(st), (unsigned)tdb);
 				fclose(dbg);
@@ -844,7 +845,7 @@ public:
 			if (reach(st, td, 0)) { best_td = td; break; }
 		}
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-TRACE-RESULT st=%d,%d best=%d\n", (int)TileX(st), (int)TileY(st), (int)best_td);
 				fclose(dbg);
@@ -855,7 +856,7 @@ public:
 			if (!dont_reserve) {
 				std::function<bool(TileIndex, Trackdir, int)> rp = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
 					if (depth <= 15) {
-						FILE *dbg = fopen("R3R_debug.log", "a");
+						FILE *dbg = R3RFopenDbg("a");
 						if (dbg != nullptr) {
 							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
 							fclose(dbg);
@@ -969,7 +970,7 @@ public:
 		if (!dont_reserve) {
 			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
 			{
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
 							(int)v->index.base(), (int)reserved, (int)next_trackdir);
@@ -1176,7 +1177,7 @@ public:
 		/* find the best path */
 		path_found = Yapf().FindPath(v);
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CRT veh=%d order=%d dir=%d origin=%d,%d td=%d found=%d\n",
 						(int)v->index.base(), (int)v->current_order.GetType(), (int)v->direction,
@@ -1382,7 +1383,7 @@ bool YapfTrainCheckReverse(const Train *v)
 		const int rel_x = TileX(tile_rev) - TileX(tile);
 		const int rel_y = TileY(tile_rev) - TileY(tile);
 		if (rel_x * delta.x + rel_y * delta.y > 0) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\n",
 						(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)moving_front->direction,
@@ -1488,7 +1489,7 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
 Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 {
 	{
-		FILE *dbg = fopen("R3R_debug.log", "a");
+		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
 			fprintf(dbg, "CPL-ENTRY veh=%d tile=%d,%d orderType=%d dontReserve=%d\n",
 					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),

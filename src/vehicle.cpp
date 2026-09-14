@@ -69,6 +69,7 @@
 #include "train_cmd.h"
 #include "vehicle_cmd.h"
 #include "tile_cmd.h"
+#include "r3r_perf.h"
 #include "3rdparty/cpp-btree/btree_set.h"
 #include "3rdparty/cpp-btree/btree_map.h"
 #include "3rdparty/robin_hood/robin_hood.h"
@@ -1211,6 +1212,13 @@ void Vehicle::PreDestructor()
 	if (this->Previous() == nullptr) {
 		InvalidateWindowData(WindowClass::VehicleDepot, this->tile.base());
 	}
+
+	/* A vehicle-view window's viewport follows its window_number (the vehicle
+	 * index) unconditionally, so it must never outlive the vehicle. The block
+	 * below only closes it while the vehicle is still a primary vehicle; custom
+	 * code can strip that identity before the vehicle is destroyed, so close it
+	 * here regardless. */
+	CloseWindowById(WindowClass::VehicleView, this->index);
 
 	if (this->IsPrimaryVehicle()) {
 		CloseWindowById(WindowClass::VehicleView, this->index);
@@ -4371,6 +4379,24 @@ void Vehicle::ShowVisualEffect(uint max_speed) const
 			if (effect_model >= VisualEffectSpawnModel::End) effect_model = VisualEffectSpawnModel::None; // unknown spawning model
 		} else {
 			effect_model = static_cast<VisualEffectSpawnModel>(GB(v->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT));
+			if (effect_model == VisualEffectSpawnModel::None) {
+				/* R3R (TEMPORARY DIAGNOSTIC): a resolved visual effect never has the
+				 * default type here, so this is the pre-crash crime scene. Dump the
+				 * whole consist with its cached values so the offending vehicle and
+				 * its chain head can be identified. */
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "VIS-MISS this=%d sub=%02X veh=%d cv=%02X\n",
+							(int)this->index.base(), (int)this->subtype,
+							(int)v->index.base(), (int)v->vcache.cached_vis_effect);
+					unsigned int i = 0;
+					for (const Vehicle *w = this; w != nullptr; w = w->Next(), i++) {
+						fprintf(dbg, "  VIS-MISS[%u] idx=%d cv=%02X st=%02X et=%u\n",
+								i, (int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype, (unsigned int)w->engine_type.base());
+					}
+					fclose(dbg);
+				}
+			}
 			assert(to_underlying(effect_model) != to_underlying(VE_TYPE_DEFAULT)); // should have been resolved by UpdateVisualEffect
 			static_assert(to_underlying(VisualEffectSpawnModel::Steam) == to_underlying(VE_TYPE_STEAM));
 			static_assert(to_underlying(VisualEffectSpawnModel::Diesel) == to_underlying(VE_TYPE_DIESEL));

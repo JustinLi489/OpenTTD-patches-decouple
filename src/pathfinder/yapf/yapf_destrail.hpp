@@ -14,6 +14,7 @@
 #include "../../vehicle_func.h"
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
+#include "../../r3r_perf.h"
 
 class CYapfDestinationRailBase {
 protected:
@@ -312,7 +313,7 @@ public:
 		if (s->IsOccupant(t->index)) return true;
 		if (s->occupants.empty()) return true;
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "COUPLE-SLOT-REJ u=%d slotRaw=%u nOcc=%zu\n",
 					(int)t->index.base(), (unsigned)slot.base(), s->occupants.size());
@@ -331,7 +332,7 @@ public:
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
 		if (IsRailStationTile(tile)) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "PFD tile=%d,%d td=%d trackbits=0x%x hasRes=%d\n",
 					(int)TileX(tile), (int)TileY(tile), (int)td,
@@ -378,7 +379,7 @@ public:
 			}
 		}
 		if (t == nullptr && IsRailStationTile(tile)) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				const TileIndexDiff delta = TileOffsByAxis(GetRailStationAxis(tile));
 				TileIndex st0 = tile;
@@ -396,7 +397,7 @@ public:
 		}
 		if (t == nullptr) {
 			if (IsRailStationTile(tile)) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "PFD tile=%d,%d hasResButNoTrain\n",
 						(int)TileX(tile), (int)TileY(tile));
@@ -407,7 +408,7 @@ public:
 		}
 		t = t->First();
 		{
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				bool co = R3RIsCarOnlyFormation(t);
 				bool wc = t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE);

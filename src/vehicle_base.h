@@ -28,6 +28,7 @@
 #include "network/network.h"
 #include "core/alignment.hpp"
 #include "sl/saveload_common.h"
+#include "r3r_perf.h"
 #include <array>
 #include <vector>
 
@@ -377,6 +378,8 @@ public:
 	UnitID unitnumber_backup = 0;                ///< R3R: this vehicle's own unit number while it inherits the consist's number (restored on decouple). NOSAVE.
 	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). NOSAVE.
 	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. NOSAVE.
+	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). NOSAVE.
+	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A); the owner keeps its own pointer, so this list must never be freed by this vehicle. NOSAVE.
 
 	NO_UNIQUE_ADDRESS NewGRFCache grf_cache{};   ///< Cache of often used calculated NewGRF values
 	Direction cur_image_valid_dir = Direction::Invalid; ///< NOSAVE: direction for which cur_image does not need to be regenerated on the next tick
@@ -1054,7 +1057,7 @@ public:
 		/* DEBUG (R3R — remove): log index advancement for GOTO_COUPLE locomotives. */
 		if (this->type == VehicleType::Train && (this->current_order.IsType(OT_GOTO_COUPLE) ||
 				(this->GetOrder(this->cur_real_order_index) != nullptr && this->GetOrder(this->cur_real_order_index)->IsType(OT_GOTO_COUPLE)))) {
-			FILE *dbg = fopen("R3R_debug.log", "a");
+			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "ADVANCE: veh=%d order=%d real_before=%d implicit_before=%d\n",
 						(int)this->index.base(), (int)this->current_order.GetType(), (int)this->cur_real_order_index, (int)this->cur_implicit_order_index);
