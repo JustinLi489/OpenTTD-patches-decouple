@@ -40,6 +40,7 @@ enum class VehicleRailFlag : uint8_t {
 	BreakdownSpeed            = 12, ///< Train has a reduced maximum speed because of a breakdown.
 	BreakdownStopped          = 13, ///< Train is stopped because of a breakdown.
 	NeedRepair                = 14, ///< Train has a reduced maximum speed because of a critical breakdown.
+	SegmentBack               = 15, ///< R3R: this vehicle is the last vehicle of a coupled-on segment; marks the segment's right boundary so vehicles dragged behind it are not mistaken for its contents. Formerly a reserved JGRPP bit.
 	BeyondPlatformEnd         = 16,
 	NotYetInPlatform          = 17,
 	AdvanceInPlatform         = 18,
@@ -164,6 +165,13 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void SetSegmentFront() { this->flags.Set(VehicleRailFlag::SegmentFront); }
 	/** Clear the segment-front marker (the vehicle is no longer part of a coupled chain boundary). */
 	void ClearSegmentFront() { this->flags.Reset(VehicleRailFlag::SegmentFront); }
+
+	/** Whether this vehicle is the last vehicle of a coupled-on segment (its right boundary). */
+	bool IsSegmentBack() const { return this->flags.Test(VehicleRailFlag::SegmentBack); }
+	/** Mark this vehicle as the last vehicle of a coupled-on segment. */
+	void SetSegmentBack() { this->flags.Set(VehicleRailFlag::SegmentBack); }
+	/** Clear the segment-back marker. */
+	void ClearSegmentBack() { this->flags.Reset(VehicleRailFlag::SegmentBack); }
 
 	/**
 	 * R3R group-role view: is this vehicle an articulated-group *member* (part role)?

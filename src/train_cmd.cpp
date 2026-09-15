@@ -1774,6 +1774,14 @@ void R3RDestroyCarOnlyFormation(Train *front)
 	front->ClearEngine();
 	front->SetWagon();
 	front->SetFreeWagon();
+	/* R3R: the segment right-boundary marker goes away together with the formation
+	 * identity: this chain is an ordinary free-wagon chain again. Only this
+	 * segment's own run is touched (up to the next segment boundary), so the
+	 * markers of following segments are left alone. */
+	for (Train *w = front; w != nullptr; w = w->Next()) {
+		if (w != front && w->IsSegmentFront()) break;
+		w->ClearSegmentBack();
+	}
 	/* NOTE: no ConsistChanged() here! After ArrangeTrains merged the formation
 	 * into the locomotive's chain, `front` is no longer a chain head, and
 	 * ConsistChanged requires `this` to be the head (assertion at
@@ -4761,18 +4769,26 @@ static void R3RReverseChainDirections(Train *chain)
 	}
 }
 
+/** R3R: 一条链上的段边界快照:★ 段首车与段右边界标记车(段尾)。 */
+struct R3RSegBoundaries {
+	std::vector<Train *> fronts; ///< 段首(★)车辆,按链序。
+	std::vector<Train *> backs;  ///< 段右边界(SegmentBack)车辆,按链序。
+};
+
 /**
- * R3R: 收集链上所有带段标记(SegmentFront ★)的车辆。
+ * R3R: 快照链上所有段边界标记。逻辑反转(R3RFlipChainBySegments)会把 ★ 与段
+ * 右边界标记一起迁移,回滚(R3RUndoLogicalFlip)时按本快照逐车原样还原。
  * @param chain 链头。
- * @return 段首车辆列表(按链序)。
+ * @return 段边界快照(fronts = ★ 段首,backs = 段右边界标记)。
  */
-static std::vector<Train *> R3RCollectSegmentFronts(Train *chain)
+static R3RSegBoundaries R3RCaptureSegBoundaries(Train *chain)
 {
-	std::vector<Train *> segs;
+	R3RSegBoundaries bounds;
 	for (Train *w = chain; w != nullptr; w = w->Next()) {
-		if (w->IsSegmentFront()) segs.push_back(w);
+		if (w->IsSegmentFront()) bounds.fronts.push_back(w);
+		if (w->IsSegmentBack()) bounds.backs.push_back(w);
 	}
-	return segs;
+	return bounds;
 }
 
 /** R3R: 一辆车上的 de-articulated 组角色位快照条目(head/member 二选一或全无)。 */
@@ -4801,26 +4817,31 @@ static std::vector<R3RArticRoleState> R3RCaptureArticRoles(Train *chain)
 
 /**
  * R3R: 撤销一次 R3RFlipChainBySegments。调用方必须先 RestoreTrainBackup
- * 恢复链序(本函数假定 chain 已是原链头),这里把方向翻回、段标记还原为
- * 翻转前的分布,并把 de-articulated 组的角色位也按快照还原。
+ * 恢复链序(本函数假定 chain 已是原链头),这里把方向翻回、段边界标记(★ 段首
+ * 与 SegmentBack 段右边界)还原为翻转前的分布,并把 de-articulated 组的角色位
+ * 也按快照还原。
  * 角色位必须还原的原因:R3RFlipChainBySegments 第 4b 步会把组角色迁移到
  * 反转后的组首,回滚若不还原,翻转前的链头(现处组内)会残留 ArticGroupMember
  * 且 Previous() 为空 —— NewGRF 变量 0x4D("articulated 组内位置")等沿
  * Previous() 回走的代码会对空指针调用虚函数,机车刚碰上车厢即卡死崩溃。
- * @param chain          已恢复链序的原链头。
- * @param old_seg_fronts 翻转前收集的段首车辆(R3RCollectSegmentFronts 的结果)。
- * @param old_roles      翻转前收集的组角色位(R3RCaptureArticRoles 的结果)。
+ * @param chain      已恢复链序的原链头。
+ * @param old_bounds 翻转前收集的段边界快照(R3RCaptureSegBoundaries 的结果)。
+ * @param old_roles  翻转前收集的组角色位(R3RCaptureArticRoles 的结果)。
  */
-static void R3RUndoLogicalFlip(Train *chain, const std::vector<Train *> &old_seg_fronts,
+static void R3RUndoLogicalFlip(Train *chain, const R3RSegBoundaries &old_bounds,
                                const std::vector<R3RArticRoleState> &old_roles)
 {
 	assert(chain != nullptr && chain->First() == chain);
 
 	R3RReverseChainDirections(chain);
 
-	/* 清除逻辑反转期间新标/迁移的 ★,再恢复原段首。 */
-	for (Train *w = chain; w != nullptr; w = w->Next()) w->ClearSegmentFront();
-	for (Train *w : old_seg_fronts) w->SetSegmentFront();
+	/* 先全清反转期间新标/迁移的段边界标记,再按快照把 ★ 与段右边界逐车还原。 */
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		w->ClearSegmentFront();
+		w->ClearSegmentBack();
+	}
+	for (Train *w : old_bounds.fronts) w->SetSegmentFront();
+	for (Train *w : old_bounds.backs) w->SetSegmentBack();
 
 	/* 角色位先全清(去掉翻转期间迁移/新设的位),再按快照逐车原样还原。 */
 	for (Train *w = chain; w != nullptr; w = w->Next()) {
@@ -5056,11 +5077,25 @@ static Train *R3RFlipChainBySegments(Train *chain)
 	for (R3RSegGroup &s : segs) {
 		if (s.blocks.empty()) continue;
 		Train *old_front = s.blocks.front().front();
+		Train *new_front = s.blocks.back().front();
 		bool old_head_is_segment = old_front->IsSegmentFront();
 		if (old_head_is_segment) old_front->ClearSegmentFront();
 		/* 旧段首是段(带 ★)或该组含引擎(真/假引擎,含 consist 假引擎头)时,
 		 * 反转后该组仍是可独立成段的组 → 新段首打 ★。 */
-		if (old_head_is_segment || s.has_engine) s.blocks.back().front()->SetSegmentFront();
+		if (old_head_is_segment || s.has_engine) new_front->SetSegmentFront();
+		/* R3R: 段右边界(SegmentBack)随段首一起迁移。组内反转后新段尾 = 旧段首块
+		 * 的尾车,而旧段尾(带标记时)现在落进了新段首块内部:先把它上面的标记
+		 * 摘掉,再在新段尾补上。必须按"块首/块尾"而不是单一车辆处理,artic 块
+		 * (父车 + parts)才正确 —— 全为单辆块时 blocks.front().back() == old_front、
+		 * blocks.back().back() == new_front,行为与旧实现完全一致。
+		 * 这样"段 = ★ 起、右边界标记止"在反转后依然成立,depot 拖动不会把段后
+		 * 拖挂进来的车辆算作段内容。 */
+		Train *old_tail = s.blocks.back().back();
+		Train *new_tail = s.blocks.front().back();
+		if (old_tail->IsSegmentBack()) {
+			old_tail->ClearSegmentBack();
+			new_tail->SetSegmentBack();
+		}
 	}
 
 	/* 4b. 组角色迁移(打散态):段内倒序重链后,把每个 de-articulated 组的
@@ -5246,8 +5281,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	};
 	bool u_flipped = false;
 	bool v_flipped = false;
-	std::vector<Train *> u_old_seg_fronts;
-	std::vector<Train *> v_old_seg_fronts;
+	R3RSegBoundaries u_old_bounds;
+	R3RSegBoundaries v_old_bounds;
 	std::vector<R3RArticRoleState> u_old_roles;
 	std::vector<R3RArticRoleState> v_old_roles;
 	Train *u_merged_head = u;
@@ -5284,7 +5319,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		RestoreTrainBackup(original_dst);
 		R3RRefreshChainCaches(v);
 		R3RRefreshChainCaches(u);
-		u_old_seg_fronts = R3RCollectSegmentFronts(u);
+		u_old_bounds = R3RCaptureSegBoundaries(u);
 		u_old_roles = R3RCaptureArticRoles(u);
 		{
 			FILE *dbg = R3RFopenDbg("a");
@@ -5335,7 +5370,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			/* 候选1 失败:撤销只翻 u(u 回原样后进候选2)。 */
 			RestoreTrainBackup(original_src);
 			RestoreTrainBackup(original_dst);
-			R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
+			R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles);
 			u_flipped = false;
 			R3RRefreshChainCaches(v);
 			R3RRefreshChainCaches(u);
@@ -5350,7 +5385,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) { fprintf(dbg, "A3-FLIP-V-ONLY\n"); fclose(dbg); }
 			}
-			v_old_seg_fronts = R3RCollectSegmentFronts(v);
+			v_old_bounds = R3RCaptureSegBoundaries(v);
 			v_old_roles = R3RCaptureArticRoles(v);
 			Train *v_flip_head = R3RFlipChainBySegments(v);
 			v_flipped = true;
@@ -5371,7 +5406,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			if (v_flip_head != v && !v_flip_head->IsEngine()) {
 				RestoreTrainBackup(original_src);
 				RestoreTrainBackup(original_dst);
-				R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+				R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
 				v_flipped = false;
 				R3RRefreshChainCaches(v);
 				R3RRefreshChainCaches(u);
@@ -5393,7 +5428,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					/* 候选2 失败:撤销只翻 v(逻辑翻回原状)。 */
 					RestoreTrainBackup(original_src);
 					RestoreTrainBackup(original_dst);
-					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+					R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
 					v_flipped = false;
 					R3RRefreshChainCaches(v);
 					R3RRefreshChainCaches(u);
@@ -5413,7 +5448,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-FLIPV\n"); fclose(dbg); }
 				}
-				v_old_seg_fronts = R3RCollectSegmentFronts(v);
+				v_old_bounds = R3RCaptureSegBoundaries(v);
 				head = R3RFlipChainBySegments(v);
 				v_flipped = true;
 				u_flip_head = R3RFlipChainBySegments(u);
@@ -5429,8 +5464,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					 * 重试)。走到这里说明"候选3 也不可行"是本 tick 实测结论。 */
 					RestoreTrainBackup(original_src);
 					RestoreTrainBackup(original_dst);
-					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
-					R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
+					R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
+					R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles);
 					v_flipped = false;
 					u_flipped = false;
 					R3RRefreshChainCaches(v);
@@ -5454,8 +5489,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					/* 彻底失败:把两条链都翻回原状再报错(下次触发会重头试)。 */
 					RestoreTrainBackup(original_src);
 					RestoreTrainBackup(original_dst);
-					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
-					R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
+					R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
+					R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles);
 					v_flipped = false;
 					u_flipped = false;
 					R3RRefreshChainCaches(v);
@@ -5483,8 +5518,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	if (!ok) {
 		RestoreTrainBackup(original_src);
 		RestoreTrainBackup(original_dst);
-		if (v_flipped) R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
-		if (u_flipped) R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
+		if (v_flipped) R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
+		if (u_flipped) R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles);
 		R3RRefreshChainCaches(v);
 		R3RRefreshChainCaches(u);
 		v->ConsistChanged(CCF_ARRANGE);
@@ -5745,7 +5780,15 @@ static void Couple(Train *v, Train *u)
 	 * TrainHasEngine is tested from merged_first so it scans the whole
 	 * merged-on group (after a logical flip the fake engine head of the
 	 * formation sits at the far end of the group). */
-	if (u_was_caronly || TrainHasEngine(merged_first)) merged_first->SetSegmentFront();
+	if (u_was_caronly || TrainHasEngine(merged_first)) {
+		merged_first->SetSegmentFront();
+		/* R3R: 同时标出这个新段的右边界(合并进来的那一段的最后一辆车,止于下一个
+		 * 段边界或链尾)。没有右边界标记的段是开放段,depot 里拖挂到它后面的车链
+		 * 会被误当成段内容一起拖动。 */
+		Train *seg_tail = merged_first;
+		while (seg_tail->Next() != nullptr && !seg_tail->Next()->IsSegmentFront()) seg_tail = seg_tail->Next();
+		seg_tail->SetSegmentBack();
+	}
 
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
 

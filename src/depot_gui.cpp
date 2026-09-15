@@ -145,16 +145,23 @@ void CcCloneVehicle(const CommandCost &result)
 
 /**
  * R3R: find the coupled-on segment (a run of vehicles that was attached by a
- * Couple order and whose front carries the SegmentFront marker) a train vehicle
- * belongs to. Vehicles in front of the first segment boundary (e.g. the leading
- * locomotive) and chains that were never coupled on do not belong to a segment.
+ * Couple order, delimited by a SegmentFront marker on its first vehicle and a
+ * SegmentBack marker on its last) a train vehicle belongs to. Vehicles in front
+ * of the first segment boundary (e.g. the leading locomotive), vehicles dragged
+ * behind a segment and chains that were never coupled on do not belong to a
+ * segment.
  * @param v The clicked/dragged train vehicle.
  * @return The front of the vehicle's segment, or nullptr when not inside one.
  */
 static const Train *TrainDepotGetSegmentFront(const Train *v)
 {
 	if (v == nullptr) return nullptr;
+	/* A vehicle sitting on the segment's own right boundary still belongs to it. */
+	const bool at_segment_back = v->IsSegmentBack();
 	for (const Train *t = v; t != nullptr; t = t->Previous()) {
+		/* Crossing another segment's tail means this vehicle is behind that
+		 * segment (a chain dragged on after it), not part of it. */
+		if (!at_segment_back && t->IsSegmentBack()) return nullptr;
 		if (t->IsSegmentFront()) return t;
 	}
 	return nullptr;
@@ -162,17 +169,20 @@ static const Train *TrainDepotGetSegmentFront(const Train *v)
 
 /**
  * R3R: cut a whole coupled-on segment out of its chain. Any vehicles trailing
- * the segment (behind its last vehicle, which is the chain end or the next
- * segment boundary) are re-attached to the original chain first, leaving the
+ * the segment (behind its last vehicle, marked by the segment's own right
+ * boundary) are re-attached to the original chain first, leaving the
  * segment as a standalone chain that can then be moved, dropped on an empty
  * row or sold as a whole.
  * @param seg First vehicle of the segment (carries SegmentFront).
  */
 static void TrainDepotDetachSegment(const Train *seg)
 {
-	/* Last vehicle of the segment: up to the chain end or the next segment boundary. */
+	/* Last vehicle of the segment: marked by the segment's own right boundary.
+	 * Chains or further segments coupled on behind it are not part of it (a
+	 * segment without a boundary marker - e.g. from an older save - still falls
+	 * back to the chain end / the next boundary). */
 	const Train *tail = seg;
-	while (tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
+	while (!tail->IsSegmentBack() && tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
 
 	const Train *rest = tail->Next();     ///< Vehicles trailing the segment (may be nullptr).
 	const Train *anchor = seg->Previous(); ///< Last vehicle that stays on the original chain (may be nullptr).

@@ -491,6 +491,11 @@ static void RearticulateChain(Train *head)
 static void SetSegmentTailFakeEngine(Train *seg)
 {
 	Train *last = GetLastChainVehicle(seg);
+	/* R3R: mark the segment's right boundary on its last vehicle. Without this
+	 * marker a segment is open-ended (it would appear to extend up to the next
+	 * segment boundary or the chain end), so vehicles dragged behind a segment
+	 * would be mistaken for part of it. */
+	last->SetSegmentBack();
 	/* A single-vehicle chain has no distinct tail to promote; a tail that is
 	 * already an engine (e.g. a second real locomotive) is left untouched. */
 	if (last == seg || last->IsEngine()) return;
@@ -506,6 +511,9 @@ static void SetSegmentTailFakeEngine(Train *seg)
 static void ClearSegmentTailFakeEngine(Train *seg)
 {
 	Train *last = GetLastChainVehicle(seg);
+	/* R3R: the right boundary marker goes away together with the tail
+	 * fake-engine identity that was granted by SetSegmentTailFakeEngine. */
+	last->ClearSegmentBack();
 	if (last == seg) return;
 	/* Only the fake-engine identity (engine subtype grafted onto a wagon
 	 * engine_type) is undone; real engines at the tail are never demoted. */
@@ -592,6 +600,7 @@ static bool R3RChainHasRealLocomotive(const Train *seg)
 	for (const Train *v = seg; v != nullptr; v = v->Next()) {
 		if (v != seg && v->IsSegmentFront()) break; /* Only scan this segment. */
 		if (v->IsEngine() && RailVehInfo(v->engine_type)->railveh_type != RailVehicleType::Wagon) return true;
+		if (v->IsSegmentBack()) break; /* R3R: stop at this segment's right boundary. */
 	}
 	return false;
 }
