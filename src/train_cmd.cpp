@@ -4460,6 +4460,22 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			u->r3r_orders_borrowed = false;   // u now owns it
 			u_inherited_running = true;
 		}
+		/* R3R (route A, 2026-09-15): does u OWN the schedule the consist was just
+		 * executing? Then the DECOUPLE that fired is an order of u's own list, so
+		 * u must resume at the WAIT_COUPLE that FOLLOWS it -- exactly like the
+		 * inherited case below -- instead of coming back at whatever stale index
+		 * it happened to hold. Route A made "u keeps its own schedule" the normal
+		 * case, which left the resume logic gated on u_inherited_running (now
+		 * always false for a real consist) and therefore dead: the consist came
+		 * back at index 0, so the next locomotive skipped its WAIT_COUPLE into the
+		 * FIRST half of the cycle again -- "go to the station it is already parked
+		 * at" was satisfied on the spot and the following DECOUPLE undid the
+		 * couple on the very next tick (observed 2026-09-15: COUPLE-OK then
+		 * DECOUPLE-FIRE at the same tile in test4.sav, after which the locomotive
+		 * ran off to its own next order and left the consist waiting forever).
+		 * Captured BEFORE R3RSyncDrivingOrders(v), which may hand v's borrowed
+		 * pointer back and break the pointer comparison. */
+		const bool u_owns_running = u_inherited_running || (u->orders != nullptr && u->orders == v->orders);
 		/* Rebuild both sides' priorities, then let each chain head re-point at its
 		 * own command owner: v gives the borrow back when it BECAME the owner
 		 * (T8701 #2 restore), otherwise it keeps driving the owner's schedule
@@ -4487,11 +4503,13 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		/* R3R: the decoupled part (u) must wait for the NEXT locomotive to couple
 		 * onto it, so resume from the WAIT_COUPLE that follows the DECOUPLE we
 		 * just ran (wrapping around the schedule) — not from the top of the
-		 * schedule, which would attempt a self-drive order and get stuck. If the
-		 * schedule has no WAIT_COUPLE, insert one at the FRONT so it is the wait
-		 * point. The next locomotive that couples skips past WAIT_COUPLE (see
-		 * Couple) and continues the real schedule. */
-		if (u_inherited_running) {
+		 * schedule, which would attempt a self-drive order and get stuck. The next
+		 * locomotive that couples skips past WAIT_COUPLE (see Couple) and continues
+		 * the real schedule. When the list holds no WAIT_COUPLE after the DECOUPLE,
+		 * a schedule-less wagon part gets one inserted at the FRONT (it has no
+		 * schedule of its own to continue); a part that owns its list just keeps
+		 * its index. */
+		if (u_owns_running) {
 			VehicleOrderID wait_idx = INVALID_VEH_ORDER_ID;
 			if (u->orders != nullptr) {
 				VehicleOrderID n = u->GetNumOrders();
@@ -4500,15 +4518,23 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 					if (u->GetOrder(i)->IsType(OT_WAIT_COUPLE)) { wait_idx = i; break; }
 				}
 			}
-			if (wait_idx == INVALID_VEH_ORDER_ID) {
+			if (wait_idx == INVALID_VEH_ORDER_ID && u_inherited_running) {
+				/* Only a schedule-less wagon part -- which got the running schedule
+				 * handed to it just above -- needs a wait point invented for it. A
+				 * consist that OWNS its schedule but has no WAIT_COUPLE after the
+				 * DECOUPLE keeps its index and simply continues its own list; the
+				 * old code inserted one unconditionally, which would now rewrite a
+				 * player's own schedule. */
 				Order wc;
 				wc.MakeWaitCouple();
 				InsertOrder(u, std::move(wc), 0);  // insert at front as the wait point
 				wait_idx = 0;
 			}
-			u->cur_real_order_index = wait_idx;
-			u->cur_implicit_order_index = wait_idx;   // sync implicit — otherwise the order window paints ▶ at the implicit index
-			u->cur_timetable_order_index = wait_idx;
+			if (wait_idx != INVALID_VEH_ORDER_ID) {
+				u->cur_real_order_index = wait_idx;
+				u->cur_implicit_order_index = wait_idx;   // sync implicit — otherwise the order window paints ▶ at the implicit index
+				u->cur_timetable_order_index = wait_idx;
+			}
 		}
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads the WAIT_COUPLE
@@ -4674,6 +4700,25 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
 	for (const Train *a = head; a != nullptr; a = a->Next()) {
 		const Train *b = a->Next();
 		if (b == nullptr) break;
+		/* R3R (P4, KI-06 fix 2026-09-15): skip articulated parent/child pairs.
+		 * A part is hard-wired to its parent -- it renders at a fixed offset
+		 * (4 px in the test4.sav 现场) and always carries the parent's
+		 * direction -- so the pair reports a small POSITIVE dot although it is
+		 * not a splice point at all. A logical flip (R3RFlipChainBySegments)
+		 * reverses every vehicle's direction while the positions stay put, so
+		 * the sign of EVERY pair's dot flips with it: a healthy -4 px pair
+		 * turns into +4 and is then (wrongly) read as a fold. Measured on
+		 * test4.sav: the repaired COUPLE-FLIP-V and COUPLE-FLIP-BOTH runs
+		 * reported worst dot=4 on `A idx=0 (632,514) dir=7 <-> B idx=1
+		 * (632,510) dir=7` -- the locomotive's own part pair -- and NO other
+		 * positive pair anywhere on the chain. That one 4 px false positive
+		 * was therefore the only thing keeping the KI-06 couple retry loop
+		 * alive. Splice points stay checked: across a segment boundary b is
+		 * the NEXT group's parent (a group head, not an artic group member),
+		 * so the pair is still evaluated as before -- e.g. the真折叠 reports
+		 * `COUPLE idx2 <-> idx3 dot=27` and `COUPLE-FLIP-U idx2 <-> idx6
+		 * dot=17` both remain vetoes. */
+		if (b->IsArticGroupMember()) continue;
 		int dot = (b->x_pos - a->x_pos) * dir_dx[(int)a->direction & 7] + (b->y_pos - a->y_pos) * dir_dy[(int)a->direction & 7];
 		if (dot > worst_dot) {
 			worst_dot = dot;
@@ -5157,6 +5202,48 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		}
 		return false;
 	};
+
+	/* R3R (KI-06 收尾, 2026-09-15): the SPLICE PAIR -- the one pair the merge
+	 * itself creates, (v_last, u_head) -- must be physically adjacent.
+	 *
+	 * This is what the old whole-chain `worst_gap > 8` test was trying to say,
+	 * minus its two false positives: it is evaluated on the splice point only,
+	 * never on the chain's interior, so neither the articulated pairs of (a) nor
+	 * the pre-splice spacing of parts that were merely re-linked in (b) can fire
+	 * it. It is what separates a correct flip from a wrong one. test4.sav
+	 * 2026-09-15, locomotive nose against the consist's rear (all dir=3, loco
+	 * 506..514 with its nose at 514, consist 515..533 with its nose at 533):
+	 *
+	 *   COUPLE-FLIP-V    splice idx0(632,514) <-> idx3(632,533) exp=2 dist=19
+	 *   COUPLE-FLIP-BOTH splice idx0(632,514) <-> idx8(632,515) exp=2 dist=1
+	 *
+	 * Accepting the 19px splice (the flip-V candidate) produced a chain whose
+	 * order jumps from the locomotive's tail straight to the consist's NOSE and
+	 * then walks the consist's body backwards -- i.e. the consist is traversed
+	 * through itself. Every *local* pair of that chain is still directionally
+	 * negative (the flipped locomotive faces away and 533 is "behind" it), so
+	 * the direction test cannot see it, and TrainController ended up with six
+	 * cars stacked on one tile (log: idx3..idx8 all at (632,496)/tile 39,31,
+	 * prog=0, spd=0) while the locomotive ran off alone. The flip-BOTH splice is
+	 * the only self-consistent one (1px) and is exactly the one the 2026-09-15
+	 * P1 comment describes ("原机车鼻顶车组尾的相邻点恰好变成机车链尾顶车组链头").
+	 * Rejecting on the splice gap therefore routes this case to candidate 3.
+	 * 8px is the same tolerance the old whole-chain test used. */
+	auto SpliceFolded = [](const Train *splice_prev, const char *tag) -> bool {
+		if (splice_prev == nullptr) return false;
+		const Train *splice_head = splice_prev->Next();
+		/* Nothing spliced (no successor), or the successor is not really linked
+		 * back to us. */
+		if (splice_head == nullptr || splice_head->Previous() != splice_prev) return false;
+		const int expected = (splice_prev->gcache.cached_veh_length + splice_head->gcache.cached_veh_length) / 2;
+		const int dist = std::max(std::abs(splice_prev->x_pos - splice_head->x_pos), std::abs(splice_prev->y_pos - splice_head->y_pos));
+		if (std::abs(dist - expected) <= 8) return false;
+		R3RDbgWrite("SPLICE-GAP-REJECT %s prev=%d x=%d y=%d head=%d x=%d y=%d exp=%d dist=%d\n",
+				tag, (int)splice_prev->index.base(), (int)splice_prev->x_pos, (int)splice_prev->y_pos,
+				(int)splice_head->index.base(), (int)splice_head->x_pos, (int)splice_head->y_pos,
+				expected, dist);
+		return true;
+	};
 	bool u_flipped = false;
 	bool v_flipped = false;
 	std::vector<Train *> u_old_seg_fronts;
@@ -5167,7 +5254,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	/* 合并链当前链头对象。普通拼接/只翻 u 时恒等于 v;逻辑翻 v 使链头离开
 	 * v 对象时更新为翻 v 后的新链头(Arrangement/折叠检查/最终检查一律用它)。 */
 	Train *head = v;
-	if (ChainFolded(v, "COUPLE")) {
+	if (ChainFolded(v, "COUPLE") || SpliceFolded(v_last, "COUPLE")) {
 		/* R3R: the first splice attempt folded — the end of the consist that
 		 * the locomotive's rear was spliced onto (the consist's chain head)
 		 * physically lies on the far side of the locomotive, i.e. the consist
@@ -5244,7 +5331,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		R3RDumpChainDbg(v, "A2-ARR-BEFORE-V");
 		R3RDumpChainDbg(u_flip_head, "A2-ARR-BEFORE-U");
 		ArrangeTrains(&v, v_last, &u_head, u_flip_head, true);
-		if (ChainFolded(v, "COUPLE-FLIP-U")) {
+		if (ChainFolded(v, "COUPLE-FLIP-U") || SpliceFolded(v_last, "COUPLE-FLIP-U")) {
 			/* 候选1 失败:撤销只翻 u(u 回原样后进候选2)。 */
 			RestoreTrainBackup(original_src);
 			RestoreTrainBackup(original_dst);
@@ -5271,11 +5358,17 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) { fprintf(dbg, "A3-FLIPV-DONE head=%d\n", (int)v_flip_head->index.base()); fclose(dbg); }
 			}
+			/* R3R (P1, KI-06 fix 2026-09-15): 候选3(双翻)改为"可达且被实测判定"。
+			 * 逻辑翻 v 使链头离开原机车对象时,仅当新链头仍是引擎(真引擎列车翻后
+			 * 新链头 = 原链尾引擎,primary 身份随成功提交迁往新链头)才接受;v 拖着
+			 * 普通车厢(翻后链头是车厢、机车失去链头)时候选2 不可行。旧代码在此处
+			 * 直接 return false —— 但候选3 同样要逻辑翻 v,"候选3 是否也不可行"因此
+			 * 成了一个从未被测量的假定(现场日志里 COUPLE-FLIP-BOTH 的判定行只可能
+			 * 来自候选2 几何失败那条路径)。现在改为:结构不可行同样回滚候选2,但
+			 * 流程继续落到候选3,由候选3 自己的同一个守卫给出结论 —— 放弃的原因
+			 * 变成实测,而不是假定。 */
+			bool try_candidate3 = false;
 			if (v_flip_head != v && !v_flip_head->IsEngine()) {
-				/* 逻辑翻 v 使链头离开原机车对象:仅当新链头仍是引擎(真引擎列车
-				 * 翻后新链头 = 原链尾引擎,primary 身份随成功提交迁往新链头)才
-				 * 接受;v 拖着普通车厢(翻后链头是车厢、机车失去链头)时候选2/
-				 * 候选3 都不可行,完整回滚并放弃本次折叠修正(下次触发重头试)。 */
 				RestoreTrainBackup(original_src);
 				RestoreTrainBackup(original_dst);
 				R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
@@ -5284,31 +5377,35 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				R3RRefreshChainCaches(u);
 				v->ConsistChanged(CCF_ARRANGE);
 				u->ConsistChanged(CCF_ARRANGE);
-				return false;
+				R3RDbgWrite("FOLDCHK-SKIP COUPLE-FLIP-V v_head_not_engine head=%d -> fall through to candidate 3\n", (int)v_flip_head->index.base());
+				try_candidate3 = true;
+			} else {
+				/* 接受翻 v:v 链真头可能已离开 v 对象(多节真引擎),把合并链当前
+				 * 链头更新为 v_flip_head(v_flip_head == v 的单块场景无副作用)。 */
+				head = v_flip_head;
+				u_merged_head = u;
+				u_head = u;
+				v_last = R3RTrainTail(v);
+				R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
+				R3RDumpChainDbg(u, "A3-ARR-BEFORE-U");
+				ArrangeTrains(&head, v_last, &u_head, u, true);
+				if (ChainFolded(head, "COUPLE-FLIP-V") || SpliceFolded(v_last, "COUPLE-FLIP-V")) {
+					/* 候选2 失败:撤销只翻 v(逻辑翻回原状)。 */
+					RestoreTrainBackup(original_src);
+					RestoreTrainBackup(original_dst);
+					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+					v_flipped = false;
+					R3RRefreshChainCaches(v);
+					R3RRefreshChainCaches(u);
+					{
+						FILE *dbg = R3RFopenDbg("a");
+						if (dbg != nullptr) { fprintf(dbg, "A3-ROLLBACK-DONE\n"); fclose(dbg); }
+					}
+					try_candidate3 = true;
+				}
 			}
 
-			/* 接受翻 v:v 链真头可能已离开 v 对象(多节真引擎),把合并链当前
-			 * 链头更新为 v_flip_head(v_flip_head == v 的单块场景无副作用)。 */
-			head = v_flip_head;
-			u_merged_head = u;
-			u_head = u;
-			v_last = R3RTrainTail(v);
-			R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
-			R3RDumpChainDbg(u, "A3-ARR-BEFORE-U");
-			ArrangeTrains(&head, v_last, &u_head, u, true);
-			if (ChainFolded(head, "COUPLE-FLIP-V")) {
-				/* 候选2 失败:撤销只翻 v(逻辑翻回原状)。 */
-				RestoreTrainBackup(original_src);
-				RestoreTrainBackup(original_dst);
-				R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
-				v_flipped = false;
-				R3RRefreshChainCaches(v);
-				R3RRefreshChainCaches(u);
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) { fprintf(dbg, "A3-ROLLBACK-DONE\n"); fclose(dbg); }
-				}
-
+			if (try_candidate3) {
 				/* 候选3:双翻 —— 机车与车底都处于错误朝向。机车逻辑反转 +
 				 * 车组逻辑反转后两链同向,原"机车鼻顶车组尾"的相邻点恰好
 				 * 变成"机车链尾顶车组链头",一次即可拼成。 */
@@ -5325,6 +5422,23 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				{
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-FLIP-DONE merged_head=%d\n", (int)u_flip_head->index.base()); fclose(dbg); }
+				}
+				if (head != v && !head->IsEngine()) {
+					/* 候选3 的结构守卫(与候选2 同一判据):双翻同样让链头离开原机车
+					 * 对象,不可接受 —— 完整回滚两条链并放弃本次折叠修正(下 tick
+					 * 重试)。走到这里说明"候选3 也不可行"是本 tick 实测结论。 */
+					RestoreTrainBackup(original_src);
+					RestoreTrainBackup(original_dst);
+					R3RUndoLogicalFlip(v, v_old_seg_fronts, v_old_roles);
+					R3RUndoLogicalFlip(u, u_old_seg_fronts, u_old_roles);
+					v_flipped = false;
+					u_flipped = false;
+					R3RRefreshChainCaches(v);
+					R3RRefreshChainCaches(u);
+					v->ConsistChanged(CCF_ARRANGE);
+					u->ConsistChanged(CCF_ARRANGE);
+					R3RDbgWrite("FOLDCHK-SKIP COUPLE-FLIP-BOTH v_head_not_engine head=%d -> give up this tick\n", (int)head->index.base());
+					return false;
 				}
 
 				u_head = u_flip_head;
@@ -5349,6 +5463,17 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					v->ConsistChanged(CCF_ARRANGE);
 					u->ConsistChanged(CCF_ARRANGE);
 					return false;
+				}
+				/* R3R (2026-09-15): candidate 3 is the LAST candidate, so a
+				 * non-adjacent splice here is accepted instead of rolled back.
+				 * Rolling back would leave the state unchanged and retry on the
+				 * next tick for ever -- exactly the KI-06 couple loop this fold
+				 * machinery exists to end. The DIRECTION verdict above is still a
+				 * hard veto (a genuine fold must not be committed); only the
+				 * splice-gap preference is relaxed here, and it says so in the
+				 * log so a broken merged chain is traceable. */
+				if (SpliceFolded(v_last, "COUPLE-FLIP-BOTH")) {
+					R3RDbgWrite("SPLICE-GAP-LAST-RESORT COUPLE-FLIP-BOTH accepted anyway (no candidate has an adjacent splice)\n");
 				}
 			}
 		}
@@ -8748,8 +8873,28 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 							{TRACK_BIT_RIGHT, TRACK_BIT_NONE,  TRACK_BIT_LOWER, TRACK_BIT_Y    }
 						}}};
 						DiagDirection exitdir = DiagdirBetweenTiles(gp.new_tile, TileVirtXY(prev->x_pos, prev->y_pos));
-						dbg_assert(IsValidDiagDirection(exitdir));
-						chosen_track = _connecting_track[enterdir][exitdir];
+						if (IsValidDiagDirection(exitdir)) {
+							chosen_track = _connecting_track[enterdir][exitdir];
+						} else {
+							/* R3R: a fold-fix merge (TryTrainCouple, see the
+							 * FOLDCHK-ACCEPT line) accepts a chain whose neighbours are
+							 * still more than one tile apart: ArrangeTrains re-links the
+							 * chain order but does NOT re-space the vehicles, so `prev`
+							 * can transiently sit two or more tiles away while the rest
+							 * of the chain is being pulled together. Upstream asserts the
+							 * adjacent-tile invariant here; an R3R-merged chain is
+							 * allowed to violate it until it has closed up (observed
+							 * 2026-09-15: this assert aborted the game, crash log
+							 * "Assertion failed at line 8823 ... IsValidDiagDirection",
+							 * right after a successful COUPLE-FLIP-V merge started to
+							 * move). A non-adjacent prev has no "connecting track", so
+							 * keep the vehicle going straight ahead and let
+							 * `chosen_track &= bits` below decide whether that is
+							 * possible at all -- if it is not, the TRACK_BIT_NONE
+							 * handling just below already leaves the vehicle where it is
+							 * instead of crashing. */
+							chosen_track = _connecting_track[enterdir][enterdir];
+						}
 					}
 					chosen_track &= bits;
 				}
