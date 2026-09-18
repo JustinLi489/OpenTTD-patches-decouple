@@ -12,6 +12,7 @@
 #include "../station_func.h"
 #include "../engine_base.h"
 #include "../vehicle_func.h"
+#include "../train.h"
 #include "refresh.h"
 #include "linkgraph.h"
 
@@ -24,7 +25,7 @@
  * @param is_full_loading If the vehicle is full loading.
  * @param cargo_mask Mask of cargoes to refresh
  */
-/* static */ void LinkRefresher::Run(Vehicle *v, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask)
+/* static */ void LinkRefresher::RunScoped(Vehicle *v, Vehicle *scope_begin, const Vehicle *scope_end, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask)
 {
 	/* If there are no orders we can't predict anything.*/
 	if (v->orders == nullptr) return;
@@ -53,7 +54,7 @@
 		const Order *first = v->orders->GetNextDecisionNode(v->GetOrder(v->cur_implicit_order_index), 0, iter_cargo_mask);
 		if (first != nullptr) {
 			HopSet seen_hops;
-			LinkRefresher refresher(v, &seen_hops, allow_merge, is_full_loading, iter_cargo_mask);
+			LinkRefresher refresher(v, &seen_hops, allow_merge, is_full_loading, iter_cargo_mask, scope_begin, scope_end);
 
 			RefreshFlags flags = {};
 			if (iter_cargo_mask.Any(have_cargo_mask)) flags.Set(RefreshFlag::HasCargo);
@@ -66,6 +67,52 @@
 }
 
 /**
+ * Refresh all links the given vehicle will visit.
+ * @param v Vehicle to refresh links for.
+ * @param allow_merge If the refresher is allowed to merge or extend link graphs.
+ * @param is_full_loading If the vehicle is full loading.
+ * @param cargo_mask Mask of cargoes to refresh
+ */
+/* static */ void LinkRefresher::Run(Vehicle *v, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask)
+{
+	RunScoped(v, v, nullptr, allow_merge, is_full_loading, cargo_mask);
+}
+
+/* static */ void LinkRefresher::RunPerSegment(Vehicle *front, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask)
+{
+	if (front == nullptr) return;
+
+	/* Pass 1: the whole consist is hauled along the route of the segment that owns
+	 * the orders (the chain head). Every vehicle is physically carried along that
+	 * route, so every vehicle's capacity counts on it. Note that a refresh only
+	 * keeps a minimum capacity (it does not add up), so this has to be done in one
+	 * go with the whole consist: splitting it per segment would throw away the
+	 * capacity of all but the largest segment. Doing it in one go is exactly the
+	 * historical whole-consist refresh, so plain trains keep their old numbers. */
+	RunScoped(front, front, nullptr, allow_merge, is_full_loading, cargo_mask);
+
+	/* Pass 2: additionally register the route every segment will run on its own
+	 * orders, counting only that segment's capacity, so the legs only that segment
+	 * will serve (for example the home leg of a wagon group waiting for its next
+	 * coupling) stay alive while it is hauled around by another segment. */
+	for (Vehicle *seg = front; seg != nullptr; ) {
+		/* Last vehicle of this segment: the one before the next segment head. */
+		Vehicle *seg_end = seg;
+		for (Vehicle *w = seg->Next(); w != nullptr; w = w->Next()) {
+			if (w->type == VehicleType::Train && Train::From(w)->IsSegmentFront()) break;
+			seg_end = w;
+		}
+
+		/* The consist route was already handled above with the full capacity. */
+		if (seg->orders != nullptr && seg->orders != front->orders) {
+			RunScoped(seg, seg, seg_end, allow_merge, is_full_loading, cargo_mask);
+		}
+
+		seg = seg_end->Next();
+	}
+}
+
+/**
  * Constructor for link refreshing algorithm.
  * @param vehicle Vehicle to refresh links for.
  * @param seen_hops Set of hops already seen. This is shared between this
@@ -73,12 +120,13 @@
  * @param allow_merge If the refresher is allowed to merge or extend link graphs.
  * @param is_full_loading If the vehicle is full loading.
  */
-LinkRefresher::LinkRefresher(Vehicle *vehicle, HopSet *seen_hops, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask) :
-	vehicle(vehicle), seen_hops(seen_hops), cargo(INVALID_CARGO), allow_merge(allow_merge),
+LinkRefresher::LinkRefresher(Vehicle *vehicle, HopSet *seen_hops, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask, Vehicle *scope_begin, const Vehicle *scope_end) :
+	vehicle(vehicle), scope_begin(scope_begin != nullptr ? scope_begin : vehicle), scope_end(scope_end),
+	seen_hops(seen_hops), cargo(INVALID_CARGO), allow_merge(allow_merge),
 	is_full_loading(is_full_loading), cargo_mask(cargo_mask)
 {
 	/* Assemble list of capacities and set last loading stations to 0. */
-	for (Vehicle *v = this->vehicle; v != nullptr; v = v->Next()) {
+	for (Vehicle *v = this->scope_begin; v != nullptr; v = this->NextInScope(v)) {
 		this->refit_capacities.push_back(RefitDesc(v->cargo_type, v->cargo_cap, v->refit_cap));
 		if (v->refit_cap > 0) {
 			assert(v->cargo_type < NUM_CARGO);
@@ -97,7 +145,7 @@ bool LinkRefresher::HandleRefit(CargoType refit_cargo)
 	this->cargo = refit_cargo;
 	RefitList::iterator refit_it = this->refit_capacities.begin();
 	bool any_refit = false;
-	for (Vehicle *v = this->vehicle; v != nullptr; v = v->Next()) {
+	for (Vehicle *v = this->scope_begin; v != nullptr; v = this->NextInScope(v)) {
 		const Engine *e = Engine::Get(v->engine_type);
 		if (!e->info.refit_mask.Test(this->cargo)) {
 			++refit_it;

@@ -22,6 +22,25 @@ class LinkRefresher {
 public:
 	static void Run(Vehicle *v, bool allow_merge = true, bool is_full_loading = false, CargoTypes cargo_mask = ALL_CARGOTYPES);
 
+	/**
+	 * R3R: Refresh the links of every segment of a (possibly coupled) consist.
+	 *
+	 * In a coupled consist every segment is physically hauled along the route of
+	 * the segment that owns the orders (the chain head), so that route is
+	 * registered with the whole consist (the historical behaviour, so plain
+	 * trains keep exactly the old numbers). Additionally each segment keeps its
+	 * own order list; the legs only that segment will run (for example the home
+	 * leg of a wagon group waiting for its next coupling) are registered with
+	 * that segment's own wagons, so those links stay alive while it is hauled
+	 * around by another segment.
+	 *
+	 * @param front Chain head of the consist.
+	 * @param allow_merge If the refresher is allowed to merge or extend link graphs.
+	 * @param is_full_loading If the vehicle is full loading.
+	 * @param cargo_mask Mask of cargoes to refresh.
+	 */
+	static void RunPerSegment(Vehicle *front, bool allow_merge = true, bool is_full_loading = false, CargoTypes cargo_mask = ALL_CARGOTYPES);
+
 protected:
 	/**
 	 * Various flags about properties of the last examined link that might have
@@ -97,7 +116,9 @@ protected:
 	typedef std::vector<RefitDesc> RefitList;
 	typedef btree::btree_set<Hop> HopSet;
 
-	Vehicle *vehicle;           ///< Vehicle for which the links should be refreshed.
+	Vehicle *vehicle;           ///< Vehicle for which the links should be refreshed; also the source of the predicted route.
+	Vehicle *scope_begin;       ///< R3R: first vehicle whose capacity is counted (== #vehicle for a whole-consist refresh).
+	const Vehicle *scope_end;   ///< R3R: last vehicle whose capacity is counted (inclusive), or nullptr for the chain end.
 	CargoArray capacities{};    ///< Current added capacities per cargo ID in the consist.
 	RefitList refit_capacities; ///< Current state of capacity remaining from previous refits versus overall capacity per vehicle in the consist.
 	HopSet *seen_hops;          ///< Hops already seen. If the same hop is seen twice we stop the algorithm. This is shared between all Refreshers of the same run.
@@ -106,7 +127,23 @@ protected:
 	bool is_full_loading;       ///< If the vehicle is full loading.
 	CargoTypes cargo_mask;      ///< Bit-mask of cargo IDs to refresh.
 
-	LinkRefresher(Vehicle *v, HopSet *seen_hops, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask);
+	LinkRefresher(Vehicle *v, HopSet *seen_hops, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask, Vehicle *scope_begin = nullptr, const Vehicle *scope_end = nullptr);
+
+	/**
+	 * R3R: Next vehicle within the capacity scope.
+	 * @param v Current vehicle.
+	 * @return Next vehicle, or nullptr if the scope is exhausted.
+	 */
+	Vehicle *NextInScope(Vehicle *v) const { return (v == this->scope_end) ? nullptr : v->Next(); }
+
+	/**
+	 * R3R: Refresh links along the route of \a route_vehicle, counting the
+	 * capacities of [\a scope_begin, \a scope_end] (inclusive, nullptr = chain end).
+	 * @param route_vehicle Vehicle whose orders drive the route prediction.
+	 * @param scope_begin First vehicle whose capacity is counted.
+	 * @param scope_end Last vehicle whose capacity is counted, or nullptr for the chain end.
+	 */
+	static void RunScoped(Vehicle *route_vehicle, Vehicle *scope_begin, const Vehicle *scope_end, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask);
 
 	bool HandleRefit(CargoType refit_cargo);
 	void ResetRefit();

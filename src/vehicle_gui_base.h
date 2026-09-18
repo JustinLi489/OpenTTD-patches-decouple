@@ -129,6 +129,7 @@ public:
 		ADI_CREATE_GROUP,
 		ADI_TRACERESTRICT_SLOT_MGMT,
 		ADI_TRACERESTRICT_COUNTER_MGMT,
+		ADI_COUPLE_GROUP_MGMT,             ///< R3R: open the couple group window (Q4).
 	};
 
 	static const VehicleTypeIndexArray<const StringID> vehicle_depot_name;

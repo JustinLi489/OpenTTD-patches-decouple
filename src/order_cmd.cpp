@@ -566,12 +566,59 @@ void OrderList::RecalculateTimetableDuration()
 }
 
 /**
+ * R3R (couple priority, route A): a "borrow" makes the consist's chain head and its
+ * command owner point at the *same* OrderList without registering it as a shared order
+ * list, so OrderList::num_vehicles counts only one of them. Every place which reasons
+ * "IsShared() == false, so this list is mine to destroy" is therefore wrong for such a
+ * list: the other referrer would be left with a dangling orders pointer, and the next
+ * time it is touched it reads freed memory. That is the reported crash
+ * crash-20260917T130637Z.log: CmdDepotSellAllVehicles -> CmdSellRailWagon ->
+ * delete sell_head -> Vehicle::PreDestructor -> DeleteVehicleOrders, where
+ * IsOrderListShared() read the freed list (0xDDDD.. debug heap poison) as "shared" and
+ * RemoveFromShared()/FirstShared() then dereferenced that poison.
+ *
+ * Find a live vehicle which still refers to the given order list, ignoring one vehicle
+ * (the one which is currently letting go of the list).
+ * @param ol The order list.
+ * @param except Vehicle to ignore, may be nullptr.
+ * @return A live vehicle still using the list, or nullptr.
+ */
+static Vehicle *R3RFindOrderListReferrer(const OrderList *ol, const Vehicle *except)
+{
+	for (Vehicle *w : Vehicle::Iterate()) {
+		if (w == except) continue;
+		if (except != nullptr && w->type != except->type) continue;
+		if (w->orders == ol || w->orders_backup == ol) return w;
+	}
+	return nullptr;
+}
+
+/**
  * Free a complete order chain.
  * @param keep_orderlist If this is true only delete the orders, otherwise also delete the OrderList.
  * @note do not use on "current_order" vehicle orders!
+ * @note R3R: callers must detach their own pointer (orders/orders_backup) *before* calling
+ *       this with keep_orderlist == false, so that the hand-over check below does not see
+ *       the vehicle which is letting go of the list.
  */
 void OrderList::FreeChain(bool keep_orderlist)
 {
+	/* R3R: never destroy an order list another vehicle is still running -- the
+	 * couple-priority borrow is not registered as a shared order list, so this
+	 * cannot be decided by IsShared()/num_vehicles. Hand the list over *untouched*
+	 * (the check therefore has to come before the orders are cleared) and re-point
+	 * the shared registration at a vehicle which still uses it. Otherwise the
+	 * remaining user is left with a dangling orders pointer -- the reported
+	 * crash-20260917T130637Z.log. */
+	if (!keep_orderlist) {
+		if (Vehicle *other = R3RFindOrderListReferrer(this, nullptr)) {
+			Vehicle *new_first = other->IsPrimaryVehicle() ? other : other->First();
+			if (new_first == nullptr) new_first = other;
+			this->first_shared = new_first;
+			return;
+		}
+	}
+
 	VehicleType type = this->GetFirstSharedVehicle()->type;
 	Owner owner = this->GetFirstSharedVehicle()->owner;
 	for (Order *o : this->Orders()) {
@@ -3481,14 +3528,21 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
 	 * The owner still holds the pointer and the borrow is deliberately not a shared
 	 * order list, so IsOrderListShared() is false here -- freeing v->orders would
 	 * destroy the owner's schedule and leave it dangling. Give the borrow back and
-	 * delete this vehicle's own schedule instead. */
-	if (v->r3r_orders_borrowed) {
+	 * delete this vehicle's own schedule instead.
+	 * Exception: a borrow which was saved and loaded comes back as a native *shared*
+	 * order list (both vehicles reference the same loaded list), so this vehicle is
+	 * then a member of that shared chain and must leave it through RemoveFromShared()
+	 * below -- detaching the pointer here would leave the other members chained to a
+	 * vehicle which is about to be destroyed. */
+	const bool r3r_borrow_is_shared = v->orders != nullptr && v->orders->IsShared() &&
+			(v->PreviousShared() != nullptr || v->FirstShared() == v);
+	if (v->r3r_orders_borrowed && !r3r_borrow_is_shared) {
 		v->orders = v->orders_backup;
 		v->orders_backup = nullptr;
-		v->r3r_orders_borrowed = false;
 		v->orders_backup_real_index = INVALID_VEH_ORDER_ID;
 		v->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
 	}
+	v->r3r_orders_borrowed = false;
 
 	if (v->IsOrderListShared()) {
 		/* Remove ourself from the shared order list. */
@@ -3498,10 +3552,27 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
 	} else {
 		CloseWindowById(GetWindowClassForVehicleType(v->type), VehicleListIdentifier(VL_SHARED_ORDERS, v->type, v->owner, v->index).ToWindowNumber());
 		if (v->orders != nullptr) {
-			/* Remove the orders */
-			if (!keep_orderlist) UpdateDeparturesWindowVehicleFilter(v->orders, true);
-			v->orders->FreeChain(keep_orderlist);
-			if (!keep_orderlist) v->orders = nullptr;
+			OrderList *ol = v->orders;
+			/* R3R: another vehicle of the consist may still be running this very list
+			 * (couple-priority borrow, see R3RFindOrderListReferrer). Hand it over
+			 * instead of destroying it, otherwise that vehicle is left with a dangling
+			 * orders pointer -- which is what crashed previously. */
+			if (R3RFindOrderListReferrer(ol, v) != nullptr) {
+				/* Another vehicle still runs this list: hand it over. FreeChain()
+				 * repeats the check, returns without destroying the list and re-points
+				 * the shared registration (first_shared) at a vehicle which still
+				 * uses it -- the registration may name this dying vehicle. */
+				v->orders = nullptr;
+				ol->FreeChain(false);
+			} else if (keep_orderlist) {
+				/* Remove the orders, but keep the (now empty) order list. */
+				ol->FreeChain(true);
+			} else {
+				/* Remove the orders */
+				UpdateDeparturesWindowVehicleFilter(ol, true);
+				v->orders = nullptr;
+				ol->FreeChain(false);
+			}
 		}
 	}
 

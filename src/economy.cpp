@@ -64,6 +64,7 @@
 #include "tile_cmd.h"
 #include "vehicle_cmd.h"
 #include "road_layout_func.h"
+#include "r3r_perf.h"
 
 #include "table/strings.h"
 #include "table/pricebase.h"
@@ -1404,6 +1405,84 @@ static void TriggerIndustryProduction(Industry *i)
 }
 
 /**
+ * R3R (KI-71): the head of the segment a vehicle belongs to. A segment starts
+ * either at the physical front of the chain or at a vehicle carrying the
+ * SegmentFront marker, so walking backwards while neither is the case lands on
+ * the segment head. Non-train vehicles are their own (single-vehicle) segment.
+ * @param v The vehicle to look up.
+ * @return The head vehicle of the segment containing \a v.
+ */
+static Vehicle *R3RGetSegmentHeadOf(Vehicle *v)
+{
+	if (v->type != VehicleType::Train) return v;
+	Vehicle *head = v;
+	while (head->Previous() != nullptr && !Train::From(head)->IsSegmentFront()) {
+		head = head->Previous();
+	}
+	return head;
+}
+
+/**
+ * R3R (KI-71): route the cargo payments made from now on to the segment that
+ * @p v belongs to. The share paid for the cargo of \a v is credited to the head
+ * vehicle of that segment right away, so a coupled chain's revenue is split
+ * over the segments that actually carried the cargo. Passing nullptr closes the
+ * scope; the remainder (everything not credited to a segment) stays on the
+ * chain front when the payment object is destroyed, keeping the total amount
+ * credited to the chain identical to the pre-R3R behaviour.
+ *
+ * R3R (P3): the same scope also remembers the company owning \a v, because in a
+ * cross-company chain the money for this leg belongs to that company and not to
+ * the chain front's owner. Statistics are unaffected by that -- they keep going
+ * to the segment head -- so a chain that stays inside one company behaves
+ * exactly as before.
+ * @param v The vehicle about to be (un)loaded, or nullptr to close the scope.
+ */
+void CargoPayment::R3RSetPaymentRecipient(Vehicle *v)
+{
+	const VehicleID recipient = this->r3r_recipient;
+	if (recipient != VehicleID::Invalid()) {
+		/* Close the previous scope, crediting everything paid meanwhile. */
+		const Money share = (this->visual_profit + this->visual_transfer) - this->r3r_recipient_base;
+		this->r3r_recipient = VehicleID::Invalid();
+		this->r3r_recipient_base = 0;
+		Vehicle *head = Vehicle::GetIfValid(recipient);
+		/* A vanished segment (sold while the payment was pending) keeps its share
+		 * on the chain front instead. */
+		if (share != 0 && head != nullptr && head != this->front) {
+			head->profit_this_year += share << 8;
+			this->r3r_booked += share << 8;
+		}
+	}
+
+	/* R3R (P3): remember which company earns the money for the vehicle handled
+	 * from now on. Only a genuine cross-company chain sets this; for an ordinary
+	 * train, for a chain owned by one company, and for every vehicle that needs
+	 * no split the payee stays the chain front, so those behave as before. */
+	this->r3r_payee_company = (v != nullptr && v->owner != this->front->owner) ? v->owner : CompanyID::Invalid();
+	if (v == nullptr) return;
+
+	Vehicle *head = R3RGetSegmentHeadOf(v);
+	/* The chain front is the default recipient, so it needs no explicit scope. */
+	if (head == nullptr || head == this->front) return;
+
+	this->r3r_recipient = head->index;
+	this->r3r_recipient_base = this->visual_profit + this->visual_transfer;
+}
+
+/**
+ * R3R (P3): the company that has to receive the money earned by the cargo handled
+ * right now. Defined here and not in the header, because the header only forward
+ * declares Vehicle and this needs the complete type to read front->owner.
+ * @return The company to pay.
+ */
+CompanyID CargoPayment::R3RGetPayeeCompany() const
+{
+	if (this->r3r_payee_company == CompanyID::Invalid()) return this->front->owner;
+	return this->r3r_payee_company;
+}
+
+/**
  * Makes us a new cargo payment helper.
  * @param index The index into the cargo payment pool
  * @param front The front of the train
@@ -1425,8 +1504,18 @@ CargoPayment::~CargoPayment()
 
 	AutoRestoreBackup cur_company(_current_company, this->front->owner);
 
+	/* R3R (P3): in a cross-company chain the shares of the other companies were
+	 * already paid out through the deferred payment ledger while the cargo was
+	 * handled, so they are not part of route_profit any more; the chain front is
+	 * banked only with what its own segments earned. */
 	SubtractMoneyFromCompany(_current_company, CommandCost(this->front->GetExpenseType(true), -this->route_profit));
-	this->front->profit_this_year += (this->visual_profit + this->visual_transfer) << 8;
+
+	/* R3R (KI-71): close the last per-segment scope, then credit the chain front
+	 * only with what was not already booked to a segment. The chain as a whole
+	 * still books exactly (visual_profit + visual_transfer) << 8, so a train's
+	 * displayed profit and the company's cash flow are unchanged. */
+	this->R3RSetPaymentRecipient(nullptr);
+	this->front->profit_this_year += ((this->visual_profit + this->visual_transfer) << 8) - this->r3r_booked;
 
 	const Vehicle *moving_front = this->front->GetMovingFront();
 	if (this->route_profit != 0 && IsLocalCompany() && !PlayVehicleSound(this->front, VSE_LOAD_UNLOAD)) {
@@ -1453,13 +1542,32 @@ CargoPayment::~CargoPayment()
  */
 void CargoPayment::PayFinalDelivery(CargoType cargo, CargoPacket *cp, uint count, TileIndex current_tile)
 {
-	/* Handle end of route payment */
+	/* Handle end of route payment. R3R (P3) note: the delivering company handed to
+	 * DeliverGoods is deliberately still the chain front's owner, so industry
+	 * exclusivity, subsidies and the delivered-cargo statistics keep behaving as
+	 * before; only the money is split below. */
 	Money profit = DeliverGoods(count, cargo, this->current_station, cp->GetDistance(current_tile), cp->GetPeriodsInTransit(), Company::Get(this->front->owner), cp->GetSource());
 
 	profit -= cp->GetFeederShare(count);
 
-	/* For Infrastructure patch. Handling transfers between other companies */
-	this->route_profit += profit;
+	/* R3R (P3): in a cross-company chain the company whose vehicle carried the
+	 * cargo into the destination gets the money for this leg. */
+	const CompanyID payee = this->R3RGetPayeeCompany();
+	if (payee == this->front->owner) {
+		/* For Infrastructure patch. Handling transfers between other companies */
+		this->route_profit += profit;
+	} else {
+		/* R3R (P3): another company's segment earned this money, so hand it over
+		 * right away through the deferred payment ledger (Paid by the call below).
+		 * It is deliberately kept out of route_profit: the destructor banks that
+		 * remainder on the chain front, and adding it here as well would create
+		 * the money twice. */
+		cp->RegisterDeferredCargoPayment(payee, this->front->type, profit);
+		if (R3RDbgOn()) {
+			R3RDbgWrite("R3R-PAY-FINAL front=%u front_owner=%d payee=%d profit=%lld count=%u\n",
+					this->front->index, (int)this->front->owner.base(), (int)payee.base(), (long long)profit, count);
+		}
+	}
 	cp->PayDeferredPayments();
 
 	/* The vehicle's profit is whatever route profit there is minus feeder shares. */
@@ -1486,8 +1594,15 @@ Money CargoPayment::PayTransfer(CargoType cargo, CargoPacket *cp, uint count, Ti
 
 	profit = profit * _settings_game.economy.feeder_payment_share / 100;
 
-	/* For Infrastructure patch. Handling transfers between other companies */
-	cp->RegisterDeferredCargoPayment(this->front->owner, this->front->type, profit);
+	/* For Infrastructure patch. Handling transfers between other companies.
+	 * R3R (P3): the transfer income goes to the company whose vehicle ran this
+	 * leg; on a single-company chain that is still the chain front's owner. */
+	const CompanyID payee = this->R3RGetPayeeCompany();
+	cp->RegisterDeferredCargoPayment(payee, this->front->type, profit);
+	if (payee != this->front->owner && R3RDbgOn()) {
+		R3RDbgWrite("R3R-PAY-TRANSFER front=%u front_owner=%d payee=%d profit=%lld count=%u\n",
+				this->front->index, (int)this->front->owner.base(), (int)payee.base(), (long long)profit, count);
+	}
 
 	this->visual_transfer += profit; // accumulate transfer profits for whole vehicle
 	return profit; // account for the (virtual) profit already made for the cargo packet
@@ -1546,12 +1661,16 @@ void PrepareUnload(Vehicle *front_v)
 			if (GetUnloadType(v) == OrderUnloadType::NoUnload) continue;
 			const GoodsEntry *ge = &st->goods[v->cargo_type];
 			if (v->cargo_cap > 0 && v->cargo.TotalCount() > 0) {
+				/* R3R (KI-71): the feeder share paid while staging this vehicle's
+				 * cargo belongs to the segment this vehicle is part of. */
+				front_v->cargo_payment->R3RSetPaymentRecipient(v);
 				v->cargo.Stage(
 						ge->status.Test(GoodsEntry::State::Acceptance),
 						front_v->last_station_visited, next_station.Get(v->cargo_type),
 						GetUnloadType(v), ge,
 						v->cargo_type, front_v->cargo_payment,
 						v->GetMovingFront()->GetCargoTile());
+				front_v->cargo_payment->R3RSetPaymentRecipient(nullptr);
 				if (v->cargo.UnloadCount() > 0) v->vehicle_flags.Set(VehicleFlag::CargoUnloading);
 			}
 		}
@@ -2146,7 +2265,11 @@ static void LoadUnloadVehicle(Vehicle *front)
 			}
 
 			assert(payment != nullptr);
+			/* R3R (KI-71): delivery money earned by the cargo in this vehicle is
+			 * credited to the segment this vehicle belongs to. */
+			payment->R3RSetPaymentRecipient(v);
 			amount_unloaded = v->cargo.Unload(amount_unloaded, &ged->cargo, v->cargo_type, payment, v->GetCargoTile());
+			payment->R3RSetPaymentRecipient(nullptr);
 			remaining = v->cargo.UnloadCount() > 0;
 			if (amount_unloaded > 0) {
 				dirty_vehicle = true;
@@ -2385,7 +2508,7 @@ static void LoadUnloadVehicle(Vehicle *front)
 		 * along them. Otherwise the vehicle could wait for cargo
 		 * indefinitely if it hasn't visited the other links yet, or if the
 		 * links die while it's loading. */
-		if (!finished_loading) LinkRefresher::Run(front, true, true);
+		if (!finished_loading) LinkRefresher::RunPerSegment(front, true, true);
 
 		front->vehicle_flags.Set(VehicleFlag::LoadingFinished, finished_loading);
 

@@ -32,6 +32,7 @@
 #include "../core/format.hpp"
 
 #include "saveload.h"
+#include "saveload_buffer.h"
 #include "vehicle_sl.h"
 
 #include "table/strings.h"
@@ -1473,6 +1474,26 @@ static void Save_VEHS()
 void Load_VEHS()
 {
 	_cargo_count = 0;
+	int r3r_veh_count = 0;
+
+	{
+		FILE *r3rf = fopen("R3R_slref.log", "a");
+		if (r3rf != nullptr) {
+			fprintf(r3rf, "VEHS_ENTER is_table=%d hdr_len=%u pos=%u\n", SlIsTableChunk() ? 1 : 0, (unsigned)SlGetFieldLength(), (unsigned)SlGetBytesRead());
+			fclose(r3rf);
+		}
+		ReadBuffer *r3rrb = ReadBuffer::GetCurrent();
+		if (r3rrb != nullptr) {
+			r3rrb->CheckBytes(1);
+			size_t r3ravail = (size_t)(r3rrb->bufe - r3rrb->bufp);
+			if (r3ravail > 16384) r3ravail = 16384;
+			FILE *r3rf2 = fopen("R3R_vehsraw.bin", "wb");
+			if (r3rf2 != nullptr) {
+				fwrite(r3rrb->bufp, 1, r3ravail, r3rf2);
+				fclose(r3rf2);
+			}
+		}
+	}
 
 	_cpp_packets.clear();
 	_veh_cpp_packets.clear();
@@ -1498,6 +1519,7 @@ void Load_VEHS()
 
 	int idx;
 	while ((idx = SlIterateArray()) != -1) {
+		r3r_veh_count++;
 		_old_order_item_ref = 0;
 
 		Vehicle *v;
@@ -1565,6 +1587,14 @@ void Load_VEHS()
 				rv->cached_path->tile[i] = _path_tile[i];
 			}
 			rv->cached_path->layout_ctr = _path_layout_ctr;
+		}
+	}
+
+	{
+		FILE *r3rf = fopen("R3R_slref.log", "a");
+		if (r3rf != nullptr) {
+			fprintf(r3rf, "VEHS_DONE count=%d pool=%u\n", r3r_veh_count, (unsigned)Vehicle::GetPoolSize());
+			fclose(r3rf);
 		}
 	}
 }

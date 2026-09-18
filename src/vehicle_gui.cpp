@@ -24,6 +24,8 @@
 #include "depot_map.h"
 #include "group_cmd.h"
 #include "group_gui.h"
+#include "couple_group.h"
+#include "couple_group_gui.h"
 #include "strings_func.h"
 #include "strings_internal.h"
 #include "core/string_builder.hpp"
@@ -510,6 +512,11 @@ Dimension BaseVehicleListWindow::GetActionDropdownSize(bool show_autoreplace, bo
 
 	d = maxdim(d, GetStringBoundingBox(STR_VEHICLE_LIST_CREATE_GROUP));
 
+	/* R3R: couple groups are a train-only concept. */
+	if (this->vli.vtype == VehicleType::Train) {
+		d = maxdim(d, GetStringBoundingBox(STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS));
+	}
+
 	return d;
 }
 
@@ -595,6 +602,11 @@ DropDownList BaseVehicleListWindow::BuildActionDropdownList(bool show_autoreplac
 	list.push_back(MakeDropDownListStringItem(STR_TRACE_RESTRICT_SLOT_MANAGE, ADI_TRACERESTRICT_SLOT_MGMT, false));
 	if (_settings_client.gui.show_adv_tracerestrict_features) {
 		list.push_back(MakeDropDownListStringItem(STR_TRACE_RESTRICT_COUNTER_MANAGE, ADI_TRACERESTRICT_COUNTER_MGMT, false));
+	}
+	/* R3R: couple group management, listed next to the trace restrict managers (Q4).
+	 * Couple groups only exist for trains, so the entry is hidden elsewhere. */
+	if (this->vli.vtype == VehicleType::Train) {
+		list.push_back(MakeDropDownListStringItem(STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS, ADI_COUPLE_GROUP_MGMT, false));
 	}
 	if (change_order_str != 0) {
 		list.push_back(MakeDropDownListStringItem(change_order_str, ADI_CHANGE_ORDER, disable));
@@ -2739,6 +2751,10 @@ public:
 						break;
 					}
 
+					case ADI_COUPLE_GROUP_MGMT: // R3R: couple group management (Q4)
+						ShowCoupleGroupWindow(this->owner);
+						break;
+
 					default: NOT_REACHED();
 				}
 				break;
@@ -3063,6 +3079,8 @@ struct VehicleDetailsWindow : Window {
 	bool vehicle_slots_line_shown = false;
 	bool vehicle_speed_restriction_line_shown = false;
 	bool vehicle_speed_adaptation_line_shown = false;
+	bool vehicle_couple_group_line_shown = false; ///< R3R: the "couple group" line is shown.
+	bool vehicle_schedule_owner_line_shown = false; ///< R3R: the "schedule owner" line is shown.
 
 	enum DropDownAction {
 		VDWDDA_CLEAR_SPEED_RESTRICTION,
@@ -3174,6 +3192,45 @@ struct VehicleDetailsWindow : Window {
 		return (v->type == VehicleType::Train && _settings_game.vehicle.train_speed_adaptation);
 	}
 
+	/**
+	 * R3R: the couple group line is shown for trains whose segment is assigned to
+	 * a group, and for any chain which is made up of more than one segment. For a
+	 * plain single-segment chain without a group nothing is shown, so a game which
+	 * does not use couple groups keeps its usual vehicle window.
+	 */
+	bool ShouldShowCoupleGroupLine(const Vehicle *v) const
+	{
+		if (v->type != VehicleType::Train) return false;
+		const Train *t = Train::From(v);
+		if (R3RGetCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) return true;
+
+		uint total = 0;
+		return R3RGetChainScheduleOwner(t, nullptr, nullptr, &total) && total > 1;
+	}
+
+	/**
+	 * R3R: "segment k of N" only carries information when the chain really has
+	 * more than one segment; for a single segment it would always read "1 of 1".
+	 */
+	bool ShouldShowScheduleOwnerLine(const Vehicle *v) const
+	{
+		if (v->type != VehicleType::Train) return false;
+
+		uint total = 0;
+		return R3RGetChainScheduleOwner(Train::From(v), nullptr, nullptr, &total) && total > 1;
+	}
+
+	/**
+	 * R3R: names of the couple groups the segment of \a v belongs to, or the
+	 * "no group" placeholder. Q5: a segment may be in several groups, in which
+	 * case the names are joined with "+" (see R3RGetCoupleGroupsNameList).
+	 */
+	static std::string GetCoupleGroupDisplayName(const Vehicle *v)
+	{
+		const std::string names = R3RGetCoupleGroupsNameList(R3RGetCoupleGroupsOfSegment(Train::From(v)));
+		return !names.empty() ? names : std::string(GetString(STR_DEPOT_CHAIN_NO_GROUP));
+	}
+
 	std::vector<TraceRestrictSlotID> GetVehicleSlots(const Vehicle *v) const
 	{
 		std::vector<TraceRestrictSlotID> slots;
@@ -3198,12 +3255,16 @@ struct VehicleDetailsWindow : Window {
 				this->vehicle_slots_line_shown = ShouldShowSlotsLine(v);
 				this->vehicle_speed_restriction_line_shown = ShouldShowSpeedRestrictionLine(v);
 				this->vehicle_speed_adaptation_line_shown = ShouldShowSpeedAdaptationLine(v);
+				this->vehicle_couple_group_line_shown = ShouldShowCoupleGroupLine(v);
+				this->vehicle_schedule_owner_line_shown = ShouldShowScheduleOwnerLine(v);
 				int lines = 4;
 				if (this->vehicle_group_line_shown) lines++;
 				if (this->vehicle_weight_ratio_line_shown) lines++;
 				if (this->vehicle_slots_line_shown) lines++;
 				if (this->vehicle_speed_restriction_line_shown) lines++;
 				if (this->vehicle_speed_adaptation_line_shown) lines++;
+				if (this->vehicle_couple_group_line_shown) lines++;
+				if (this->vehicle_schedule_owner_line_shown) lines++;
 				size.height = lines * GetCharacterHeight(FontSize::Normal) + padding.height;
 
 				format_buffer buffer;
@@ -3237,6 +3298,13 @@ struct VehicleDetailsWindow : Window {
 				}
 				if (this->vehicle_group_line_shown) {
 					process(STR_VEHICLE_INFO_GROUP, v->group_id.base() | GROUP_NAME_HIERARCHY);
+				}
+				if (this->vehicle_couple_group_line_shown) {
+					/* R3R: the width is taken from the actual name, like the vehicle group line above. */
+					process(STR_VEHICLE_INFO_COUPLE_GROUP, GetCoupleGroupDisplayName(v));
+				}
+				if (this->vehicle_schedule_owner_line_shown) {
+					process(STR_VEHICLE_INFO_SCHEDULE_OWNER, max_value_i16, max_value_i16);
 				}
 				if (this->vehicle_weight_ratio_line_shown) {
 					process(STR_VEHICLE_INFO_WEIGHT_RATIOS,
@@ -3473,6 +3541,23 @@ struct VehicleDetailsWindow : Window {
 					tr.top += GetCharacterHeight(FontSize::Normal);
 				}
 
+				bool should_show_couple_group = this->ShouldShowCoupleGroupLine(v);
+				if (should_show_couple_group) {
+					DrawString(tr, GetString(STR_VEHICLE_INFO_COUPLE_GROUP, GetCoupleGroupDisplayName(v)));
+					tr.top += GetCharacterHeight(FontSize::Normal);
+				}
+
+				bool should_show_schedule_owner = this->ShouldShowScheduleOwnerLine(v);
+				if (should_show_schedule_owner) {
+					const Train *owner = nullptr;
+					uint index = 0;
+					uint total = 0;
+					if (R3RGetChainScheduleOwner(Train::From(v), &owner, &index, &total)) {
+						DrawString(tr, GetString(STR_VEHICLE_INFO_SCHEDULE_OWNER, index, total));
+						tr.top += GetCharacterHeight(FontSize::Normal);
+					}
+				}
+
 				bool should_show_slots = this->ShouldShowSlotsLine(v);
 				if (should_show_slots) {
 					std::vector<TraceRestrictSlotID> slots = this->GetVehicleSlots(v);
@@ -3517,7 +3602,9 @@ struct VehicleDetailsWindow : Window {
 						this->vehicle_weight_ratio_line_shown != should_show_weight_ratio ||
 						this->vehicle_slots_line_shown != should_show_slots ||
 						this->vehicle_speed_restriction_line_shown != should_show_speed_restriction ||
-						this->vehicle_speed_adaptation_line_shown != should_show_speed_adaptation) {
+						this->vehicle_speed_adaptation_line_shown != should_show_speed_adaptation ||
+						this->vehicle_couple_group_line_shown != should_show_couple_group ||
+						this->vehicle_schedule_owner_line_shown != should_show_schedule_owner) {
 					const_cast<VehicleDetailsWindow *>(this)->ReInit();
 				}
 				break;
@@ -4137,10 +4224,15 @@ public:
 		bool is_localcompany = v->owner == _local_company;
 		bool can_control = IsVehicleControlAllowed(v, _local_company);
 		bool refittable_and_stopped_in_depot = IsVehicleRefittable(v);
+		/* R3R (D4-1): a chain coupled across a company boundary is frozen
+		 * read-only while it is coupled: the refit would reconfigure the foreign
+		 * segment as well, so it is not offered here (the command layer refuses
+		 * it too). Decouple the chain first when it has to be reconfigured. */
+		bool r3r_chain_spans_companies = v->type == VehicleType::Train && R3RChainSpansCompanies(v, _local_company);
 
 		this->SetWidgetDisabledState(WID_VV_RENAME, !is_localcompany);
 		this->SetWidgetDisabledState(WID_VV_GOTO_DEPOT, !is_localcompany);
-		this->SetWidgetDisabledState(WID_VV_REFIT, !refittable_and_stopped_in_depot || !is_localcompany);
+		this->SetWidgetDisabledState(WID_VV_REFIT, !refittable_and_stopped_in_depot || !is_localcompany || r3r_chain_spans_companies);
 		this->SetWidgetDisabledState(WID_VV_CLONE, !is_localcompany);
 
 		this->UpdateDepotButton();

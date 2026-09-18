@@ -849,6 +849,13 @@ enum class WindowClass : uint16_t {
 	 */
 	ModifierKeyToggle,
 
+	/**
+	 * R3R couple group list/management window; %Window numbers:
+	 *   - 0 = #CoupleGroupListWidgets
+	 *   - #CoupleGroupID = #CoupleGroupWidgets
+	 */
+	CoupleGroup,
+
 	End,              ///< End sentinel.
 	Invalid = 0xFFFF, ///< Invalid window.
 };

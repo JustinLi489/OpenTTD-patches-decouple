@@ -37,6 +37,8 @@
 #include "vehicle_gui_base.h"
 #include "train_cmd.h"
 #include "vehicle_cmd.h"
+#include "couple_group.h"
+#include "couple_group_gui.h"
 #include "tbtr_template_vehicle_cmd.h"
 
 #include "widgets/depot_widget.h"
@@ -94,6 +96,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_MAKE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_MAKE_SEGMENT, STR_DEPOT_MAKE_SEGMENT_TOOLTIP),
 			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_DEMOTE_SEGMENT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_DEMOTE_SEGMENT, STR_DEPOT_DEMOTE_SEGMENT_TOOLTIP),
+			NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_COUPLE_GROUPS), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_COUPLE_GROUPS, STR_DEPOT_COUPLE_GROUPS_TOOLTIP),
 		EndContainer(),
 	EndContainer(),
 };
@@ -168,6 +171,21 @@ static const Train *TrainDepotGetSegmentFront(const Train *v)
 }
 
 /**
+ * R3R: find the last vehicle of the coupled-on segment whose first vehicle is \a seg.
+ * The segment ends at its own right boundary; chains or further segments coupled on
+ * behind it are not part of it. A segment without a boundary marker (e.g. from an
+ * older save) falls back to the chain end / the next boundary.
+ * @param seg First vehicle of the segment (carries SegmentFront).
+ * @return The last vehicle of the segment.
+ */
+static const Train *TrainDepotGetSegmentTail(const Train *seg)
+{
+	const Train *tail = seg;
+	while (!tail->IsSegmentBack() && tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
+	return tail;
+}
+
+/**
  * R3R: cut a whole coupled-on segment out of its chain. Any vehicles trailing
  * the segment (behind its last vehicle, marked by the segment's own right
  * boundary) are re-attached to the original chain first, leaving the
@@ -177,12 +195,7 @@ static const Train *TrainDepotGetSegmentFront(const Train *v)
  */
 static void TrainDepotDetachSegment(const Train *seg)
 {
-	/* Last vehicle of the segment: marked by the segment's own right boundary.
-	 * Chains or further segments coupled on behind it are not part of it (a
-	 * segment without a boundary marker - e.g. from an older save - still falls
-	 * back to the chain end / the next boundary). */
-	const Train *tail = seg;
-	while (!tail->IsSegmentBack() && tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
+	const Train *tail = TrainDepotGetSegmentTail(seg);
 
 	const Train *rest = tail->Next();     ///< Vehicles trailing the segment (may be nullptr).
 	const Train *anchor = seg->Previous(); ///< Last vehicle that stays on the original chain (may be nullptr).
@@ -382,6 +395,8 @@ struct DepotWindow : Window {
 	Scrollbar *vscroll = nullptr;
 	uint count_width = 0; ///< Width of length count, including separator.
 	uint header_width = 0; ///< Width of unit number and flag, including separator.
+	uint tag_width = 0; ///< R3R: width of the chain state tag (loose chain / segment / couple group), including separator. Zero for non-train depots.
+	uint tag_name_budget = 0; ///< R3R: pixels a couple group name may use on the second tag line; longer names are cut off.
 	Dimension flag_size{}; ///< Size of start/stop flag.
 	VehicleCellSize cell_size{}; ///< Vehicle sprite cell size.
 	bool last_overlay_state = false;
@@ -418,6 +433,21 @@ struct DepotWindow : Window {
 	}
 
 	/**
+	 * R3R: The coupled-on segment the currently dragged vehicle belongs to, or
+	 * nullptr when the drag selection is not part of a segment. Dragging any
+	 * vehicle of such a segment moves - and therefore highlights - the whole
+	 * segment, whatever vehicle inside it was grabbed.
+	 * @return Front vehicle of the dragged segment, or nullptr.
+	 */
+	const Train *GetDraggedSegmentFront() const
+	{
+		if (this->sel == VehicleID::Invalid()) return nullptr;
+		const Vehicle *v = Vehicle::Get(this->sel);
+		if (v == nullptr || v->type != VehicleType::Train) return nullptr;
+		return TrainDepotGetSegmentFront(Train::From(v));
+	}
+
+	/**
 	 * Count the dragged selection length if appropriate for the provided train.
 	 * @note This ignores potential changes in length due to callback returning different results.
 	 * @param t Train being counted.
@@ -439,11 +469,102 @@ struct DepotWindow : Window {
 
 		/* Sum the length of the dragged selection. */
 		uint length = 0;
+		/* R3R: a vehicle inside a coupled-on segment stands for the whole segment. */
+		const Train *drag_seg_front = this->GetDraggedSegmentFront();
+		const Train *drag_seg_tail = (drag_seg_front != nullptr) ? TrainDepotGetSegmentTail(drag_seg_front) : nullptr;
 		for (Train *u = Train::Get(this->sel); u != nullptr; u = _cursor.vehchain ? u->Next() : (u->HasArticulatedPart() ? u->GetNextArticulatedPart() : nullptr)) {
 			length += u->gcache.cached_veh_length;
+			if (u == drag_seg_tail) break;
 		}
 
 		return length;
+	}
+
+	/**
+	 * R3R: shorten a couple group name so it fits the reserved depot tag width.
+	 * The name is cut at whole UTF-8 characters and marked with ".." when
+	 * something was dropped; a name which already fits is returned unchanged.
+	 * @param name      Name to shorten.
+	 * @param max_width Width in pixels the shortened name may use.
+	 * @return The name, possibly shortened.
+	 */
+	static std::string ShortenCoupleGroupName(std::string_view name, uint max_width)
+	{
+		if (GetStringBoundingBox(name, FontSize::Small).width <= max_width) return std::string(name);
+
+		size_t cut = 0;
+		while (cut < name.size()) {
+			/* Step over one whole UTF-8 sequence; continuation bytes are 10xxxxxx. */
+			size_t next = cut + 1;
+			while (next < name.size() && (static_cast<uint8_t>(name[next]) & 0xC0) == 0x80) next++;
+
+			std::string candidate(name.substr(0, next));
+			candidate.append("..");
+			if (GetStringBoundingBox(candidate, FontSize::Small).width > max_width) break;
+			cut = next;
+		}
+
+		std::string result(name.substr(0, cut));
+		result.append("..");
+		return result;
+	}
+
+	/**
+	 * R3R: Draw the chain state tag, telling loose chains (no segment) and segments apart.
+	 * The first line tells which segment of the chain the row's own car belongs to
+	 * ("Segment k/N"), the second line names the couple group of the segment which
+	 * owns the schedule together with its position, i.e. "which segment of this
+	 * chain issues the orders".
+	 * @param v    Vehicle of the depot row (any car of the chain).
+	 * @param r    Rect of the depot row.
+	 * @param rtl  Whether the current text direction is right-to-left.
+	 */
+	void DrawChainStateTag(const Train *v, const Rect &r, bool rtl) const
+	{
+		if (this->tag_width == 0 || v == nullptr) return;
+
+		const Train *owner = nullptr;
+		uint index = 0;
+		uint total = 0;
+		if (!R3RGetChainScheduleOwner(v, &owner, &index, &total)) return;
+
+		bool grouped = false;
+		if (owner != nullptr) {
+			for (const Train *t = v; t != nullptr && !grouped; t = t->Next()) {
+				if (R3RGetCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) grouped = true;
+			}
+		}
+
+		Rect tag = r.WithWidth(this->tag_width - WidgetDimensions::scaled.hsep_normal, rtl)
+				.WithHeight(GetCharacterHeight(FontSize::Small))
+				.Translate(0, WidgetDimensions::scaled.matrix.top);
+
+		/* R3R: 'total' counts the head segment as well, so a chain consisting of a single
+		 * segment (an upgraded segment standing on its own) also has total == 1. Whether a
+		 * chain is made of segments therefore has to be told by the segment head marker,
+		 * not by the segment count. */
+		const bool segmented = v->IsSegmentFront() || total > 1;
+
+		if (segmented) {
+			/* Q2 follow-up: the first line is about *this row's* segment, so that a
+			 * multi-segment chain no longer shows the very same "segment 1" on every
+			 * row. */
+			uint self_index = 0;
+			uint self_total = 0;
+			R3RGetSegmentPosition(v, &self_index, &self_total);
+			DrawString(tag, GetString(STR_DEPOT_CHAIN_SEGMENT_POS, self_index, self_total), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
+		} else {
+			DrawString(tag, GetString(STR_DEPOT_CHAIN_LOOSE), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
+		}
+
+		if (!grouped && !segmented) return;
+
+		std::string name = R3RGetCoupleGroupsNameList(R3RGetCoupleGroupsOfSegment(owner));
+		if (name.empty()) name = std::string(GetString(STR_DEPOT_CHAIN_NO_GROUP));
+		name = ShortenCoupleGroupName(name, this->tag_name_budget);
+
+		tag = tag.Translate(0, GetCharacterHeight(FontSize::Small));
+		DrawString(tag, GetString(STR_DEPOT_CHAIN_GROUP_OWNER, name, index, total), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
 	}
 
 	/**
@@ -456,8 +577,8 @@ struct DepotWindow : Window {
 		bool free_wagon = false;
 
 		bool rtl = _current_text_dir == TD_RTL;
-		Rect text = r.Shrink(RectPadding::zero, WidgetDimensions::scaled.matrix);       /* Ract for text elements, horizontal is already applied. */
-		Rect image = r.Indent(this->header_width, rtl).Indent(this->count_width, !rtl); /* Rect for vehicle images */
+		Rect text = r.Shrink(RectPadding::zero, WidgetDimensions::scaled.matrix).Indent(this->tag_width, rtl); /* Ract for text elements, horizontal is already applied. */
+		Rect image = r.Indent(this->tag_width, rtl).Indent(this->header_width, rtl).Indent(this->count_width, !rtl); /* Rect for vehicle images */
 
 		switch (v->type) {
 			case VehicleType::Train: {
@@ -468,7 +589,10 @@ struct DepotWindow : Window {
 						ScaleSpriteTrad(_consistent_train_width != 0 ? _consistent_train_width : TRAININFO_DEFAULT_VEHICLE_WIDTH) :
 						0;
 
-				DrawTrainImage(u, image.Indent(x_space, rtl), this->sel, EIT_IN_DEPOT, free_wagon ? 0 : this->hscroll->GetPosition(), this->vehicle_over);
+				/* R3R: when a coupled-on segment is dragged, frame it as a whole,
+				 * whatever vehicle inside it was grabbed. */
+				const Train *drag_seg_front = this->GetDraggedSegmentFront();
+				DrawTrainImage(u, image.Indent(x_space, rtl), drag_seg_front != nullptr ? drag_seg_front->index : this->sel, EIT_IN_DEPOT, free_wagon ? 0 : this->hscroll->GetPosition(), this->vehicle_over);
 
 				/* Length of consist in tiles with 1 fractional digit (rounded up) */
 				uint length = u->gcache.cached_total_length + this->CountDraggedLength(u);
@@ -476,6 +600,9 @@ struct DepotWindow : Window {
 				DrawString(count.left, count.right, count.bottom - GetCharacterHeight(FontSize::Small) + 1,
 						GetString(STR_JUST_DECIMAL, CeilDiv(length * 10, TILE_SIZE), 1),
 						TextColour::Black, SA_RIGHT | SA_FORCE, false, FontSize::Small); // Draw the counter
+
+				/* R3R: tag the chain state so the player can tell loose chains and segments apart. */
+				this->DrawChainStateTag(u, r, rtl);
 				break;
 			}
 
@@ -500,7 +627,7 @@ struct DepotWindow : Window {
 		if (free_wagon) {
 			DrawString(text, STR_DEPOT_NO_ENGINE);
 		} else {
-			Rect flag = r.WithWidth(this->flag_size.width, rtl).WithHeight(this->flag_size.height).Translate(0, diff_y);
+			Rect flag = r.Indent(this->tag_width, rtl).WithWidth(this->flag_size.width, rtl).WithHeight(this->flag_size.height).Translate(0, diff_y);
 			DrawSpriteIgnorePadding((v->vehstatus.Test(VehState::Stopped)) ? SPR_FLAG_VEH_STOPPED : SPR_FLAG_VEH_RUNNING, PAL_NONE, flag, SA_CENTER);
 
 			DrawString(text, GetString(STR_JUST_COMMA, v->unitnumber), (v->max_age - DAYS_IN_LEAP_YEAR) >= v->age ? TextColour::Black : TextColour::Red);
@@ -529,7 +656,7 @@ struct DepotWindow : Window {
 		if (this->type == VehicleType::Train && _consistent_train_width != 0) {
 			int w = ScaleSpriteTrad(2 * _consistent_train_width);
 			PixelColour col = GetColourGradient(wid->colour, Shade::Normal);
-			Rect image = ir.Indent(this->header_width, rtl).Indent(this->count_width, !rtl);
+			Rect image = ir.Indent(this->tag_width, rtl).Indent(this->header_width, rtl).Indent(this->count_width, !rtl);
 			int first_line = w + (-this->hscroll->GetPosition()) % w;
 			if (rtl) {
 				for (int x = image.right - first_line; x >= image.left; x -= w) {
@@ -640,6 +767,10 @@ struct DepotWindow : Window {
 			is_wagon = true;
 		}
 
+		/* Skip the R3R chain state tag column (zero width for non-train depots). */
+		if (xm < this->tag_width) return {.action = DepotGUIAction::ShowVehicle, .vehicle = vehicle};
+		xm -= this->tag_width;
+
 		if (xm <= this->header_width) {
 			switch (this->type) {
 				case VehicleType::Train:
@@ -663,13 +794,13 @@ struct DepotWindow : Window {
 		if (this->type != VehicleType::Train) return {.action = DepotGUIAction::DragVehicle, .vehicle = vehicle};
 
 		/* Clicking on the counter */
-		if (xm >= matrix_widget->current_x - this->count_width) {
+		if (xm >= matrix_widget->current_x - this->tag_width - this->count_width) {
 			if (is_wagon) return {.action = DepotGUIAction::Error};
 			return  {.action = DepotGUIAction::ShowVehicle, .vehicle = vehicle};
 		}
 
 		/* Account for the header */
-		x -= this->header_width;
+		x -= this->tag_width + this->header_width;
 
 		/* find the vehicle in this row that was clicked */
 		const Train *wagon = Train::From(vehicle);
@@ -706,12 +837,11 @@ struct DepotWindow : Window {
 				} else if (v != nullptr) {
 					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
 					SetMouseCursorVehicle(v, EIT_IN_DEPOT);
-					/* R3R: dragging a vehicle inside a coupled-on segment always drags
-					 * the whole segment, so show the chain cursor regardless of ctrl. */
-					const Train *seg_front = (v->type == VehicleType::Train) ? TrainDepotGetSegmentFront(Train::From(v)) : nullptr;
-					_cursor.vehchain = _ctrl_pressed || seg_front != nullptr;
 
 					this->sel = v->index;
+					/* R3R: dragging a vehicle inside a coupled-on segment always drags
+					 * the whole segment, so show the chain cursor regardless of ctrl. */
+					_cursor.vehchain = _ctrl_pressed || this->GetDraggedSegmentFront() != nullptr;
 					this->SetDirty();
 				}
 				break;
@@ -806,20 +936,36 @@ struct DepotWindow : Window {
 
 				if (this->type == VehicleType::Train) {
 					this->count_width = GetStringBoundingBox(GetString(STR_JUST_DECIMAL, GetParamMaxValue(1000, 0, FontSize::Small), 1), FontSize::Small).width + WidgetDimensions::scaled.hsep_normal;
+					/* R3R: reserve room for the chain state tag. */
+					uint tag = GetStringBoundingBox(STR_DEPOT_CHAIN_LOOSE, FontSize::Small).width;
+					tag = std::max(tag, GetStringBoundingBox(GetString(STR_DEPOT_CHAIN_SEGMENT_POS, GetParamMaxValue(1000, 0, FontSize::Small), GetParamMaxValue(1000, 0, FontSize::Small)), FontSize::Small).width);
+					/* R3R: the second tag line shows the couple group and the segment which
+					 * owns the schedule. Its reserved width is the state line plus the
+					 * "k/N" part; a longer group name is cut off at #tag_name_budget so the
+					 * depot window cannot grow with the name of a group. */
+					this->tag_name_budget = tag;
+					uint owner = GetStringBoundingBox(GetString(STR_DEPOT_CHAIN_GROUP_OWNER, std::string(), GetParamMaxValue(1000, 0, FontSize::Small), GetParamMaxValue(1000, 0, FontSize::Small)), FontSize::Small).width;
+					this->tag_width = tag + owner + WidgetDimensions::scaled.hsep_normal;
 				} else {
 					this->count_width = 0;
+					this->tag_width = 0;
+					this->tag_name_budget = 0;
 				}
 
 				Dimension unumber = GetStringBoundingBox(GetString(STR_JUST_COMMA, GetParamMaxDigits(this->unitnumber_digits)));
 
 				if (this->type == VehicleType::Train || this->type == VehicleType::Road) {
 					min_height = std::max<uint>(unumber.height, this->flag_size.height);
+					if (this->type == VehicleType::Train) {
+						/* R3R: the chain state tag uses two small lines. */
+						min_height = std::max<uint>(min_height, WidgetDimensions::scaled.matrix.top + 2 * GetCharacterHeight(FontSize::Small));
+					}
 					this->header_width = unumber.width + WidgetDimensions::scaled.hsep_normal + this->flag_size.width + WidgetDimensions::scaled.hsep_normal;
 				} else {
 					min_height = unumber.height + WidgetDimensions::scaled.vsep_normal + this->flag_size.height;
 					this->header_width = std::max<uint>(unumber.width, this->flag_size.width) + WidgetDimensions::scaled.hsep_normal;
 				}
-				int base_width = this->count_width + this->header_width + padding.width;
+				int base_width = this->count_width + this->header_width + this->tag_width + padding.width;
 
 				resize.height = std::max<uint>(this->cell_size.height, min_height + padding.height);
 				if (this->type == VehicleType::Train) {
@@ -981,6 +1127,13 @@ struct DepotWindow : Window {
 				break;
 			}
 
+			case WID_D_COUPLE_GROUPS: // Couple groups button (R3R)
+				/* Opens the couple group window; segments are assigned to a group
+				 * from that window, so no object is placed here. */
+				ShowCoupleGroupWindow(this->owner);
+				SndClickBeep();
+				break;
+
 			case WID_D_RENAME: // Rename button
 				ShowQueryString(GetString(STR_DEPOT_NAME, this->type, Depot::GetByTile(TileIndex(this->window_number))->index), STR_DEPOT_RENAME_DEPOT_CAPTION,
 					MAX_LENGTH_DEPOT_NAME_CHARS, this, CS_ALPHANUMERAL, {QueryStringFlag::EnableDefault, QueryStringFlag::LengthIsInChars});
@@ -1107,10 +1260,10 @@ struct DepotWindow : Window {
 
 		if (_ctrl_pressed) {
 			/* Share-clone, do not open new viewport, and keep tool active */
-			Command<Commands::CloneVehicle>::Post(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying(v->type), _settings_client.gui.open_vehicle_gui_clone_share ? CommandCallback::CloneVehicle : CommandCallback::None, TileIndex(this->window_number), v->index, true);
+			Command<Commands::CloneVehicle>::Post(GetCmdBuildVehMsg(v), _settings_client.gui.open_vehicle_gui_clone_share ? CommandCallback::CloneVehicle : CommandCallback::None, TileIndex(this->window_number), v->index, true);
 		} else {
 			/* Copy-clone, open viewport for new vehicle, and deselect the tool (assume player wants to changs things on new vehicle) */
-			if (Command<Commands::CloneVehicle>::Post(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying(v->type), CommandCallback::CloneVehicle, TileIndex(this->window_number), v->index, false)) {
+			if (Command<Commands::CloneVehicle>::Post(GetCmdBuildVehMsg(v), CommandCallback::CloneVehicle, TileIndex(this->window_number), v->index, false)) {
 				ResetObjectToPlace();
 			}
 		}
@@ -1153,11 +1306,11 @@ struct DepotWindow : Window {
 				})) {
 					OnVehicleSelect(*begin);
 				} else {
-					ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying((*begin)->type)),
+					ShowErrorMessage(GetEncodedString(GetCmdBuildVehMsg(*begin)),
 						GetEncodedString(STR_ERROR_CAN_T_COPY_ORDER_VEHICLE_LIST), WarningLevel::Info);
 				}
 			} else {
-				ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying((*begin)->type)),
+				ShowErrorMessage(GetEncodedString(GetCmdBuildVehMsg(*begin)),
 					GetEncodedString(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST), WarningLevel::Info);
 			}
 		} else {
@@ -1170,11 +1323,11 @@ struct DepotWindow : Window {
 				})) {
 					OnVehicleSelect(*begin);
 				} else {
-					ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying((*begin)->type)),
+					ShowErrorMessage(GetEncodedString(GetCmdBuildVehMsg(*begin)),
 						GetEncodedString(STR_ERROR_CAN_T_SHARE_ORDER_VEHICLE_LIST), WarningLevel::Info);
 				}
 			} else {
-				ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_BUY_TRAIN + to_underlying((*begin)->type)),
+				ShowErrorMessage(GetEncodedString(GetCmdBuildVehMsg(*begin)),
 					GetEncodedString(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST), WarningLevel::Info);
 			}
 		}
@@ -1348,7 +1501,7 @@ struct DepotWindow : Window {
 		this->vscroll->SetCapacityFromWidget(this, WID_D_MATRIX);
 		NWidgetCore *nwi = this->GetWidget<NWidgetCore>(WID_D_MATRIX);
 		if (this->type == VehicleType::Train) {
-			this->hscroll->SetCapacity(nwi->current_x - this->header_width - this->count_width);
+			this->hscroll->SetCapacity(nwi->current_x - this->tag_width - this->header_width - this->count_width);
 		} else {
 			this->num_columns = nwi->current_x / nwi->resize_x;
 		}
@@ -1357,7 +1510,9 @@ struct DepotWindow : Window {
 	EventState OnCTRLStateChange() override
 	{
 		if (this->sel != VehicleID::Invalid()) {
-			_cursor.vehchain = _ctrl_pressed;
+			/* R3R: a coupled-on segment is dragged as a whole, ctrl or not, so
+			 * releasing ctrl must not shrink the drag back to a single vehicle. */
+			_cursor.vehchain = _ctrl_pressed || this->GetDraggedSegmentFront() != nullptr;
 			this->SetWidgetDirty(WID_D_MATRIX);
 			return ES_HANDLED;
 		}

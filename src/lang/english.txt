@@ -4150,6 +4150,7 @@ STR_VEHICLE_LIST_AVAILABLE_SHIPS                                :Available Ships
 STR_VEHICLE_LIST_AVAILABLE_AIRCRAFT                             :Available Aircraft
 
 STR_VEHICLE_LIST_MANAGE_LIST                                    :{BLACK}Manage list
+STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS                           :{BLACK}Manage couple groups
 STR_VEHICLE_LIST_MANAGE_LIST_TOOLTIP                            :{BLACK}Send instructions to all vehicles in this list
 STR_VEHICLE_LIST_REPLACE_VEHICLES                               :Replace vehicles
 STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Send for servicing
@@ -6106,3 +6107,41 @@ STR_ORDER_DECOUPLE_QUERY_TAIL                                  :Release last N s
 STR_ORDER_DECOUPLE_QUERY_HEAD                                  :Split between segment N and segment N+1...
 STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :Number of trailing segments to release
 STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :Head segment to split after
+
+STR_DEPOT_CHAIN_LOOSE                                          :Loose chain
+STR_DEPOT_CHAIN_SEGMENT_POS                                    :Segment {NUM}/{NUM}
+
+STR_COUPLE_GROUP_CAPTION                                        :{WHITE}Couple groups
+STR_COUPLE_GROUP_GROUPS_TOOLTIP                                 :Couple groups
+STR_COUPLE_GROUP_SEGMENTS_TOOLTIP                               :Segments which belong to the selected couple group
+STR_COUPLE_GROUP_NEW                                            :New group
+STR_COUPLE_GROUP_NEW_TOOLTIP                                    :Create a new couple group
+STR_COUPLE_GROUP_RENAME_TOOLTIP                                 :Rename the selected couple group
+STR_COUPLE_GROUP_DELETE                                         :Delete
+STR_COUPLE_GROUP_DELETE_TOOLTIP                                 :Delete the selected couple group; its segments become unassigned
+STR_COUPLE_GROUP_REMOVE_SEGMENT                                 :Remove segment
+STR_COUPLE_GROUP_REMOVE_SEGMENT_TOOLTIP                         :Take the selected segment out of this couple group; its other groups are kept
+STR_COUPLE_GROUP_NONE                                           :No couple group has been created yet
+STR_COUPLE_GROUP_NO_SEGMENTS                                    :No segment is assigned to this couple group
+STR_COUPLE_GROUP_LIST_ITEM                                      :{RAW_STRING} ({NUM} segments)
+STR_COUPLE_GROUP_SEGMENT_ITEM                                   :#{NUM} ({NUM} vehicles)
+STR_COUPLE_GROUP_SEGMENT_ALSO_IN                                :also in: {RAW_STRING}
+STR_COUPLE_GROUP_QUERY_NEW                                      :Name of the new couple group
+STR_COUPLE_GROUP_QUERY_RENAME                                   :New name of the couple group
+STR_COUPLE_GROUP_QUERY_DELETE_CAPTION                           :{WHITE}Delete couple group
+STR_COUPLE_GROUP_QUERY_DELETE                                   :Are you sure you want to delete couple group '{RAW_STRING}'? Its segments become unassigned.
+
+STR_DEPOT_CHAIN_GROUP_OWNER                                     :{RAW_STRING} (owner {NUM}/{NUM})
+STR_DEPOT_CHAIN_NO_GROUP                                        :no group
+STR_COUPLE_GROUP_OWNER_MARK                                     :(schedule owner {NUM}/{NUM})
+STR_VEHICLE_INFO_COUPLE_GROUP                                   :{BLACK}Couple group: {LTBLUE}{RAW_STRING}
+STR_VEHICLE_INFO_SCHEDULE_OWNER                                 :{BLACK}Schedule owner: segment {NUM} of {NUM}
+STR_DEPOT_COUPLE_GROUPS                                         :{BLACK}Couple groups
+STR_DEPOT_COUPLE_GROUPS_TOOLTIP                                 :{BLACK}Open the couple group window: create, rename or delete couple groups and assign segments to a group
+STR_COUPLE_GROUP_ADD_SEGMENT                                    :{BLACK}Assign segment
+STR_COUPLE_GROUP_ADD_SEGMENT_TOOLTIP                            :{BLACK}Click a segment in the world to assign it to the selected couple group
+STR_COUPLE_GROUP_CROSS_COMPANY                                  :{BLACK}Allow other companies to join and couple
+STR_COUPLE_GROUP_CROSS_COMPANY_TOOLTIP                          :{BLACK}With this enabled, other companies may assign their own segments to this couple group, and segments of different companies may be coupled together when they share it. Turning it off takes the segments of other companies back out of the group; it never changes who owns a vehicle and never separates a chain which is already coupled.
+STR_COUPLE_GROUP_SHARED                                         :{BLACK}Allow other companies to join
+STR_COUPLE_GROUP_SHARED_TOOLTIP                                 :{BLACK}With this enabled every other company may assign its own segments to this couple group, and the group is listed for them. Turning it off takes the segments of other companies back out of the group; it never changes who owns a vehicle and never separates a chain which is already coupled. To actually couple across companies, 'Allow cross-company coupling' must be enabled as well.
+STR_COUPLE_GROUP_LIST_SHARED                                    : (shared)

@@ -314,12 +314,17 @@ bool Vehicle::NeedsServicing() const
 
 	for (const Vehicle *v = this; v != nullptr; v = (v->type == VehicleType::Train) ? Train::From(v)->GetNextUnit() : nullptr) {
 		bool replace_when_old = false;
-		EngineID new_engine = EngineReplacementForCompany(c, v->engine_type, v->group_id, &replace_when_old);
+		/* R3R: a physical chain may contain vehicles of another company when cross-company
+		 * coupling is enabled, so each vehicle must be evaluated against its own company.
+		 * Vehicle::NeedsAutorenewing() asserts that the passed company matches the vehicle
+		 * owner, which the chain's company does not for such a vehicle. */
+		const Company *vc = (v->owner == this->owner) ? c : Company::Get(v->owner);
+		EngineID new_engine = EngineReplacementForCompany(vc, v->engine_type, v->group_id, &replace_when_old);
 
 		/* Check engine availability */
 		if (new_engine == EngineID::Invalid() || !Engine::Get(new_engine)->company_avail.Test(v->owner)) continue;
 		/* Is the vehicle old if we are not always replacing? */
-		if (replace_when_old && !v->NeedsAutorenewing(c, false)) continue;
+		if (replace_when_old && !v->NeedsAutorenewing(vc, false)) continue;
 
 		/* Check refittability */
 		CargoTypes available_cargo_types, union_mask;
@@ -1238,10 +1243,13 @@ void Vehicle::PreDestructor()
 	this->cargo.Truncate();
 	DeleteVehicleOrders(this);
 	/* R3R: release the backed-up order list (the locomotive's own schedule
-	 * parked here while it was executing a coupled consist's schedule). */
+	 * parked here while it was executing a coupled consist's schedule).
+	 * The pointer is detached first: OrderList::FreeChain() only destroys the list
+	 * when no other vehicle still uses it, and it must not see this dying vehicle. */
 	if (this->orders_backup != nullptr) {
-		this->orders_backup->FreeChain(false);
+		OrderList *backup = this->orders_backup;
 		this->orders_backup = nullptr;
+		backup->FreeChain(false);
 	}
 	DeleteDepotHighlightOfVehicle(this);
 
@@ -3622,7 +3630,7 @@ void Vehicle::LeaveStation()
 			 * during the stop and that refit_cap == cargo_cap for each vehicle in
 			 * the consist. */
 			this->ResetRefitCaps();
-			LinkRefresher::Run(this, true, false, cargoes_can_leave_with_cargo);
+			LinkRefresher::RunPerSegment(this, true, false, cargoes_can_leave_with_cargo);
 		}
 
 		if (cargoes_can_leave_with_cargo == ALL_CARGOTYPES) {

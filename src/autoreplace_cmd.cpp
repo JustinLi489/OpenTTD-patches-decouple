@@ -951,6 +951,21 @@ CommandCost CmdAutoreplaceVehicle(DoCommandFlags flags, VehicleID veh_id, bool s
 	}
 	if (!v->IsChainInDepot()) return CMD_ERROR;
 
+	/* R3R: with cross-company coupling enabled a single physical chain may legitimately
+	 * contain vehicles of more than one company. Upstream autoreplace/autorenew assumes
+	 * the whole chain belongs to _current_company: one Company pointer is passed for every
+	 * vehicle (Vehicle::NeedsAutorenewing asserts c == Company::Get(owner)) and the chain is
+	 * rebuilt as a whole, which would also sell and buy vehicles belonging to the other
+	 * company. Such a chain has no valid autoreplace semantics, so skip it silently.
+	 * CMD_ERROR carries no message, so this does not create advice news items.
+	 * The whole physical chain is checked (not just GetNextUnit() units) because a coupled
+	 * child unit of another company is exactly the case that must be detected. */
+	if (!free_wagon) {
+		for (const Vehicle *w = v->Next(); w != nullptr; w = w->Next()) {
+			if (w->owner != v->owner) return CMD_ERROR;
+		}
+	}
+
 	const Company *c = Company::Get(_current_company);
 	bool wagon_removal = c->settings.renew_keep_length;
 

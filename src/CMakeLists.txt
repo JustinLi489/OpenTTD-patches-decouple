@@ -125,6 +125,13 @@ add_files(
     company_gui.h
     company_manager_face.h
     company_type.h
+    couple_group.cpp
+    couple_group.h
+    couple_group_cmd.cpp
+    couple_group_cmd.h
+    couple_group_gui.cpp
+    couple_group_gui.h
+    couple_group_type.h
     console.cpp
     console_cmds.cpp
     console_func.h

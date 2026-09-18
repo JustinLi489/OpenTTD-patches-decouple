@@ -8,6 +8,7 @@ add_files(
     cheat_widget.h
     company_widget.h
     console_widget.h
+    couple_group_widget.h
     date_widget.h
     departures_widget.h
     depot_widget.h

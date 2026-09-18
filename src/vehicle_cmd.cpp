@@ -41,6 +41,7 @@
 #include "tbtr_template_vehicle_cmd.h"
 #include "tbtr_template_vehicle_func.h"
 #include "scope.h"
+#include "couple_group.h"
 #include "r3r_perf.h"
 
 #include <cstdio>
@@ -271,16 +272,32 @@ static bool R3RPromoteFreeWagonChainToFront(Train *t)
 	if (front == nullptr) return false;
 	front->SetFrontEngine();
 	if (front->unitnumber == 0) {
-		front->unitnumber = GetFreeUnitNumber(VehicleType::Train);
-		/* R3R: mark the number as used in the company's freeunits pool, so a
-		 * locomotive bought afterwards does not get the same number (observed:
-		 * consist got number 1, then the purchased loco also got number 1). */
-		if (front->unitnumber != UINT16_MAX) Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
+		if (front->unitnumber_backup != 0) {
+			/* R3R: this chain lent its unit number to the train it was coupled
+			 * onto (Couple parks its own number in unitnumber_backup). Having just
+			 * been split off in the depot it takes its own number back instead of
+			 * being renumbered ("Train 1" used to come back as "Train 3"). */
+			front->unitnumber = front->unitnumber_backup;
+			front->unitnumber_backup = 0;
+			Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
+		} else {
+			front->unitnumber = GetFreeUnitNumber(VehicleType::Train);
+			/* R3R: mark the number as used in the company's freeunits pool, so a
+			 * locomotive bought afterwards does not get the same number (observed:
+			 * consist got number 1, then the purchased loco also got number 1). */
+			if (front->unitnumber != UINT16_MAX) Company::Get(front->owner)->freeunits[VehicleType::Train].UseID(front->unitnumber);
+		}
 	}
 	front->group_id = t->group_id;
 	UpdateTrainGroupID(t);
 	GroupStatistics::CountVehicle(t, 1);
 	InvalidateVehicleListWindows(t->type);
+	/* R3R: the chain head just became a front engine. The vehicle tick caches
+	 * (which drive Train::Tick -> TrainLocoHandler) are only rebuilt after an
+	 * explicit invalidation, so without this the promoted front would never be
+	 * ticked: it could not load its orders nor wait for a coupling locomotive.
+	 * Same rule as the promotion in DecoupleTrain / TryTrainCouple. */
+	InvalidateVehicleTickCaches();
 	return true;
 }
 
@@ -539,10 +556,20 @@ static void ClearSegmentTailFakeEngine(Train *seg)
 CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
 {
 	Train *t = Train::GetIfValid(veh_id);
-	if (t == nullptr || !IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+	if (t == nullptr) return CMD_ERROR;
 
 	/* Resolve the clicked vehicle to its independent chain front. */
 	while (t->Previous() != nullptr) t = t->Previous();
+
+	/* R3R: the promotion acts on the whole (independent) chain, so the chain
+	 * head must be ours. */
+	CommandCost ret = CheckOwnership(t->owner);
+	if (ret.Failed()) return ret;
+	/* R3R: the depot tile check is infrastructure-sharing aware. A company may
+	 * promote its own chain in a foreign depot whenever sharing lets it use
+	 * that depot (the same rule the depot window uses for its other tools). */
+	ret = CheckInfraUsageAllowed(VehicleType::Train, GetTileOwner(t->tile), t->tile);
+	if (ret.Failed()) return ret;
 
 	/* R3R debug probe: log the command receipt and every validation result. */
 	FILE *dbg = R3RFopenDbg("a");
@@ -627,7 +654,14 @@ static bool R3RChainHasRealLocomotive(const Train *seg)
 CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, ClientID client_id)
 {
 	Train *t = Train::GetIfValid(veh_id);
-	if (t == nullptr || !IsTileOwner(t->tile, _current_company)) return CMD_ERROR;
+	if (t == nullptr) return CMD_ERROR;
+
+	/* R3R: only our own chain may be demoted, and the depot tile check is
+	 * infrastructure-sharing aware (see CmdMakeSegment). */
+	CommandCost ret = CheckOwnership(t->owner);
+	if (ret.Failed()) return ret;
+	ret = CheckInfraUsageAllowed(VehicleType::Train, GetTileOwner(t->tile), t->tile);
+	if (ret.Failed()) return ret;
 
 	/* Look for a segment boundary on the clicked vehicle or before it. */
 	Train *seg = nullptr;
@@ -729,8 +763,25 @@ CommandCost CmdSellVehicle(DoCommandFlags flags, TileIndex tile, VehicleID v_id,
 	/* Do this check only if the vehicle to be moved is non-virtual */
 	if (!HasFlag(sell_flags, SellVehicleFlags::VirtualOnly) && !front->IsStoppedInDepot()) return CommandCost(STR_ERROR_TRAIN_MUST_BE_STOPPED_INSIDE_DEPOT + to_underlying(front->type));
 
+	/* R3R (D4-1): a chain which was coupled across a company boundary contains
+	 * segments of several companies (a coupling never transfers ownership). The
+	 * foreign segments are frozen read-only for us: selling them would destroy
+	 * another company's property, so only the vehicles this company owns may go.
+	 * The owner of a segment is unaffected by this check and keeps the right to
+	 * decouple and reclaim it at any time. */
 	if (v->type == VehicleType::Train) {
-		ret = CmdSellRailWagon(flags, v, HasFlag(sell_flags, SellVehicleFlags::SellChain), HasFlag(sell_flags, SellVehicleFlags::BackupOrder), client_id);
+		const bool sell_chain = HasFlag(sell_flags, SellVehicleFlags::SellChain);
+		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
+			if (R3RIsFrozenForeignSegment(w, _current_company)) {
+				if (R3RDbgOn()) R3RDbgWrite("R3R-FROZEN-SELL veh=%d owner=%d company=%d sell_chain=%d\n", (int)w->index.base(), (int)w->owner.base(), (int)_current_company.base(), sell_chain ? 1 : 0);
+				return CommandCost(STR_ERROR_CAN_T_SELL_TRAIN);
+			}
+			/* Only this vehicle (and its rear engine part, which always shares
+			 * its owner) goes when the chain is not sold as a whole. */
+			if (!sell_chain) break;
+		}
+
+		ret = CmdSellRailWagon(flags, v, sell_chain, HasFlag(sell_flags, SellVehicleFlags::BackupOrder), client_id);
 	} else {
 		ret = CommandCost(ExpensesType::NewVehicles, -front->value);
 
@@ -1024,6 +1075,35 @@ CommandCost CmdRefitVehicle(DoCommandFlags flags, VehicleID veh_id, CargoType ne
 
 	/* For aircraft there is always only one. */
 	only_this |= front->type == VehicleType::Aircraft || (front->type == VehicleType::Ship && num_vehicles == 1);
+
+	/* R3R (D4-1): the foreign segment of a cross-company chain is frozen, so a
+	 * refit must never reconfigure vehicles this company does not own. Refitting
+	 * a single car is checked directly; a multi-vehicle refit is checked against
+	 * the very set RefitVehicle() is going to refit below. */
+	if (v->type == VehicleType::Train) {
+		const Vehicle *frozen = nullptr;
+		if (only_this) {
+			const Vehicle *w = v;
+			if (R3RIsFrozenForeignSegment(w, _current_company)) frozen = w;
+		} else {
+			VehicleSet vehicles_to_refit;
+			GetVehicleSet(vehicles_to_refit, v, num_vehicles == 0 ? UINT8_MAX : num_vehicles);
+			for (const Vehicle *w = front; w != nullptr; w = w->Next()) {
+				if (std::ranges::find(vehicles_to_refit, w->index) == vehicles_to_refit.end()) continue;
+				if (R3RIsFrozenForeignSegment(w, _current_company)) {
+					frozen = w;
+					break;
+				}
+			}
+		}
+
+		if (frozen != nullptr) {
+			/* Auto-refit is driven by the loading logic and may be retried every
+			 * tick, so only the explicit (player / order) refits are logged. */
+			if (!auto_refit && R3RDbgOn()) R3RDbgWrite("R3R-FROZEN-REFIT veh=%d owner=%d company=%d only_this=%d\n", (int)frozen->index.base(), (int)frozen->owner.base(), (int)_current_company.base(), only_this ? 1 : 0);
+			return CommandCost(STR_ERROR_CAN_T_REFIT_TRAIN);
+		}
+	}
 
 	CommandCost cost = RefitVehicle(v, only_this, num_vehicles, new_cid, new_subtype, flags, auto_refit);
 	if (is_virtual_train && !flags.Test(DoCommandFlag::QueryCost)) cost.MultiplyCost(0);

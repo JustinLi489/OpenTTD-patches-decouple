@@ -2220,8 +2220,11 @@ bool AfterLoadGame()
 
 		for (Vehicle *v : Vehicle::Iterate()) {
 			if (v->orders != nullptr && v->orders->GetFirstOrder() != nullptr && v->orders->GetFirstOrder()->IsType(OT_NOTHING)) {
-				v->orders->FreeChain();
+				/* R3R: detach before freeing, OrderList::FreeChain() keeps a list alive
+				 * while another vehicle still refers to it. */
+				OrderList *ol = v->orders;
 				v->orders = nullptr;
+				ol->FreeChain();
 			}
 
 			v->current_order.ConvertFromOldSavegame();

@@ -943,8 +943,83 @@ static const NamedSaveLoad _table_station_desc[] = {
 	NSLT_STRUCTLIST<RoadStopTileDataStructHandler>("roadstoptiledata"),
 };
 
+/* ==== R3R (KI-99): Station::loading_vehicles 失效车辆引用自愈清理 ====
+ *
+ * 现象：读档在 SlFixPointers() 的 STNN 通道里报
+ *       "Referencing invalid Vehicle"（IntToReference REF_VEHICLE 分支，
+ *       SlErrorCorruptWithChunk），存档直接读不进去。
+ *
+ * 根因：Station::loading_vehicles 是 Station 表（STNN）里【唯一】的
+ *       REF_VEHICLE 字段（SLE_CONDREFVEC(Station, loading_vehicles, REF_VEHICLE)）。
+ *       正常进出由 economy.cpp PrepareUnload() 压入、Vehicle::LeaveStation() /
+ *       Vehicle::PreDestructor() 摘除，三方都靠 vehicle->last_station_visited
+ *       反查站点。R3R 的拆链 / 编组 / 段升级降级 / 卖车路径若在"装卸途中"
+ *       改写了链头身份或直接删除链头车辆，压入方与摘除方用的站点就会对不上，
+ *       条目永久残留在站点里；存档把这个指向已释放车辆的脏条目写进文件，
+ *       下次读档在指针修正阶段被判死。
+ *
+ * 处置（自愈，不改变任何正常车辆行为）：正常条目必定命中"活车集合"或
+ *       "车辆池有效索引"，一条都不会被误删；只有真正失效的条目被剔除。
+ */
+
+/**
+ * 读档期清理：此时表内元素尚未经 SLA_PTRS 转换，存放的是
+ * ReferenceToInt 的结果（索引 + 1，0 表示 nullptr）的裸序号。
+ * 只做存在性判断，绝不解引用任何指针，因此绝对安全。
+ */
+static void R3RPurgeInvalidLoadingVehiclesRaw()
+{
+	for (Station *st : Station::Iterate()) {
+		auto &lv = st->loading_vehicles;
+		for (auto it = lv.begin(); it != lv.end();) {
+			const size_t raw = reinterpret_cast<size_t>(*it);
+			if (raw == 0 || !Vehicle::IsValidID(raw - 1)) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "SL-STNN-PURGE station=%d raw=%u (loader) removed\n",
+							(int)st->index.base(), (unsigned)raw);
+					fclose(dbg);
+				}
+				it = lv.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+}
+
+/**
+ * 存档期清理：此时表内是真实指针，用活车集合过滤悬垂指针。
+ * 比对只用指针值，不解引用，故对已释放车辆同样安全。
+ */
+static void R3RPurgeInvalidLoadingVehicles()
+{
+	for (Station *st : Station::Iterate()) {
+		auto &lv = st->loading_vehicles;
+		for (auto it = lv.begin(); it != lv.end();) {
+			bool alive = false;
+			for (const Vehicle *v : Vehicle::Iterate()) {
+				if (v == *it) { alive = true; break; }
+			}
+			if (!alive) {
+				FILE *dbg = fopen("R3R_debug.log", "a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "SL-STNN-PURGE station=%d (saver) removed stale entry\n",
+							(int)st->index.base());
+					fclose(dbg);
+				}
+				it = lv.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+}
+
 static void Save_STNN()
 {
+	R3RPurgeInvalidLoadingVehicles();
+
 	SaveLoadTableData slt = SlTableHeader(_table_station_desc);
 
 	/* Write the stations */
@@ -977,6 +1052,9 @@ static void Load_STNN_table()
 		SlObjectLoadFiltered(bst, slt);
 		PostLoadStation_STNN(bst);
 	}
+
+	/* R3R (KI-99): 必须在 SlFixPointers()/Ptrs_STNN() 之前剔除失效车辆条目。 */
+	R3RPurgeInvalidLoadingVehiclesRaw();
 }
 
 static void Load_STNN()
@@ -1133,6 +1211,9 @@ static void Load_STNN()
 
 		PostLoadStation_STNN(bst);
 	}
+
+	/* R3R (KI-99): 必须在 SlFixPointers()/Ptrs_STNN() 之前剔除失效车辆条目。 */
+	R3RPurgeInvalidLoadingVehiclesRaw();
 }
 
 static void Ptrs_STNN()

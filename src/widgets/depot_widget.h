@@ -34,6 +34,7 @@ enum DepotWidgets : WidgetID {
 	WID_D_MAKE_SEGMENT,    ///< Turn the selected loose wagon chain/consist/train into an independent segment (R3R).
 	WID_D_DEMOTE_SEGMENT,  ///< Demote the selected segment back to loose wagons or a plain train (R3R).
 	WID_D_SHOW_SEGMENT_TOOLS, ///< Show the segment tool row (R3R, trains only).
+	WID_D_COUPLE_GROUPS,   ///< Open the couple groups window (R3R).
 };
 
 #endif /* WIDGETS_DEPOT_WIDGET_H */

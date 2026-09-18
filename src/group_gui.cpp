@@ -30,6 +30,7 @@
 #include "newgrf_debug.h"
 #include "group_cmd.h"
 #include "group_gui.h"
+#include "couple_group_gui.h"
 #include "zoom_func.h"
 #include "vehicle_cmd.h"
 
@@ -1215,6 +1216,10 @@ public:
 						ShowTraceRestrictCounterWindow(this->owner);
 						break;
 					}
+
+					case ADI_COUPLE_GROUP_MGMT: // R3R: couple group management (Q4)
+						ShowCoupleGroupWindow(this->owner);
+						break;
 
 					default: NOT_REACHED();
 				}

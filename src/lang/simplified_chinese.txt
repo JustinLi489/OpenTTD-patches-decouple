@@ -1446,7 +1446,7 @@ STR_CONFIG_SETTING_SHOWFINANCES_PERIOD                          :在周期末显
 STR_CONFIG_SETTING_SHOWFINANCES_HELPTEXT                        :"打开"时，在年底显示财务报表窗口，方便查看公司财务状况
 STR_CONFIG_SETTING_SHOWFINANCES_HELPTEXT_PERIOD                 :如果启用，财务窗口会在每期结束时弹出，以便于检查公司的财务状况
 
-STR_CONFIG_SETTING_NONSTOP_BY_DEFAULT                           :设定命令时默认选择"直达"命令：{STRING}
+STR_CONFIG_SETTING_NONSTOP_BY_DEFAULT                           :新建命令时默认选择"不停车"命令：{STRING}
 STR_CONFIG_SETTING_NONSTOP_BY_DEFAULT_HELPTEXT                  :通常，车辆在它经过的每一个车站都会停车。"打开"本选项时，车辆会不停车的通过所有中间车站前往最终目的地。注意：这只是为每一条新调度命令设置一个默认信息，仍然可以为每条调度命令设置明确的信息
 
 STR_CONFIG_SETTING_STOP_LOCATION                                :列车调度计划中新命令默认停靠于站台{STRING}位置
@@ -4133,6 +4133,7 @@ STR_VEHICLE_LIST_AVAILABLE_SHIPS                                :可用的船只
 STR_VEHICLE_LIST_AVAILABLE_AIRCRAFT                             :可用的飞机
 
 STR_VEHICLE_LIST_MANAGE_LIST                                    :{BLACK}管理列表
+STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS                           :{BLACK}管理挂接分组
 STR_VEHICLE_LIST_MANAGE_LIST_TOOLTIP                            :{BLACK}向所有在此列表中的运输工具发出指令
 STR_VEHICLE_LIST_REPLACE_VEHICLES                               :替换车辆/飞机/船只
 STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :进行保养
@@ -6078,3 +6079,41 @@ STR_ORDER_DECOUPLE_QUERY_TAIL                                  :解挂尾部 N �
 STR_ORDER_DECOUPLE_QUERY_HEAD                                  :在第 N 段与第 N+1 段之间解挂…
 STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :要解挂的尾部段数
 STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :从车头数起在第几段后切开
+
+STR_DEPOT_CHAIN_LOOSE                                          :散链
+STR_DEPOT_CHAIN_SEGMENT_POS                                    :第 {NUM}/{NUM} 段
+
+STR_COUPLE_GROUP_CAPTION                                        :{WHITE}挂接分组
+STR_COUPLE_GROUP_GROUPS_TOOLTIP                                 :挂接分组
+STR_COUPLE_GROUP_SEGMENTS_TOOLTIP                               :所选挂接分组包含的段
+STR_COUPLE_GROUP_NEW                                            :新建分组
+STR_COUPLE_GROUP_NEW_TOOLTIP                                    :新建一个挂接分组
+STR_COUPLE_GROUP_RENAME_TOOLTIP                                 :重命名所选挂接分组
+STR_COUPLE_GROUP_DELETE                                         :删除
+STR_COUPLE_GROUP_DELETE_TOOLTIP                                 :删除所选挂接分组；其中的段将变为未分组
+STR_COUPLE_GROUP_REMOVE_SEGMENT                                 :移出分组
+STR_COUPLE_GROUP_REMOVE_SEGMENT_TOOLTIP                         :把所选段移出该挂接分组，其余分组保持不变
+STR_COUPLE_GROUP_NONE                                           :尚未新建任何挂接分组
+STR_COUPLE_GROUP_NO_SEGMENTS                                    :该挂接分组下还没有段
+STR_COUPLE_GROUP_LIST_ITEM                                      :{RAW_STRING}（{NUM} 个段）
+STR_COUPLE_GROUP_SEGMENT_ITEM                                   :#{NUM}（{NUM} 节）
+STR_COUPLE_GROUP_SEGMENT_ALSO_IN                                :同属 {RAW_STRING}
+STR_COUPLE_GROUP_QUERY_NEW                                      :新挂接分组的名称
+STR_COUPLE_GROUP_QUERY_RENAME                                   :挂接分组的新名称
+STR_COUPLE_GROUP_QUERY_DELETE_CAPTION                           :{WHITE}删除挂接分组
+STR_COUPLE_GROUP_QUERY_DELETE                                   :确定要删除挂接分组“{RAW_STRING}”吗？其中的段将变为未分组。
+
+STR_DEPOT_CHAIN_GROUP_OWNER                                     :{RAW_STRING}（归属 {NUM}/{NUM}）
+STR_DEPOT_CHAIN_NO_GROUP                                        :无分组
+STR_COUPLE_GROUP_OWNER_MARK                                     :（命令归属 {NUM}/{NUM}）
+STR_VEHICLE_INFO_COUPLE_GROUP                                   :{BLACK}挂接分组：{LTBLUE}{RAW_STRING}
+STR_VEHICLE_INFO_SCHEDULE_OWNER                                 :{BLACK}命令归属：第 {NUM} 段 / 共 {NUM} 段
+STR_DEPOT_COUPLE_GROUPS                                         :{BLACK}挂接分组
+STR_DEPOT_COUPLE_GROUPS_TOOLTIP                                 :{BLACK}打开挂接分组窗口：新建、改名或删除挂接分组，并把段指派进分组
+STR_COUPLE_GROUP_ADD_SEGMENT                                    :{BLACK}指派段
+STR_COUPLE_GROUP_ADD_SEGMENT_TOOLTIP                            :{BLACK}在世界中点击一段（独立列车或段头所在车），把它指派到当前选中的挂接分组
+STR_COUPLE_GROUP_CROSS_COMPANY                                  :{BLACK}允许他公司加入并跨公司挂接
+STR_COUPLE_GROUP_CROSS_COMPANY_TOOLTIP                          :{BLACK}勾选后，其他公司可以把自己的段指派到本挂接分组，共用本分组的不同公司段之间也允许挂接。取消勾选会把其他公司的段从本组移出；不改变任何车辆的所有权，已经挂好的列车也不会被解开
+STR_COUPLE_GROUP_SHARED                                         :{BLACK}允许他公司加入
+STR_COUPLE_GROUP_SHARED_TOOLTIP                                 :{BLACK}勾选后，其他公司可以把自己的段指派到本挂接分组，并且能在列表里看到本组。取消勾选会把其他公司的段从本组移出；不改变任何车辆的所有权，已经挂好的列车也不会被解开。要真正挂上，还需要同时勾选“允许跨公司挂接”
+STR_COUPLE_GROUP_LIST_SHARED                                    :（已共享）

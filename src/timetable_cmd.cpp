@@ -22,6 +22,8 @@
 #include "scope.h"
 #include "timetable_cmd.h"
 
+#include "r3r_perf.h"
+
 #include "widgets/vehicle_widget.h"
 
 #include "table/strings.h"
@@ -955,7 +957,37 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 			return;
 		}
 	} else {
-		assert_msg(real_timetable_order == real_current_order, "{}, {}", v->cur_real_order_index, v->cur_timetable_order_index);
+		/*
+		 * R3R: upstream asserts that the timetable index points at the same order as
+		 * the real index. Several R3R paths change order indices behind each other's
+		 * back (borrowing a segment's schedule on couple, pinning the index on
+		 * OT_GOTO_COUPLE, re-pointing schedules in depots), and an index that was
+		 * pinned while a GOTO_COUPLE order was being executed can survive a save/load
+		 * and end up one order behind afterwards. The assert then takes the game down
+		 * in Debug builds ("real_timetable_order == real_current_order").
+		 *
+		 * Re-sync the timetable index to the real one instead -- the same thing the
+		 * scope guard above does on a travelling update -- and log the event so the
+		 * offending path can be found in R3R_debug.log via the TT-DESYNC lines.
+		 */
+		if (real_timetable_order != real_current_order) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "TT-DESYNC veh=%d trav=%d real=%d tt=%d impl=%d n=%d curType=%d realType=%d ttType=%d types=",
+						(int)v->index.base(), travelling ? 1 : 0, (int)v->cur_real_order_index, (int)v->cur_timetable_order_index,
+						(int)v->cur_implicit_order_index, (int)v->GetNumOrders(), (int)v->current_order.GetType(),
+						(int)(real_current_order != nullptr ? real_current_order->GetType() : 255),
+						(int)(real_timetable_order != nullptr ? real_timetable_order->GetType() : 255));
+				VehicleOrderID i = 0;
+				for (const Order *o : v->Orders()) {
+					fprintf(dbg, "%d%s", (int)o->GetType(), (++i < v->GetNumOrders()) ? "," : "");
+				}
+				fprintf(dbg, "\n");
+				fclose(dbg);
+			}
+			v->cur_timetable_order_index = v->cur_real_order_index;
+			real_timetable_order = real_current_order;
+		}
 	}
 
 	if (just_started) return;

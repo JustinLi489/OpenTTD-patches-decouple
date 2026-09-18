@@ -683,6 +683,16 @@ Train *R3RCreateCarOnlyFormation(Train *front_wagon);
 void R3RDestroyCarOnlyFormation(Train *front);
 bool R3RIsCarOnlyFormation(const Train *v);
 
+/* R3R (KI-62): whether a consist is a legitimate destination for an automatic
+ * coupling -- i.e. a real segment (chain head carrying the SegmentFront marker,
+ * the same test the depot list uses to tell "segment k/N" from a loose chain)
+ * that is holding a WAIT_COUPLE order. A loose wagon chain is never a target,
+ * no matter which orders it happens to hold, and neither is a segment that is
+ * not waiting to be coupled onto. Used by the couple pathfinder (destination +
+ * back-walk safety) and by TrainCoupleHandler (arrival gate) alike, so the
+ * path found and the coupling that is finally executed agree on targets. */
+bool R3RIsCoupleTarget(const Train *t);
+
 /* R3R couple priority (route A): the priority/borrow state of a consist is
  * runtime-only, so it is rebuilt from the order-list pointers after a load. */
 void R3RRebuildCouplePriorities(Train *chain);

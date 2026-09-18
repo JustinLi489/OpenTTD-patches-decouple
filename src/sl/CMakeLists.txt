@@ -8,6 +8,7 @@ add_files(
     cargopacket_sl.cpp
     cheat_sl.cpp
     company_sl.cpp
+    couple_group_sl.cpp
     debug_sl.cpp
     depot_sl.cpp
     economy_sl.cpp

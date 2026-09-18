@@ -54,11 +54,27 @@ void CcBuildWagon(const CommandCost &result, TileIndex tile)
 }
 
 /**
+ * R3R: Find the last vehicle of the coupled-on segment whose first vehicle is \a seg.
+ * Normally that is the vehicle carrying the segment-back marker; a segment without
+ * such a marker (e.g. from an older save) falls back to the next segment front or the
+ * end of the chain, matching how the depot cuts segments out of their chain.
+ * @param seg First vehicle of the segment.
+ * @return The last vehicle of the segment.
+ */
+static const Train *GetSegmentTail(const Train *seg)
+{
+	const Train *tail = seg;
+	while (!tail->IsSegmentBack() && tail->Next() != nullptr && !tail->Next()->IsSegmentFront()) tail = tail->Next();
+	return tail;
+}
+
+/**
  * Highlight the position where a rail vehicle is dragged over by drawing a light gray background.
  * @param px        The current x position to draw from.
  * @param max_width The maximum space available to draw.
  * @param y         The vertical centre position to draw from.
- * @param selection Selected vehicle that is dragged.
+ * @param selection Selected vehicle that is dragged. When it is the front of a
+ *                  coupled-on segment, the whole segment is the dragged unit.
  * @param chain     Whether a whole chain is dragged.
  * @return The width of the highlight mark.
  */
@@ -67,9 +83,14 @@ static int HighlightDragPosition(int px, int max_width, int y, VehicleID selecti
 	bool rtl = _current_text_dir == TD_RTL;
 
 	assert(selection != VehicleID::Invalid());
+	/* R3R: a coupled-on segment is dragged as a whole, so the preview covers the
+	 * whole segment instead of everything behind the grabbed vehicle. */
+	const Train *sel_head = Train::Get(selection);
+	const Train *sel_tail = (chain && sel_head->IsSegmentFront()) ? GetSegmentTail(sel_head) : nullptr;
 	int dragged_width = 0;
 	for (Train *t = Train::Get(selection); t != nullptr; t = chain ? t->Next() : (t->HasArticulatedPart() ? t->GetNextArticulatedPart() : nullptr)) {
 		dragged_width += t->GetDisplayImageWidth(nullptr);
+		if (t == sel_tail) break;
 	}
 
 	int drag_hlight_left = rtl ? std::max(px - dragged_width + 1, 0) : px;
@@ -121,6 +142,11 @@ void DrawTrainImage(const Train *v, const Rect &r, VehicleID selection, EngineIm
 		bool sel_articulated = false;
 		bool dragging = (drag_dest != VehicleID::Invalid());
 		bool drag_at_end_of_train = (drag_dest == v->index); // Head index is used to mark dragging at end of train.
+		/* R3R: when a coupled-on segment is dragged, the frame covers the whole
+		 * segment, i.e. it stops at the segment tail instead of the train end. */
+		const Train *sel_head = (selection != VehicleID::Invalid()) ? Train::Get(selection) : nullptr;
+		const Train *sel_tail = (sel_head != nullptr && _cursor.vehchain && sel_head->IsSegmentFront()) ? GetSegmentTail(sel_head) : nullptr;
+		bool sel_frame_done = false;
 		for (; v != nullptr && (rtl ? px > 0 : px < max_width); v = v->Next()) {
 			if (dragging && !drag_at_end_of_train && drag_dest == v->index) {
 				/* Highlight the drag-and-drop destination inside the train. */
@@ -145,12 +171,13 @@ void DrawTrainImage(const Train *v, const Rect &r, VehicleID selection, EngineIm
 				highlight_l = rtl ? px - width : px;
 				highlight_r = rtl ? px - 1 : px + width - 1;
 				sel_articulated = true;
-			} else if ((_cursor.vehchain && highlight_r != 0) || sel_articulated) {
+			} else if (!sel_frame_done && ((_cursor.vehchain && highlight_r != 0) || sel_articulated)) {
 				if (rtl) {
 					highlight_l -= width;
 				} else {
 					highlight_r += width;
 				}
+				if (v == sel_tail) sel_frame_done = true;
 			}
 
 			if (do_overlays) AddCargoIconOverlay(overlays, px, width, v);

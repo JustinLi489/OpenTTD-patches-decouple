@@ -14,6 +14,12 @@
 #include "articulated_vehicles.h"
 #include "command_func.h"
 #include "couple_score.h"
+/* R3R (KI-73): `R3RSettleLoadingBeforeChainEdit()` does `delete v->cargo_payment`
+ * on the fallback path. Without the complete type the compiler silently skips
+ * `~CargoPayment()` (MSVC C4150), i.e. neither the pool slot is released nor
+ * `front->cargo_payment` cleared, and the money booking in the destructor never
+ * runs. Pull the real definition in. */
+#include "economy_base.h"
 #include "pathfinder/yapf/yapf.hpp"
 #include "news_func.h"
 #include "company_func.h"
@@ -51,6 +57,7 @@
 #include "event_logs.h"
 #include "misc_cmd.h"
 #include "tile_cmd.h"
+#include "couple_group.h"
 #include "train_cmd.h"
 #include "vehicle_cmd.h"
 #include "tbtr_template_vehicle_cmd.h"
@@ -1801,6 +1808,33 @@ bool R3RIsCarOnlyFormation(const Train *v)
 	return RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
 }
 
+/**
+ * R3R (KI-62): whether a consist may be the destination of an automatic coupling
+ * (and may therefore be coupled onto once a locomotive has reached it).
+ *
+ * Both conditions are required:
+ *  - the consist is a real segment: its chain head carries the segment-front
+ *    marker (★). This is the very test the depot list uses to tell a segment
+ *    ("第 k/N 段") from a loose wagon chain ("散链"), and it is what the depot
+ *    "upgrade to segment" command and the couple path grant. A loose chain is
+ *    never a couple target, no matter which orders it happens to hold.
+ *  - the segment holds a WAIT_COUPLE order, i.e. it is actually waiting to be
+ *    coupled onto. Being a segment alone is not enough.
+ *
+ * The couple pathfinder (destination detection and back-walk safety) and the
+ * arrival gate in TrainCoupleHandler() both use this, so the target the path was
+ * planned for and the coupling that is finally executed agree on what a target
+ * is.
+ *
+ * @param t Chain head of the candidate consist.
+ * @return True when it is a segment waiting for a coupling locomotive.
+ */
+bool R3RIsCoupleTarget(const Train *t)
+{
+	if (t == nullptr || !t->IsSegmentFront()) return false;
+	return t->current_order.IsType(OT_WAIT_COUPLE);
+}
+
 static void AddRearEngineToMultiheadedTrain(Train *v)
 {
 	Train *u = Train::Create();
@@ -2253,6 +2287,32 @@ static CommandCost ValidateTrains(Train *original_dst, Train *dst, Train *origin
  * @param src        The to be moved vehicle.
  * @param move_chain Whether to move all vehicles after src or not.
  */
+/* R3R (couple priority, route A): forward declaration -- the depot edit paths
+ * (CmdMoveRailVehicle / CmdSellRailWagon) below must re-derive the schedule
+ * ownership after they rearranged a chain. Definition sits with the rest of the
+ * couple-priority helpers further down in this file. */
+static void R3RSyncChainAfterDepotEdit(Train *chain);
+
+/* R3R diagnostic: the R3R code rewrites order indices by hand in a few places
+ * (couple, decouple, schedule hand-over). Each of those blocks is supposed to
+ * leave cur_timetable_order_index pointing at the same order as
+ * cur_real_order_index. When it does not, UpdateVehicleTimetable used to assert
+ * on the next station stop (see the TT-DESYNC log there). Call this right after
+ * such a block: it writes one line per break, naming the block that caused it,
+ * so the offending spot can be found from a single reproduction. */
+static void R3RCheckTtSync(const Vehicle *v, const char *tag)
+{
+	if (v == nullptr) return;
+	if (v->cur_timetable_order_index == INVALID_VEH_ORDER_ID) return;  /* not started yet */
+	if (v->cur_timetable_order_index == v->cur_real_order_index) return;  /* the invariant holds */
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "TT-CHK-BREAK %s veh=%d real=%d tt=%d impl=%d n=%d curType=%d\n",
+			tag, (int)v->index.base(), (int)v->cur_real_order_index, (int)v->cur_timetable_order_index,
+			(int)v->cur_implicit_order_index, (int)v->GetNumOrders(), (int)v->current_order.GetType());
+	fclose(dbg);
+}
+
 static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train *src, bool move_chain)
 {
 	{
@@ -2531,12 +2591,32 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 			if (src_head != nullptr && src_head->IsFrontEngine()) {
 				/* Cases #?b: Transfer order, unit number and other stuff
 				 * to the new front engine. */
-				src_head->orders = src->orders;
-				if (src_head->orders != nullptr) src_head->AddToShared(src);
+				/* R3R (couple priority, route A): a front engine which coupled its
+				 * train onto another consist runs the schedule of the consist's
+				 * command owner and has parked its own schedule in orders_backup.
+				 * Hand the schedule the dragged-out train *owns* over to the new
+				 * head; otherwise the consist's schedule is transferred (and then
+				 * removed below), leaving the train with an empty schedule. */
+				if (src->r3r_orders_borrowed) {
+					src->orders = src->orders_backup;
+					src->orders_backup = nullptr;
+					src->orders_backup_real_index = INVALID_VEH_ORDER_ID;
+					src->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
+					src->r3r_orders_borrowed = false;
+				}
+				if (src_head->orders == nullptr) {
+					src_head->orders = src->orders;
+					if (src_head->orders != nullptr) src_head->AddToShared(src);
+				}
 				src_head->CopyVehicleConfigAndStatistics(src);
 			}
 			/* Remove stuff not valid anymore for non-front engines. */
-			DeleteVehicleOrders(src);
+			if (src_head != src) {
+				/* R3R: when the vehicle is (still) the head of its own resulting
+				 * chain, the transfer above was a self-assignment; deleting the
+				 * schedule here would throw away the very schedule the train keeps. */
+				DeleteVehicleOrders(src);
+			}
 			src->ReleaseUnitNumber();
 			src->dispatch_records.clear();
 			if (!_settings_game.vehicle.non_leading_engines_keep_name) {
@@ -2565,6 +2645,15 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 		 * This should be done after NormaliseTrainHead due to engine total limit checks in GetFreeUnitNumber. */
 		if (src_head != nullptr && src_head->IsFrontEngine()) GroupStatistics::CountVehicle(src_head, 1);
 		if (dst_head != nullptr && dst_head->IsFrontEngine()) GroupStatistics::CountVehicle(dst_head, 1);
+
+		/* R3R (couple priority, route A): a depot edit can split or join chains,
+		 * which changes which segment owns the schedule. Re-derive the ranking and
+		 * re-point each resulting chain head at its own command owner, so that a
+		 * locomotive which was coupled (and therefore executing the schedule of
+		 * the consist it picked up) gets its own parked schedule back as soon as
+		 * it is dragged out of that consist again. */
+		R3RSyncChainAfterDepotEdit(src_head);
+		R3RSyncChainAfterDepotEdit(dst_head);
 
 		if (!flags.Test(DoCommandFlag::NoCargoCapacityCheck)) {
 			CheckCargoCapacity(src_head);
@@ -2673,6 +2762,13 @@ CommandCost CmdSellRailWagon(DoCommandFlags flags, Vehicle *t, bool sell_chain, 
 
 		/* We need to update the information about the train. */
 		NormaliseTrainHead(new_head);
+
+		/* R3R (couple priority, route A): selling part of a consist can remove the
+		 * very segment that owned the schedule (e.g. selling the consist while the
+		 * locomotive was executing its schedule). Re-point the survivors at their
+		 * own owner *before* the sold part releases the order list, otherwise the
+		 * remaining head keeps a pointer into a list that is about to be freed. */
+		R3RSyncChainAfterDepotEdit(new_head);
 
 		/* We are undoubtedly changing something in the depot and train list. */
 		/* Unless its a virtual train */
@@ -3706,7 +3802,7 @@ static Train *GetSegmentHeadFromRear(Train *v, uint num_segments)
 	}
 	if (segment_heads.empty()) return nullptr;
 	if (num_segments == 0) num_segments = 1;
-	if (num_segments > segment_heads.size()) num_segments = segment_heads.size();
+	if (num_segments > segment_heads.size()) num_segments = static_cast<uint>(segment_heads.size());
 	return segment_heads[segment_heads.size() - num_segments];
 }
 
@@ -3959,6 +4055,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 			chain->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
 			chain->r3r_orders_borrowed = false;
 			InvalidateVehicleOrder(chain, 0);
+			R3RCheckTtSync(chain, "sync-return-borrow");
 		}
 		return;
 	}
@@ -3970,6 +4067,9 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 		if (inherit_progress) {
 			chain->cur_real_order_index = owner->cur_real_order_index;
 			chain->cur_implicit_order_index = owner->cur_implicit_order_index;
+			/* R3R: keep the timetable index in sync with the adopted progress,
+			 * otherwise UpdateVehicleTimetable asserts on the next station stop. */
+			chain->cur_timetable_order_index = chain->cur_real_order_index;
 		}
 		return;
 	}
@@ -3990,6 +4090,80 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	chain->cur_timetable_order_index = chain->cur_real_order_index;
 	chain->DeleteUnreachedImplicitOrders();
 	InvalidateVehicleOrder(chain, 0);
+	R3RCheckTtSync(chain, "sync-borrow");
+}
+
+/**
+ * R3R (couple priority, route A): re-derive the schedule ownership of one chain
+ * after a depot edit rearranged it (a drag in the depot list, selling a wagon).
+ *
+ * Such an edit splits a consist or joins two chains, which changes which segment
+ * is the command owner, but the priorities left over from the last couple or
+ * decouple (and the borrow flag of the old head) stay as they were. Renumbering
+ * first compacts the leftovers while preserving their relative order (ties fall
+ * back to physical order, so the chain head wins over a segment dragged in
+ * behind it), which is exactly what DecoupleTrain() does for its parts; the sync
+ * then either hands the borrowed schedule back -- the case a locomotive hits
+ * when it is dragged out of the consist it had coupled to -- or switches the
+ * head to the new owner. Both steps are no-ops for a plain free-wagon chain,
+ * where the head is always its own owner.
+ *
+ * @param chain Head of one of the chains resulting from the edit (may be nullptr).
+ */
+static void R3RSyncChainAfterDepotEdit(Train *chain)
+{
+	if (chain == nullptr) return;
+
+	R3RRenumberPriorities(chain);
+	R3RSyncDrivingOrders(chain, false);
+
+	/* R3R (couple priority, route A): a depot edit must neither leave an
+	 * independent train without a schedule nor silently renumber it.
+	 *
+	 * Unit number: a segment which was coupled to another train lent its number to
+	 * the merged train (Couple parks its own number in unitnumber_backup). Now that
+	 * it is on its own again it takes its own number back instead of being given a
+	 * fresh one, which is what made "Train 1" turn into "Train 3".
+	 *
+	 * Schedule: the head may have ended up without a schedule while the consist
+	 * still carries one (e.g. the schedule stayed behind on the old head after the
+	 * head state was trashed by a drag). Adopt the parked own schedule, or failing
+	 * that the first schedule still present in the chain, rather than coming out of
+	 * the depot empty. */
+	if (!chain->r3r_orders_borrowed && chain->unitnumber_backup != 0 && chain->IsFrontEngine()) {
+		if (chain->unitnumber != 0 && chain->unitnumber != chain->unitnumber_backup) {
+			Company::Get(chain->owner)->freeunits[chain->type].ReleaseID(chain->unitnumber);
+		}
+		chain->unitnumber = chain->unitnumber_backup;
+		chain->unitnumber_backup = 0;
+		Company::Get(chain->owner)->freeunits[chain->type].UseID(chain->unitnumber);
+	}
+	if (!chain->r3r_orders_borrowed && chain->orders == nullptr &&
+			(chain->IsFrontEngine() || chain->orders_backup != nullptr)) {
+		Train *donor = nullptr;
+		if (chain->orders_backup != nullptr) {
+			donor = chain;
+		} else {
+			for (Train *w = chain; w != nullptr; w = w->Next()) {
+				if (w->orders != nullptr) {
+					donor = w;
+					break;
+				}
+			}
+		}
+		if (donor != nullptr) {
+			chain->orders = donor->orders;
+			chain->cur_real_order_index = donor->cur_real_order_index;
+			chain->cur_implicit_order_index = donor->cur_implicit_order_index;
+			chain->cur_timetable_order_index = chain->cur_real_order_index;
+			chain->DeleteUnreachedImplicitOrders();
+			if (donor != chain) chain->AddToShared(donor);
+			chain->orders_backup = nullptr;
+			chain->orders_backup_real_index = INVALID_VEH_ORDER_ID;
+			chain->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
+			InvalidateVehicleOrder(chain, 0);
+		}
+	}
 }
 
 /* --- KI-14 (1): edge-triggered debug output -------------------------------
@@ -4012,6 +4186,10 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_TTB,
 	R3REDGE_COUPLEFAIL, ///< TrainCoupleHandler: no coupling target found
 	R3REDGE_CPLS0,      ///< TrainLocoHandler: stopped-coupler check
+	R3REDGE_COUPLEGATE, ///< R3RCanCoupleNow: a candidate consist was rejected by the couple gate
+	R3REDGE_CPLGEO,      ///< GetCouplePosition: exact end-to-end hit (nominal geometry, no overlap)
+	R3REDGE_CPLHIT,      ///< CheckTrainCollision: touch/overlap test fired the couple (min_diff has -1)
+	R3REDGE_CPLGEOCOMMIT, ///< KI-106 fix 1: an exact hit was made while ROLLING (+ whether the merge committed)
 	R3REDGE_COUNT,
 };
 
@@ -4388,6 +4566,77 @@ static bool TryTrainDecouple(Train *v, Train *u)
 }
 
 /**
+ * R3R (KI-69): 在 R3R 改写订单 / 迁移链头身份之前，先把「正在装卸」这件事结清。
+ *
+ * CargoPayment 由 PrepareUnload() 建在【链头】上（economy.cpp:1524-1540，同时把该车
+ * 压进 Station::loading_vehicles），释放它的唯一路径是 Vehicle::LeaveStation()
+ * （vehicle.cpp:3588-3592），而它只会被两处触达：
+ *   1. TrainController（train_cmd.cpp:3296-3303）—— 前端车已不在该站 / 已越过站台；
+ *   2. Vehicle::HandleLoading（vehicle.cpp:3826-3831）—— 装卸完毕。
+ * 其中 HandleLoading 只对【链头】生效（TrainLocoHandler 里 consist->HandleLoading()，
+ * train_cmd.cpp:10267）。于是 R3R 只要在装卸途中把链头的 current_order 改写成非装卸
+ * 类型，或把链拆开/合并让原链头不再是链头，payment 就再也没人结算：车上
+ * cargo_payment 永久非空，loading_vehicles 里留下残条目，下一次
+ * BeginLoading() -> PrepareUnload() 直接踩
+ * assert(front_v->cargo_payment == nullptr)（economy.cpp:1535）。这正是
+ * 「跑三个循环后突然崩溃」的现场（crash-20260916T175303Z.log：2 号机车在 39,33 站台
+ * 装卸途中被解挂，CP 一直挂在车上，下个循环回站即炸）。
+ *
+ * 政策（允许型）：不禁止在站台解挂，只是「先把离站手续办完」——与列车自然装卸完毕
+ * 离站完全等价。结算后 current_order 变成 OT_LEAVESTATION，下一 tick 由
+ * TrainLocoHandler（train_cmd.cpp:10366-10369）正常 Free 并按新订单出发。
+ *
+ * 必须在调用方动 current_order 之前调用：LeaveStation() 自带
+ * assert(current_order.IsAnyLoadingType())（vehicle.cpp:3590）。
+ *
+ * @param chain 待改写的链（沿其 Next() 遍历；在拆链【之后】调用时只覆盖该半条链）。
+ * @param site  探针标签，便于在 R3R_debug.log 里定位是谁结的账。
+ */
+static void R3RSettleLoadingBeforeChainEdit(Train *chain, const char *site)
+{
+	if (chain == nullptr) return;
+
+	/* 只有链头可能持有 payment（PrepareUnload 绑链头），且结算过程不改链序，
+	 * 所以沿原链顺序走一遍即可。 */
+	for (Train *v = chain; v != nullptr; v = v->Next()) {
+		if (v->cargo_payment == nullptr) continue;
+
+		if (v->current_order.IsAnyLoadingType()) {
+			/* 完整走原生结算：删 payment、从 loading_vehicles 摘除、复位装卸标志、
+			 * current_order 转 OT_LEAVESTATION。不能「继续装完」：调用方马上要给这辆车
+			 * 换订单，而且链一旦拆开/合并，只管链头的 HandleLoading 再也不会跑。 */
+			v->LeaveStation();
+		} else {
+			/* 兜底：订单已被改写，原生结算不可用（vehicle.cpp:3590 断言订单类型），
+			 * 手工释放 payment 与 loading_vehicles 里的残留登记，避免下次
+			 * PrepareUnload() 踩 economy.cpp:1535。 */
+			Station *st = Station::GetIfValid(v->last_station_visited);
+			if (st != nullptr) {
+				for (auto it = st->loading_vehicles.begin(); it != st->loading_vehicles.end();) {
+					if (*it == v) {
+						it = st->loading_vehicles.erase(it);
+					} else {
+						++it;
+					}
+				}
+			}
+			delete v->cargo_payment;   // ~CargoPayment 会把 v->cargo_payment 置空
+			v->vehicle_flags.Reset(VehicleFlag::LoadingFinished);
+			v->vehicle_flags.Reset(VehicleFlag::CargoUnloading);
+			v->load_unload_ticks = 0;
+		}
+
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "SETTLE-LOAD site=%s veh=%d co=%d tx=%d ty=%d\n",
+					site, (int)v->index.base(), (int)v->current_order.GetType(),
+					TileX(v->tile), TileY(v->tile));
+			fclose(dbg);
+		}
+	}
+}
+
+/**
  * Decouple the rear part of the train as specified by the DECOUPLE order.
  * @param v %Train to decouple.
  * @return The first vehicle of the decoupled rear part, or the original train if decoupling failed.
@@ -4406,6 +4655,12 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	Train *u = GetDecoupleVehicle(v);
 	if (u == nullptr) return v;
 	if (!TryTrainDecouple(v, u)) return v;
+
+	/* R3R (KI-69)：拆分已经成功（此时才结账，避免 TryTrainDecouple 回滚后列车白跑一趟），
+	 * 但订单/身份的改写还没开始 —— 在这里把装卸结算掉。链头 v 是拆前整链的前端车，
+	 * payment 就挂在它身上；u 侧一并扫一遍是防御（正常不该有）。 */
+	R3RSettleLoadingBeforeChainEdit(v, "decouple-front");
+	R3RSettleLoadingBeforeChainEdit(u, "decouple-rear");
 
 	if (u->IsEngine()) {
 		u->ClearFreeWagon();   // R3R: drop any stale free-wagon flag so the front stays a (fake) engine
@@ -4502,6 +4757,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * of re-running the completed one (which the GOTO_COUPLE index lock would
 		 * otherwise keep it stuck on forever). */
 		v->IncrementRealOrderIndex();
+		R3RCheckTtSync(v, "decouple-v");
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads the restored order
 		 * at orders_backup_real_index — otherwise the train would sit idle
@@ -4543,6 +4799,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 				u->cur_implicit_order_index = wait_idx;   // sync implicit — otherwise the order window paints ▶ at the implicit index
 				u->cur_timetable_order_index = wait_idx;
 			}
+			R3RCheckTtSync(u, "decouple-u");
 		}
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads the WAIT_COUPLE
@@ -4578,13 +4835,33 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	GroupStatistics::CountVehicle(u, 1);
 	NormaliseTrainHead(u);
 	NormaliseTrainHead(v);
+	/* R3R: the released part's head was just promoted to a front engine (the
+	 * engine branch's SetFrontEngine() above, or R3RCreateCarOnlyFormation() for
+	 * a pure-wagon part) -- and that happened *after* this tick's vehicle tick
+	 * caches were built, so the new front is missing from
+	 * _tick_train_front_cache. That cache is only rebuilt when it has been
+	 * invalidated, therefore without this call the released part would never be
+	 * Tick()ed again: TrainLocoHandler() never runs, its WAIT_COUPLE order is
+	 * never loaded into current_order, and every coupling locomotive is rejected
+	 * by R3RCanCoupleNow with reject=target-not-wait for ever -- the depot
+	 * "couple again after a decouple" then never happens. Mirrors the same fix
+	 * at the identity relocation in TryTrainCouple(). */
+	InvalidateVehicleTickCaches();
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
 
-	/* R3R: the decoupled part is now an independent train, so drop the
-	 * segment-front marker on its head. Segment-front markers further down the
-	 * chain (when several segments were decoupled at once) are kept so the new
-	 * train can be decoupled at those boundaries again. */
-	u->ClearSegmentFront();
+	/* R3R (KI-62): the decoupled part keeps its segment identity. A segment is a
+	 * persistent object -- what the depot "upgrade to segment" command and the
+	 * couple path create, and what the depot list shows as "第 k/N 段" -- not a
+	 * boundary marker of whichever coupled chain it happens to sit in. Dropping
+	 * the marker here turned a freshly decoupled segment into a loose wagon chain:
+	 * it showed up as "散链" in the depot list and could no longer be a coupling
+	 * destination at all (see R3RIsCoupleTarget). Markers further down the chain
+	 * (when several segments were decoupled at once) were already kept; the head's
+	 * marker is now kept as well, so every released segment stays a segment.
+	 * GetSegmentHeadFromRear() skips a marker sitting on the chain head, so a
+	 * stand-alone segment is never mistaken for one of its own coupled-on
+	 * segments. */
+	if (R3RIsCarOnlyFormation(u)) u->SetSegmentFront();
 
 	/* R3R: the waiting consist must hold its path reservation (occupy the track)
 	 * so the signalling system treats it as an obstacle: other trains must not
@@ -4752,15 +5029,21 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
 }
 
 /**
- * R3R (裁决 2026-09-07 / 图像方向 memo): 就地反转一条链上所有车辆的方向
- * (direction),车辆位置不动。逻辑翻转(R3RFlipChainBySegments 第1步)与回滚
- * (R3RUndoLogicalFlip)成对共用:每次 direction 反转同时 Flip
- * VehicleRailFlag::Flipped —— 渲染方向 = ReverseDir(direction) × Flipped,
- * 净图像方向不变:逻辑翻转只是运行账目(让等待链按反侧挂上机车),玩家看不到
- * 链在轨道上原地翻面;回滚再翻一次恰好复原,不漂移。链序交给
+ * R3R: 逻辑翻转的"方向改写"钩子 —— 就地反转链上每节车的 direction,并同步 Flip
+ * VehicleRailFlag::Flipped,用后者抵偿前者来保住渲染(净图像方向 =
+ * R(direction) × Flipped 不变,见 Train::GetImage())。链序交给
  * RestoreTrainBackup 恢复(它只重建 SetNext,不碰 direction/flags),★/组角色
  * 由 R3RUndoLogicalFlip 单独还原。
+ * 2026-09-18 曾试装 (a′)(本函数改空操作)并已回退,原因见下方函数头注释与
+ * R3R_KNOWN_ISSUES.md 的 KI-105。
  */
+/* R3R 2026-09-18 回退记录:(a′) 试验(把本函数改成空操作、不再碰 direction/Flipped)
+ * 已实测证伪 —— 详见 R3R_KNOWN_ISSUES.md 的 KI-105。direction 的反转不是"纯账目":
+ * 折叠判定 R3RCheckChainFoldedDirection(4975)按 a->direction 算点积、依赖"逻辑翻转
+ * 把相邻对点积符号整体翻过来";TrainController 的 moving-front 也读它。取消反转后
+ * 健康候选被判成折叠 ⇒ 逐候选回滚、机车一路穿模压进车底,直到缝上 dy 恰好=0 才勉强
+ * COUPLE-OK(其 worst_gap=2、seam dist=0 ⇒ 一片重叠),随后 CRT-FOLD 立即反对、
+ * 整列以尾端为"前"跑。故恢复旧实现。 */
 static void R3RReverseChainDirections(Train *chain)
 {
 	for (Train *w = chain; w != nullptr; w = w->Next()) {
@@ -5124,6 +5407,12 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to)
 	assert(from->IsFrontEngine());
 	assert(to != nullptr && to->First() == to);
 
+	/* R3R (KI-69)：身份要从 from 迁到 to，from 若还挂着装卸结算单（cargo_payment）
+	 * 就成了永远没人结的孤儿账 —— 在拷贝身份/清 from 的 front 位之前先结清。
+	 * 真机车 v 只在执行 GOTO_COUPLE 时才会走到这里（不是装卸态），此调用是防御；
+	 * 一旦将来有新的调用点落在装卸途中，这里能兜住 economy.cpp:1535 的断言。 */
+	R3RSettleLoadingBeforeChainEdit(from, "relocate-front");
+
 	/* 随列车身份迁移的窗口。 */
 	CloseWindowById(WindowClass::VehicleView, from->index);
 	CloseWindowById(WindowClass::VehicleOrders, from->index);
@@ -5134,6 +5423,18 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to)
 	CloseWindowById(WindowClass::VehicleOrderImportErrors, from->index);
 	DeleteNewGRFInspectWindow(GrfSpecFeature::Trains, from->index.base());
 	SetWindowDirty(WindowClass::Company, from->owner);
+
+	/* 车号 / current_order / dest_tile / profit / 服役间隔 / timetable 标志:
+	 * 复用官方"新车头取代旧头"的复制逻辑(顺带把 from 的车号清零)。
+	 * 顺序要紧:CopyVehicleConfigAndStatistics 内部会调用 BaseConsist::
+	 * CopyConsistPropertiesFrom(base_consist.cpp:34-36),把 cur_real_order_index /
+	 * cur_implicit_order_index / cur_timetable_order_index 也一并从 from 复制到
+	 * to。若把它排在下面的"订单位置搬运"之后,刚搬给 to 的正确索引会被 from 侧
+	 * 已清零的值覆盖(to 恒为 0)→ 挂车时 v->orders_backup_real_index 记成 0。
+	 * 2026-09-16 现场(R3R_debug.log):车库内第二次挂车时该索引被清成 0,解挂
+	 * 还原后机车从 index 0 起 IncrementRealOrderIndex 跳过自己的 GOTO_COUPLE,
+	 * 直接跑去 waypoint → 不再回库与段耦合(ADVANCE real_before=0)。 */
+	to->CopyVehicleConfigAndStatistics(from);
 
 	/* orders 与订单位置。机车 orders 独有、不与他人共享,Couple 的 orders 交接
 	 * 同为指针直搬(见 Couple ~4637);若未来出现共享 orders 需先退出共享链。 */
@@ -5149,10 +5450,6 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to)
 	from->cur_real_order_index = 0;
 	from->cur_implicit_order_index = 0;
 	from->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
-
-	/* 车号 / current_order / dest_tile / profit / 服役间隔 / timetable 标志:
-	 * 复用官方"新车头取代旧头"的复制逻辑(顺带把 from 的车号清零)。 */
-	to->CopyVehicleConfigAndStatistics(from);
 
 	/* 预置新链头 subtype(FrontEngine / FreeWagon)并清掉链内其余车辆(含旧链头
 	 * from)的 front 位 —— 与 DecoupleTrain 3690-3696 的预置同款,Couple 尾
@@ -5690,6 +5987,10 @@ static void Couple(Train *v, Train *u)
 		v->orders_backup_implicit_index = v->cur_implicit_order_index;
 		v->unitnumber_backup = 0;
 		if (u->unitnumber != 0) {
+			/* R3R: the consist which lends its number keeps a copy of it, so a
+			 * depot drag which splits it off again can take that number back
+			 * instead of being handed a new one from the pool. */
+			if (u->unitnumber_backup == 0) u->unitnumber_backup = u->unitnumber;
 			v->unitnumber_backup = v->unitnumber;
 			v->unitnumber = u->unitnumber;
 			u->unitnumber = 0;
@@ -5715,6 +6016,7 @@ static void Couple(Train *v, Train *u)
 			v->IncrementRealOrderIndex();
 			v->UpdateRealOrderIndex();
 		}
+		R3RCheckTtSync(v, "couple-waitcouple");
 		/* Keep the timetable index in sync (IncrementRealOrderIndex does not
 		 * update it; a mismatch crashes UpdateVehicleTimetable on station leave:
 		 * "real_timetable_order == real_current_order"). */
@@ -5729,9 +6031,17 @@ static void Couple(Train *v, Train *u)
 					(int)v->cur_real_order_index, (int)(co ? co->GetType() : -1),
 					(int)TileX(v->tile), (int)TileY(v->tile), (int)v->x_pos, (int)v->y_pos);
 				for (const Train *w = v; w != nullptr; w = w->Next()) {
-					fprintf(dbg, "  CPL idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X\n",
+					/* R3R 1px probe: gap = actual centre distance - nominal
+					 * (len_a + len_b)/2. Negative => the two boxes overlap. */
+					const Train *nxt = w->Next();
+					const int gap = (nxt != nullptr)
+							? std::max(std::abs((int)w->x_pos - (int)nxt->x_pos), std::abs((int)w->y_pos - (int)nxt->y_pos))
+									- (w->gcache.cached_veh_length + nxt->gcache.cached_veh_length) / 2
+							: 0;
+					fprintf(dbg, "  CPL idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X len=%d gap=%d\n",
 							(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-							(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track);
+							(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track,
+							(int)w->gcache.cached_veh_length, gap);
 				}
 				fclose(dbg);
 			}
@@ -5848,6 +6158,78 @@ static void Couple(Train *v, Train *u)
 }
 
 /**
+ * R3R (KI-60, couple gating): the hard conditions a coupling attempt must meet.
+ *
+ * Reported by the player after two illegitimate couplings in a depot: a
+ * locomotive coupled onto a *stopped* waiting consist, and onto a same-group
+ * consist that was not waiting for a coupling at all. A coupling is only
+ * legitimate when all of the following hold:
+ *
+ *  1. the active side (the locomotive) is really executing GOTO_COUPLE;
+ *  2. the passive side holds a WAIT_COUPLE order -- "car-only formation" is NOT
+ *     a substitute any more (a segment that is not waiting must be left alone,
+ *     even if it sits in the same couple group);
+ *  3. neither side is stopped by the player (VehState::Stopped) -- both must be
+ *     started, so a consist the player parked/stopped is never grabbed;
+ *  4. the couple-group whitelist permits it (R3RCoupleAllowed).
+ *
+ * Every target resolution in TrainCoupleHandler() goes through here, so an
+ * illegitimate candidate is treated exactly like "no waiting consist at all":
+ * the scan keeps looking for another candidate, and a locomotive without one
+ * simply stays parked with its GOTO_COUPLE order (the ordinary COUPLE-FAIL
+ * path) instead of coupling.
+ *
+ * @param coupler The locomotive executing the GOTO_COUPLE order.
+ * @param target  The candidate consist (its chain head).
+ * @param site    Name of the resolution path, used for the probe line.
+ * @param why     Optional out-parameter: the rejection reason.
+ * @return True when the two may couple.
+ */
+static bool R3RCanCoupleNow(const Train *coupler, const Train *target, const char *site, const char **why = nullptr)
+{
+	if (why != nullptr) *why = nullptr;
+	if (coupler == nullptr || target == nullptr) return false;
+
+	const char *reason = nullptr;
+	if (!coupler->current_order.IsType(OT_GOTO_COUPLE)) {
+		reason = "active-not-goto";
+	} else if (!target->IsSegmentFront()) {
+		reason = "target-not-segment";
+	} else if (!target->current_order.IsType(OT_WAIT_COUPLE)) {
+		reason = "target-not-wait";
+	} else if (coupler->vehstatus.Test(VehState::Stopped)) {
+		reason = "active-stopped";
+	} else if (target->vehstatus.Test(VehState::Stopped)) {
+		reason = "target-stopped";
+	} else if (!R3RCoupleAllowed(coupler, target)) {
+		reason = "group-mismatch";
+	} else {
+		return true;
+	}
+
+	if (why != nullptr) *why = reason;
+	/* KI-14: edge-triggered -- this gate is re-evaluated every tick while a
+	 * locomotive sits next to a candidate it is not allowed to couple onto. */
+	const uint64_t g_key = ((uint64_t)coupler->index.base() << 32) ^ (uint64_t)target->index.base();
+	const uint64_t g_payload = R3RDbgTagHash(reason) ^
+			(R3RDbgTagHash(site != nullptr ? site : "-") << 24);
+	if (R3RDbgEdge(R3REDGE_COUPLEGATE, g_key, g_payload)) {
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "[R3R] CPL-GATE reject=%s site=%s act=%d tgt=%d aOrd=%d tOrd=%d aStop=%d tStop=%d grp=%d\n",
+					reason, site != nullptr ? site : "-",
+					(int)coupler->index.base(), (int)target->index.base(),
+					(int)coupler->current_order.GetType(), (int)target->current_order.GetType(),
+					(int)coupler->vehstatus.Test(VehState::Stopped),
+					(int)target->vehstatus.Test(VehState::Stopped),
+					(int)R3RCoupleAllowed(coupler, target));
+			fclose(dbg);
+		}
+	}
+	return false;
+}
+
+/**
  * Get the position of the consist to couple onto, if the train has reached it.
  * @param v %Train executing a GOTO_COUPLE order.
  * @param reverse Whether the consist is facing the opposite direction.
@@ -5861,32 +6243,68 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
 	if (other_vehicle == nullptr) return nullptr;
 	if (other_vehicle->First()->index == v->index) return nullptr;
 	Train *u = Train::From(other_vehicle)->First();
-	/* Target: a car-only formation (zero-power train front: engine bit with a
-	 * wagon rail vehicle type), or a plain primary train holding a WAIT_COUPLE
-	 * order (the pxp-decouple flavour, which never becomes a formation). P7: a
-	 * bare (non-segment) free wagon chain is NOT a valid couple target — it must
-	 * first be turned into a segment (waiting formation) via MakeSegment. */
-	if (!R3RIsCarOnlyFormation(u) &&
-			!(u->IsPrimaryVehicle() && u->current_order.IsType(OT_WAIT_COUPLE))) return nullptr;
+	/* R3R (KI-60): the couple gate decides whether this candidate may be coupled
+	 * onto at all -- active side in GOTO_COUPLE, passive side holding a
+	 * WAIT_COUPLE order, both started, same couple group. A rejected candidate is
+	 * reported as "no waiting consist here" (no geometric hit), so the locomotive
+	 * keeps its GOTO_COUPLE order and retries, or looks for another candidate. */
+	if (!R3RCanCoupleNow(v, u, "geo")) return nullptr;
 
-	DirDiff dir_diff = DirDifference(v->direction, u->direction);
-	reverse = dir_diff == DirDiff::Same || dir_diff == DirDiff::Right45 || dir_diff == DirDiff::Left45;
+	/* R3R (KI-106 fix 3): measure from the end of the loco chain that actually
+	 * leads, and against the end of the waiting consist that is closest to it.
+	 *
+	 * A loco driving backwards (db=1) leads with its chain TAIL -- GetMovingFront()
+	 * returns Last() in that state (vehicle_base.h). The old code measured from the
+	 * chain head v regardless, so while reversing the nominal touch point lay a
+	 * whole consist length away from the leading end and NO movement frame ever
+	 * satisfied diff == need. The loco then kept rolling until
+	 * CheckTrainCollision's overlap fallback (need - 1) fired and froze the merge
+	 * with a constant 1 px overlap: the exact KI-106 symptom, on the reversing
+	 * path fix 1 did not cover.
+	 *
+	 * Which end of u faces the loco follows from the geometry too: a reversing
+	 * loco approaches u's HEAD even though u is still "same direction", so the old
+	 * direction-only reverse flag (which forces u->Last()) picked the far end as
+	 * well.
+	 *
+	 * Choosing the nearest end is a strict generalisation, not a behaviour change
+	 * for the already working case: for a forward loco the near end of u is still
+	 * u->Last() whenever the direction difference is Same/45 deg, so those
+	 * couplings keep hitting the exact pixel as before. */
+	Train *v_near = v->GetMovingFront();
+	const auto end_dist = [](const Vehicle *a, const Vehicle *b) {
+		return std::max(std::abs(a->x_pos - b->x_pos), std::abs(a->y_pos - b->y_pos));
+	};
+	const bool z_is_tail = end_dist(v_near, u->Last()) < end_dist(v_near, u);
+	Train *z = z_is_tail ? u->Last() : u;
+	reverse = z_is_tail;
 
-	Train *z;
-	if (reverse) {
-		z = u->Last();
-	} else {
-		z = u;
-	}
-	int x_diff = abs(v->x_pos - z->x_pos);
-	int y_diff = abs(v->y_pos - z->y_pos);
+	int x_diff = std::abs(v_near->x_pos - z->x_pos);
+	int y_diff = std::abs(v_near->y_pos - z->y_pos);
 
 	int diff = std::max(x_diff, y_diff);
 
-	uint8_t v_length = v->gcache.cached_veh_length;
-	uint8_t u_length = reverse ? u->Last()->gcache.cached_veh_length : u->gcache.cached_veh_length;
+	uint8_t v_length = v_near->gcache.cached_veh_length;
+	uint8_t u_length = z->gcache.cached_veh_length;
 
 	if (diff == ((v_length + 1) / 2 + (u_length + 1) / 2)) {
+		/* R3R 1px probe: this is the *exact* end-to-end path -- the loco stopped
+		 * on the nominal pixel, so the coupled chain has no pixel overlap. Logged
+		 * once per (loco, consist, lengths) so it does not flood the file. */
+		const uint64_t g_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
+		const uint64_t g_payload = ((uint64_t)v_length << 32) ^ (uint64_t)u_length ^ ((uint64_t)(reverse ? 1u : 0u) << 16);
+		if (R3RDbgEdge(R3REDGE_CPLGEO, g_key, g_payload)) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "[R3R] CPL-GEO site=%s v=%d vn=%d vlen=%d u=%d z=%d ulen=%d rev=%d dx=%d dy=%d diff=%d need=%d spd=%d db=%d\n",
+						"geo", (int)v->index.base(), (int)v_near->index.base(), (int)v_length,
+						(int)u->index.base(), (int)z->index.base(),
+						(int)u_length, (int)reverse, x_diff, y_diff, diff,
+						(int)((v_length + 1) / 2 + (u_length + 1) / 2),
+						(int)v->cur_speed, (int)v->IsDrivingBackwards());
+				fclose(dbg);
+			}
+		}
 		return u;
 	}
 
@@ -5908,12 +6326,22 @@ static bool TrainCoupleHandler(Train *v)
 		_r3r_couple_fail_news_shown.erase(v->index);
 		return false;
 	}
-	if (v->cur_speed != 0) {
+	/* R3R (KI-106 fix 1): the exact-geometry path must also run while the loco is
+	 * ROLLING. The movement loop in TrainLocoHandler advances exactly one map
+	 * pixel per iteration and runs the couple check *after* moving, so
+	 * diff = max(|dx|,|dy|) passes through `need` on some frame; skipping that
+	 * frame used to let CheckTrainCollision's min_diff = need - 1 take over one
+	 * pixel later and freeze the loco with a constant 1 px overlap.
+	 * The early-out is kept for the depot branch only: it has NO distance
+	 * criterion (it couples onto any gate-approved consist on the tile), so it
+	 * must not run while rolling. */
+	const bool r3r_rolling = v->cur_speed != 0;
+	if (r3r_rolling) {
 		/* R3R: the locomotive is moving again, so a previous continuous failure
 		 * episode (if any) has ended; clear the throttle so a later stationary
 		 * attempt that fails again can report once more. */
 		_r3r_couple_fail_news_shown.erase(v->index);
-		return false;
+		if (v->track == TRACK_BIT_DEPOT) return false;
 	}
 
 	bool reverse = false;
@@ -5927,19 +6355,21 @@ static bool TrainCoupleHandler(Train *v)
 			Vehicle *first = GetFirstVehicleOnTile(tile, VehicleType::Train);
 			for (Train *w = first != nullptr ? Train::From(first) : nullptr; w != nullptr; w = w->HashTileNext()) {
 				if (w->First()->index == v->index) continue; // Skip self.
-				if (w->owner != v->owner) continue;
-				/* R3R: also accept an ordinary WAIT_COUPLE train. The open-track
-				 * branch (below) already couples plain WAIT_COUPLE trains via its
-				 * 8-neighbour scan, but the depot branch only looked at FreeWagon /
-				 * car-only formations. A wagon set that has never been decoupled
-				 * (e.g. the very first round, started fresh in the depot) is a
-				 * plain train with a WAIT_COUPLE order and matches neither
-				 * FreeWagon nor R3RIsCarOnlyFormation, so the loco could never
-				 * couple it inside a depot — it would instead drive off to
-				 * wherever the open-track scan found it (often the wrong station).
-				 * Align both branches on the same "waiting to be coupled"
-				 * semantics. */
-				if (R3RIsCarOnlyFormation(w->First()) || w->First()->current_order.IsType(OT_WAIT_COUPLE)) {
+				/* R3R (D6-①): the old "same owner" filter is gone. A candidate of
+				 * another company is admitted -- or refused -- by the couple gate
+				 * below (R3RCanCoupleNow -> R3RCoupleAllowed), which demands a
+				 * shared couple group with the cross-company opt-in switched on.
+				 * Anything else is treated exactly like "no waiting consist on this
+				 * tile", so the scan keeps looking and nothing starts to spin. */
+				/* R3R: a target here (as everywhere else) must be an actual
+				 * waiting consist. The depot branch and the open-track branch are
+				 * aligned on the same "waiting to be coupled" semantics -- see
+				 * R3RCanCoupleNow: WAIT_COUPLE order held, started (not stopped by
+				 * the player), same couple group. A candidate that fails the gate
+				 * is not a target, so the scan keeps looking; a locomotive without
+				 * any qualifying candidate simply stays parked and retries (the
+				 * ordinary COUPLE-FAIL path). */
+				if (R3RCanCoupleNow(v, w->First(), "depot")) {
 					u = w->First();
 					break;
 				}
@@ -5948,7 +6378,11 @@ static bool TrainCoupleHandler(Train *v)
 		}
 	} else {
 		u = GetCouplePosition(v, reverse);
-		if (u == nullptr) {
+		/* R3R (KI-106 fix 1): the 9-tile touch/overlap scan below has only a loose
+		 * upper bound (<= half-length sum), so running it while rolling would
+		 * couple at an arbitrary distance short of the exact pixel -- the exact
+		 * opposite of the fix. It therefore stays a standstill-only fallback. */
+		if (u == nullptr && !r3r_rolling) {
 			/* R3R: also couple when the loco is touching/overlapping the waiting
 			 * consist, or parked at the exact end-to-end distance that
 			 * CheckTrainCollision's 8px hash gate misses. GetCouplePosition only
@@ -5967,9 +6401,11 @@ static bool TrainCoupleHandler(Train *v)
 							fv = Train::From(fv)->HashTileNext()) {
 						Train *w = Train::From(fv);
 						if (w->First()->index == v->index) continue; // Skip self.
-						if (w->owner != v->owner) continue;
-						if (!R3RIsCarOnlyFormation(w->First()) &&
-								!(w->First()->IsPrimaryVehicle() && w->First()->current_order.IsType(OT_WAIT_COUPLE))) continue;
+						/* R3R (D6-①): no owner filter -- see the depot branch above;
+						 * the couple gate decides, and a refused candidate is just
+						 * "nothing here". */
+						/* R3R (KI-60): same gate as the geometry and depot paths. */
+						if (!R3RCanCoupleNow(v, w->First(), "scan")) continue;
 						Train *z = w->First();
 						int x_diff = abs(v->x_pos - z->x_pos);
 						int y_diff = abs(v->y_pos - z->y_pos);
@@ -5985,6 +6421,12 @@ static bool TrainCoupleHandler(Train *v)
 		}
 	}
 	if (u == nullptr) {
+		if (r3r_rolling) {
+			/* R3R (KI-106 fix 1): for a rolling loco "not on the exact pixel yet" is
+			 * the normal state of almost every movement step -- not a failure, and
+			 * not worth the edge-probe hash either. */
+			return false;
+		}
 		/* KI-14 (2): edge-triggered. This branch is reached on every tick (and on
 		 * every movement step, see the loop at the end of TrainLocoHandler) while
 		 * a GOTO_COUPLE loco has no reachable target, so the two raw
@@ -6034,6 +6476,24 @@ static bool TrainCoupleHandler(Train *v)
 	//}
 
 	Couple(v, u);
+	if (r3r_rolling) {
+		/* R3R (KI-106 fix 1) probe: the couple was triggered from the movement loop
+		 * (spd != 0) instead of from standstill. merged tells whether the merge
+		 * actually committed -- a fold-fix rollback leaves the two chains apart and
+		 * the loco is stopped on the exact pixel, retrying from standstill. */
+		const uint64_t gm_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
+		const uint64_t gm_payload = (uint64_t)v->tile.base();
+		if (R3RDbgEdge(R3REDGE_CPLGEOCOMMIT, gm_key, gm_payload)) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "[R3R] CPL-GEO-DONE v=%d u=%d merged=%d spd=%d x=%d y=%d\n",
+						(int)v->index.base(), (int)u->index.base(),
+						(int)(u->First() == v->First()),
+						(int)v->cur_speed, (int)v->x_pos, (int)v->y_pos);
+				fclose(dbg);
+			}
+		}
+	}
 	return true;
 }
 
@@ -8155,6 +8615,27 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 			int y_diff = v->y_pos - moving_front->y_pos;
 			int min_diff = (v->gcache.cached_veh_length + 1) / 2 + (moving_front->gcache.cached_veh_length + 1) / 2 - 1;
 			if (x_diff * x_diff + y_diff * y_diff <= min_diff * min_diff) {
+				/* R3R 1px probe: the touch/overlap gate fired. min_diff is one pixel
+				 * short of the "boxes just touch" distance, so on axis-aligned track
+				 * the loco freezes already overlapping by 1px. */
+				{
+					const uint64_t g_key = ((uint64_t)loco->index.base() << 32) ^ (uint64_t)v->index.base();
+					const uint64_t g_payload = ((uint64_t)v->gcache.cached_veh_length << 32) ^ (uint64_t)moving_front->gcache.cached_veh_length;
+					if (R3RDbgEdge(R3REDGE_CPLHIT, g_key, g_payload)) {
+						FILE *dbg = R3RFopenDbg("a");
+						if (dbg != nullptr) {
+							const int len_v = v->gcache.cached_veh_length;
+							const int len_mf = moving_front->gcache.cached_veh_length;
+							const int fit = (len_v + len_mf) / 2;
+							const int maxd = std::max(std::abs(x_diff), std::abs(y_diff));
+							fprintf(dbg, "[R3R] CPL-HIT site=depot loco=%d v=%d len_v=%d len_mf=%d min_diff=%d need=%d fit=%d dx=%d dy=%d maxd=%d overlap=%d spd=%d dir=%d\n",
+									(int)loco->index.base(), (int)v->index.base(), len_v, len_mf,
+									min_diff, min_diff + 1, fit, x_diff, y_diff, maxd, fit - maxd,
+									(int)moving_front->cur_speed, (int)moving_front->direction);
+							fclose(dbg);
+						}
+					}
+				}
 				Couple(loco, v->First());
 				moving_front->cur_speed = 0;
 				moving_front->progress = 0;
@@ -8210,6 +8691,25 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 	if (loco->current_order.IsType(OT_GOTO_COUPLE) &&
 			v->First()->current_order.IsType(OT_WAIT_COUPLE) &&
 			loco != v->First()) {
+		/* R3R 1px probe: open-track touch/overlap gate (mirror of the depot one). */
+		{
+			const uint64_t g_key = ((uint64_t)loco->index.base() << 32) ^ (uint64_t)v->index.base();
+			const uint64_t g_payload = ((uint64_t)v->gcache.cached_veh_length << 32) ^ (uint64_t)moving_front->gcache.cached_veh_length;
+			if (R3RDbgEdge(R3REDGE_CPLHIT, g_key, g_payload)) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					const int len_v = v->gcache.cached_veh_length;
+					const int len_mf = moving_front->gcache.cached_veh_length;
+					const int fit = (len_v + len_mf) / 2;
+					const int maxd = std::max(std::abs(x_diff), std::abs(y_diff));
+					fprintf(dbg, "[R3R] CPL-HIT site=open loco=%d v=%d len_v=%d len_mf=%d min_diff=%d need=%d fit=%d dx=%d dy=%d maxd=%d overlap=%d spd=%d dir=%d\n",
+							(int)loco->index.base(), (int)v->index.base(), len_v, len_mf,
+							min_diff, min_diff + 1, fit, x_diff, y_diff, maxd, fit - maxd,
+							(int)moving_front->cur_speed, (int)moving_front->direction);
+					fclose(dbg);
+				}
+			}
+		}
 		Couple(loco, v->First());
 		moving_front->cur_speed = 0;
 		moving_front->progress = 0;
@@ -10010,14 +10510,19 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					int dbg_depotDir = dbg_destDepot ? (int)GetRailDepotDirection(dbg_dest) : -1;
 					int dbg_enterDir = (int)TrackdirToExitdir(consist->GetVehicleTrackdir());
 
-					fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) curType=%d stuck=%d tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d\n",
+					fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) curType=%d stuck=%d tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d tt=%d impl=%d\n",
 						(int)consist->index.base(), (int)consist->cur_speed,
 						(int)consist->cur_real_order_index, (int)(consist->GetOrder(consist->cur_real_order_index) ? consist->GetOrder(consist->cur_real_order_index)->GetType() : -1),
 						(int)consist->current_order.GetType(),
 						(int)consist->flags.Test(VehicleRailFlag::Stuck),
 						(int)tile_is_depot, (int)TileX(consist->tile), (int)TileY(consist->tile),
 						dbg_destTx, dbg_destTy, (int)dbg_destDepot, (int)dbg_destResv, (int)dbg_tileEqDest,
-						dbg_depotDir, dbg_enterDir);
+						dbg_depotDir, dbg_enterDir,
+						/* R3R: the timetable index is what UpdateVehicleTimetable asserts on.
+						 * Logging it here shows whether the desync (TT-DESYNC) already
+						 * existed when the depot arrival was handled, i.e. which R3R block
+						 * rewrote the order indices behind each other's back. */
+						(int)consist->cur_timetable_order_index, (int)consist->cur_implicit_order_index);
 					for (const Train *w = consist; w != nullptr; w = w->GetNextUnit()) {
 						bool tw = w->tile != INVALID_TILE;
 						fprintf(dbg, "  CHAIN idx=%d head=%d tileDepot=%d track=%d x=%d y=%d\n",
@@ -10108,6 +10613,13 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	}
 
 	bool valid_order = !consist->current_order.IsType(OT_NOTHING) && consist->current_order.GetType() != OT_CONDITIONAL && !consist->current_order.IsSlotCounterOrder() && !consist->current_order.IsType(OT_LABEL);
+	/* R3R: ProcessOrders() calls UpdateVehicleTimetable() as soon as the train
+	 * arrives at / leaves an order. That function asserts that the timetable index
+	 * points at the same order as the real index; a stale index took the game down
+	 * (timetable_cmd.cpp "real_timetable_order == real_current_order"). Trap the
+	 * state directly in front of the call so R3R_debug.log names the tick on which
+	 * the desync became visible, next to the DEPOT-ARR dump above. */
+	R3RCheckTtSync(consist, "pre-processorders");
 	bool r3r_may_reverse;
 	{
 		R3RScopeTimer r3r_ord_timer(&r3r_ord_ns, &r3r_ord_calls);
@@ -11187,6 +11699,15 @@ CommandCost CmdTemplateReplaceVehicle(DoCommandFlags flags, VehicleID veh_id)
 
 	if (incoming == nullptr || !incoming->IsPrimaryVehicle() || !incoming->IsChainInDepot()) {
 		return CMD_ERROR;
+	}
+
+	/* R3R: template replacement rebuilds the entire chain, selling whatever the template
+	 * does not cover and buying a new train in its place. Upstream assumes the chain to be
+	 * owned by one company, so a cross-company coupled chain would sell vehicles of the
+	 * other company. There is no valid template replacement semantics for such a chain,
+	 * so skip it silently (CMD_ERROR carries no message). */
+	for (const Vehicle *w = incoming->Next(); w != nullptr; w = w->Next()) {
+		if (w->owner != incoming->owner) return CMD_ERROR;
 	}
 
 	Train *outgoing = incoming;

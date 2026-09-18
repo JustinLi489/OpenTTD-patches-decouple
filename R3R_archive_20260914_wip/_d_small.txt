@@ -1,0 +1,790 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 396e35b6bf..6cf571832a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -537,4 +537,15 @@ if(OPTION_NO_TAGGED_PTRS)
+ endif()
+ 
++# R3R: allow the compile-time probe default to be forced from the command line.
++# R3R_release_build.cmd passes -DR3R_PROBES_DEFAULT=0 so the published exe has
++# the R3R performance/logging probes compiled out (see src/r3r_perf.h, KI-28).
++# Without this block CMake would only warn "Manually-specified variables were
++# not used by the project" and the define would never reach build.ninja, so the
++# [5d] hard gate in R3R_release_build.cmd aborts with EXIT_CODE=94.
++if(DEFINED R3R_PROBES_DEFAULT)
++    add_definitions(-DR3R_PROBES_DEFAULT=${R3R_PROBES_DEFAULT})
++    message(STATUS "R3R probes default override -- -DR3R_PROBES_DEFAULT=${R3R_PROBES_DEFAULT}")
++endif()
++
+ enable_testing()
+ 
+diff --git a/src/framerate_gui.cpp b/src/framerate_gui.cpp
+index 7fa15b0747..7a653df71c 100644
+--- a/src/framerate_gui.cpp
++++ b/src/framerate_gui.cpp
+@@ -1098,4 +1098,20 @@ void ConPrintFramerate()
+ }
+ 
++/**
++ * R3R (KI-26 step 3): current "GL train ticks" average, in ms per frame.
++ *
++ * Exactly the number the in-game 'framerates' command prints for the train
++ * element, from the same _pf_data entry, so a Release run can log it next to the
++ * R3R probes and the "trains line" comparison no longer needs a Debug build nor
++ * an OCR of the framerate window.
++ * @return ms per frame, or -1.0 when no measurement has been taken yet.
++ */
++double R3RGetTrainsMs()
++{
++	auto &pf = _pf_data[PFE_GL_TRAINS];
++	if (pf.num_valid == 0) return -1.0;
++	return pf.GetAverageDurationMilliseconds(NUM_FRAMERATE_POINTS / 4);
++}
++
+ /**
+  * This drains the PFE_SOUND measurement data queue into _pf_data.
+diff --git a/src/newgrf_engine.cpp b/src/newgrf_engine.cpp
+index e1707594ca..8b9ec8bf4d 100644
+--- a/src/newgrf_engine.cpp
++++ b/src/newgrf_engine.cpp
+@@ -9,4 +9,5 @@
+ 
+ #include "stdafx.h"
++#include "r3r_perf.h"
+ #include "debug.h"
+ #include "train.h"
+@@ -429,4 +430,12 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
+ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
+ {
++	/* R3R perf probe (KI-14): this runs on the sprite path, so its cost is a
++	 * frame-rate cost. pos_steps is the interesting one: the segment walk is
++	 * O(n) per vehicle, i.e. O(n^2) per chain whenever the NewGRF cache is
++	 * invalidated. */
++	R3RPerfCounters &r3rp = R3RP();
++	r3rp.pos_helper++;
++	R3RPerfTimer r3r_pos_timer(&r3rp.pos_ns);
++
+ 	const Vehicle *u;
+ 	uint8_t chain_before = 0;
+@@ -459,4 +468,8 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
+ 	}
+ 
++	const uint64_t r3r_steps = (uint64_t)chain_before + chain_after;
++	r3rp.pos_steps += r3r_steps;
++	if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
++
+ 	return chain_before | chain_after << 8 | (chain_before + chain_after + consecutive) << 16;
+ }
+diff --git a/src/order_cmd.cpp b/src/order_cmd.cpp
+index 909e02bacc..b87fc700bf 100644
+--- a/src/order_cmd.cpp
++++ b/src/order_cmd.cpp
+@@ -3477,4 +3477,18 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
+ 	extern void UpdateDeparturesWindowVehicleFilter(const OrderList *order_list, bool remove);
+ 
++	/* R3R (couple priority, route A): this vehicle is executing a schedule that is
++	 * BORROWED from another segment of its consist (the consist's command owner).
++	 * The owner still holds the pointer and the borrow is deliberately not a shared
++	 * order list, so IsOrderListShared() is false here -- freeing v->orders would
++	 * destroy the owner's schedule and leave it dangling. Give the borrow back and
++	 * delete this vehicle's own schedule instead. */
++	if (v->r3r_orders_borrowed) {
++		v->orders = v->orders_backup;
++		v->orders_backup = nullptr;
++		v->r3r_orders_borrowed = false;
++		v->orders_backup_real_index = INVALID_VEH_ORDER_ID;
++		v->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
++	}
++
+ 	if (v->IsOrderListShared()) {
+ 		/* Remove ourself from the shared order list. */
+diff --git a/src/pathfinder/yapf/yapf_common.hpp b/src/pathfinder/yapf/yapf_common.hpp
+index 2e52059f44..84b23063fd 100644
+--- a/src/pathfinder/yapf/yapf_common.hpp
++++ b/src/pathfinder/yapf/yapf_common.hpp
+@@ -14,4 +14,5 @@
+ #include "../../tile_type.h"
+ #include "../../track_type.h"
++#include "../../r3r_perf.h"
+ 
+ /** YAPF origin provider base class - used when origin is one tile / multiple trackdirs */
+@@ -106,5 +107,5 @@ public:
+ 	{
+ 		if (this->origin_tile == TileXY(38, 35)) {
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-STARTUP origin=%d,%d td=%d revTile=%d,%d revTd=%d\n",
+diff --git a/src/pathfinder/yapf/yapf_destrail.hpp b/src/pathfinder/yapf/yapf_destrail.hpp
+index 3201204bfb..b47b8124a9 100644
+--- a/src/pathfinder/yapf/yapf_destrail.hpp
++++ b/src/pathfinder/yapf/yapf_destrail.hpp
+@@ -15,4 +15,5 @@
+ #include "../pathfinder_func.h"
+ #include "../pathfinder_type.h"
++#include "../../r3r_perf.h"
+ 
+ class CYapfDestinationRailBase {
+@@ -313,5 +314,5 @@ public:
+ 		if (s->occupants.empty()) return true;
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "COUPLE-SLOT-REJ u=%d slotRaw=%u nOcc=%zu\n",
+@@ -332,5 +333,5 @@ public:
+ 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
+ 		if (IsRailStationTile(tile)) {
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "PFD tile=%d,%d td=%d trackbits=0x%x hasRes=%d\n",
+@@ -379,5 +380,5 @@ public:
+ 		}
+ 		if (t == nullptr && IsRailStationTile(tile)) {
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				const TileIndexDiff delta = TileOffsByAxis(GetRailStationAxis(tile));
+@@ -397,5 +398,5 @@ public:
+ 		if (t == nullptr) {
+ 			if (IsRailStationTile(tile)) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "PFD tile=%d,%d hasResButNoTrain\n",
+@@ -408,5 +409,5 @@ public:
+ 		t = t->First();
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				bool co = R3RIsCarOnlyFormation(t);
+diff --git a/src/pathfinder/yapf/yapf_rail.cpp b/src/pathfinder/yapf/yapf_rail.cpp
+index 107d9c0a1b..facadef3ba 100644
+--- a/src/pathfinder/yapf/yapf_rail.cpp
++++ b/src/pathfinder/yapf/yapf_rail.cpp
+@@ -20,4 +20,5 @@
+ #include "../../debug.h"
+ #include "../../misc/dbg_helpers.h"
++#include "../../r3r_perf.h"
+ 
+ #include "../../safeguards.h"
+@@ -109,5 +110,5 @@ private:
+ 	{
+ 		if (IsRailDepotTile(tile)) {
+-		FILE *dbg = fopen("R3R_debug.log", "a");
++		FILE *dbg = R3RFopenDbg("a");
+ 		if (dbg != nullptr) {
+ 			fprintf(dbg, "FSCP tile=%d,%d fail=depot\n", (int)TileX(tile), (int)TileY(tile));
+@@ -149,5 +150,5 @@ private:
+ 				if (best->index == Yapf().GetVehicle()->index) return true;
+ 				if (!R3RIsCarOnlyFormation(best) && !best->current_order.IsType(OT_WAIT_COUPLE)) {
+-					FILE *dbg = fopen("R3R_debug.log", "a");
++					FILE *dbg = R3RFopenDbg("a");
+ 					if (dbg != nullptr) {
+ 						fprintf(dbg, "FSCP tile=%d,%d fail=notWC best=%d ord=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType());
+@@ -157,5 +158,5 @@ private:
+ 				}
+ 				if (second_best != nullptr) {
+-					FILE *dbg = fopen("R3R_debug.log", "a");
++					FILE *dbg = R3RFopenDbg("a");
+ 					if (dbg != nullptr) {
+ 						fprintf(dbg, "FSCP tile=%d,%d fail=2nd best=%d 2nd=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)second_best->index.base());
+@@ -167,5 +168,5 @@ private:
+ 				FollowTrainReservation(best, &other_train);
+ 				if (other_train != nullptr && other_train != best) {
+-					FILE *dbg = fopen("R3R_debug.log", "a");
++					FILE *dbg = R3RFopenDbg("a");
+ 					if (dbg != nullptr) {
+ 						fprintf(dbg, "FSCP tile=%d,%d fail=other best=%d other=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)other_train->index.base());
+@@ -177,5 +178,5 @@ private:
+ 		} else if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
+ 			if (!TryReserveRailTrack(tile, TrackdirToTrack(td))) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d\n", (int)TileX(tile), (int)TileY(tile), (int)td);
+@@ -616,5 +617,5 @@ public:
+ 			const bool is_depot = IsRailDepotTile(old_node.GetLastTile());
+ 			if (is_depot || (TileX(old_node.GetLastTile()) == 38 && TileY(old_node.GetLastTile()) == 27)) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "DEPOTCHK t=%d,%d isDepot=%d isRailway=%d parent=%s\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)is_depot, (int)IsTileType(old_node.GetLastTile(), TileType::Railway), old_node.parent != nullptr ? "y" : "n");
+@@ -628,5 +629,5 @@ public:
+ 			TrackFollower F2(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
+ 			if (F2.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "CPL-FOLLOW from=%d,%d td=%d to=%d,%d tdbits=0x%x\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)old_node.GetLastTrackdir(), (int)TileX(F2.new_tile), (int)TileY(F2.new_tile), (unsigned)F2.new_td_bits);
+@@ -658,5 +659,5 @@ public:
+ 		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-ORIGIN veh=%d origin=%d,%d td=%d vehDir=%d vehTd=%d dontReserve=%d\n",
+@@ -672,5 +673,5 @@ public:
+ 		bool path_found = Yapf().FindPath(v);
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-PATHFOUND veh=%d found=%d\n", (int)v->index.base(), (int)path_found);
+@@ -711,5 +712,5 @@ public:
+ 			}
+ 			{
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d\n",
+@@ -721,5 +722,5 @@ public:
+ 		}
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-BEST veh=%d tile=%d,%d td=%d cost=%d\n",
+@@ -753,5 +754,5 @@ public:
+ 
+ 			{
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()));
+@@ -761,5 +762,5 @@ public:
+ 			if (!this->CheckSafePositionOnNode(pPrev)) {
+ 				{
+-					FILE *dbg = fopen("R3R_debug.log", "a");
++					FILE *dbg = R3RFopenDbg("a");
+ 					if (dbg != nullptr) {
+ 						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d\n",
+@@ -786,5 +787,5 @@ public:
+ 		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+ 			if (depth <= 15) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
+@@ -833,5 +834,5 @@ public:
+ 		tdb = GetTileTrackdirBits(st, ::TransportType::TRANSPORT_RAIL, 0);
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-TRACE st=%d,%d tdb=0x%x\n", (int)TileX(st), (int)TileY(st), (unsigned)tdb);
+@@ -845,5 +846,5 @@ public:
+ 		}
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CPL-TRACE-RESULT st=%d,%d best=%d\n", (int)TileX(st), (int)TileY(st), (int)best_td);
+@@ -856,5 +857,5 @@ public:
+ 				std::function<bool(TileIndex, Trackdir, int)> rp = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+ 					if (depth <= 15) {
+-						FILE *dbg = fopen("R3R_debug.log", "a");
++						FILE *dbg = R3RFopenDbg("a");
+ 						if (dbg != nullptr) {
+ 							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
+@@ -970,5 +971,5 @@ public:
+ 			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
+ 			{
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
+@@ -1177,5 +1178,5 @@ public:
+ 		path_found = Yapf().FindPath(v);
+ 		{
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CRT veh=%d order=%d dir=%d origin=%d,%d td=%d found=%d\n",
+@@ -1383,5 +1384,5 @@ bool YapfTrainCheckReverse(const Train *v)
+ 		const int rel_y = TileY(tile_rev) - TileY(tile);
+ 		if (rel_x * delta.x + rel_y * delta.y > 0) {
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\n",
+@@ -1489,5 +1490,5 @@ Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
+ {
+ 	{
+-		FILE *dbg = fopen("R3R_debug.log", "a");
++		FILE *dbg = R3RFopenDbg("a");
+ 		if (dbg != nullptr) {
+ 			fprintf(dbg, "CPL-ENTRY veh=%d tile=%d,%d orderType=%d dontReserve=%d\n",
+diff --git a/src/pbs.cpp b/src/pbs.cpp
+index ae1e9e589d..f4141179ed 100644
+--- a/src/pbs.cpp
++++ b/src/pbs.cpp
+@@ -18,4 +18,5 @@
+ #include "train_speed_adaptation.h"
+ #include "bridge_signal_map.h"
++#include "r3r_perf.h"
+ 
+ #include "table/strings.h"
+@@ -264,5 +265,5 @@ void UnreserveRailTrack(TileIndex tile, Track t)
+ 				 * find who clears the WAIT_COUPLE consist's reservation. */
+ 				{
+-					FILE *dbg = fopen("R3R_debug.log", "a");
++					FILE *dbg = R3RFopenDbg("a");
+ 					if (dbg != nullptr) {
+ 						fprintf(dbg, "UNRESERVE-STATION tile=%d,%d\n",
+diff --git a/src/r3r_perf.h b/src/r3r_perf.h
+new file mode 100644
+index 0000000000..6c1ade32b0
+--- /dev/null
++++ b/src/r3r_perf.h
+@@ -0,0 +1,196 @@
++/*
++ * R3R performance probes (known issue KI-14).
++ *
++ * Purpose: localise a reported frame-rate drop / latency increase without
++ * shipping a profiler. The game already measures PFE_GAMELOOP / PFE_GL_TRAINS /
++ * PFE_DRAWING / PFE_DRAWWORLD / PFE_VIDEO (console command "framerates"), so
++ * these probes only cover the R3R-specific suspects:
++ *
++ *   1. the fold-fix retry loop, which calls TryTrainCouple -> ChainFolded ->
++ *      R3RCheckChainFold once per tick while it never converges, and every one
++ *      of those calls does fopen/fprintf/fclose on R3R_debug.log (KI-06);
++ *   2. the per-tick debug dumps (R3RDumpChainDbg / R3RDumpCoupleIdentity),
++ *      which walk the whole chain and write it out;
++ *   3. PositionHelper's "position in segment" rewrite (KI-10), which walks the
++ *      chain backwards to the segment front and forwards to the segment end on
++ *      the graphics path -- O(n) per vehicle becomes O(n^2) per chain whenever
++ *      the NewGRF cache is invalidated.
++ *
++ * Everything here is counters plus one aggregate line per 128 rendered frames,
++ * so the probes themselves are ~free. Remove this header (and the R3RPerf*
++ * calls) once KI-14 is closed.
++ *
++ * Output files (game working directory): R3R_perf.log (aggregates).
++ */
++
++#ifndef R3R_PERF_H
++#define R3R_PERF_H
++
++#include <chrono>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++/** Monotonic nanoseconds, for the RAII timers below. */
++inline uint64_t R3RPerfNowNs()
++{
++	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++		std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++struct R3RPerfCounters {
++	/* frame timing (filled by R3RPerfFrameTick) */
++	uint64_t frames = 0;
++	uint64_t frame_ms_sum = 0;
++	uint64_t frame_ms_max = 0;
++
++	/* hot paths */
++	uint64_t try_couple = 0, try_couple_ns = 0;
++	uint64_t fold_check = 0, fold_check_ns = 0;
++	uint64_t dump_chain = 0, dump_chain_ns = 0;
++	uint64_t dump_ident = 0, dump_ident_ns = 0;
++
++	/* R3R_debug.log writes */
++	uint64_t dbg_writes = 0, dbg_ns = 0;
++
++	/* PositionHelper (NewGRF position-in-segment) */
++	uint64_t pos_helper = 0, pos_steps = 0, pos_max = 0, pos_ns = 0;
++};
++
++/** Process-wide counters (single-threaded game logic). */
++inline R3RPerfCounters &R3RP()
++{
++	static R3RPerfCounters c;
++	return c;
++}
++
++/**
++ * Compile-time default of the probes, used when R3R_DBG / R3R_PERF are unset.
++ *
++ * User decision 2026-09-14 (restated): the two build trees have two roles --
++ *   build\\          = internal test build, probes ON, this is what you play;
++ *   build-release\\  = what gets published, probes OFF.
++ * So the default must follow the build type, not a hand-maintained flag.
++ *
++ * An explicit -DR3R_PROBES_DEFAULT=<n> always wins (R3R_release_build.cmd passes
++ * 0). Without it the type is derived: MSVC defines _DEBUG only for the Debug
++ * configuration (Debug CRT, /MTd), never for RelWithDebInfo/Release. Deriving it
++ * is the safety net -- a Release build configured by hand still ships with the
++ * probes off, which is exactly the intent for a published exe.
++ *
++ * A shipped exe can still force the probes back on at runtime with R3R_DBG=1
++ * (see R3RDbgOn below), so a release binary stays debuggable when needed.
++ */
++#ifndef R3R_PROBES_DEFAULT
++#  if defined(_DEBUG)
++#    define R3R_PROBES_DEFAULT 1
++#  else
++#    define R3R_PROBES_DEFAULT 0
++#  endif
++#endif
++
++/**
++ * Master switch for every R3R probe and every R3R_debug.log write.
++ *
++ * With no environment variable set the behaviour follows R3R_PROBES_DEFAULT
++ * (ON everywhere except a release build). R3R_DBG=0 forces a probe-free run --
++ * that is the A/B baseline KI-26 asks for ("Release with the probes really
++ * off"); R3R_DBG=1 forces the probes back on even in a release build. One
++ * predicted branch on a cached static, so calling it at a log site is free
++ * compared to the fopen/fprintf/fclose it guards (~160 us measured).
++ */
++inline bool R3RDbgOn()
++{
++	static const bool on = []() {
++		const char *env = std::getenv("R3R_DBG");
++		if (env != nullptr && env[0] == '0') return false;
++		if (env != nullptr && env[0] == '1') return true;
++		return R3R_PROBES_DEFAULT != 0;
++	}();
++	return on;
++}
++
++/**
++ * Switch for the *timers* (R3RPerfTimer / R3RScopeTimer / the per-window PERF
++ * line), i.e. the KI-14 / KI-26 frame-budget probes.
++ *
++ * Defaults to R3RDbgOn(), so R3R_DBG=0 really does shut the probes down (they
++ * are not free: ~6.5k timer calls per frame plus the counters). R3R_PERF=1
++ * overrides that and keeps the buckets alive while the log stays off -- the
++ * useful combination for an A/B run, because the reported distribution is then
++ * the one without any log-writing on top of it.
++ */
++inline bool R3RPerfOn()
++{
++	static const bool on = []() {
++		const char *env = std::getenv("R3R_PERF");
++		if (env != nullptr && env[0] == '0') return false;
++		if (env != nullptr && env[0] == '1') return true;
++		return R3RDbgOn();
++	}();
++	return on;
++}
++
++/** RAII accumulator: adds the elapsed time to *acc on scope exit. */
++struct R3RPerfTimer {
++	uint64_t *acc;
++	uint64_t t0;
++	bool on;
++	explicit R3RPerfTimer(uint64_t *a) : acc(a), t0(0), on(R3RPerfOn())
++	{
++		if (this->on) this->t0 = R3RPerfNowNs();
++	}
++	~R3RPerfTimer() { if (this->on) *acc += R3RPerfNowNs() - t0; }
++};
++
++/**
++ * fopen() for R3R_debug.log, honouring R3RDbgOn().
++ * Returns nullptr when the switch is off, which every call site already handles
++ * (they all test `if (dbg != nullptr)`), so turning the switch off costs nothing
++ * more than failing the open.
++ */
++inline FILE *R3RFopenDbg(const char *mode)
++{
++	return R3RDbgOn() ? fopen("R3R_debug.log", mode) : nullptr;
++}
++
++/**
++ * Central R3R debug-log write: counts the call and the fopen/fprintf/fclose cost.
++ * Only worth routing the *suspected hot* sites through here -- the cold ones can
++ * keep their plain fopen, they are not part of the frame budget.
++ */
++inline void R3RDbgWrite(const char *fmt, ...)
++{
++	if (!R3RDbgOn()) return;
++	R3RPerfCounters &p = R3RP();
++	p.dbg_writes++;
++	const uint64_t t0 = R3RPerfNowNs();
++	FILE *dbg = fopen("R3R_debug.log", "a");
++	if (dbg != nullptr) {
++		va_list ap;
++		va_start(ap, fmt);
++		vfprintf(dbg, fmt, ap);
++		va_end(ap);
++		fclose(dbg);
++	}
++	p.dbg_ns += R3RPerfNowNs() - t0;
++}
++
++/** Snapshot the world, write one aggregate line to R3R_perf.log, reset counters. */
++void R3RPerfDumpAndReset();
++
++/**
++ * Called once per rendered frame from UpdateWindows().
++ * @param delta_ms Real time since the previous frame -- the frame rate itself.
++ */
++inline void R3RPerfFrameTick(uint32_t delta_ms)
++{
++	R3RPerfCounters &p = R3RP();
++	p.frames++;
++	p.frame_ms_sum += delta_ms;
++	if (delta_ms > p.frame_ms_max) p.frame_ms_max = delta_ms;
++	if (p.frames >= 128) R3RPerfDumpAndReset();
++}
++
++#endif /* R3R_PERF_H */
+diff --git a/src/sl/vehicle_sl.cpp b/src/sl/vehicle_sl.cpp
+index 7aaeb9bc52..101db63c9e 100644
+--- a/src/sl/vehicle_sl.cpp
++++ b/src/sl/vehicle_sl.cpp
+@@ -21,4 +21,5 @@
+ #include "../disaster_vehicle.h"
+ #include "../scope_info.h"
++#include "../r3r_perf.h"
+ #include "../string_func.h"
+ #include "../error.h"
+@@ -490,4 +491,10 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
+ 					t->gcache.last_speed = t->cur_speed; // update displayed train speed
+ 					t->ConsistChanged(CCF_SAVELOAD);
++					/* R3R: the couple-priority/borrow state is runtime-only, so a load
++					 * leaves it at its defaults and decouples would take the legacy
++					 * hand-over path (KI-02/KI-05). Rebuild it from the order-list
++					 * pointers. Only on a real load: a NewGRF reload runs this same
++					 * pass with live state that must not be disturbed. */
++					if (part_of_load) R3RRebuildCouplePriorities(t);
+ 				}
+ 				break;
+@@ -536,4 +543,36 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
+ 	}
+ 
++	/* R3R (TEMPORARY DIAGNOSTIC): unconditional load census. Written on every call
++	 * so that "savegame not loaded" can be told apart from "loaded but no bad
++	 * vehicle". Reports every train with an unresolved visual effect wherever it
++	 * sits in the chain (not only at chain heads), plus its chain head identity. */
++	{
++		FILE *dbg = R3RFopenDbg("a");
++		if (dbg != nullptr) {
++			fprintf(dbg, "=== LOADCENSUS-ENTER part_of_load=%d ===\n", (int)part_of_load);
++			unsigned int ntot = 0, nbad = 0;
++			for (const Vehicle *w : Vehicle::Iterate()) {
++				if (w->type != VehicleType::Train) continue;
++				ntot++;
++				const bool bad = !HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
++						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT;
++				if (!bad) continue;
++				nbad++;
++				const Train *wt = Train::From(w);
++				const Vehicle *hd = w->First();
++				fprintf(dbg, "LOADCENSUS-BAD idx=%d cv=%02X st=%02X et=%u prev=%d next=%d first=%d FE=%d FW=%d FWG=%d ENG=%d VIRT=%d ART=%d\n",
++						(int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype,
++						(unsigned int)w->engine_type.base(),
++						(int)(w->Previous() != nullptr ? w->Previous()->index.base() : -1),
++						(int)(w->Next() != nullptr ? w->Next()->index.base() : -1),
++						(int)(hd != nullptr ? hd->index.base() : -1),
++						(int)wt->IsFrontEngine(), (int)wt->IsFreeWagon(), (int)wt->IsFrontWagon(),
++						(int)wt->IsEngine(), (int)wt->IsVirtual(), (int)wt->IsArticGroupMember());
++			}
++			fprintf(dbg, "=== LOADCENSUS-LEAVE total=%u bad=%u ===\n", ntot, nbad);
++			fclose(dbg);
++		}
++	}
++
+ 	if (part_of_load && SlXvIsFeaturePresent(XSLFI_TEMPLATE_REPLACEMENT) && (_network_server || !_networking)) {
+ 		for (Train *t : Train::IterateFrontOnly()) {
+@@ -634,4 +673,21 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
+ 		v->cargo.AssertCountConsistency();
+ 	}
++
++	/* R3R (TEMPORARY DIAGNOSTIC): second sampling point, after the virtual-vehicle
++	 * cleanup above, to catch chains (re)linked after the ConsistChanged() calls at
++	 * the top of this function. */
++	{
++		FILE *dbg = R3RFopenDbg("a");
++		if (dbg != nullptr) {
++			unsigned int nbad = 0;
++			for (const Vehicle *w : Vehicle::Iterate()) {
++				if (w->type != VehicleType::Train) continue;
++				if (!HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
++						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT) nbad++;
++			}
++			fprintf(dbg, "=== LOADCENSUS-PHASE2END bad=%u ===\n", nbad);
++			fclose(dbg);
++		}
++	}
+ }
+ 
+diff --git a/src/station_cmd.cpp b/src/station_cmd.cpp
+index e773a2dfbd..e56459a22f 100644
+--- a/src/station_cmd.cpp
++++ b/src/station_cmd.cpp
+@@ -67,4 +67,5 @@
+ #include "rail_cmd.h"
+ #include "tile_cmd.h"
++#include "r3r_perf.h"
+ #include "road_layout_func.h"
+ 
+@@ -3678,5 +3679,5 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
+ 			static uint32_t r3r_draw_n = 0;
+ 			if ((r3r_draw_n++ % 200) == 0) {
+-				FILE *dbg = fopen("R3R_debug.log", "a");
++				FILE *dbg = R3RFopenDbg("a");
+ 				if (dbg != nullptr) {
+ 					fprintf(dbg, "DRAW-STATION-NORES tile=%d,%d overlayBranch=%d showRes=%d\n",
+diff --git a/src/train.h b/src/train.h
+index 1298fb8751..837f4ccf3a 100644
+--- a/src/train.h
++++ b/src/train.h
+@@ -676,3 +676,7 @@ void R3RDestroyCarOnlyFormation(Train *front);
+ bool R3RIsCarOnlyFormation(const Train *v);
+ 
++/* R3R couple priority (route A): the priority/borrow state of a consist is
++ * runtime-only, so it is rebuilt from the order-list pointers after a load. */
++void R3RRebuildCouplePriorities(Train *chain);
++
+ #endif /* TRAIN_H */
+diff --git a/src/vehicle.cpp b/src/vehicle.cpp
+index 11f4a92177..8860f9a6c3 100644
+--- a/src/vehicle.cpp
++++ b/src/vehicle.cpp
+@@ -70,4 +70,5 @@
+ #include "vehicle_cmd.h"
+ #include "tile_cmd.h"
++#include "r3r_perf.h"
+ #include "3rdparty/cpp-btree/btree_set.h"
+ #include "3rdparty/cpp-btree/btree_map.h"
+@@ -1213,4 +1214,11 @@ void Vehicle::PreDestructor()
+ 	}
+ 
++	/* A vehicle-view window's viewport follows its window_number (the vehicle
++	 * index) unconditionally, so it must never outlive the vehicle. The block
++	 * below only closes it while the vehicle is still a primary vehicle; custom
++	 * code can strip that identity before the vehicle is destroyed, so close it
++	 * here regardless. */
++	CloseWindowById(WindowClass::VehicleView, this->index);
++
+ 	if (this->IsPrimaryVehicle()) {
+ 		CloseWindowById(WindowClass::VehicleView, this->index);
+@@ -4372,4 +4380,22 @@ void Vehicle::ShowVisualEffect(uint max_speed) const
+ 		} else {
+ 			effect_model = static_cast<VisualEffectSpawnModel>(GB(v->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT));
++			if (effect_model == VisualEffectSpawnModel::None) {
++				/* R3R (TEMPORARY DIAGNOSTIC): a resolved visual effect never has the
++				 * default type here, so this is the pre-crash crime scene. Dump the
++				 * whole consist with its cached values so the offending vehicle and
++				 * its chain head can be identified. */
++				FILE *dbg = R3RFopenDbg("a");
++				if (dbg != nullptr) {
++					fprintf(dbg, "VIS-MISS this=%d sub=%02X veh=%d cv=%02X\n",
++							(int)this->index.base(), (int)this->subtype,
++							(int)v->index.base(), (int)v->vcache.cached_vis_effect);
++					unsigned int i = 0;
++					for (const Vehicle *w = this; w != nullptr; w = w->Next(), i++) {
++						fprintf(dbg, "  VIS-MISS[%u] idx=%d cv=%02X st=%02X et=%u\n",
++								i, (int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype, (unsigned int)w->engine_type.base());
++					}
++					fclose(dbg);
++				}
++			}
+ 			assert(to_underlying(effect_model) != to_underlying(VE_TYPE_DEFAULT)); // should have been resolved by UpdateVisualEffect
+ 			static_assert(to_underlying(VisualEffectSpawnModel::Steam) == to_underlying(VE_TYPE_STEAM));
+diff --git a/src/vehicle_base.h b/src/vehicle_base.h
+index ba85b0df29..c1e8cb6e66 100644
+--- a/src/vehicle_base.h
++++ b/src/vehicle_base.h
+@@ -29,4 +29,5 @@
+ #include "core/alignment.hpp"
+ #include "sl/saveload_common.h"
++#include "r3r_perf.h"
+ #include <array>
+ #include <vector>
+@@ -378,4 +379,6 @@ public:
+ 	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). NOSAVE.
+ 	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. NOSAVE.
++	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). NOSAVE.
++	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A); the owner keeps its own pointer, so this list must never be freed by this vehicle. NOSAVE.
+ 
+ 	NO_UNIQUE_ADDRESS NewGRFCache grf_cache{};   ///< Cache of often used calculated NewGRF values
+@@ -1055,5 +1058,5 @@ public:
+ 		if (this->type == VehicleType::Train && (this->current_order.IsType(OT_GOTO_COUPLE) ||
+ 				(this->GetOrder(this->cur_real_order_index) != nullptr && this->GetOrder(this->cur_real_order_index)->IsType(OT_GOTO_COUPLE)))) {
+-			FILE *dbg = fopen("R3R_debug.log", "a");
++			FILE *dbg = R3RFopenDbg("a");
+ 			if (dbg != nullptr) {
+ 				fprintf(dbg, "ADVANCE: veh=%d order=%d real_before=%d implicit_before=%d\n",
+diff --git a/src/vehicle_cmd.cpp b/src/vehicle_cmd.cpp
+index 5353b60092..5e93d8c0e3 100644
+--- a/src/vehicle_cmd.cpp
++++ b/src/vehicle_cmd.cpp
+@@ -42,4 +42,5 @@
+ #include "tbtr_template_vehicle_func.h"
+ #include "scope.h"
++#include "r3r_perf.h"
+ 
+ #include <cstdio>
+@@ -331,5 +332,5 @@ static void R3RStopChainInDepot(Train *t)
+ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
+ {
+-	FILE *dbg = fopen("R3R_debug.log", "a");
++	FILE *dbg = R3RFopenDbg("a");
+ 	if (dbg == nullptr) return;
+ 	if (head == nullptr) {
+@@ -537,5 +538,5 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
+ 
+ 	/* R3R debug probe: log the command receipt and every validation result. */
+-	FILE *dbg = fopen("R3R_debug.log", "a");
++	FILE *dbg = R3RFopenDbg("a");
+ 	if (dbg != nullptr) {
+ 		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d chainInDepot=%d nxt=%d\n",
+diff --git a/src/viewport.cpp b/src/viewport.cpp
+index c536a5ddc7..3404f86d78 100644
+--- a/src/viewport.cpp
++++ b/src/viewport.cpp
+@@ -4542,4 +4542,11 @@ void UpdateNextViewportPosition(Window *w, uint32_t delta_ms)
+ 	const Viewport *vp = w->viewport;
+ 
++	/* Guard: the followed vehicle's pool slot may already have been freed (e.g. a
++	 * vehicle-view window whose train lost its primary identity was sold without
++	 * the window being closed). Drop the follow instead of dereferencing null. */
++	if (w->viewport->follow_vehicle != VehicleID::Invalid() && Vehicle::Get(w->viewport->follow_vehicle) == nullptr) {
++		w->viewport->CancelFollow(*w);
++	}
++
+ 	if (w->viewport->follow_vehicle != VehicleID::Invalid()) {
+ 		const Vehicle *veh = Vehicle::Get(w->viewport->follow_vehicle)->GetMovingFront();
+diff --git a/src/window.cpp b/src/window.cpp
+index 682d935655..04cfed0c2d 100644
+--- a/src/window.cpp
++++ b/src/window.cpp
+@@ -9,4 +9,5 @@
+ 
+ #include "stdafx.h"
++#include "r3r_perf.h"
+ #include "company_func.h"
+ #include "gfx_func.h"
+@@ -2664,6 +2665,12 @@ static EventState HandleViewportScroll()
+ 	if (_last_scroll_window == GetMainWindow() && _last_scroll_window->viewport->follow_vehicle != VehicleID::Invalid()) {
+ 		/* If the main window is following a vehicle, then first let go of it! */
+-		const Vehicle *veh = Vehicle::Get(_last_scroll_window->viewport->follow_vehicle)->GetMovingFront();
+-		ScrollMainWindowTo(veh->x_pos, veh->y_pos, veh->z_pos, true); // This also resets follow_vehicle
++		const Vehicle *veh = Vehicle::Get(_last_scroll_window->viewport->follow_vehicle);
++		if (veh != nullptr) {
++			veh = veh->GetMovingFront();
++			ScrollMainWindowTo(veh->x_pos, veh->y_pos, veh->z_pos, true); // This also resets follow_vehicle
++		} else {
++			/* The followed vehicle is gone; defensively stop following it. */
++			_last_scroll_window->viewport->CancelFollow(*_last_scroll_window);
++		}
+ 		return ES_NOT_HANDLED;
+ 	}
+@@ -3404,4 +3411,8 @@ void UpdateWindows()
+ 	PerformanceAccumulator::Reset(PFE_DRAWWORLD);
+ 
++	/* R3R perf probe (KI-14): once per rendered frame, dumps an aggregate line
++	 * to R3R_perf.log every 128 frames. */
++	R3RPerfFrameTick(delta_ms);
++
+ 	ProcessPendingPerformanceMeasurements();
+ 

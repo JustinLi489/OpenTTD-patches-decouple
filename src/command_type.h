@@ -36,7 +36,8 @@ DECLARE_ENUM_AS_BIT_SET(CommandCostIntlFlags)
 
 using CommandCostAllowedResultTypes = TypeList<uint32_t, struct PlanIDTag, struct VehicleIDTag, struct SignIDTag, struct GroupIDTag, struct GoalIDTag, struct TownIDTag,
 		struct StoryPageIDTag, struct StoryPageElementIDTag, struct LeagueTableElementIDTag, struct LeagueTableIDTag,
-		struct TraceRestrictSlotIDTag, struct TraceRestrictSlotGroupIDTag, struct TraceRestrictCounterIDTag>;
+		struct TraceRestrictSlotIDTag, struct TraceRestrictSlotGroupIDTag, struct TraceRestrictCounterIDTag,
+		struct CoupleGroupIDTag>;
 using CommandCostResultTypeIndex = uint8_t;
 
 template <typename T>
@@ -772,6 +773,14 @@ enum class Commands : uint8_t {
 	AcquireUnownedPlan,
 
 	DesyncCheck,                            ///< Force desync checks to be run
+
+	/* couple_group_cmd.cpp */
+	CreateCoupleGroup,                      ///< create a new couple group
+	RenameCoupleGroup,                      ///< rename an existing couple group
+	DeleteCoupleGroup,                      ///< delete an existing couple group
+	SetCoupleGroup,                         ///< add a train segment to a couple group (a segment may be in several)
+	SetCoupleGroupAllowOthers,              ///< open/close a couple group for other companies (D6-①+D6-③: one switch: join + cross-company coupling)
+	RemoveCoupleGroup,                      ///< take a train segment out of one couple group
 
 	End,                                    ///< Must ALWAYS be on the end of this list!! (period)
 };

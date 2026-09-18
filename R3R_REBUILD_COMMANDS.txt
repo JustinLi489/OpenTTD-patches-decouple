@@ -1,0 +1,58 @@
+R3R 全量/断点编译 —— 手动运行命令清单
+==================================================
+原因:本机 8GB 内存,CodeBuddy 多进程占约 3.7GB,与编译抢内存导致换页假死。
+关闭 CodeBuddy 后运行本清单中的编译命令,内存充足,速度会快很多。
+(当前进度:198/687 obj 已编完,剩余 449 步。以下命令会自动从断点继续,
+不会重编已完成部分。)
+
+方式一:一键脚本(推荐)
+--------------------------------------------------
+关闭 CodeBuddy 全部窗口后,双击运行:
+    d:\sourcecode of JGRPP\rebuild_R3R.cmd
+
+脚本内部依次执行方式二中的 1~6 步(停任务/清理残留/载入MSVC/编译),
+完成后窗口会显示 exit code,0 即成功,并停在 pause 处供查看。
+
+方式二:手动逐条执行(在 cmd 或 PowerShell 中)
+--------------------------------------------------
+
+[1] 关闭 CodeBuddy 释放内存(先保存好工作,编译完再打开)
+    (CMD 窗口)
+    taskkill /F /IM "CodeBuddy CN.exe"
+    (或在 PowerShell 中:)
+    powershell -NoProfile -Command "Get-Process 'CodeBuddy CN' -ErrorAction SilentlyContinue | Stop-Process -Force"
+
+[2] 停止残留的计划任务与构建进程(如之前有卡死的)
+    schtasks /End /TN R3R_batchC_rebuild
+    taskkill /F /IM cl.exe 2>nul
+    taskkill /F /IM ninja.exe 2>nul
+    taskkill /F /IM mspdbsrv.exe 2>nul
+    taskkill /F /IM cmake.exe 2>nul
+
+[3] (可选)确认内存已释放,应显示空闲 >2GB
+    powershell -NoProfile -Command "$os=Get-CimInstance Win32_OperatingSystem; Write-Host ([math]::Round($os.FreePhysicalMemory/1MB,2))"
+
+[4] 加载 MSVC 编译环境(必须,否则 cl 找不到头文件)
+    call "D:\VISUAL STUDIO\MAIN PACK\VC\Auxiliary\Build\vcvars64.bat"
+
+[5] 编译(从断点继续;退出码 0 = 成功)
+    "D:\gcc new\mingw64\bin\ninja.exe" -C "d:\sourcecode of JGRPP\build" -j 4 openttd
+    echo %ERRORLEVEL%
+
+    说明:
+    - -j 4 = 4 路并发,适合本机 8GB 内存(之前在内存不足时 10 路会换页假死)。
+      若已关 CodeBuddy 且想更快,可改成 -j 6 或 -j 8,但留意内存。
+    - 只改了 .cpp 且想全量重编?不必删 obj,直接跑即可(头文件改动
+      才会需要删全部 obj,见下一行)。
+
+[6] 需要"从头全量重编"(改过 src/*.h)时,在第 5 步前先删全部 obj:
+    powershell -NoProfile -Command "Get-ChildItem 'd:\sourcecode of JGRPP\build' -Recurse -Filter *.obj -ErrorAction SilentlyContinue | Remove-Item -Force"
+
+[7] 查看/核对编译结果
+    编译输出日志(若之前用计划任务): d:\sourcecode of JGRPP\build\R3R_batchC_rebuild4.log
+    产物 exe: d:\sourcecode of JGRPP\build\openttd.exe
+    查看 obj 总数与最新时间:
+    powershell -NoProfile -Command "$o=Get-ChildItem 'd:\sourcecode of JGRPP\build' -Recurse -Filter *.obj; Write-Host ('objs=' + @($o).Count); Write-Host ('latest=' + ($o | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime)"
+
+[8] 编译结束后重新打开 CodeBuddy 继续开发。
+==================================================

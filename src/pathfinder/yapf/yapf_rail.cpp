@@ -20,6 +20,7 @@
 #include "../../debug.h"
 #include "../../misc/dbg_helpers.h"
 #include "../../r3r_perf.h"
+#include "../../couple_group.h"
 
 #include "../../safeguards.h"
 
@@ -148,14 +149,25 @@ private:
 				 * first tile (FSCP ... fail=notWC best=<self>) and the locomotive
 				 * is locked forever: no track, speed 0, COUPLE-FAIL every tick. */
 				if (best->index == Yapf().GetVehicle()->index) return true;
-				if (!R3RIsCarOnlyFormation(best) && !best->current_order.IsType(OT_WAIT_COUPLE)) {
+				/* R3R (KI-62): same gate as the pathfinder's destination test -- only a
+				 * real segment waiting to be coupled onto counts as a couple target, so
+				 * its occupied tile is passable for the couple path. A loose wagon chain
+				 * ("散链") is an obstacle like any other train. */
+				if (!R3RIsCoupleTarget(best)) {
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d fail=notWC best=%d ord=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType());
+						fprintf(dbg, "FSCP tile=%d,%d fail=notSeg best=%d ord=%d sf=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType(), (int)best->IsSegmentFront());
 						fclose(dbg);
 					}
 					return false;
 				}
+				/* R3R: couple group whitelist (step 5). A waiting consist in a
+				 * different couple group is not a couple target at all, so its
+				 * occupied tile counts as an obstacle for the couple path exactly
+				 * like any other train. No probe here: this runs for every tile of
+				 * every back-walk and a rejection is a normal outcome -- the
+				 * caller already reports CPL-SAFE-FAIL. */
+				if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), best)) return false;
 				if (second_best != nullptr) {
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {

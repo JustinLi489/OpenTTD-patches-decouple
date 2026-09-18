@@ -21,6 +21,7 @@
 #include "order_func.h"
 #include "transport_type.h"
 #include "group_type.h"
+#include "couple_group_type.h"
 #include "timetable.h"
 #include "base_consist.h"
 #include "newgrf_cache_check.h"
@@ -380,6 +381,7 @@ public:
 	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. NOSAVE.
 	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). NOSAVE.
 	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A); the owner keeps its own pointer, so this list must never be freed by this vehicle. NOSAVE.
+	CoupleGroupMask couple_groups = COUPLE_GROUP_MASK_NONE; ///< R3R: couple groups of the segment which this vehicle heads (only meaningful on a segment head, see couple_group.h). A segment may be in several groups at once (Q5); an empty mask forms one implicit group with every other unassigned segment. SAVED separately by the CGVR chunk, so the vehicle table layout is untouched.
 
 	NO_UNIQUE_ADDRESS NewGRFCache grf_cache{};   ///< Cache of often used calculated NewGRF values
 	Direction cur_image_valid_dir = Direction::Invalid; ///< NOSAVE: direction for which cur_image does not need to be regenerated on the next tick
@@ -1054,16 +1056,6 @@ public:
 	 */
 	void IncrementRealOrderIndex()
 	{
-		/* DEBUG (R3R — remove): log index advancement for GOTO_COUPLE locomotives. */
-		if (this->type == VehicleType::Train && (this->current_order.IsType(OT_GOTO_COUPLE) ||
-				(this->GetOrder(this->cur_real_order_index) != nullptr && this->GetOrder(this->cur_real_order_index)->IsType(OT_GOTO_COUPLE)))) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "ADVANCE: veh=%d order=%d real_before=%d implicit_before=%d\n",
-						(int)this->index.base(), (int)this->current_order.GetType(), (int)this->cur_real_order_index, (int)this->cur_implicit_order_index);
-				fclose(dbg);
-			}
-		}
 		if (this->cur_implicit_order_index == this->cur_real_order_index) {
 			/* Increment both real and implicit order */
 			this->IncrementImplicitOrderIndex();

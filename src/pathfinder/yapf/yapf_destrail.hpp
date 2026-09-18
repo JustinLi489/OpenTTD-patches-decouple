@@ -15,6 +15,7 @@
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
 #include "../../r3r_perf.h"
+#include "../../couple_group.h"
 
 class CYapfDestinationRailBase {
 protected:
@@ -366,8 +367,11 @@ public:
 						if (t == nullptr) {
 							for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
 								Train *first = tr->First();
-								if (tr->IsFrontEngine() && (R3RIsCarOnlyFormation(first) ||
-										(first->IsPrimaryVehicle() && first->current_order.IsType(OT_WAIT_COUPLE)))) {
+								/* R3R (KI-62): only a real segment waiting to be coupled
+								 * onto may be picked up here. A loose wagon chain ("散链")
+								 * or a consist holding some other order must not become the
+								 * couple destination. */
+								if (tr->IsFrontEngine() && R3RIsCoupleTarget(first)) {
 									t = first; break;
 								}
 							}
@@ -422,8 +426,26 @@ public:
 			}
 		}
 
+		/* R3R: couple group whitelist (step 5). A waiting consist whose segment
+		 * belongs to a different couple group is not a candidate at all: it must
+		 * vanish from the destination set (PfDetectDestination returns false) so the
+		 * pathfinder keeps looking for a consist in the same group and otherwise
+		 * ends up in the ordinary "no couple target" outcome. No probe here on
+		 * purpose -- this runs for every station/depot tile of every path search, a
+		 * rejection is a normal outcome, and the downstream COUPLE-FAIL probe is
+		 * edge-gated and already reports the resulting "nothing to couple to". */
+		if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), t)) return false;
+
 		/* R3R (pxp-decouple): the waiting formation must fit into its station. */
 		if (!TrainFitStation(t)) return false;
+
+		/* R3R (KI-62): only a real segment that is waiting to be coupled onto is a
+		 * couple destination. The segment-front marker is what tells a segment
+		 * ("第 k/N 段") from a loose wagon chain ("散链") in the depot list, and a
+		 * loose chain must never be aimed at. This replaces the old car-only
+		 * short-circuit, which let any zero-power formation through regardless of
+		 * which order it held. */
+		if (!R3RIsCoupleTarget(t)) return false;
 
 		/* Target 1: a car-only formation (zero-power train front) waiting to be
 		 * coupled. */
@@ -433,7 +455,7 @@ public:
 		 * order declares WAIT_COUPLE is a candidate, provided it satisfies all
 		 * requirements of the locomotive's GOTO_COUPLE order (load / cargo type /
 		 * wagon count / trace restrict slot). */
-		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) {
+		if (t->IsPrimaryVehicle()) {
 			return CheckOrderLoad(t) && CheckOrderCargoType(t) &&
 					CheckNumberOfWagons(t) && CheckOrderSlot(t);
 		}
