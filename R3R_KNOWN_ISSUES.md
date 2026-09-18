@@ -863,3 +863,38 @@ ClearPathReservation(v, v->tile, v->GetVehicleTrackdir(), true);
 4. `build-release\` 在改过 `src/*.h` 后**增量构建不安全**（KI-15：ninja 读不到 cl 的中文 `注意: 包含文件:` 前缀）。**`R3R_release_build.cmd` 自己不会删 obj**，[6] 只跑 `ninja openttd`；改过头文件时必须先手工 `del /s /q build-release\*.obj`。副产物：`R3RDbgWrite` 变成宏后，**陈旧 obj 会以"未解析外部符号"在链接期报错**，这反而是一道保护。
 5. `R3R_release_build.cmd` 的 [5c]/[5d] 硬闸门已实测有效：`build-release\build.ninja` 中 `-DR3R_PROBES_DEFAULT=0` 命中 623 条编译规则，`-DWITH_ZLIB/-DWITH_LIBLZMA/-DWITH_ZSTD/-DWITH_LZO/-DWITH_PNG/-DWITH_OPUSFILE` 齐备。
 
+---
+
+### KI-117（第 66 轮，2026-09-19）：`build\` 调试版在 KI-116 改了 `src/r3r_perf.h` 之后**未全量重编**，其 `openttd.exe` 是「陈旧 obj + 新头文件」的混合二进制
+
+**一句话**：KI-116 改的 `src/r3r_perf.h`（mtime 2026-09-19 05:51:19）触发的是**全量重编**规则（KI-15）；`build-release\` 照做了（623/623 obj 晚于该头文件），但 `build\` **只重编了 6 个 obj**（613/619 obj 早于该头文件），所以 `build\openttd.exe` 现在是混合布局二进制 —— 按 KI-15 / 记忆 66636022 的经验，这类二进制会随机崩溃，拿它调试会凭空多出一轮假崩溃。
+
+**来源**：第 66 轮发行版加固后的「构件一致性核查」（不属于任何既有 KI 的现场）。
+
+**证据**：
+- `src/r3r_perf.h` LastWriteTime = 2026-09-19 05:51:19。
+- `build-release\`：623 个 `.obj`，晚于该头文件的 = 623（陈旧 0）；619 个编于 06:xx 小时、4 个编于 07:36（本轮最后的探针泄漏修复：`openttd.cpp` / `sl/saveload.cpp` / `sl/vehicle_sl.cpp` / `os/windows/win32.cpp`）；`openttd.exe` 链接于 07:40:20（22 707 712 B，RelWithDebInfo + `/O2 /Ob2`）。
+- `build\`：619 个 `.obj`，晚于该头文件的仅 6（陈旧 613）；`openttd.exe` 06:58:48（50 675 712 B，Debug）。
+
+**影响**：`build\openttd.exe` 既可能因 vtable / 结构体布局不一致而随机崩溃，又仍带旧头文件的探针语义（`R3R_DBG` 等在那份 exe 里照旧生效）。**发行版 `build-release\openttd.exe` 不受影响**，已完成无探针验证（见下节）。
+
+**修法（未做，等真正要用调试版时再执行）**：在 `build\` 下 `del /s /q *.obj`，于 vcvars64 环境全量重编（约 25–40 分钟，见 KI-15）。**在此之前不要用 `build\openttd.exe` 判断崩溃真伪，也不要拿它的帧率做基线。**
+
+**状态**：未修（仅记录；发行版与源码树均不受影响）。**严重度**：中（会产生错误结论，但产物本身可重建）。
+
+---
+
+### 发行版无探针验证（第 66 轮，2026-09-19）—— KI-116 关闭依据
+
+**一句话**：`build-release\` 全量重编得到的 `openttd.exe` 已证明**不含任何探针**：任何环境变量都无法让它写出日志文件。
+
+**证据**：
+1. 二进制字符串扫描（`findstr /m /c:<s> build-release\openttd.exe`）：`R3R_debug.log` / `R3R_perf.log` / `R3R_slref.log` / `R3R_vehsraw.bin` / `R3R_DBG` / `R3R_PERF` / `R3R_DIAG` 全部 **found=0**。
+2. 无头运行：先清空 `build-release\R3R_*`，再设 `R3R_DBG=1` `R3R_PERF=1` `R3R_DIAG=1` 运行 `openttd.exe -g test_multi_company.sav -v null:until_exit`，持续 60 秒（进程存活到 60 秒才被主动结束，无崩溃日志），结束后 `build-release\` 下 R3R 日志文件数 = **0**。
+3. 构建门禁：`build-release\build.ninja` 含 `-DR3R_PROBES_DEFAULT=0`（623 条编译规则命中），六个 `-DWITH_*` 依赖齐备。
+4. 时间戳核对：改动的源码（最晚 05:53 左右的编辑）早于 `build-release\openttd.exe`（07:40:20），且 `build-release\R3R_incbuild.done` = `EXIT_CODE=0`。
+
+**残余字符串（已知、良性、不写任何文件）**：exe 内仍可见三类 —— `R3R_PROBES_DEFAULT`（宏名本身）、`INVALID_REF_VEHICLE`（`sl/saveload.cpp` 里位于 `if (r3rf != nullptr)` 块内的格式串，`r3rf` 恒为 `nullptr`，永不执行）、`COUPLE-FLIP`（作为 tag 实参传给 `ChainFolded()` / `SpliceFolded()` / `R3RDbgWrite()` 等**非内联**函数，函数实参无法被 `((void)0)` 宏丢弃）。三者在 `R3R_PROBES=0` 下都不产生文件写入。
+
+**状态**：已修（第 66 轮，2026-09-19）。**严重度**：低（已闭环）。
+
