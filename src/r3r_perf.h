@@ -21,6 +21,20 @@
  * calls) once KI-14 is closed.
  *
  * Output files (game working directory): R3R_perf.log (aggregates).
+ *
+ * Gating -- the layer has TWO switches (release audit, 2026-09-19):
+ *   R3R_PROBES            compile time. 0 = the probes are not in the binary at
+ *                         all (see the macro below); 1 = compiled in, and the
+ *                         runtime switches below decide what actually runs.
+ *   R3R_DBG / R3R_PERF    runtime override of a probe-enabled build.
+ *
+ * The two hot entry points used to run even with the probes off:
+ *   - R3RPerfFrameTick(): every 128 rendered frames it ran a full
+ *     Train::Iterate() scan and opened/created R3R_debug.log + R3R_perf.log;
+ *   - the R3RDbgEdge() gate (train_cmd.cpp): one unordered_map lookup per call,
+ *     reached once per vehicle per tick from ReserveTrackUnderConsist() and once
+ *     per collision pair per movement step from CheckTrainCollision().
+ * Both now bail out before doing any work, so "off" costs one predicted branch.
  */
 
 #ifndef R3R_PERF_H
@@ -91,6 +105,32 @@ inline R3RPerfCounters &R3RP()
 #endif
 
 /**
+ * Compile-time master switch for the whole probe layer.
+ *
+ * Defaults to R3R_PROBES_DEFAULT, i.e. ON in the internal test build (build\)
+ * and OFF in the published release (build-release\ also passes
+ * -DR3R_PROBES_DEFAULT=0 explicitly).
+ *
+ *   1 -> everything below is compiled as before, and R3R_DBG / R3R_PERF can
+ *        still force the probes on or off at runtime. This is the build you
+ *        diagnose with; R3R_DBG=0 on it is the KI-26 "probes really off"
+ *        baseline.
+ *   0 -> the probes are removed at compile time. R3RDbgOn() / R3RPerfOn() become
+ *        a constant false, so every guarded block collapses to `if (false)`,
+ *        MSVC then drops the block together with its format strings, and
+ *        neither R3R_debug.log nor R3R_perf.log is ever opened or written. Use
+ *        this for a release you want provably probe-free: no environment
+ *        variable can turn anything back on.
+ *
+ * A release that still needs the probes for field diagnosis can be built with
+ * -DR3R_PROBES=1 (keeping -DR3R_PROBES_DEFAULT=0 so they stay off unless
+ * R3R_DBG=1 asks for them).
+ */
+#ifndef R3R_PROBES
+#define R3R_PROBES R3R_PROBES_DEFAULT
+#endif
+
+/**
  * Master switch for every R3R probe and every R3R_debug.log write.
  *
  * With no environment variable set the behaviour follows R3R_PROBES_DEFAULT
@@ -102,6 +142,7 @@ inline R3RPerfCounters &R3RP()
  */
 inline bool R3RDbgOn()
 {
+#if R3R_PROBES
 	static const bool on = []() {
 		const char *env = std::getenv("R3R_DBG");
 		if (env != nullptr && env[0] == '0') return false;
@@ -109,6 +150,9 @@ inline bool R3RDbgOn()
 		return R3R_PROBES_DEFAULT != 0;
 	}();
 	return on;
+#else
+	return false; ///< compiled out; no environment variable can re-enable it
+#endif
 }
 
 /**
@@ -123,6 +167,7 @@ inline bool R3RDbgOn()
  */
 inline bool R3RPerfOn()
 {
+#if R3R_PROBES
 	static const bool on = []() {
 		const char *env = std::getenv("R3R_PERF");
 		if (env != nullptr && env[0] == '0') return false;
@@ -130,6 +175,9 @@ inline bool R3RPerfOn()
 		return R3RDbgOn();
 	}();
 	return on;
+#else
+	return false; ///< compiled out; no environment variable can re-enable it
+#endif
 }
 
 /** RAII accumulator: adds the elapsed time to *acc on scope exit. */
@@ -159,7 +207,20 @@ inline FILE *R3RFopenDbg(const char *mode)
  * Central R3R debug-log write: counts the call and the fopen/fprintf/fclose cost.
  * Only worth routing the *suspected hot* sites through here -- the cold ones can
  * keep their plain fopen, they are not part of the frame budget.
+ *
+ * R3R (release audit 2026-09-19): in an R3R_PROBES=0 build this becomes a macro
+ * that discards the whole call, *arguments included*.
+ *
+ * Why the macro is needed even though the body already folds away: an inlined
+ * `if (!R3RDbgOn()) return;` removes the body, but the caller still evaluates
+ * every argument before the (now empty) call. The sites in the window paint
+ * path pass things like `GetWidget<NWidgetCore>(...)`, which the compiler cannot
+ * prove side-effect free, so they survived as real work in a "probe-free" exe
+ * -- once per window repaint. `((void)0)` removes the call and its arguments,
+ * and unlike a `do {} while (0)` helper it stays a valid single statement, so a
+ * braceless `if (...)` / `else` around a call site keeps compiling.
  */
+#if R3R_PROBES
 inline void R3RDbgWrite(const char *fmt, ...)
 {
 	if (!R3RDbgOn()) return;
@@ -176,6 +237,9 @@ inline void R3RDbgWrite(const char *fmt, ...)
 	}
 	p.dbg_ns += R3RPerfNowNs() - t0;
 }
+#else
+#define R3RDbgWrite(...) ((void)0)
+#endif
 
 /** Snapshot the world, write one aggregate line to R3R_perf.log, reset counters. */
 void R3RPerfDumpAndReset();
@@ -183,9 +247,16 @@ void R3RPerfDumpAndReset();
 /**
  * Called once per rendered frame from UpdateWindows().
  * @param delta_ms Real time since the previous frame -- the frame rate itself.
+ *
+ * R3R (release audit 2026-09-19): this is the only per-frame hook in the tree, and
+ * it used to keep counting and then call R3RPerfDumpAndReset() every 128 frames
+ * even with the probes off -- a full Train::Iterate() scan plus two fopen() and a
+ * write to R3R_perf.log, i.e. a periodic I/O burst and a stray log file next to a
+ * published exe. Bail out first; with R3R_PROBES=0 the whole body is compiled away.
  */
 inline void R3RPerfFrameTick(uint32_t delta_ms)
 {
+	if (!R3RPerfOn()) return;
 	R3RPerfCounters &p = R3RP();
 	p.frames++;
 	p.frame_ms_sum += delta_ms;

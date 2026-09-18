@@ -655,3 +655,211 @@
 **新观察（低 · 非缺陷）**：正向场景 `546: FOLDCHK-ACCEPT COUPLE-FLIP-V worst_gap=18 residual gap (chain still closing up), not a fold` 放行后，`547: SPLICE-GAP-REJECT COUPLE-FLIP-V prev=0 … dist=20` 又将同一候选拒绝 ⇒ 折叠放行判据（`FOLDCHK-ACCEPT` 的残余间隙豁免）与拼接端点判据（`SPLICE-GAP`）宽严不一致，FLIP-V 白试一轮才落到 BOTH。最终结果正确（`worst_gap=0`），仅多一次尝试-回滚，暂不处理；若日后尝试链变长可考虑统一两处判据。
 
 **结论**：**KI-106 关闭**（状态 `已修`，严重度降为低）——倒车（坑 3）与正向两条路径均零重叠、`CPL-HIT` 兜底归零。剩余未覆盖项仅"`Couple` 折叠回滚未提交（`merged=0`）的停住场景"与 PERF 逐项核对，与本 1px 无关。
+
+### KI-107（第 60 轮，2026-09-18）：站台耦合后 `YapfTrainCheckReverse` 断言崩溃（`ReverseTrackdir` / `track_func.h:249`）
+
+**来源**：玩家实报崩溃日志 `C:\Users\冯洁敏\Documents\OpenTTD\crash-20260918T121130Z.log`（exe `r3r-stable-2026-09-15-m (2)`，Build Sep 17 2026 19:50:20，`DBG_ASSERTS WITH_ASSERT` 全开，触发于 `assert_str_error` → `FatalErrorI`）。
+
+**调用栈**：
+
+```
+[05] ReverseTrackdir                (src\track_func.h:249)
+[06] YapfTrainCheckReverse          (src\pathfinder\yapf\yapf_rail.cpp:1379)
+[07] CheckReverseTrain              (src\train_cmd.cpp:8161)
+[08] Couple                         (src\train_cmd.cpp:6151)
+[09] TrainCoupleHandler             (src\train_cmd.cpp:6478)
+[10] TrainLocoHandler               (src\train_cmd.cpp:10840)
+[11] Train::Tick                    (src\train_cmd.cpp:10933)
+[12] CallVehicleTicks               (src\vehicle.cpp:1695)
+```
+
+**根因**：`YapfTrainCheckReverse()` 原第 1379 行把**链尾**的 trackdir 直接喂给 `ReverseTrackdir()`：
+
+```cpp
+Trackdir td = moving_front->GetVehicleTrackdir();
+Trackdir td_rev = ReverseTrackdir(moving_back->GetVehicleTrackdir());   // 崩溃点
+```
+
+`Train::GetVehicleTrackdir()`（`train_cmd.cpp:11048` 起）有**两条不触发内部断言**就返回 `INVALID_TRACKDIR` 的路径：(1) `vehstatus` 带 `VehState::Crashed`（11050）；(2) `track == TRACK_BIT_WORMHOLE`（隧道/桥）时，`GetAcrossTunnelBridgeReservationTrackBits()` 与 `GetAcrossTunnelBridgeTrackBits()` 都解不出有效轨（11067 的上游守卫），或 `TrackExitdirToTrackdir()` 因轨向与桥洞方向不符而返回 `INVALID_TRACKDIR`（11068）。其余"无轨道位"路径会先在 `TrackDirectionToTrackdir()` 内部断言（`track_func.h:458`），与本次崩溃点 249 不符 ⇒ 现场必属 (1)(2) 之一。
+
+而 `CheckReverseTrain()`（`train_cmd.cpp:8150`）**只守了前端**（`moving_front->track != TRACK_BIT_NONE`），链尾毫无守卫 ⇒ 断言正好炸在耦合提交（`Couple` → `CheckReverseTrain`）之后。这也是"耦合场景专属崩溃"的原因：`Couple()` 刚做完段合并/身份迁移，链尾可能正处于隧道/桥或撞毁等"轨向不可判定"状态。
+
+**现场证据**：崩溃上下文 `CallVehicleTicks: veh: 0: (Train, c:0, st:E, vs:D, trk: 0x02, tile 39,31 (Station), front: 2: (Train 1, st:FE, trk: 0x20, tile 39,30 (Railway)))` —— ticked 车 `veh 0` 已沦为**链内普通引擎**（`st:E`，无 `G`/front 位），链头是 `veh 2`；`build\R3R_debug.log`（mtime 20:05:33）中 `COUPLE-OK loco=2 rear=12` 后的 12 节链快照 `2,1,0,5,4,3,11,10,9,14,13,12` 与该上下文（veh 0 在 39,31 `trk=0x02`、veh 2 在 39,30 `trk=0x20`、链头=veh 2）逐项吻合 ⇒ 崩溃发生在**这条 12 节合并链**的耦合/续耦合之后。日志最后写入 20:05:33 而崩溃时刻 20:11:30，且崩溃前无 `COUPLE-OK` 行 ⇒ 该 tick 的 `Couple()` 走的是 `u->orders == nullptr`（不打印 `COUPLE-OK`）分支后仍在 6151 崩溃，与"车组仍带 `GOTO_COUPLE`、`TrainCoupleHandler` 反复调用 `Couple()` 同一链"的时序一致。
+
+**修复（仅 `.cpp`，符合 KI-15 增量合规）**：
+
+1. `src/pathfinder/yapf/yapf_rail.cpp` — `YapfTrainCheckReverse()`：拆出 `td` / `td_back`，新增守卫 `td == INVALID_TRACKDIR || td_back == INVALID_TRACKDIR || moving_front->track == TRACK_BIT_NONE || moving_back->track == TRACK_BIT_NONE` → 写 `CRT-NOTD` 探针（`veh/db` + 两端 `idx/tile/trk/dir/crashed/td`）后 `return false`（**任一链端没有可用 trackdir 就绝不建议折返**），`ReverseTrackdir(td_back)` 移到守卫之后。同文件 `YapfTrainFindNearestDepot()`（1507-1518）同类加固：`td_back == INVALID_TRACKDIR` → `return FindDepotData()`。
+2. `src/station_cmd.cpp` — `FreeTrainStationPlatformReservation()`（1528）与 `RestoreTrainReservation()`（1557）：`TrackdirToExitdir(ReverseTrackdir(...))`（`track_func.h:396/249` 双断言）之前加 `td_front/td_back != INVALID_TRACKDIR` 判定，无效端跳过（该端本来也压不住站台预留）。
+3. `src/train_cmd.cpp` — `Train::GetVehicleTrackdir()`：结尾分支在**完全没有轨道位**时 `TrackDirectionToTrackdir(FindFirstTrack(this->track), ...)` 会先在 `track_func.h:458` 断言；改为 `FindFirstTrack()` 无效时按朝向 `DiagDirToDiagTrackdir(DirToDiagDir(this->GetMovingDirection()))` 猜一个（与隧道/桥分支的 "educated guess" 同构），使所有调用点天然安全；`track & TRACK_BIT_WORMHOLE` 分支同样补 `IsValidTrack` 守卫（返回 `INVALID_TRACKDIR`，由调用点守卫兜住，不再在 458 断言）。
+
+**编译**：`_tmp_inc_build.cmd` 增量 `EXIT_CODE=0`、日志末行 `Linking CXX executable openttd.exe`、`build\openttd.exe` @ 2026-09-18 20:22:35（50 647 552 B）。注释同步后已重编一次（`[4/4]` 同款流程）。
+
+**未验证 / 待复测**（本轮只做"断言路径封堵 + 编译通过"，**未复现现场**）：
+
+- `CRT-NOTD` 是否出现；若出现，读该行的**链尾 `trk=`** 即可确认真凶：`0x40`（`TRACK_BIT_WORMHOLE`）⇒ 隧道/桥 (2)；`crashed=1` ⇒ 撞毁 (1)。本轮分析只能排除其余路径，无法区分 (1)(2)。
+- 功能回归点：站台边缘**倒车**入位耦合、**正向**入位耦合、nose-to-nose、多段链换端后 `CRT found=1` 正常、`COUPLE-OK`/`REVERSEDIR`/`FOLDCHK` 时序不回归（对照 KI-106 第 59 轮基准：`CPL-GEO` 4 次、`CPL-HIT` 0 次、`gap` 全 0）。
+- 残留风险：第 3 条把"无轨道位"的返回值从"断言崩溃"改成"按朝向猜"，若日后出现朝向异常的折返建议，需回看 `CRT-NOTD` 是否被走过。
+- 崩溃前的"车组带 `GOTO_COUPLE` 继续被扫为目标"的调度侧时序未深究 —— 本次只保证不再因 trackdir 失效而崩，不保证该重复 `Couple()` 语义本身合理。
+
+**状态**：**部分防护（编译通过，实测待做）** | 严重度：**高**（崩溃）
+
+### KI-108（第 61 轮，2026-09-18）：站台内 `ClearPathReservation` 被喂 `INVALID_TRACKDIR` 断言崩溃（`TrackdirToExitdir` / `track_func.h:396`）
+
+**来源**：玩家实报 `C:\Users\冯洁敏\Documents\OpenTTD\crash-20260918T130500Z.log`（exe `r3r-stable-2026-09-18-m (2)`，Build Sep 18 2026 20:19:18，`DBG_ASSERTS WITH_ASSERT` 全开）；同一现象在 21:12:46（`crash-20260918T131245Z.log`，Build 同为 20:19:18）**再次复现**，两次崩溃上下文逐项相同 ⇒ 该场景可复现。
+
+**崩溃签名**：
+
+```
+Assertion failed at line 396 of D:\sourcecode of JGRPP\src\track_func.h: IsValidTrackdirForRoadVehicle(trackdir)
+Within context:
+  0: TrainController: veh 3 (trk:0x02, tile 867 (39 x 33) Station), front: veh 2 (trk:0x02, tile 7A6 (38 x 30) Railway)
+  1: CallVehicleTicks
+```
+
+（上下文只列 `DebugContext` scope：`ClearPathReservation()` 是文件内 `static` 且内部无 `SCOPE_INFO`，故不单独成帧，仅 `TrainController` 可见。）
+
+**根因**：`train_cmd.cpp:9547`
+
+```cpp
+ClearPathReservation(v, v->tile, v->GetVehicleTrackdir(), true);
+```
+
+链内车处于**轨道与朝向不匹配**状态（`track = TRACK_BIT_Y (0x02)`、`direction = DIR_N`，见 `R3R_debug.log` 的 `CRT-NOTD ... back(idx=3 tile=39,33 trk=0x2 dir=0 td=255)`，`td=255` 即 `INVALID_TRACKDIR`）时，`Train::GetVehicleTrackdir()` 走 `TrackDirectionToTrackdir(track, this->GetMovingDirection())`（`track_func.h:456`，不匹配时**断言不触发**、直接返回 `INVALID_TRACKDIR`）；而 `v->tile` 是站台瓦片 ⇒ 进入 `ClearPathReservation()` 站台分支 `:6957 TrackdirToExitdir(track_dir)`（`track_func.h:396` 断言 `IsValidTrackdirForRoadVehicle`）崩溃。该状态无匹配轨道，`track & TRACK_BIT_WORMHOLE` 的早退也不成立；KI-107 只堵了 `CheckReverseTrain` / `FreeTrainStationPlatformReservation` / `RestoreTrainReservation` 等**外部**调用点，这条**内部**调用点漏了。
+
+**修复（仅改 `src/train_cmd.cpp` ⇒ 符合 KI-15 增量合规）**：
+
+1. `Train::GetVehicleTrackdir()` 主路径：`td == INVALID_TRACKDIR` 时改为返回 `TrackToTrackdir(track)`，并落 `VEHTD-MISMATCH` 探针（新增边沿标签 `R3REDGE_VEHTD`，payload = veh/tile/track/direction），使**所有**调用点天然安全；
+2. `ClearPathReservation()` 入口兜底：`track_dir == INVALID_TRACKDIR` 时按 `v->track & TRACK_BIT_MASK` 推 `TrackToTrackdir(FindFirstTrack(tbits))`；bits 为空（wormhole/depot/无轨道）直接 `return`；命中写 `VEHTD-CLEARRES`；
+3. `TrainMovedChangeSignal()` 两处 `FindFirstTrackdir()`：结果 `== INVALID_TRACKDIR`（该 `dir` 下无任何可达 trackdir）时跳过——第一处不取 `TrackdirToExitdir` 也不调 `UpdateSignalsOnSegment`，第二处不做长预留隧桥检查（同为 `track_func.h:396` 断言类的兜底）。
+
+**编译**：`_tmp_inc_build.cmd` 增量 → `build\R3R_incbuild.done` = `EXIT_CODE=0`；`train_cmd.cpp.obj` @ 22:01:26 晚于源码 @ 21:57:30；`build\openttd.exe` @ **2026-09-18 22:25:44**（50 656 256 B）；`findstr VEHTD-CLEARRES build\openttd.exe` 命中 ⇒ 补丁确在产物内。
+
+**实测（本轮，仅冒烟）**：无头 `-g test_multi_company.sav -v null:until_exit` 跑 60 s（CPU 34 s，进程仍在主循环）⇒ 加载/运行无回归、无断言；日志新增 `LOADCENSUS-PHASE2END bad=0` / `DRAW-STATION-NORES tile=39,31`；未出现 `VEHTD-MISMATCH` / `VEHTD-CLEARRES`（该存档不含裂开的 R3R 链，未触碰该路径，故**不能**算现场验证）。
+
+**待复测**（复现原场景：站台耦合后链车呈 `trk=0x02 dir=0`）：
+
+- 断言崩溃消失；日志应出现 `VEHTD-MISMATCH`（或 `VEHTD-CLEARRES`），读其 `trk=` / `dir=` 可确认现场；
+- 功能回归对照 KI-106 / KI-107 基线：站台耦合、倒车入位、多段链换端应保持 `CPL-GEO` 4 次、`CPL-HIT` 0 次、`gap` 全 0、`CRT found=1`。
+
+**更深根因（未修，重要）**：`track` 与 `direction` 不一致本身是 R3R 链编辑（耦合 / 逻辑翻转 / 解挂）留下的**状态损坏**；本轮只是把"查询该状态"从崩溃改成"按 `track` 猜一个 trackdir"，**没有消除不一致状态**。若后续日志持续出现 `VEHTD-MISMATCH`，需回到链编辑提交点（`R3RFlipChainBySegments` / `Couple` / `ReverseTrainSwapVehicles`）补"提交后按 `track` 重算 `direction`"或加提交前校验。
+
+**状态**：**部分防护（编译通过 + 无头冒烟无回归；现场复现待测）** | 严重度：**高**（崩溃）
+
+---
+
+### 4-11 第 62 轮（2026-09-18 夜 ~ 09-19 凌晨）：无头 census 复测（KI-107/108 现场仍未复现）+ 两处"改诊断/改标志"引入的玩家可见回归修复
+
+**触发**：第 61 轮（KI-108）之后，为了复现 KI-107/108 的裂链现场，在 `GameLoop()` 里加了临时诊断（pause 打点 + 自动清暂停 + 每 256 tick `R3RStrandCensus()`）并做无头复测。**这一轮当时的记录漏写**（玩家当面指出"你应该是修完立刻忘记了"），此处补记；顺带补上玩家本次实报的两个回归。
+
+**期间新增的两个崩溃（来自诊断/复测路径本身，不是新的游戏 bug）**：
+
+1. `crash-20260918T153216Z.log`（23:32）：断言 `this == this->First()` @ `vehicle_base.h:669` ← `Vehicle::IsStoppedInDepot` ← **`R3RStrandCensus`**（当时 `train_cmd.cpp:5190`）← `GameLoop`。根因=**探针自己**对链内非头车调 `IsStoppedInDepot`。→ 已改为 `(w == v && wt->IsStoppedInDepot())`，只在链头上判（现 `train_cmd.cpp:5196`）；随后 01:02 的运行跑到 `CENSUS seq=6` 未再断言。记 **KI-111（已修）**。
+2. `crash-20260918T161050Z.log`（00:11）：`0xC0000005` **写** 地址 `0x68` ← `Vehicle::RemoveFromShared`（`vehicle.cpp:4616`）← `DeleteVehicleOrders`（`order_cmd.cpp:3551`）← `Vehicle::PreDestructor`（`vehicle.cpp:1244`）← `~Train` ← `CmdSellRailWagon`（`train_cmd.cpp:2781`）← `CmdSellVehicle` ← `ReplaceChain`（`autoreplace_cmd.cpp:852`）← `CmdAutoreplaceVehicle` ← `CallVehicleTicks`（`vehicle.cpp:1853`）。即 **KI-93 家族的"自动替换"新入口**：跨公司多业主链被自动替换卖掉时共享 `OrderList` 簿记被踩。现场证据=同轮 census 打印 `head=2 own=0 n=9 multiown=1`（`ow0`: 2,1,0 / `ow1`: 8..3），即 42,28 库内一条跨公司 9 节链。记 **KI-112（未修）**。
+
+**本轮修复的两个玩家可见回归（玩家实报）**：
+
+- **KI-109 游戏无法暂停**：`src/openttd.cpp` 的诊断块**无条件**执行 `_pause_mode = PauseModes{}`（只放过 `PauseMode::SaveLoad`），玩家一按暂停当帧就被解除 ⇒ 游戏永远停不下来，且整个世界继续跑（连带表现为"列车还在动"）。修复：整块诊断改为**默认关闭**，仅当环境变量 `R3R_DIAG=1` 时生效（无头复测仍可用 `set R3R_DIAG=1` 打开 pause 清除 + census）；顺带避免玩家局里每 256 tick 写 census 日志。
+- **KI-110 列车"自行启动"**：`src/train_cmd.cpp`（原 10585）在库内挂车块里**无条件** `consist->vehstatus.Reset(VehState::Stopped)`。该标志就是玩家的"开始/停止"状态；挂车失败时该块每 tick 重入 ⇒ 玩家按下停止后标志被反复抹掉，列车看起来自己启动了。修复：清标志只保留在**挂车尝试期间**（`R3RCanCoupleNow()` 会以 `active-stopped` 拒绝停着的挂车方），**挂车未成功则恢复 `Stopped`**；成功仍不恢复（维持原设计：合并后的链在下一 tick 按车底排程继续）。
+
+**编译与产物**：`_tmp_inc_build.cmd` 增量（仅 `.cpp`，符合 KI-15）⇒ `build\R3R_incbuild.done` = `EXIT_CODE=0`；`.ninja_log` 末段为 `openttd_lib.dir/src/openttd.cpp.obj` → `openttd_lib.dir/src/train_cmd.cpp.obj` → `openttd.exe`（链接耗时 ~748 s）；两个源码 @ 2026-09-19 01:18:12，产物 `build\openttd.exe` @ **2026-09-19 01:30:19**（50 673 664 B）；`findstr /C:R3R_DIAG build\openttd.exe` 命中 ⇒ 补丁确在产物内。
+
+**待办**：
+
+1. 玩家用新 exe 复测：暂停键（含 P / 菜单暂停）必须真的停住；被停止的列车在库内等待挂车时不得自行启动、启动/停止按钮状态不得自行翻转。
+2. **KI-112（未修，高）**：自动替换 × 跨公司链的 `RemoveFromShared` 写崩，仍待修（可考虑"R3R 多业主/借用链拒绝自动替换"守卫，或补齐 `OrderList` 借用+删除的交接）。
+3. KI-107 / KI-108 的现场（`CRT-NOTD` / `VEHTD-MISMATCH` / `VEHTD-CLEARRES`）仍未复现，保持待测。
+4. **KI-113（新，未定位）**：玩家实报"车厢莫名其妙分离"。本轮在备忘与工作区均**查无对应条目**，`src/` 内 grep `R3R\w*(Detach|Strand|Unhook|Stray|Separat|Loose|Lost)` 只命中只读看门狗 `R3RStrandCensus()` ⇒ **无法确认是否真的修过**。需玩家补细节（存档 / 发生时机 / 是否跨公司）后重新定位。
+
+**状态**：KI-109 **已修**、KI-110 **已修**、KI-111 **已修**（均为 `.cpp` 增量，符合 KI-15）；KI-112 **未修**（高）；KI-113 **未定位**（待补细节）。
+
+---
+
+## 附：第 63 轮（2026-09-19）新增条目
+
+### KI-114（第 63 轮，2026-09-19）：`Couple()` 的「方向统一循环」把链头朝向无条件写给整条合并链，使处在无法承载该朝向的轨道上的车辆变成 `(track, direction)` 不一致状态 —— KI-108「更深根因」所指的写入点，现已定位
+
+**一句话**：`Couple()` 合并提交点有一段循环把 `v->direction`（合并链头的朝向）覆盖到 `merged_first` 起的每一辆车；当链跨越多块轨道时（`TRACK_X`→NE/SW、`TRACK_Y`→SE/NW、`TRACK_LEFT/RIGHT`→N/S），所在轨道承载不了链头朝向的那些车就被写成非法组合，直接违背引擎不变式「train 的 direction 恒等于其下方轨道」（`src/train.h:621-629` 注释），并触发 `GetVehicleTrackdir()` 的 `VEHTD-MISMATCH` 兜底。
+
+**来源**：KI-108「更深根因（未修，重要）」＋ 本轮现场 `build\R3R_debug.log`（2026-09-19 01:38，第 62 轮 exe 运行）。
+
+**证据（build\R3R_debug.log，2026-09-19 01:38）**：
+- `A3-BOTH-FLIP-DONE merged_head=8`：折叠修正候选 3（双翻）成功。双翻之后每车朝向本来与自身轨道自洽 —— v(idx0/1/2) `4→0`，u 中 idx3-7（在 `TRACK_BIT_Y`）`3→7`、idx8 `4→0`（`R3RReverseChainDirections` 逐节 `ReverseDir`）。
+- `COUPLE-OK loco=2 rear=3` 之后全链 9 车的 `CPL idx=` 一律 `dir=0`；其中 `idx=3..7` 的 `trk=0x2`（`TRACK_BIT_Y`，只允许 SE(3)/NW(7)）被写成 0 —— 正是该循环自 `merged_first=8` 起遍历 8→7→6→5→4→3 覆盖的结果。
+- 紧随其后 `VEHTD-MISMATCH veh=3 tile=39,33 track=0x2 dir=0 mdir=0 -> coerced=1`。
+- 表证据：`_track_direction_to_trackdir[TRACK_Y][DIR_N] == INVALID_TRACKDIR`；`_vehicle_subcoord` 亦表明 `TRACK_Y` 期望 SE/NW（`src/vehicle.cpp:5137-5170`）。
+
+**机制/影响**：该不一致只在「有车进入新 tile」时才由 `VehicleEnterTileCoordinates()`（`src/vehicle.cpp:5172-5185`）按新 tile 的 track 重算 direction 而自愈。列车在耦合点静止期间，这几节货车的 direction 一直是错的：`GetVehicleTrackdir()` 只能走 KI-108 兜底「按 track 猜 trackdir」，而信号/预留/`R3RCheckChainFoldedDirection` 点积/渲染都建立在这个错值上 —— 这正是 KI-107 / KI-108 崩溃窗口的状态来源。耦合完成即写错、直到车动起来才逐步纠正，因此耦合/解挂后的静止期是风险窗口。
+
+**修法（未修，待拍板；仅 `.cpp` 增量，符合 KI-15）**：
+1. 首选（最小、贴合原意）：给该循环加「本车轨道能承载链头朝向」的门，不能承载则保留翻转后本来正确的自身朝向：
+   ```cpp
+   const TrackBits tbits = w->track & TRACK_BIT_MASK;
+   if (tbits != TRACK_BIT_NONE &&
+       TrackDirectionToTrackdir(FindFirstTrack(tbits), v->direction) == INVALID_TRACKDIR) {
+       continue;
+   }
+   ```
+   注意：必须先用 `TRACK_BIT_MASK` 屏蔽 `TRACK_BIT_DEPOT`(0x80) / `TRACK_BIT_WORMHOLE`(0x40)，否则 `FindFirstTrack()` 会取到 `Track::End`，`TrackDirectionToTrackdir()` 会断言崩溃。
+2. 兜底：在链编辑提交点（`R3RFlipChainBySegments` / `Couple` / `ReverseTrainSwapVehicles`）之后，按各车 `track` 用「最接近链头移动方向」的 trackdir 重算 direction，即把 (1) 的语义推广到所有链编辑路径。
+
+**状态**：**已修**（第 64 轮，2026-09-19）。**严重度**：中（状态不一致，本身不崩溃；但它是 KI-107/108 崩溃窗口的触发状态，且影响渲染与 trackdir 查询）。
+
+**修法（第 64 轮，2026-09-19，`src/train_cmd.cpp` `Couple()`，见 `R3R_couple_direction_rule_memo.md`）**：不是给旧循环加「轨道能否承载」的门（那只让部分车 `continue`，仍是覆写逻辑），而是**整体废除 `w->direction = v->direction` 的整链覆写**，改为只看拼缝端面两节的环形差判据：`circ <= 1` 不动（一个字节都不改）、`circ == 2` 判事故撞毁（另见 KI-115）、`circ >= 3` 只对拼入段 `R3RReverseChainDirections`（逐节 `ReverseDir` + `Flip(Flipped)` 图像补偿，恒合轨）。
+本项正是 KI-114 提出的「修法」的加强版；KI-114 证据里的 A3 双翻现场（`merged_head=8`、idx3..7 `dir=7`、idx8 `dir=0`）在新判据下 `circ=1` ⇒ 走「不动」分支，逐节朝向原样保留，即 KI-114 想要的结果。KI-108 的兜底（`GetVehicleTrackdir()` 返回 `TrackToTrackdir`）**保留**作为其它路径的保险。
+
+**状态行**：KI-109/110/111 **已修**、KI-112 **未修**（高）、KI-113 **未定位**、KI-114 **已修**（第 64 轮）、KI-115 **已实现待实测**（第 64 轮，中）。（均为 `.cpp`，符合 KI-15）。
+
+---
+
+### KI-115（第 64 轮，2026-09-19）：直角（90°）挂车从「照旧强制拼接」改为「判为事故按撞毁处理」——耦合/撞毁边界移动
+
+- **描述**：`Couple()` 新「端面方向判据」`circ = min(|a-b|, 8-|a-b|)`（`a = merged_first->Previous()` 主动方链尾端面、
+  `b = merged_first` 拼入段端面）取 `circ == 2` 时，直接对该合并链调 `TrainCrashed(v)` +
+  `AddTileNewsItem(GetEncodedString(STR_NEWS_TRAIN_CRASH, num_victims), NewsType::Accident, v->tile)` 并 `return`，
+  **不再走排程交接**。此前该几何会被无条件拼接并写坏 `(track, direction)`（即 KI-114 病灶之一）。
+- **来源**：用户 2026-09-19 拍板（`R3R_couple_direction_rule_memo.md` §1 问①）。用户认可「现实里没有直角挂车，
+  直角插过去属于事故」，并明确**预期并接受**耦合/撞毁边界会因此改变。
+- **状态**：已实现（待实测）。**严重度**：中（**语义/手感改动**：原本会「照旧拼上」的场景现在出事故毁车；不是崩溃，但不可逆）。
+- **注意点**：
+  1. 撞毁发生在**物理拼接之后**（`ArrangeTrains` 已重链），是「已连上的一列车被判事故」，不是「拒绝拼接」。
+  2. 直角错位的方向点积 ≈ 0，**通常不会**触发折叠否决（`R3RCheckChainFoldedDirection` 只在 dot > 0 时否决），
+     故该分支预期可达；若实测发现总是被折叠否决拦在前面（回滚后下 tick 重试），需把检测**提前到 `TryTrainCouple` 拼前**。
+  3. 无图像/位置改动；`circ <= 1` 分支与旧行为逐位等价（旧循环此时本就是 no-op，因为 `w->direction == v->direction`）。
+  4. `TrainCrashed` 需前置声明（定义在文件后段 `~8695`，`Couple` 在 `~5979`），已加 `static uint TrainCrashed(Train *v);`。
+- **待实测**：直角场景应出现 `COUPLE-SEAM-CRASH circ=2 a=.. b=..` 与事故新闻，且**不再每 tick 刷屏重试**（对齐 KI-06/KI-107 的「折叠修正死循环」观感问题）。
+
+---
+
+## 附：第 65 轮（2026-09-19）新增条目
+
+> 本轮目标：发行前审计 `build\R3R_debug.log`，并逐一排查「每帧调用 / 高频调用」的代码，把探针改成 release 编译可关闭。改动仅落在 `src/*.h` + `src/*.cpp`，**探针开启时逐位等价**（无行为改动）。
+
+### KI-116（第 65 轮，2026-09-19）：`R3R_PROBES=0`（发行构建）下探针并未真正编译掉 —— 每帧全车扫描、每车每 tick 的 `unordered_map` 查找、以及**日志实参求值**仍在跑
+
+**一句话**：探针层原本只有「运行时开关」，`R3RDbgOn()` / `R3RPerfOn()` 只是 `return false`，而调用点与其实参照旧求值、热点函数体也照旧执行到自己的早退为止。
+
+**来源**：用户 2026-09-19「先检查一下有没有什么影响帧率的代码，也就是那些每帧调用的或者高频调用的，然后那些探针也记得调成 release 编译可关闭的」。
+
+**残留开销（审计结论，四类）**：
+1. `R3RPerfFrameTick(delta_ms)`（`src/window.cpp:3415`，每**渲染帧**调用；定义在 `src/r3r_perf.h`）—— 探针关闭时仍累加计数器，并在每 128 帧调 `R3RPerfDumpAndReset()`：一次**全车 `Train::Iterate()` 世界扫描** + `fopen("R3R_debug.log","rb")` + `fopen("R3R_perf.log","a")`（会在已发布的 exe 旁边凭空生成 `R3R_perf.log`）。
+2. `R3RDbgEdge()`（`src/train_cmd.cpp`）—— 无任何开关，每次调用都做 `unordered_map::find`（miss 还 insert）；调用点是 `Train::ReserveTrackUnderConsist()`（每车每 tick，平台等待闸门）与 `CheckTrainCollision()`（每对碰撞候选每移动步）。
+3. `R3RDbgWrite(...)` 是**普通 inline 函数**：即使函数体被折叠成空，**调用点的实参仍会被求值**。`src/couple_group_gui.cpp` 的绘制路径（`CG-PAINT`，每次窗口重绘）就传了 `GetWidget<NWidgetCore>(...)` 这类编译器无法判定为无副作用的表达式。
+4. 冷路径但会「偷偷写日志」：`src/sl/station_sl.cpp` 的两个 purge 函数用**裸 `fopen("R3R_debug.log","a")`**，绕过门控。
+
+**修法（已落地）**：
+- `src/r3r_perf.h` 新增编译期总开关 `R3R_PROBES`（`#ifndef`，默认取 `R3R_PROBES_DEFAULT`：`build\` = 1，`build-release\` = 0）。`R3RDbgOn()` / `R3RPerfOn()` 仅在 `#if R3R_PROBES` 下含 `getenv` 逻辑，否则 `return false`（编译期常量）。
+- `R3RDbgWrite` 在 `R3R_PROBES == 0` 时改为宏 `#define R3RDbgWrite(...) ((void)0)`，连**实参一起**编译掉。刻意**不用** `do {} while (0)` 形式：`((void)0)` 仍是合法单语句，无括号的 `if (...) R3RDbgWrite(...);` 与随后的 `else` 都不会被打断。
+- `R3RPerfFrameTick()` 首行 `if (!R3RPerfOn()) return;`；`R3RPerfDumpAndReset()` 入口同样早退（双保险，`R3R_PROBES=0` 时整函数只剩 `ret`）。
+- `R3RDbgEdge()` 首行 `if (!R3RDbgOn()) return false;`，把 map 查找彻底挡在后面。
+- 无门控自增全部加门控：`fold_check` / `dump_chain` / `dump_ident` / `try_couple`（`src/train_cmd.cpp`）、`pos_helper` / `pos_steps` / `pos_max`（`src/newgrf_engine.cpp` `PositionHelper()`）。
+- `src/sl/station_sl.cpp` 两处裸 `fopen("R3R_debug.log","a")` 改为 `R3RFopenDbg("a")`（调用点本就判 `nullptr`，行为不变）。
+
+**状态**：已改（第 65 轮，2026-09-19；**`.h` 改动 ⇒ 必须全量重编**，见 KI-15）。**严重度**：低（不影响正确性，只影响发行版帧率与"后台写日志"）。
+
+**残余 / 未做**：
+1. `src/vehicle_base.h:32` 的 `#include "r3r_perf.h"` 经核实**未使用任何探针符号**，纯编译期牵连、运行时零成本。本轮**有意不动**（改它会再强制一次全量重编，收益只是编译时间），留待后续。
+2. `src/openttd.cpp:1816-1837` 的 `R3R_DIAG` 暂停诊断块仍由**环境变量**（而非 `R3R_PROBES`）控制，每次游戏主循环有一次可预测分支；未设 `R3R_DIAG` 时 `R3RStrandCensus()` 不会执行。属"显式 opt-in 诊断"，保留。
+3. **玩法类高热路径不是探针，本轮未动、也不应关掉**：`PositionHelper()` 的段内定位（真实功能）、`GetVehicleTrackdir()` 的 KI-108 兜底、`ReserveTrackUnderConsist()`、碰撞即耦合、平台等待闸门。
+4. `build-release\` 在改过 `src/*.h` 后**增量构建不安全**（KI-15：ninja 读不到 cl 的中文 `注意: 包含文件:` 前缀）。**`R3R_release_build.cmd` 自己不会删 obj**，[6] 只跑 `ninja openttd`；改过头文件时必须先手工 `del /s /q build-release\*.obj`。副产物：`R3RDbgWrite` 变成宏后，**陈旧 obj 会以"未解析外部符号"在链接期报错**，这反而是一道保护。
+5. `R3R_release_build.cmd` 的 [5c]/[5d] 硬闸门已实测有效：`build-release\build.ninja` 中 `-DR3R_PROBES_DEFAULT=0` 命中 623 条编译规则，`-DWITH_ZLIB/-DWITH_LIBLZMA/-DWITH_ZSTD/-DWITH_LZO/-DWITH_PNG/-DWITH_OPUSFILE` 齐备。
+

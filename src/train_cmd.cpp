@@ -3591,17 +3591,22 @@ static void ReverseTrainDirection(Train *consist)
 	if (IsRailDepotTile(moving_front->tile) || (IsTileType(moving_front->tile, TileType::TunnelBridge) && (moving_front->track & TRACK_BIT_WORMHOLE || dir == GetTunnelBridgeDirection(moving_front->tile)))) dir = DiagDirection::Invalid;
 
 	if (UpdateSignalsOnSegment(moving_front->tile, dir, consist->owner) == SigSegState::Path || _settings_game.pf.reserve_paths) {
+		/* R3R (KI-108): TrackdirToExitdir() asserts on INVALID_TRACKDIR (track_func.h:396),
+		 * so resolve the trackdir once and skip the trackdir dependent checks if we do not
+		 * have one (crashed vehicle). */
+		const Trackdir moving_front_td = moving_front->GetVehicleTrackdir();
+
 		/* If we are currently on a tile with conventional signals, we can't treat the
 		 * current tile as a safe tile or we would enter a PBS block without a reservation. */
-		bool first_tile_okay = !HasBlockSignalOnTrackdir(moving_front->tile, moving_front->GetVehicleTrackdir());
+		bool first_tile_okay = moving_front_td == INVALID_TRACKDIR || !HasBlockSignalOnTrackdir(moving_front->tile, moving_front_td);
 
 		/* If we are on a depot tile facing outwards, do not treat the current tile as safe. */
-		if (IsRailDepotTile(moving_front->tile) && TrackdirToExitdir(moving_front->GetVehicleTrackdir()) == GetRailDepotDirection(moving_front->tile)) first_tile_okay = false;
+		if (moving_front_td != INVALID_TRACKDIR && IsRailDepotTile(moving_front->tile) && TrackdirToExitdir(moving_front_td) == GetRailDepotDirection(moving_front->tile)) first_tile_okay = false;
 
 		/* If we are on a signalled tunnel/bridge end-tile in the exit direction, do not treat the current tile as safe. */
-		if (IsTunnelBridgeWithSignalSimulation(moving_front->tile) && !(moving_front->track & TRACK_BIT_WORMHOLE) && TrackdirExitsTunnelBridge(moving_front->tile, moving_front->GetVehicleTrackdir())) first_tile_okay = false;
+		if (moving_front_td != INVALID_TRACKDIR && IsTunnelBridgeWithSignalSimulation(moving_front->tile) && !(moving_front->track & TRACK_BIT_WORMHOLE) && TrackdirExitsTunnelBridge(moving_front->tile, moving_front_td)) first_tile_okay = false;
 
-		if (IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(moving_front->GetVehicleTrackdir()), true);
+		if (moving_front_td != INVALID_TRACKDIR && IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(moving_front_td), true);
 		if (TryPathReserve(consist, false, first_tile_okay)) {
 			/* Do a look-ahead now in case our current tile was already a safe tile. */
 			CheckNextTrainTile(moving_front);
@@ -3718,9 +3723,13 @@ static TrainForceProceeding DetermineNextTrainForceProceeding(const Train *t)
 	if (!t->flags.Test(VehicleRailFlag::Stuck)) return t->IsChainInDepot() ? TFP_STUCK : TFP_SIGNAL;
 
 	const Train *moving_front = t->GetMovingFront();
-	TileIndex next_tile = TileAddByDiagDir(moving_front->tile, TrackdirToExitdir(moving_front->GetVehicleTrackdir()));
+	/* R3R (KI-108): TrackdirToExitdir() asserts on INVALID_TRACKDIR (track_func.h:396). */
+	const Trackdir moving_front_td = moving_front->GetVehicleTrackdir();
+	if (unlikely(moving_front_td == INVALID_TRACKDIR)) return TFP_STUCK;
+	const DiagDirection moving_front_exitdir = TrackdirToExitdir(moving_front_td);
+	TileIndex next_tile = TileAddByDiagDir(moving_front->tile, moving_front_exitdir);
 	if (next_tile == INVALID_TILE || !IsTileType(next_tile, TileType::Railway) || !HasSignals(next_tile)) return TFP_STUCK;
-	TrackBits new_tracks = DiagdirReachesTracks(TrackdirToExitdir(moving_front->GetVehicleTrackdir())) & GetTrackBits(next_tile);
+	TrackBits new_tracks = DiagdirReachesTracks(moving_front_exitdir) & GetTrackBits(next_tile);
 	return new_tracks != TRACK_BIT_NONE && HasSignalOnTrack(next_tile, FindFirstTrack(new_tracks)) ? TFP_SIGNAL : TFP_STUCK;
 }
 
@@ -4190,6 +4199,7 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_CPLGEO,      ///< GetCouplePosition: exact end-to-end hit (nominal geometry, no overlap)
 	R3REDGE_CPLHIT,      ///< CheckTrainCollision: touch/overlap test fired the couple (min_diff has -1)
 	R3REDGE_CPLGEOCOMMIT, ///< KI-106 fix 1: an exact hit was made while ROLLING (+ whether the merge committed)
+	R3REDGE_VEHTD,       ///< KI-108: GetVehicleTrackdir() had to coerce a direction/track mismatch
 	R3REDGE_COUNT,
 };
 
@@ -4274,6 +4284,14 @@ static R3RDbgEdgeState &R3REdgeState()
  */
 static bool R3RDbgEdge(uint32_t tag, uint64_t key, uint64_t payload)
 {
+	/* R3R (release audit 2026-09-19): this gate is reached once per vehicle per
+	 * tick from ReserveTrackUnderConsist() and once per collision pair per
+	 * movement step, and it used to do an unordered_map lookup (and, on a miss,
+	 * an insert) every time even with the probes off. With the log off nothing
+	 * can ever be emitted, so bail out first: with R3R_PROBES=0 R3RDbgOn() is a
+	 * constant, the whole body disappears, and callers collapse to their
+	 * non-logging branch. */
+	if (!R3RDbgOn()) return false;
 	R3RScopeTimer r3r_edge_timer(&r3r_edge_ns, &r3r_edge_calls);
 	R3RDbgEdgeState &s = R3REdgeState();
 	const uint64_t k = ((uint64_t)tag << 56) | (key & 0x00FFFFFFFFFFFFFFULL);
@@ -4329,6 +4347,14 @@ static void R3RDbgEdgeReset()
  */
 void R3RPerfDumpAndReset()
 {
+	/* R3R (release audit 2026-09-19): guard here as well as at the frame tick,
+	 * because the body is expensive for a "switched off" probe -- a full
+	 * Train::Iterate() world scan, an fopen/ftell/fclose of R3R_debug.log and
+	 * the fopen/fprintf/fclose of R3R_perf.log (which also creates a stray log
+	 * file next to a published exe). With R3R_PROBES=0 R3RPerfOn() is a
+	 * constant false, so MSVC keeps only the `ret`. */
+	if (!R3RPerfOn()) return;
+
 	/* Measures the world snapshot + log accounting below (not the fprintf
 	 * itself, which runs after this value is read). */
 	R3RScopeTimer r3r_dump_timer(&r3r_dump_ns);
@@ -4927,7 +4953,7 @@ static int R3RCheckChainFold(Train *head, const char *tag)
 	 * converges (KI-06). The scan itself is cheap; the per-call
 	 * fopen/fprintf/fclose of the whole chain is gone (edge-triggered below). */
 	R3RPerfCounters &r3rp = R3RP();
-	r3rp.fold_check++;
+	if (R3RPerfOn()) r3rp.fold_check++;
 	R3RPerfTimer r3r_fold_timer(&r3rp.fold_check_ns);
 
 	int worst_gap = 0;
@@ -5137,12 +5163,110 @@ static void R3RUndoLogicalFlip(Train *chain, const R3RSegBoundaries &old_bounds,
 	}
 }
 
+/**
+ * R3R (TEMPORARY DIAGNOSTIC): chain census + stranded-vehicle watchdog.
+ *
+ * Called once every 256 state ticks from StateGameLoop(). It prints one line per
+ * train chain (head identity, length, role flags and the per-vehicle tile /
+ * direction / flags) plus an explicit anomaly line whenever a chain head is
+ * neither a single front engine nor a set of free wagons -- which is what a
+ * wagon left behind by a chain edit looks like. Read-only, changes nothing.
+ */
+void R3RStrandCensus()
+{
+	static uint32_t r3r_census_seq = 0;
+	r3r_census_seq++;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+
+	fprintf(dbg, "=== CENSUS seq=%u ===\n", (unsigned)r3r_census_seq);
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->type != VehicleType::Train) continue;
+		if (v->Previous() != nullptr) continue;
+
+		uint n = 0, nfe = 0, nfw = 0, nseg = 0;
+		const Owner head_owner = v->owner;
+		bool multi_owner = false;
+		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
+			const Train *wt = Train::From(w);
+			n++;
+			if (wt->IsFrontEngine()) nfe++;
+			if (wt->IsFreeWagon()) nfw++;
+			if (wt->IsSegmentFront()) nseg++;
+			if (w->owner != head_owner) multi_owner = true;
+		}
+
+		fprintf(dbg, "CENSUS-CHAIN head=%d own=%d n=%u FE=%u FW=%u SEGF=%u multiown=%d ord=%d tile=%d,%d dir=%d xy=%d,%d:",
+				(int)v->index.base(), (int)head_owner.base(), n, nfe, nfw, nseg,
+				(int)multi_owner, (int)(v->orders != nullptr), TileX(v->tile), TileY(v->tile),
+				(int)v->direction, v->x_pos, v->y_pos);
+		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
+			const Train *wt = Train::From(w);
+			fprintf(dbg, " %d[ow%d t%d,%d d%d m%d %s %s %s %s]",
+					(int)w->index.base(), (int)w->owner.base(), TileX(w->tile), TileY(w->tile),
+					(int)w->direction, (int)wt->GetMovingDirection(),
+					wt->IsFrontEngine() ? "FE" : "--",
+					wt->IsFreeWagon() ? "FW" : "--",
+					wt->IsSegmentFront() ? "SF" : "--",
+					(w == v && wt->IsStoppedInDepot()) ? "DP" : "--");
+		}
+		fprintf(dbg, "\n");
+
+		if (nfe != 1) {
+			fprintf(dbg, "CENSUS-ANOMALY head=%d n=%u FE=%u FW=%u SEGF=%u (chain head is not exactly one front engine)\n",
+					(int)v->index.base(), n, nfe, nfw, nseg);
+		}
+	}
+	/* R3R (TEMPORARY DIAGNOSTIC): couple-gate probe. Prints the couple group
+	 * table plus, for every ordered pair of chain heads, the verdict of the
+	 * couple gate and the depot GOTO_COUPLE preconditions, so a coupling which
+	 * never happens can be attributed to a specific condition. Read-only. */
+	if (r3r_census_seq <= 8) {
+		for (const CoupleGroup *cg : CoupleGroup::Iterate()) {
+			fprintf(dbg, "CGPROBE-GROUP id=%d own=%d flags=%02X open=%d name=%s\n",
+					(int)cg->index.base(), (int)cg->owner.base(), (unsigned)cg->flags,
+					(int)cg->AllowsOthers(), cg->name.c_str());
+		}
+		std::vector<const Train *> heads;
+		for (const Vehicle *v : Vehicle::Iterate()) {
+			if (v->type != VehicleType::Train || v->Previous() != nullptr) continue;
+			heads.push_back(Train::From(v));
+		}
+		for (const Train *a : heads) {
+			for (const Train *b : heads) {
+				if (a == b) continue;
+				const bool a_target_depot = a->current_order.IsType(OT_GOTO_COUPLE) &&
+						a->current_order.GetCoupleIsDepot() && IsRailDepotTile(a->tile) &&
+						a->current_order.GetDestination().ToDepotID() == GetDepotIndex(a->tile);
+				const Order *ra = (a->orders != nullptr) ? a->GetOrder(a->cur_real_order_index) : nullptr;
+				const Order *rb = (b->orders != nullptr) ? b->GetOrder(b->cur_real_order_index) : nullptr;
+				fprintf(dbg, "CGPROBE-PAIR a=%d b=%d ownA=%d ownB=%d gA=%llX gB=%llX allowed=%d"
+						" aStopped=%d aSpd=%u aCo=%d aReal=%d aTargetDepot=%d"
+						" bCo=%d bReal=%d bSegF=%d bDepot=%d\n",
+						(int)a->index.base(), (int)b->index.base(), (int)a->owner.base(), (int)b->owner.base(),
+						(unsigned long long)R3RGetCoupleGroupsOfSegment(a),
+						(unsigned long long)R3RGetCoupleGroupsOfSegment(b),
+						(int)R3RCoupleAllowed(a, b),
+						(int)a->vehstatus.Test(VehState::Stopped), (unsigned)a->cur_speed,
+						(int)a->current_order.GetType(), (int)(ra != nullptr ? ra->GetType() : -1),
+						(int)a_target_depot,
+						(int)b->current_order.GetType(), (int)(rb != nullptr ? rb->GetType() : -1),
+						(int)b->IsSegmentFront(), (int)b->IsStoppedInDepot());
+			}
+		}
+	}
+
+	fprintf(dbg, "=== CENSUS-END ===\n");
+	fclose(dbg);
+}
+
 /** Debug dump of a train chain structure for hang diagnosis. */
 static void R3RDumpChainDbg(const Train *head, const char *tag)
 {
 	/* R3R perf probe (KI-14). */
 	R3RPerfCounters &r3rp = R3RP();
-	r3rp.dump_chain++;
+	if (R3RPerfOn()) r3rp.dump_chain++;
 	R3RPerfTimer r3r_dump_timer(&r3rp.dump_chain_ns);
 
 	FILE *dbg = R3RFopenDbg("a");
@@ -5175,7 +5299,7 @@ static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
 {
 	/* R3R perf probe (KI-14). */
 	R3RPerfCounters &r3rp = R3RP();
-	r3rp.dump_ident++;
+	if (R3RPerfOn()) r3rp.dump_ident++;
 	R3RPerfTimer r3r_ident_timer(&r3rp.dump_ident_ns);
 
 	FILE *dbg = R3RFopenDbg("a");
@@ -5478,7 +5602,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	/* R3R perf probe (KI-14): a converging couple calls this once; a fold-fix
 	 * retry loop calls it every tick (KI-06). */
 	R3RPerfCounters &r3rp = R3RP();
-	r3rp.try_couple++;
+	if (R3RPerfOn()) r3rp.try_couple++;
 	R3RPerfTimer r3r_couple_timer(&r3rp.try_couple_ns);
 
 	/* R3R: refuse invalid input. Both chains must be intact (each argument must
@@ -5842,8 +5966,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	}
 	/* The merged-on group is headed by u itself on the plain splice, and by
 	 * the logically reversed former tail after a fold-fix flip. Callers use
-	 * merged_first as the chain anchor for the direction-unify loop and the
-	 * segment-marker ★ placement. */
+	 * merged_first as the chain anchor for the seam-direction test (R3R 2026-09-19,
+	 * R3R_couple_direction_rule_memo.md) and the segment-marker ★ placement. */
 	merged_first = u_merged_head;
 	return true;
 }
@@ -5861,6 +5985,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
  * merely suppresses one future report and is cleared as soon as that (or any)
  * locomotive with the same index moves again. */
 static btree::btree_map<VehicleID, bool> _r3r_couple_fail_news_shown;
+
+/* R3R (裁决 2026-09-19 / R3R_couple_direction_rule_memo.md): Couple() turns a
+ * 90-degree seam into an accident, which needs TrainCrashed(). That one is defined
+ * far below (next to CheckTrainCollision), so forward-declare it here. */
+static uint TrainCrashed(Train *v);
 
 /**
  * Couple the train onto the waiting consist.
@@ -5915,31 +6044,67 @@ static void Couple(Train *v, Train *u)
 	v->lookahead.reset();
 	u->lookahead.reset();
 
-	/* R3R: the consist may couple nose-to-nose (it kept its own heading while
-	 * waiting), leaving the merged chain with mixed directions (e.g. loco SE,
-	 * consist NW). The JGR flip logic (ReverseTrainSwapVeh) derives the flipped
-	 * heading from the LAST vehicle's direction, which is only valid when the
-	 * whole chain shares one heading; with a mixed heading a realistic reverse
-	 * computes the same wrong heading (SE again) and the train strands right
-	 * after flipping (REVERSEDIR -> CRT found=0). Unify the consist's heading
-	 * to the locomotive's so the chain is coherent.
+	/* R3R (裁决 2026-09-19 / R3R_couple_direction_rule_memo.md): 挂车「端面方向判据」。
 	 *
-	 * Walk from merged_first: after a fold-fix logical flip of the waiting
-	 * chain the group's chain head is the reversed former tail, and u (the
-	 * pre-flip head) now sits at the far end of the merged-on group; starting
-	 * from u would only touch that single vehicle. On plain splices
-	 * merged_first == u, so this covers both paths. */
-	/* R3R (裁决 2026-09-07 / 图像方向 memo): direction 统一到机车方向是运行语义
-	 * 需要(整列同向、moving-* 不撕裂),但 nose-to-nose 拼入段等待时保持了自己的
-	 * 朝向,图像不应随 direction 原地翻面 —— 对被改写的节同步翻转
-	 * VehicleRailFlag::Flipped(渲染方向 = ReverseDir(direction) = 统一前原朝向),
-	 * 拼入段保持等待姿态(倒退)被拖走。用 != 而非无条件 Flip,兼容拼入段已有
-	 * Flipped 初值(造车概率/单节 reverse),保持其原渲染结果。折叠修正路径
-	 * (修正后拼入段 direction 已与机车同向)不触发。 */
-	for (Train *w = merged_first; w != nullptr; w = w->Next()) {
-		if (w->direction != v->direction) w->flags.Flip(VehicleRailFlag::Flipped);
-		w->direction = v->direction;
-		w->UpdateViewport(false, false);
+	 * 旧实现(KI-114)把链头朝向 v->direction 无条件覆盖到 merged_first 起的每一节。
+	 * 链跨多块轨道时，承载不了该朝向的车被写成 (track, direction) 非法组合
+	 * (TRACK_Y 只允许 SE/NW 却被写 N)，只有车再动起来才由 VehicleEnterTileCoordinates
+	 * 自愈 —— 这正是 KI-107 / KI-108 崩溃窗口的状态来源。
+	 *
+	 * 新判据只看拼缝「端面两节」：a = merged_first->Previous()(主动方链尾端面)、
+	 * b = merged_first(拼入段端面)。direction 是 0..7 的环，
+	 *   circ = min(|a->direction - b->direction|, 8 - |a->direction - b->direction|) ∈ [0,4]
+	 *     circ <= 1  同向(含相邻轨道 45° 差)：链已自洽，一个字节都不改。
+	 *     circ == 2  直角错位(90°)：现实里没有直角挂车，判为事故，按撞毁处理。
+	 *     circ >= 3  反向(nose-to-nose / tail-to-tail)：对拼入段逐节 ReverseDir 并同步
+	 *                Flip(Flipped) 作图像补偿(净渲染 = 原朝向，一个像素不动)，即
+	 *                R3RReverseChainDirections。逐节反转恒合轨(轨道对 180° 对称)，
+	 *                且把 circ 3/4 映射成 circ 1/0，拼缝自洽。
+	 *
+	 * 不依赖「整列同向」：moving-*(GetMovingFront / GetMovingNext / GetMovingPrev /
+	 * GetMovingBack，vehicle_base.h)只读 DrivingBackwards 标志，与逐节 direction 无关；
+	 * ReverseTrainSwapVeh 是成对 swap(不推链尾朝向)。旧注释「必须整列同向」的两条论据
+	 * 在本代码树里都不成立。
+	 *
+	 * 起点用 merged_first 而非 u：折叠修正逻辑翻过 u 之后，拼入段的几何头是反转后的
+	 * 原链尾，从 u 起只会碰到那一节。普通拼接 merged_first == u，两条路径都覆盖。 */
+	if (merged_first != nullptr) {
+		Train *const seam_prev = merged_first->Previous();
+		if (seam_prev != nullptr) {
+			const int seam_delta = static_cast<int>(merged_first->direction) - static_cast<int>(seam_prev->direction);
+			const int seam_abs = (seam_delta < 0) ? -seam_delta : seam_delta;
+			const int seam_circ = (seam_abs > 4) ? 8 - seam_abs : seam_abs;
+			if (seam_circ == 2) {
+				/* 直角(90°)拼缝 = 事故。两车在这之前已完成物理拼接(ArrangeTrains)，这里立即
+				 * 按撞毁处理，不再走下面的排程交接：车已毁，orders 交接没有意义。 */
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "[R3R] COUPLE-SEAM-CRASH circ=2 a=%d dirA=%d b=%d dirB=%d tile=%u\n",
+							(int)seam_prev->index.base(), (int)seam_prev->direction,
+							(int)merged_first->index.base(), (int)merged_first->direction,
+							(unsigned)v->tile.base());
+					fclose(dbg);
+				}
+				if (!v->vehstatus.Test(VehState::Crashed)) {
+					const uint num_victims = TrainCrashed(v);
+					if (v->owner == _local_company) {
+						AddTileNewsItem(GetEncodedString(STR_NEWS_TRAIN_CRASH, num_victims), NewsType::Accident, v->tile);
+					}
+				}
+				return;
+			}
+			if (seam_circ >= 3) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "[R3R] COUPLE-SEAM-FLIP circ=%d a=%d dirA=%d b=%d dirB=%d\n",
+							seam_circ, (int)seam_prev->index.base(), (int)seam_prev->direction,
+							(int)merged_first->index.base(), (int)merged_first->direction);
+					fclose(dbg);
+				}
+				R3RReverseChainDirections(merged_first);
+			}
+		}
+		for (Train *w = merged_first; w != nullptr; w = w->Next()) w->UpdateViewport(false, false);
 	}
 
 	/* The consist's schedule belongs to the wagon part: hand the orders over to the
@@ -5954,7 +6119,7 @@ static void Couple(Train *v, Train *u)
 	 * WITHOUT migrating identity off it (R3RFlipChainBySegments only re-links
 	 * directions / ★ marks / de-articulated group roles). merged_first is the
 	 * merged-on group's geometric head — equal to u except after a logical flip
-	 * of u — so it anchors the direction-unify loop and the ★ placement below,
+	 * of u — so it anchors the seam-direction test above and the ★ placement below,
 	 * while the identity reads here stay anchored on u. A fold-fix logical
 	 * flip of v (multi-engine loco chain) may move the merged head off the
 	 * original locomotive object: TryTrainCouple then migrates the train
@@ -6915,6 +7080,21 @@ static void UnreserveBridgeTunnelTile(TileIndex tile)
  */
 static void ClearPathReservation(const Train *v, TileIndex tile, Trackdir track_dir, bool tunbridge_clear_unsignaled_other_end = false)
 {
+	/* R3R KI-108: GetVehicleTrackdir() can hand us INVALID_TRACKDIR (crashed vehicle,
+	 * or the direction/track mismatch state left behind by chain edits). Both
+	 * TrackdirToExitdir() and TrackdirToTrack() assert on that, so recover an
+	 * equivalent trackdir from the vehicle's own track bits instead of crashing. */
+	if (unlikely(track_dir == INVALID_TRACKDIR)) {
+		const TrackBits tbits = v->track & TRACK_BIT_MASK;
+		if (tbits == TRACK_BIT_NONE) return;
+		track_dir = TrackToTrackdir(FindFirstTrack(tbits));
+		if (R3RDbgEdge(R3REDGE_VEHTD, (uint64_t)v->index.base(), ((uint64_t)v->tile.base() << 32) | ((uint64_t)(uint)v->track << 16) | (uint64_t)(uint)track_dir)) {
+			R3RDbgWrite("VEHTD-CLEARRES veh=%d tile=%d,%d trk=0x%X td=%d\n",
+					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+					(uint)v->track, (int)track_dir);
+		}
+	}
+
 	if (IsTileType(tile, TileType::TunnelBridge)) {
 		if (IsTrackAcrossTunnelBridge(tile, TrackdirToTrack(track_dir))) {
 			UnreserveBridgeTunnelTile(tile);
@@ -8423,7 +8603,9 @@ static TrainMovedChangeSignalEnum TrainMovedChangeSignal(Train *consist, TileInd
 			GetRailTileType(tile) == RailTileType::Signals) {
 		TrackdirBits tracks = TrackBitsToTrackdirBits(GetTrackBits(tile)) & DiagdirReachesTrackdirs(dir);
 		Trackdir trackdir = FindFirstTrackdir(tracks);
-		if (UpdateSignalsOnSegment(tile,  TrackdirToExitdir(trackdir), GetTileOwner(tile)) == SigSegState::Path && HasSignalOnTrackdir(tile, trackdir)) {
+		/* R3R KI-108: an inconsistent vehicle direction/track state can leave no
+		 * trackdir reachable from \a dir; TrackdirToExitdir() would assert on it. */
+		if (trackdir != INVALID_TRACKDIR && UpdateSignalsOnSegment(tile,  TrackdirToExitdir(trackdir), GetTileOwner(tile)) == SigSegState::Path && HasSignalOnTrackdir(tile, trackdir)) {
 			/* A PBS block with a non-PBS signal facing us? */
 			if (!IsPbsSignal(GetSignalType(tile, TrackdirToTrack(trackdir)))) return CHANGED_NORMAL_TO_PBS_BLOCK;
 
@@ -8438,7 +8620,7 @@ static TrainMovedChangeSignalEnum TrainMovedChangeSignal(Train *consist, TileInd
 	if (is_front && _settings_game.vehicle.train_braking_model == TBM_REALISTIC && IsTileType(tile, TileType::TunnelBridge) && IsTunnelBridgeSignalSimulationEntrance(tile)) {
 		TrackdirBits tracks = TrackBitsToTrackdirBits(GetTunnelBridgeTrackBits(tile)) & DiagdirReachesTrackdirs(dir);
 		Trackdir trackdir = FindFirstTrackdir(tracks);
-		if (CheckLongReservePbsTunnelBridgeOnTrackdir(consist, tile, trackdir) != INVALID_TILE) return CHANGED_LR_PBS;
+		if (trackdir != INVALID_TRACKDIR && CheckLongReservePbsTunnelBridgeOnTrackdir(consist, tile, trackdir) != INVALID_TILE) return CHANGED_LR_PBS;
 	}
 
 	return CHANGED_NOTHING;
@@ -10370,10 +10552,31 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		}
 	}
 
+	/* R3R: a locomotive that was ordered to couple *inside this very depot* is
+	 * expected to be parked (VehState::Stopped) when it gets here -- the depot
+	 * couple block below even clears that flag once the couple ran. The generic
+	 * "stopped train bails out" gate must therefore not swallow this case: the
+	 * chain gets its Stopped flag from R3R's own depot tools (MakeSegment /
+	 * DemoteSegment call R3RStopChainInDepot), and a parked train never runs
+	 * ProcessOrders, so it would sit in its target depot forever while the
+	 * consist it was ordered to pick up stays stranded next to it (no couple
+	 * attempt is ever made -- confirmed on test_multi_company.sav, where the
+	 * cross-company couple gate itself answers allowed=1). Because a parked
+	 * train keeps current_order at OT_NOTHING, the pending order is read by
+	 * index. The exemption is deliberately narrow: it only applies when the
+	 * real order is a GOTO_COUPLE whose depot destination IS the depot the
+	 * locomotive is standing in, so a locomotive the player stopped anywhere
+	 * else keeps its old "give control back" behaviour. */
+	const Order *r3r_pend = (consist->orders != nullptr) ? consist->GetOrder(consist->cur_real_order_index) : nullptr;
+	const bool r3r_pending_depot_couple = consist->IsEngine() && r3r_pend != nullptr &&
+			r3r_pend->IsType(OT_GOTO_COUPLE) && r3r_pend->GetCoupleIsDepot() &&
+			IsRailDepotTile(consist->tile) &&
+			r3r_pend->GetDestination().ToDepotID() == GetDepotIndex(consist->tile);
+
 	/* exit if train is stopped (a stopped locomotive should not keep trying to
 	 * couple: the player stopped it, so give control back for stop/skip/return
 	 * commands instead of parking it in the GOTO_COUPLE state forever). */
-	if (consist->vehstatus.Test(VehState::Stopped) && consist->cur_speed == 0) {
+	if (!r3r_pending_depot_couple && consist->vehstatus.Test(VehState::Stopped) && consist->cur_speed == 0) {
 		/* R3R DEBUG: log a stopped train bailing out here.
 		 * KI-14 (1): edge-triggered -- this gate is reached every tick while the
 		 * train stays stopped (4902 of the 28838 lines written in 38 s). Since
@@ -10406,12 +10609,38 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * the tile in front of the door, while the waiting consist sat elsewhere.
 		 * The destination check mirrors CheckTrainStayInDepot (IsRailDepotTile +
 		 * GetDepotIndex). */
-		const bool couple_targets_this_depot = consist->current_order.IsType(OT_GOTO_COUPLE) &&
+		const bool couple_targets_this_depot = r3r_pending_depot_couple ||
+				(consist->current_order.IsType(OT_GOTO_COUPLE) &&
 				consist->current_order.GetCoupleIsDepot() &&
 				IsRailDepotTile(consist->tile) &&
-				consist->current_order.GetDestination().ToDepotID() == GetDepotIndex(consist->tile);
+				consist->current_order.GetDestination().ToDepotID() == GetDepotIndex(consist->tile));
 		if (couple_targets_this_depot) {
-			if (TrainCoupleHandler(consist)) {
+			/* R3R: a locomotive that was parked in its target depot (R3R's own
+			 * depot tools call R3RStopChainInDepot) never ran ProcessOrders, so it
+			 * still carries current_order == OT_NOTHING and the Stopped flag.
+			 * Materialise the state a running locomotive would have before trying
+			 * the couple: otherwise R3RCanCoupleNow() rejects the one legitimate
+			 * candidate with "active-not-goto" / "active-stopped" and the parked
+			 * locomotive can never pick up the consist it was ordered to collect. */
+			if (r3r_pending_depot_couple) {
+				if (consist->vehstatus.Test(VehState::Stopped)) {
+					consist->StopSeparation();
+					consist->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+				}
+				if (!consist->current_order.IsType(OT_GOTO_COUPLE)) consist->current_order = *r3r_pend;
+			}
+			/* R3R: VehState::Stopped must be off while the couple gate runs (it
+			 * rejects a stopped coupler as "active-stopped"), but the very same flag
+			 * is the player's own Start/Stop state. Clearing it for good made a
+			 * stopped train report itself as running again, and because the couple
+			 * block is re-entered every tick while the consist is still missing, the
+			 * flag was wiped again and again -- the train then looked like it had
+			 * started by itself. Clear it only for the duration of the attempt and
+			 * restore it when nothing was coupled (KI-110). */
+			const bool r3r_was_stopped = consist->vehstatus.Test(VehState::Stopped);
+			consist->vehstatus.Reset(VehState::Stopped);
+			const bool r3r_coupled = TrainCoupleHandler(consist);
+			if (r3r_coupled) {
 				consist->cur_speed = 0;
 				consist->progress = 0;
 			}
@@ -10421,7 +10650,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			 * coupling on the next tick instead of driving out again. */
 			consist->cur_speed = 0;
 			consist->progress = 0;
-			consist->vehstatus.Reset(VehState::Stopped);
+			if (!r3r_coupled && r3r_was_stopped && consist->IsFrontEngine()) consist->vehstatus.Set(VehState::Stopped);
 			consist->flags.Reset(VehicleRailFlag::LeavingStation);
 
 			/* R3R: the depot GOTO_COUPLE coupling above may have handed the train
@@ -10508,7 +10737,12 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					int dbg_destTx = dbg_destValid ? (int)TileX(dbg_dest) : -1;
 					int dbg_destTy = dbg_destValid ? (int)TileY(dbg_dest) : -1;
 					int dbg_depotDir = dbg_destDepot ? (int)GetRailDepotDirection(dbg_dest) : -1;
-					int dbg_enterDir = (int)TrackdirToExitdir(consist->GetVehicleTrackdir());
+					/* R3R (KI-108): guard this probe as well - TrackdirToExitdir()
+					 * asserts on INVALID_TRACKDIR (track_func.h:396) and this line was
+					 * the actual crash site of 2026-09-18 21:05 (a chain end parked on
+					 * TRACK_BIT_Y while facing a direction not along that track). Log -1. */
+					const Trackdir dbg_td = consist->GetVehicleTrackdir();
+					int dbg_enterDir = (dbg_td == INVALID_TRACKDIR) ? -1 : (int)TrackdirToExitdir(dbg_td);
 
 					fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) curType=%d stuck=%d tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d tt=%d impl=%d\n",
 						(int)consist->index.base(), (int)consist->cur_speed,
@@ -11064,15 +11298,61 @@ Trackdir Train::GetVehicleTrackdir() const
 			tracks = GetAcrossTunnelBridgeTrackBits(this->tile);
 		}
 		Track track = FindFirstTrack(tracks);
-		if (unlikely(!IsValidTrack(track))) return INVALID_TRACKDIR;
+		/* R3R (KI-108): never hand INVALID_TRACKDIR back to the callers - they pass
+		 * the value on to ReverseTrackdir()/TrackdirToExitdir()/TrackdirToTrack(),
+		 * all of which assert (track_func.h:249/396/264). Guess from the facing
+		 * direction if the tunnel/bridge head gives us nothing to work with. */
+		if (unlikely(!IsValidTrack(track))) return DiagDirToDiagTrackdir(DirToDiagDir(this->GetMovingDirection()));
 		Trackdir td = TrackExitdirToTrackdir(track, GetTunnelBridgeDirection(this->tile));
+		if (unlikely(td == INVALID_TRACKDIR)) return DiagDirToDiagTrackdir(DirToDiagDir(this->GetMovingDirection()));
 		if (GetTunnelBridgeDirection(this->tile) != DirToDiagDir(this->GetMovingDirection())) td = ReverseTrackdir(td);
 		return td;
 	} else if (this->track & TRACK_BIT_WORMHOLE) {
-		return TrackDirectionToTrackdir(FindFirstTrack(this->track & TRACK_BIT_MASK), this->GetMovingDirection());
+		const Track w_track = FindFirstTrack(this->track & TRACK_BIT_MASK);
+		if (unlikely(!IsValidTrack(w_track))) return DiagDirToDiagTrackdir(DirToDiagDir(this->GetMovingDirection()));
+		const Trackdir w_td = TrackDirectionToTrackdir(w_track, this->GetMovingDirection());
+		return unlikely(w_td == INVALID_TRACKDIR) ? TrackToTrackdir(w_track) : w_td;
 	}
 
-	return TrackDirectionToTrackdir(FindFirstTrack(this->track), this->GetMovingDirection());
+	/* R3R (KI-107): a train end may legitimately have no track bits set - e.g. a
+	 * freshly created vehicle, or a chain end that is being (re)positioned while
+	 * a locomotive couples onto it half outside a platform. FindFirstTrack() then
+	 * yields an invalid track and TrackDirectionToTrackdir() would trip its own
+	 * assertion; returning INVALID_TRACKDIR from here would in turn crash every
+	 * caller that hands the result to ReverseTrackdir()/TrackdirToExitdir()
+	 * (that is exactly how track_func.h:249 killed the game right after Couple()).
+	 * Guess from the facing direction instead, just like the tunnel/bridge case
+	 * above does. */
+	const Track track = FindFirstTrack(this->track);
+	if (unlikely(!IsValidTrack(track))) return DiagDirToDiagTrackdir(DirToDiagDir(this->GetMovingDirection()));
+	const Trackdir td = TrackDirectionToTrackdir(track, this->GetMovingDirection());
+	/* R3R (KI-108): the vehicle may sit on a track that does not run in the
+	 * direction it faces - R3R creates this state transiently while merging
+	 * chains (crash log 2026-09-18 21:05: a chain end parked on TRACK_BIT_Y
+	 * while facing a direction that is not along the track, GetVehicleTrackdir()
+	 * returned INVALID_TRACKDIR). TrackDirectionToTrackdir() returns
+	 * INVALID_TRACKDIR for that combination (it does not assert), and every
+	 * caller that forwards the result to ReverseTrackdir()/TrackdirToExitdir()/
+	 * TrackdirToTrack() then trips its own assertion (track_func.h:249/396/264).
+	 * Stay on the vehicle's own track and use its canonical trackdir instead,
+	 * and record the state (edge triggered) so the origin of the mismatch can
+	 * be pinned down. */
+	if (unlikely(td == INVALID_TRACKDIR)) {
+		const uint64_t vehtd_payload = ((uint64_t)this->tile.base() << 32) |
+				((uint64_t)(uint)this->track << 16) | (uint64_t)(uint)this->direction;
+		if (R3RDbgEdge(R3REDGE_VEHTD, (uint64_t)this->index.base(), vehtd_payload)) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "VEHTD-MISMATCH veh=%d tile=%d,%d track=0x%X dir=%d mdir=%d -> coerced=%d\n",
+						(int)this->index.base(), (int)TileX(this->tile), (int)TileY(this->tile),
+						(uint)this->track, (int)this->direction, (int)this->GetMovingDirection(),
+						(int)TrackToTrackdir(track));
+				fclose(dbg);
+			}
+		}
+		return TrackToTrackdir(track);
+	}
+	return td;
 }
 
 /**

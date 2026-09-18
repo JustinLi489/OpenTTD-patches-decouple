@@ -974,7 +974,11 @@ static void R3RPurgeInvalidLoadingVehiclesRaw()
 		for (auto it = lv.begin(); it != lv.end();) {
 			const size_t raw = reinterpret_cast<size_t>(*it);
 			if (raw == 0 || !Vehicle::IsValidID(raw - 1)) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				/* R3R (release audit 2026-09-19): route through the gated open,
+				 * otherwise a published (R3R_PROBES=0) exe would still create
+				 * R3R_debug.log behind the player's back whenever this purge
+				 * fires. Pure diagnostics, nothing here needs to run. */
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "SL-STNN-PURGE station=%d raw=%u (loader) removed\n",
 							(int)st->index.base(), (unsigned)raw);
@@ -1002,7 +1006,8 @@ static void R3RPurgeInvalidLoadingVehicles()
 				if (v == *it) { alive = true; break; }
 			}
 			if (!alive) {
-				FILE *dbg = fopen("R3R_debug.log", "a");
+				/** R3R (release audit 2026-09-19): see R3RPurgeInvalidLoadingVehiclesRaw(). */
+				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
 					fprintf(dbg, "SL-STNN-PURGE station=%d (saver) removed stale entry\n",
 							(int)st->index.base());

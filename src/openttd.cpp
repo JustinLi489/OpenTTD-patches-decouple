@@ -112,7 +112,9 @@
 #include <mutex>
 
 #include <system_error>
+#include <cstdlib>
 
+#include "r3r_perf.h"
 #include "table/strings.h"
 
 #ifdef __EMSCRIPTEN__
@@ -1800,6 +1802,50 @@ void GameLoop()
 	}
 
 	ProcessAsyncSaveFinish();
+
+#if R3R_PROBES
+	/* R3R (TEMPORARY DIAGNOSTIC, OPT-IN): pause tracing + stranded-vehicle watchdog.
+	 * The game pauses with PauseMode::Error when NewGRF data or vehicle lengths
+	 * look wrong, which makes an unattended headless run look "stuck". Log every
+	 * pause transition, clear it (equivalent to the player dismissing the error
+	 * window) and take a periodic census of all train chains.
+	 *
+	 * DISABLED BY DEFAULT ON PURPOSE: clearing _pause_mode makes the game
+	 * impossible to pause -- and therefore everything, trains included, keeps
+	 * running while the player believes the game is paused. That diagnostic must
+	 * never run in an interactive game; enable it only for unattended headless
+	 * runs by setting R3R_DIAG=1 in the environment (see R3R_KNOWN_ISSUES KI-109).
+	 *
+	 * R3R (release audit 2026-09-19): the whole block is additionally behind
+	 * R3R_PROBES. A runtime-only gate is not enough here, because the dangerous
+	 * part is not the log write but the `_pause_mode = PauseModes{}` below: in a
+	 * release build the log file would silently not be created while the game
+	 * still cleared its own pause mode. A published binary must contain neither,
+	 * so the block is compiled out entirely (sign the publish build with
+	 * -DR3R_PROBES=1 to get it back for a headless run). */
+	static const bool r3r_diag_enabled = []() {
+		const char *env = std::getenv("R3R_DIAG");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (r3r_diag_enabled) {
+		extern void R3RStrandCensus();
+		static uint32_t r3r_loop_counter = 0;
+		static uint8_t r3r_pause_last = 0xFF;
+		if (_pause_mode.base() != r3r_pause_last) {
+			r3r_pause_last = _pause_mode.base();
+			FILE *dbg = fopen("R3R_debug.log", "a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "R3R-LOOP pause=%u modal_saveload=%d (diagnostic: clearing unless saving/loading)\n",
+						(unsigned)r3r_pause_last, (int)_pause_mode.Test(PauseMode::SaveLoad));
+				fclose(dbg);
+			}
+			if (!_pause_mode.Test(PauseMode::SaveLoad)) _pause_mode = PauseModes{};
+		}
+		if (r3r_pause_last == 0) {
+			if ((r3r_loop_counter++ & 255) == 0) R3RStrandCensus();
+		}
+	}
+#endif
 
 	if (unlikely(_check_special_modes)) GameLoopSpecial();
 

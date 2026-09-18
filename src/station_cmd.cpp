@@ -1528,8 +1528,15 @@ void FreeTrainStationPlatformReservation(const Train *v)
 {
 	Train *moving_front = v->GetMovingFront();
 	Train *moving_back = v->GetMovingBack();
-	if (IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(moving_front->GetVehicleTrackdir()), false);
-	if (IsRailStationTile(moving_back->tile)) SetRailStationPlatformReservation(moving_back->tile, TrackdirToExitdir(ReverseTrackdir(moving_back->GetVehicleTrackdir())), false);
+	/* R3R (KI-107): a chain end can be without a usable trackdir (a locomotive
+	 * hanging half outside a platform while coupling, a chain end that is being
+	 * repositioned, ...). TrackdirToExitdir() and ReverseTrackdir() assert on
+	 * INVALID_TRACKDIR (track_func.h:249/396), so skip such an end instead of
+	 * killing the game - it cannot hold a platform reservation anyway. */
+	const Trackdir td_front = moving_front->GetVehicleTrackdir();
+	const Trackdir td_back = moving_back->GetVehicleTrackdir();
+	if (td_front != INVALID_TRACKDIR && IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(td_front), false);
+	if (td_back != INVALID_TRACKDIR && IsRailStationTile(moving_back->tile)) SetRailStationPlatformReservation(moving_back->tile, TrackdirToExitdir(ReverseTrackdir(td_back)), false);
 }
 
 /**
@@ -1550,9 +1557,12 @@ static void RestoreTrainReservation(Train *v)
 {
 	Train *moving_front = v->GetMovingFront();
 	Train *moving_back = v->GetMovingBack();
-	if (IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(moving_front->GetVehicleTrackdir()), true);
+	/* R3R (KI-107): see FreeTrainStationPlatformReservation() above. */
+	const Trackdir td_front = moving_front->GetVehicleTrackdir();
+	const Trackdir td_back = moving_back->GetVehicleTrackdir();
+	if (td_front != INVALID_TRACKDIR && IsRailStationTile(moving_front->tile)) SetRailStationPlatformReservation(moving_front->tile, TrackdirToExitdir(td_front), true);
 	TryPathReserve(v, true, true);
-	if (IsRailStationTile(moving_back->tile)) SetRailStationPlatformReservation(moving_back->tile, TrackdirToExitdir(ReverseTrackdir(moving_back->GetVehicleTrackdir())), true);
+	if (td_back != INVALID_TRACKDIR && IsRailStationTile(moving_back->tile)) SetRailStationPlatformReservation(moving_back->tile, TrackdirToExitdir(ReverseTrackdir(td_back)), true);
 }
 
 /**

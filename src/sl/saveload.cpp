@@ -49,6 +49,11 @@
 #include "../newgrf_railtype.h"
 #include "../newgrf_roadtype.h"
 #include "../3rdparty/cpp-ring-buffer/ring_buffer.hpp"
+/* R3R (release audit 2026-09-19): the R3R_slref.log probes in this file used a
+ * plain fopen(), so they survived into a release build and littered the game
+ * directory. Route them through R3RFopenDbg(), which is a null-returning inline
+ * when R3R_PROBES=0 and therefore removes the call and its format string. */
+#include "../r3r_perf.h"
 #include "../timer/timer_game_tick.h"
 #include "../session_stats.h"
 #include <atomic>
@@ -488,7 +493,7 @@ struct ThreadSlErrorException {
 [[noreturn]] void SlError(StringID string, std::string extra_msg)
 {
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "SLERROR action=%d stringid=%u chunk=%u arr=%d msg=%s\n",
 					(int)_sl.action, (unsigned)string, (unsigned)_sl.current_chunk_id, _sl.array_index, extra_msg.c_str());
@@ -1537,7 +1542,7 @@ void *IntToReference(size_t index, SLRefType rt)
 		case REF_VEHICLE:
 			if (Vehicle::IsValidID(index)) return Vehicle::Get(index);
 			{
-				FILE *r3rf = fopen("R3R_slref.log", "a");
+				FILE *r3rf = R3RFopenDbg("a");
 				if (r3rf != nullptr) {
 					fprintf(r3rf, "INVALID_REF_VEHICLE raw_index=%u zero_based=%u pool_size=%u arr_index=%d chunk=%u\n",
 							(unsigned)index + 1, (unsigned)index, (unsigned)Vehicle::GetPoolSize(), _sl.array_index, (unsigned)_sl.current_chunk_id);
@@ -3096,7 +3101,7 @@ static void SlLoadChunks()
 		}
 		Debug(sl, 3, "Loaded chunk {} ({} bytes)", ChunkIDDumper()(id), SlGetBytesRead() - read);
 		{
-			FILE *r3rf = fopen("R3R_slref.log", "a");
+			FILE *r3rf = R3RFopenDbg("a");
 			if (r3rf != nullptr) {
 				fprintf(r3rf, "CHUNKLOAD%c%c%c%c pool=%u arr=%d pos=%d\n",
 						(int)(id & 0xFF), (int)((id >> 8) & 0xFF), (int)((id >> 16) & 0xFF), (int)((id >> 24) & 0xFF),
@@ -3107,7 +3112,7 @@ static void SlLoadChunks()
 	}
 
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "AFTER_LOADCHUNKS pool=%u valid0=%d valid1=%d\n",
 					(unsigned)Vehicle::GetPoolSize(), Vehicle::IsValidID(0) ? 1 : 0, Vehicle::IsValidID(1) ? 1 : 0);
@@ -3161,7 +3166,7 @@ static void SlFixPointers()
 	_sl.action = SLA_PTRS;
 
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "BEFORE_PTRS upstream_mode=%d pool=%u valid0=%d valid1=%d\n",
 					_sl_upstream_mode ? 1 : 0, (unsigned)Vehicle::GetPoolSize(), Vehicle::IsValidID(0) ? 1 : 0, Vehicle::IsValidID(1) ? 1 : 0);

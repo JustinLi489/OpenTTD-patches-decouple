@@ -15,6 +15,8 @@
 #include "../ship.h"
 #include "../aircraft.h"
 #include "../station_base.h"
+#include "../depot_map.h"
+#include "../rail_map.h"
 #include "../effectvehicle_base.h"
 #include "../company_base.h"
 #include "../company_func.h"
@@ -687,6 +689,87 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT) nbad++;
 			}
 			fprintf(dbg, "=== LOADCENSUS-PHASE2END bad=%u ===\n", nbad);
+			fclose(dbg);
+		}
+	}
+
+	/* R3R (TEMPORARY DIAGNOSTIC): full train/station dump used to analyse
+	 * cross-company coupling and stranded-wagon reports. Read-only. */
+	if (part_of_load) {
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "=== R3RDUMP-BEGIN ===\n");
+			for (const Station *st : Station::Iterate()) {
+				fprintf(dbg, "R3RDUMP-STATION idx=%d xy=%d,%d lv=%u:",
+						(int)st->index.base(), TileX(st->xy), TileY(st->xy),
+						(unsigned int)st->loading_vehicles.size());
+				for (const Vehicle *lv : st->loading_vehicles) {
+					const size_t raw = reinterpret_cast<size_t>(lv);
+					if (raw == 0 || !Vehicle::IsValidID(raw - 1)) {
+						fprintf(dbg, " raw%u(INVALID)", (unsigned)raw);
+					} else {
+						fprintf(dbg, " %u", (unsigned)(raw - 1));
+					}
+				}
+				fprintf(dbg, "\n");
+			}
+			for (const Vehicle *w : Vehicle::Iterate()) {
+				if (w->type != VehicleType::Train) continue;
+				const Train *wt = Train::From(w);
+				const Vehicle *hd = w->First();
+				const Vehicle *tl = w->Last();
+				fprintf(dbg, "R3RDUMP idx=%d et=%u sub=%02X dir=%d tile=%d,%d xy=%d,%d tb=%02X ow=%d un=%d"
+						" FE=%d FW=%d FWG=%d ENG=%d VIRT=%d ARTH=%d ARTM=%d SEGF=%d DB=%d spd=%u"
+						" | prev=%d next=%d head=%d tail=%d ord=%d co=%d\n",
+						(int)w->index.base(), (unsigned int)w->engine_type.base(), (unsigned int)w->subtype,
+						(int)w->direction, TileX(w->tile), TileY(w->tile), w->x_pos, w->y_pos, (unsigned int)wt->track,
+						(int)w->owner.base(), (int)w->unitnumber,
+						(int)wt->IsFrontEngine(), (int)wt->IsFreeWagon(), (int)wt->IsFrontWagon(),
+						(int)wt->IsEngine(), (int)wt->IsVirtual(), (int)wt->IsArticGroupHead(),
+						(int)wt->IsArticGroupMember(), (int)wt->IsSegmentFront(),
+						(int)wt->IsDrivingBackwards(), (unsigned int)wt->cur_speed,
+						(int)(w->Previous() != nullptr ? w->Previous()->index.base() : -1),
+						(int)(w->Next() != nullptr ? w->Next()->index.base() : -1),
+						(int)(hd != nullptr ? hd->index.base() : -1),
+						(int)(tl != nullptr ? tl->index.base() : -1),
+						(int)(w->orders != nullptr), (int)w->current_order.GetType());
+			}
+			/* R3R (TEMPORARY DIAGNOSTIC): per-chain identity, depot ownership and
+			 * the complete order list, so a stranded-wagon / cross-company report
+			 * can be tied to the schedule that produced it. Read-only. */
+			for (const Vehicle *w : Vehicle::Iterate()) {
+				if (w->type != VehicleType::Train || w->Previous() != nullptr) continue;
+				const Train *wt = Train::From(w);
+				uint n = 0;
+				for (const Vehicle *q = w; q != nullptr; q = q->Next()) n++;
+				const Order *r = (w->orders != nullptr) ? w->GetOrder(w->cur_real_order_index) : nullptr;
+				const bool rail_tile = IsTileType(w->tile, TileType::Railway);
+				const uint depot_idx = (rail_tile && IsRailDepotTile(w->tile)) ? GetDepotIndex(w->tile).base() : UINT_MAX;
+				fprintf(dbg, "R3RDUMP-CHAIN head=%d ow=%d isai=%d n=%u stopped=%d inDepot=%d spd=%u prio=%u borrow=%d"
+						" ordCount=%u ordbk=%d curReal=%u curImpl=%u coType=%d realType=%d"
+						" tile=%d,%d tileOw=%d isDepot=%d depotIdx=%d\n",
+						(int)w->index.base(), (int)w->owner.base(),
+						(int)(Company::IsValidID(w->owner) ? Company::Get(w->owner)->is_ai : -1), n,
+						(int)w->vehstatus.Test(VehState::Stopped), (int)wt->IsStoppedInDepot(), (unsigned)wt->cur_speed,
+						(unsigned)w->r3r_priority, (int)w->r3r_orders_borrowed,
+						(unsigned)(w->orders != nullptr ? w->orders->GetNumOrders() : 0),
+						(int)(w->orders_backup != nullptr),
+						(unsigned)w->cur_real_order_index, (unsigned)w->cur_implicit_order_index,
+						(int)w->current_order.GetType(), (int)(r != nullptr ? r->GetType() : -1),
+						TileX(w->tile), TileY(w->tile), (int)(rail_tile ? GetTileOwner(w->tile).base() : -1),
+						(int)(depot_idx != UINT_MAX), (int)(depot_idx == UINT_MAX ? -1 : (int)depot_idx));
+				if (w->orders != nullptr) {
+					for (uint i = 0; i < w->orders->GetNumOrders(); i++) {
+						const Order *o = w->orders->GetOrderAt(i);
+						if (o == nullptr) continue;
+						fprintf(dbg, "R3RDUMP-ORDER head=%d i=%u type=%d dest=%u isDepot=%d\n",
+								(int)w->index.base(), i, (int)o->GetType(),
+								(unsigned)o->GetDestination().base(),
+								(int)o->GetCoupleIsDepot());
+					}
+				}
+			}
+			fprintf(dbg, "=== R3RDUMP-END ===\n");
 			fclose(dbg);
 		}
 	}
@@ -1477,11 +1560,16 @@ void Load_VEHS()
 	int r3r_veh_count = 0;
 
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "VEHS_ENTER is_table=%d hdr_len=%u pos=%u\n", SlIsTableChunk() ? 1 : 0, (unsigned)SlGetFieldLength(), (unsigned)SlGetBytesRead());
 			fclose(r3rf);
 		}
+#if R3R_PROBES
+		/* R3R (release audit 2026-09-19): the raw-byte dump writes a 16 KB
+		 * R3R_vehsraw.bin into the game directory. It is a one-off forensic aid
+		 * for the savegame-reference crash, so it must not exist in a release.
+		 * (The R3R_slref.log line above it is routed through R3RFopenDbg.) */
 		ReadBuffer *r3rrb = ReadBuffer::GetCurrent();
 		if (r3rrb != nullptr) {
 			r3rrb->CheckBytes(1);
@@ -1493,6 +1581,7 @@ void Load_VEHS()
 				fclose(r3rf2);
 			}
 		}
+#endif
 	}
 
 	_cpp_packets.clear();
@@ -1591,7 +1680,7 @@ void Load_VEHS()
 	}
 
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "VEHS_DONE count=%d pool=%u\n", r3r_veh_count, (unsigned)Vehicle::GetPoolSize());
 			fclose(r3rf);

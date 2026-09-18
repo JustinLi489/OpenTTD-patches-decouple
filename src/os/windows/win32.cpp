@@ -8,6 +8,10 @@
 /** @file win32.cpp Implementation of MS Windows system calls. */
 
 #include "../../stdafx.h"
+/* R3R (release audit 2026-09-19): the R3R_slref.log probe in ShowInfoI() used a
+ * plain fopen(), so it survived into a release build; R3RFopenDbg() is a
+ * null-returning inline when R3R_PROBES=0 and removes the call entirely. */
+#include "../../r3r_perf.h"
 #include "../../debug.h"
 #include "../../gfx_func.h"
 #include "../../strings_func.h"
@@ -373,7 +377,7 @@ static INT_PTR CALLBACK HelpDialogFunc(HWND wnd, UINT msg, WPARAM wParam, LPARAM
 void ShowInfoI(std::string_view str)
 {
 	{
-		FILE *r3rf = fopen("R3R_slref.log", "a");
+		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "SHOWINFO has_console=%d msg=%.*s\n", _has_console ? 1 : 0, (int)str.size(), str.data());
 			fclose(r3rf);

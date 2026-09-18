@@ -432,9 +432,13 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 	/* R3R perf probe (KI-14): this runs on the sprite path, so its cost is a
 	 * frame-rate cost. pos_steps is the interesting one: the segment walk is
 	 * O(n) per vehicle, i.e. O(n^2) per chain whenever the NewGRF cache is
-	 * invalidated. */
+	 * invalidated.
+	 * R3R (release audit 2026-09-19): the counters sit behind R3RPerfOn() so a
+	 * release build with the probes compiled out (R3R_PROBES=0) keeps only the
+	 * segment walk -- which is real functionality, not a probe. */
 	R3RPerfCounters &r3rp = R3RP();
-	r3rp.pos_helper++;
+	const bool r3r_probe = R3RPerfOn();
+	if (r3r_probe) r3rp.pos_helper++;
 	R3RPerfTimer r3r_pos_timer(&r3rp.pos_ns);
 
 	const Vehicle *u;
@@ -467,9 +471,11 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 		u = u->Next();
 	}
 
-	const uint64_t r3r_steps = (uint64_t)chain_before + chain_after;
-	r3rp.pos_steps += r3r_steps;
-	if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
+	if (r3r_probe) {
+		const uint64_t r3r_steps = (uint64_t)chain_before + chain_after;
+		r3rp.pos_steps += r3r_steps;
+		if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
+	}
 
 	return chain_before | chain_after << 8 | (chain_before + chain_after + consecutive) << 16;
 }

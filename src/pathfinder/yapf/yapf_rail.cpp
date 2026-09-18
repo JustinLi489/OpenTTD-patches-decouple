@@ -1376,7 +1376,39 @@ bool YapfTrainCheckReverse(const Train *v)
 
 	/* get trackdirs of both ends */
 	Trackdir td = moving_front->GetVehicleTrackdir();
-	Trackdir td_rev = ReverseTrackdir(moving_back->GetVehicleTrackdir());
+	Trackdir td_back = moving_back->GetVehicleTrackdir();
+
+	/* R3R (KI-107): GetVehicleTrackdir() can legitimately return INVALID_TRACKDIR
+	 * without asserting internally in two cases: (a) the vehicle is flagged
+	 * crashed, and (b) it sits in a tunnel/bridge (track == TRACK_BIT_WORMHOLE)
+	 * whose across-tunnel/bridge track bits cannot be resolved (pre-existing
+	 * upstream guard) or whose track does not match the bridge exit direction
+	 * (TrackExitdirToTrackdir returns INVALID_TRACKDIR). Every other "no track
+	 * bits" case used to assert inside TrackDirectionToTrackdir(), so it is not
+	 * what the crash report shows. CheckReverseTrain() only guards the FRONT end
+	 * (moving_front->track != TRACK_BIT_NONE) and the original code fed
+	 * moving_back->GetVehicleTrackdir() straight into ReverseTrackdir(), which
+	 * asserts on INVALID_TRACKDIR (track_func.h:249) and killed the game right
+	 * after Couple(). Never suggest reversing unless both ends have a usable
+	 * trackdir, and log the state so the true source can be pinned down. */
+	if (unlikely(td == INVALID_TRACKDIR || td_back == INVALID_TRACKDIR ||
+			moving_front->track == TRACK_BIT_NONE || moving_back->track == TRACK_BIT_NONE)) {
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "CRT-NOTD veh=%d db=%d front(idx=%d tile=%d,%d trk=0x%X dir=%d crashed=%d td=%d) back(idx=%d tile=%d,%d trk=0x%X dir=%d crashed=%d td=%d)\n",
+					(int)v->index.base(), (int)v->vehicle_flags.Test(VehicleFlag::DrivingBackwards),
+					(int)moving_front->index.base(), (int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
+					(uint)moving_front->track, (int)moving_front->direction,
+					(int)moving_front->vehstatus.Test(VehState::Crashed), (int)td,
+					(int)moving_back->index.base(), (int)TileX(moving_back->tile), (int)TileY(moving_back->tile),
+					(uint)moving_back->track, (int)moving_back->direction,
+					(int)moving_back->vehstatus.Test(VehState::Crashed), (int)td_back);
+			fclose(dbg);
+		}
+		return false;
+	}
+
+	Trackdir td_rev = ReverseTrackdir(td_back);
 
 	/* tiles where front and back are */
 	TileIndex tile = moving_front->tile;
@@ -1478,7 +1510,12 @@ FindDepotData YapfTrainFindNearestDepot(const Train *v, int max_penalty)
 
 	PBSTileInfo origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::OkayUnused);
 	TileIndex last_tile = moving_back->tile;
-	Trackdir td_rev = ReverseTrackdir(moving_back->GetVehicleTrackdir());
+	/* R3R (KI-107): never feed an invalid trackdir into ReverseTrackdir()
+	 * (assertion at track_func.h:249); see YapfTrainCheckReverse(). A chain end
+	 * without trackdir cannot start a two-way depot search. */
+	const Trackdir td_back = moving_back->GetVehicleTrackdir();
+	if (unlikely(td_back == INVALID_TRACKDIR)) return FindDepotData();
+	Trackdir td_rev = ReverseTrackdir(td_back);
 
 	return _settings_game.pf.forbid_90_deg
 		? CYapfAnyDepotRailNo90::stFindNearestDepotTwoWay(v, origin.tile, origin.trackdir, last_tile, td_rev, max_penalty, YAPF_INFINITE_PENALTY)
