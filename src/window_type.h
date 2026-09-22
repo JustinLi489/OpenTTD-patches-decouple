@@ -856,6 +856,12 @@ enum class WindowClass : uint16_t {
 	 */
 	CoupleGroup,
 
+	/**
+	 * R3R station yard (站场) management window; %Window numbers:
+	 *   - StationID = #StationYardWidgets
+	 */
+	StationYard,
+
 	End,              ///< End sentinel.
 	Invalid = 0xFFFF, ///< Invalid window.
 };

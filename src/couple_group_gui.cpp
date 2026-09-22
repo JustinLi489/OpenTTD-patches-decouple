@@ -260,6 +260,15 @@ public:
 		return this->segments[this->selected_segment];
 	}
 
+	/**
+	 * R3R (KI-90): the company whose groups this window lists.
+	 *
+	 * Needed by ShowCoupleGroupWindow(): the window is a singleton, so it has to
+	 * be able to tell whether an already open window is already showing the
+	 * requested company or has to be re-targeted.
+	 */
+	Owner GetCompany() const { return this->company; }
+
 	/** Confirmation callback for deleting the selected couple group. */
 	static void DeleteCoupleGroupCallback(Window *w, bool confirmed);
 
@@ -385,16 +394,26 @@ public:
 
 	void OnPaint() override
 	{
-		const bool can_manage = this->IsSelectedGroupManageable();
+		/* R3R (KI-90): this window can be opened for a company which is not the one
+		 * currently playing -- the depot window passes its own owner through, and a
+		 * shared depot hands over the owner of the depot tile. Every command
+		 * authorises against _current_company, so a control which looks enabled in
+		 * another company's window fails silently when clicked (exactly the report
+		 * behind this issue: "the buttons should be grey"). Editing therefore
+		 * follows the local company only, while the lists stay readable so another
+		 * company's groups can still be inspected. */
+		const bool can_edit = (this->company == _local_company);
+		const bool can_manage = can_edit && this->IsSelectedGroupManageable();
 		/* R3R (D6-③): assigning and removing our own segments only needs the
 		 * weaker membership right, so a group which another company shared with
 		 * us can be used without giving us power over the group itself. */
-		const bool can_join = this->IsSelectedGroupJoinable();
+		const bool can_join = can_edit && this->IsSelectedGroupJoinable();
 		/* R3R (KI-55): "new group" needs a usable company. this->company holds the
-		 * company this window was opened for (with the local company as fallback),
-		 * while this->owner is re-applied in OnInit(); accept either so the button
-		 * can never stay grey just because of how the window was opened. */
-		const bool can_create = Company::IsValidID(this->company) || Company::IsValidID(this->owner);
+		 * company this window was opened for (with the local company as fallback,
+		 * see the constructor), and KI-90 additionally restricts it to the local
+		 * company: creating a group while looking at somebody else's window would
+		 * file it under our own name and it would not show up in the list. */
+		const bool can_create = can_edit && Company::IsValidID(this->company);
 		this->SetWidgetDisabledState(WID_CG_NEW, !can_create);
 		this->SetWidgetDisabledState(WID_CG_RENAME, !can_manage);
 		this->SetWidgetDisabledState(WID_CG_DELETE, !can_manage);
@@ -615,6 +634,18 @@ void ShowCoupleGroupWindow(Owner company)
 			(unsigned)company.base(), (int)Company::IsValidID(company),
 			(unsigned)_local_company.base());
 
-	if (BringWindowToFrontById(WindowClass::CoupleGroup, 0) != nullptr) return;
+	/* R3R (KI-90): the window is a singleton (id 0), but it is *not*
+	 * interchangeable between companies -- it only ever lists the groups of one
+	 * company. Simply bringing an already open window to the front would show
+	 * company A's groups while the player asked for company B's, so an existing
+	 * window is re-targeted instead. Note that a depot tile may be owned by
+	 * something which is not a company; such a request is normalised to the local
+	 * company here, exactly like CoupleGroupWindow's constructor does. */
+	if (!Company::IsValidID(company)) company = _local_company;
+	Window *existing = BringWindowToFrontById(WindowClass::CoupleGroup, 0);
+	if (existing != nullptr) {
+		if (static_cast<CoupleGroupWindow *>(existing)->GetCompany() == company) return;
+		CloseWindowById(WindowClass::CoupleGroup, 0);
+	}
 	new CoupleGroupWindow(_couple_group_desc, company);
 }

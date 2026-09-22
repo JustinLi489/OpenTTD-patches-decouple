@@ -130,6 +130,12 @@ protected:
 	StationID dest_station_id;
 	bool any_depot;
 
+	/* R3R: station yard (站场). 只在 SetDestination() 那一刻算一次；之后每节点
+	 * 只做一次二分查找。绝不每 tick 遍历站台。 */
+	uint16_t dest_yard_sel;                   ///< R3R: 订单的目的场（0=整站）
+	bool dest_yard_active;                    ///< R3R: 是否启用场地过滤
+	std::vector<TileIndex> dest_yard_tiles;   ///< R3R: 允许停靠的 tile（升序、无重复）
+
 	/** @copydoc CYapfBaseT::Yapf */
 	Tpf &Yapf()
 	{
@@ -140,6 +146,9 @@ public:
 	void SetDestination(const Train *v)
 	{
 		this->any_depot = false;
+		this->dest_yard_sel = Station::R3R_YARD_NONE;
+		this->dest_yard_active = false;
+		this->dest_yard_tiles.clear();
 		switch (v->current_order.GetType()) {
 			case OT_GOTO_WAYPOINT:
 				if (!Waypoint::Get(v->current_order.GetDestination().ToStationID())->IsSingleTile()) {
@@ -170,6 +179,21 @@ public:
 				this->dest_trackdirs = GetTileTrackdirBits(this->dest_tile, TRANSPORT_RAIL, 0);
 				break;
 		}
+
+		/* R3R: station yard (站场) —— 整个寻路只在这里遍历一次站点数据。
+		 * 场为空 / 车站没有任何场 / 场里没有有效 tile ⇒ 完全按原生整站处理。 */
+		if (v->current_order.IsType(OT_GOTO_STATION) && this->dest_station_id != StationID::Invalid()) {
+			const uint16_t yard = v->current_order.GetR3RYard();
+			if (yard != Station::R3R_YARD_NONE) {
+				const Station *st = Station::GetIfValid(this->dest_station_id);
+				if (st != nullptr && st->R3RHasAnyYard()) {
+					R3RCollectYardDestinationTiles(st, yard, this->dest_yard_tiles);
+					this->dest_yard_sel = yard;
+					this->dest_yard_active = !this->dest_yard_tiles.empty();
+				}
+			}
+		}
+
 		this->CYapfDestinationRailBase::SetDestination(v);
 	}
 
@@ -183,9 +207,18 @@ public:
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
 	{
 		if (this->dest_station_id != StationID::Invalid()) {
-			return HasStationTileRail(tile)
-				&& (GetStationIndex(tile) == this->dest_station_id)
-				&& (GetRailStationTrack(tile) == TrackdirToTrack(td));
+			if (!HasStationTileRail(tile)
+					|| (GetStationIndex(tile) != this->dest_station_id)
+					|| (GetRailStationTrack(tile) != TrackdirToTrack(td))) {
+				return false;
+			}
+			/* R3R: 场地过滤。dest_yard_tiles 恒为升序，故此处是 O(log n) 二分。
+			 * 注意：平台是否空闲/被预留不参与到达判定（与原版一致），列车照常
+			 * 进站排队；场地只缩小「允许停靠的 tile 集合」。 */
+			if (this->dest_yard_active && !std::binary_search(this->dest_yard_tiles.begin(), this->dest_yard_tiles.end(), tile)) {
+				return false;
+			}
+			return true;
 		}
 
 		if (this->any_depot) {
@@ -330,6 +363,12 @@ public:
 		/* Only platform or depot tiles qualify. */
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) return false;
 
+		/* R3R (KI-165): the GOTO_COUPLE order's own destination is enforced one
+		 * level up, in R3RCoupleAllowed() (couple_group.cpp) -- called at the end
+		 * of this function. Keeping it there means the destination set of THIS
+		 * pathfinder, the back-walk safety test in yapf_rail.cpp and the arrival
+		 * gate in train_cmd.cpp all judge candidates by the same rule. */
+
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
 		if (IsRailStationTile(tile)) {
@@ -382,34 +421,7 @@ public:
 				}
 			}
 		}
-		if (t == nullptr && IsRailStationTile(tile)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				const TileIndexDiff delta = TileOffsByAxis(GetRailStationAxis(tile));
-				TileIndex st0 = tile;
-				while (IsCompatibleTrainStationTile(st0, tile)) st0 -= delta;
-				for (TileIndex st = st0 + delta; IsCompatibleTrainStationTile(st, tile); st += delta) {
-					for (Train *tr : VehiclesOnTile<VehicleType::Train>(st)) {
-						fprintf(dbg, "PFD-SCAN tile=%d,%d veh=%d front=%d co=%d ord=%d\n",
-							(int)TileX(st), (int)TileY(st), (int)tr->index.base(),
-							(int)tr->IsFrontEngine(), (int)R3RIsCarOnlyFormation(tr->First()),
-							(int)tr->current_order.GetType());
-					}
-				}
-				fclose(dbg);
-			}
-		}
-		if (t == nullptr) {
-			if (IsRailStationTile(tile)) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFD tile=%d,%d hasResButNoTrain\n",
-						(int)TileX(tile), (int)TileY(tile));
-					fclose(dbg);
-				}
-			}
-			return false;
-		}
+		if (t == nullptr) return false;
 		t = t->First();
 		{
 			FILE *dbg = R3RFopenDbg("a");

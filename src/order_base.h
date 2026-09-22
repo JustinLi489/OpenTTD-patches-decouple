@@ -563,79 +563,44 @@ public:
 	inline void SetStopLocation(OrderStopLocation stop_location) { SB(this->type, 4, 2, to_underlying(stop_location)); }
 
 	/**
-	 * R3R: Get whether the consist must reverse at this station order.
-	 * When the consist arrives at this station it is turned around before
-	 * departing, so it leaves the platform facing the other way. This lets
-	 * a locomotive approach a coupling point (OT_GOTO_COUPLE) nose-first
-	 * instead of backing up to couple.
-	 * Stored in bit 0 of xdata2 (which is only used by OT_CONDITIONAL
-	 * orders for their via-station, so it is free for station orders).
+	 * R3R: Get the destination yard (站场) of this station order.
+	 * 0 = whole station (no yard), 1..n = index of the yard in the destination
+	 * station's yard list (see Station::R3RYardTiles()).
+	 *
+	 * The yard ID is stored in the high 16 bits of xdata2. Those bits are free
+	 * for OT_GOTO_STATION orders (only OT_CONDITIONAL orders use the low bits
+	 * for the dispatch schedule / condition station ID and, historically, a
+	 * write-only flag in the high bits). Low bit 0 historically held the R3R
+	 * reverse-at-station flag, which has been removed; it is never read anymore.
+	 *
+	 * Savegames written before the N-yard refactor stored the yard in bits 1..2
+	 * of the low half (0/1/2/3 = whole/A/B/shared); those values are read back
+	 * here as a fallback so old saves keep working.
+	 *
 	 * @pre IsType(OT_GOTO_STATION).
 	 */
-	inline bool HasReverseAtStation() const
+	inline uint16_t GetR3RYard() const
 	{
-		return (this->GetXData2Low() & 1) != 0;
+		const uint16_t cur = static_cast<uint16_t>(this->GetXData2High());
+		if (cur != 0) return cur; // 0 == Station::R3R_YARD_NONE (no yard)
+		/* Legacy (SYRD v1) encoding: bits 1..2 of the low half. */
+		return static_cast<uint16_t>(GB(this->GetXData2Low(), 1, 2));
 	}
 
 	/**
-	 * R3R: Set whether the consist must reverse at this station order.
+	 * R3R: Set the destination yard (站场) of this station order.
+	 * @param yard 0 = whole station, 1..n = index of the yard in the
+	 *             destination station's yard list.
 	 * @pre IsType(OT_GOTO_STATION).
 	 */
-	inline void SetReverseAtStation(bool value)
+	inline void SetR3RYard(uint16_t yard)
 	{
-		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
+		/* Clear the legacy (SYRD v1) 2-bit field so GetR3RYard() does not fall
+		 * back to it once a yard has been set through the new encoding. */
+		SB(this->GetXData2Ref(), 1, 2, 0);
+		this->SetXData2High(yard);
 	}
 
-	/**
-	 * R3R: Get whether the consist must turn around in the depot of this
-	 * depot order. When the whole consist has entered the depot it is turned,
-	 * so it drives out facing the opposite way; a drive-through depot can
-	 * thus be used as a turning point.
-	 * Stored in bit 0 of xdata2, same slot as HasReverseAtStation() (the two
-	 * can never be set at once since the order types differ).
-	 * @pre IsType(OT_GOTO_DEPOT).
-	 */
-	inline bool HasReverseAtDepot() const
-	{
-		return (this->GetXData2Low() & 1) != 0;
-	}
-
-	/**
-	 * R3R: Set whether the consist must turn around in the depot of this
-	 * depot order.
-	 * @pre IsType(OT_GOTO_DEPOT).
-	 */
-	inline void SetReverseAtDepot(bool value)
-	{
-		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
-	}
-
-	/**
-	 * R3R: Get whether the consist must reverse at this waypoint order.
-	 * When the consist reaches the waypoint it is stopped and turned around
-	 * in place (the waypoint tile is treated as a stopping point for this
-	 * one order), so it drives back out the way it came; a waypoint can then
-	 * be used as a turning point without needing the consist to fully pass it.
-	 * This is the "stop-on-waypoint" counterpart to the stock JGR waypoint
-	 * reverse flag, which drives the whole consist past the waypoint first.
-	 * Stored in bit 0 of xdata2, same slot as HasReverseAtStation() and
-	 * HasReverseAtDepot() (they can never be set at once since the order
-	 * types differ).
-	 * @pre IsType(OT_GOTO_WAYPOINT).
-	 */
-	inline bool HasReverseAtWaypoint() const
-	{
-		return (this->GetXData2Low() & 1) != 0;
-	}
-
-	/**
-	 * R3R: Set whether the consist must reverse at this waypoint order.
-	 * @pre IsType(OT_GOTO_WAYPOINT).
-	 */
-	inline void SetReverseAtWaypoint(bool value)
-	{
-		this->SetXData2Low((uint16_t)((this->GetXData2Low() & ~(uint16_t)1u) | (value ? 1u : 0u)));
-	}
 	/**
 	 * Set the cause to go to the depot.
 	 * @param depot_order_type The reason to go to the depot.

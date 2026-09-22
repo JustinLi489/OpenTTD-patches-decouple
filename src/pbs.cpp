@@ -261,16 +261,6 @@ void UnreserveRailTrack(TileIndex tile, Track t)
 
 		case TileType::Station:
 			if (HasStationRail(tile)) {
-				/* DEBUG (R3R): log EVERY unreserve of a station platform tile, to
-				 * find who clears the WAIT_COUPLE consist's reservation. */
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "UNRESERVE-STATION tile=%d,%d\n",
-								(int)TileX(tile), (int)TileY(tile));
-						fclose(dbg);
-					}
-				}
 				SetRailStationReservation(tile, false);
 				MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 			}

@@ -1037,6 +1037,35 @@ uint GetOrderDistance(const Order *prev, const Order *cur, const Vehicle *v, int
  * Add an order to the orderlist of a vehicle.
  * @return the cost of this operation or an error
  */
+/**
+ * R3R (KI-132): is this vehicle's order list also held by a vehicle of another
+ * company inside the same physical chain?
+ *
+ * After a cross-company R3R coupling the merged head borrows the schedule of a
+ * foreign segment (see Couple() in train_cmd.cpp): both vehicles then point at
+ * the same OrderList while belonging to different companies. OrderList carries
+ * no owner of its own, so the list is attributed through the vehicles that hold
+ * it -- walk the physical chain of @a v and look for a differently owned vehicle
+ * carrying the very same OrderList pointer.
+ *
+ * The native permission checks only look at the company of the vehicle being
+ * commanded, so without this test the owner of the chain head could edit (and
+ * later execute) another company's schedule just by having coupled onto it.
+ *
+ * @param v Vehicle to test.
+ * @return true when the order list is shared with another company.
+ */
+static bool R3ROrdersSharedWithOtherCompany(const Vehicle *v)
+{
+	const OrderList *const ol = v->orders;
+	if (ol == nullptr) return false;
+
+	for (const Vehicle *w = v->First(); w != nullptr; w = w->Next()) {
+		if (w != v && w->orders == ol && w->owner != v->owner) return true;
+	}
+	return false;
+}
+
 CommandCost CmdInsertOrder(DoCommandFlags flags, const InsertOrderCmdData &data)
 {
 	Order new_order{};
@@ -1060,6 +1089,12 @@ CommandCost CmdDuplicateOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrd
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
+
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	if (sel_ord >= v->GetNumOrders()) return CMD_ERROR;
 
@@ -1093,6 +1128,12 @@ CommandCost CmdSetRouteOverlayColour(DoCommandFlags flags, VehicleID veh_id, Col
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
+
 	if (flags.Test(DoCommandFlag::Execute)) {
 		v->orders->SetRouteOverlayColour(colour);
 	}
@@ -1105,6 +1146,12 @@ static CommandCost PreInsertOrderCheck(Vehicle *v, const Order &new_order, CmdIn
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
+
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	/* Check if the inserted order is to the correct destination (owner, type),
 	 * and has the correct flags if any */
@@ -1662,6 +1709,12 @@ CommandCost CmdDeleteOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
+
 	/* If we did not select an order, we maybe want to de-clone the orders */
 	if (sel_ord >= v->GetNumOrders()) return DecloneOrder(v, flags);
 
@@ -1780,6 +1833,12 @@ CommandCost CmdSkipToOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
+
 	if (flags.Test(DoCommandFlag::Execute)) {
 		if (v->current_order.IsAnyLoadingType()) v->LeaveStation();
 		if (v->current_order.IsType(OT_WAITING)) v->HandleWaiting(true);
@@ -1832,6 +1891,12 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
+
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	const VehicleOrderID order_count = v->GetNumOrders();
 
@@ -1976,6 +2041,12 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
+
 	switch (op) {
 		case ReverseOrderOperation::Reverse: {
 			VehicleOrderID order_count = v->GetNumOrders();
@@ -2076,6 +2147,12 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
+
 	/* Is it a valid order? */
 	if (sel_ord >= v->GetNumOrders()) return CMD_ERROR;
 
@@ -2086,15 +2163,15 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 	} else {
 		switch (order->GetType()) {
 			case OT_GOTO_STATION:
-				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_R3R_YARD) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_DEPOT:
-				if (mof != MOF_NON_STOP && mof != MOF_DEPOT_ACTION && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_DEPOT_ACTION) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_WAYPOINT:
-				if (mof != MOF_NON_STOP && mof != MOF_WAYPOINT_FLAGS && mof != MOF_RV_TRAVEL_DIR && mof != MOF_REVERSE_AT_STATION) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_WAYPOINT_FLAGS && mof != MOF_RV_TRAVEL_DIR) return CMD_ERROR;
 				break;
 
 			case OT_CONDITIONAL:
@@ -2399,11 +2476,6 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (data != (data & OrderWaypointFlags(OrderWaypointFlag::Reverse).base())) return CMD_ERROR;
 			break;
 
-		case MOF_REVERSE_AT_STATION:
-			if (v->type != VehicleType::Train) return CMD_ERROR;
-			if (data > 1) return CMD_ERROR;
-			break;
-
 		case MOF_SLOT:
 			if (data != INVALID_TRACE_RESTRICT_SLOT_ID) {
 				const TraceRestrictSlot *slot = TraceRestrictSlot::GetIfValid(data);
@@ -2462,6 +2534,16 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (static_cast<DecoupleBoundaryMode>(GB(data, 8, 8)) >= DecoupleBoundaryMode::End) return CMD_ERROR;
 			if (GB(data, 0, 8) > 63) return CMD_ERROR;
 			break;
+
+		case MOF_R3R_YARD: {
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (!order->IsType(OT_GOTO_STATION)) return CMD_ERROR;
+			if (data > Station::R3R_MAX_YARDS) return CMD_ERROR;
+			/* The yard must actually exist at the destination station. */
+			const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+			if (st != nullptr && data > st->R3RNumYards()) return CMD_ERROR;
+			break;
+		}
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -2483,16 +2565,6 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 
 			case MOF_STOP_LOCATION:
 				order->SetStopLocation(static_cast<OrderStopLocation>(data));
-				break;
-
-			case MOF_REVERSE_AT_STATION:
-				if (order->GetType() == OT_GOTO_DEPOT) {
-					order->SetReverseAtDepot(data != 0);
-				} else if (order->GetType() == OT_GOTO_WAYPOINT) {
-					order->SetReverseAtWaypoint(data != 0);
-				} else {
-					order->SetReverseAtStation(data != 0);
-				}
 				break;
 
 			case MOF_UNLOAD:
@@ -2565,6 +2637,10 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				order->SetDecoupleBoundary(static_cast<DecoupleBoundaryMode>(GB(data, 8, 8)), GB(data, 0, 8));
 				break;
 			}
+
+			case MOF_R3R_YARD:
+				order->SetR3RYard(data);
+				break;
 
 			case MOF_COND_VARIABLE: {
 				/* Check whether old conditional variable had a cargo as value */
@@ -2858,6 +2934,12 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (mof == MOF_RV_TRAVEL_DIR && sel_ord == u->cur_real_order_index &&
 					(u->current_order.IsType(OT_GOTO_STATION) || u->current_order.IsType(OT_GOTO_WAYPOINT))) {
 				u->current_order.SetRoadVehTravelDirection((DiagDirection)data);
+			}
+			/* R3R: keep the active (copied) station order in sync so an en-route
+			 * train uses the new destination yard on its next pathfind. */
+			if (mof == MOF_R3R_YARD && sel_ord == u->cur_real_order_index &&
+					u->current_order.IsType(OT_GOTO_STATION)) {
+				u->current_order.SetR3RYard(data);
 			}
 
 			/* Unbunching data is no longer valid. */
@@ -3273,6 +3355,12 @@ CommandCost CmdOrderRefit(DoCommandFlags flags, VehicleID veh, VehicleOrderID or
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
+
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	Order *order = v->GetOrder(order_number);
 	if (order == nullptr) return CMD_ERROR;
@@ -4243,7 +4331,7 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 					v->current_order.SetDestination(closest_depot.destination);
 
 					/* If there is no depot in front, reverse automatically (trains only) */
-					if (v->type == VehicleType::Train && closest_depot.reverse) Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, v->index, false, false);
+					if (v->type == VehicleType::Train && closest_depot.reverse) Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, v->index, false);
 
 					if (v->type == VehicleType::Aircraft) {
 						Aircraft *a = Aircraft::From(v);
@@ -4454,13 +4542,8 @@ bool ProcessOrders(Vehicle *v)
 	v->vehicle_flags.Reset(VehicleFlag::ConditionalOrderWait);
 
 	/* Check if we've reached a 'via' destination. */
-	/* R3R: a waypoint order with the "reverse on arrival" flag is a stopping
-	 * order, not a drive-through 'via' destination. It must stay the current
-	 * order until the consist has actually stopped on the waypoint, so that
-	 * TrainEnterStation() can spot the flag and turn the consist around. */
 	if (((v->current_order.IsType(OT_GOTO_STATION) && (v->current_order.GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) ||
-			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train) &&
-					!v->current_order.HasReverseAtWaypoint())) &&
+			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train))) &&
 			IsTileType(moving_front->tile, TileType::Station) &&
 			v->current_order.GetDestination() == GetStationIndex(moving_front->tile)) {
 		v->DeleteUnreachedImplicitOrders();
@@ -4546,13 +4629,7 @@ bool Order::UseOccupancyValueForAverage() const
  */
 bool Order::ShouldStopAtStation(StationID last_station_visited, StationID station, bool waypoint) const
 {
-	/* R3R: a waypoint order with the reverse-at-waypoint flag set is treated as a
-	 * stopping point too, so the look-ahead brakes the consist to a stop on the
-	 * waypoint tile and it can be turned around in place there. The JGR
-	 * "drive-through reverse" waypoint flag takes precedence: while set, the
-	 * consist keeps driving through the waypoint and reverses after it. */
-	if (waypoint) return this->IsType(OT_GOTO_WAYPOINT) && this->dest == station &&
-			(this->IsWaitTimetabled() || (this->HasReverseAtWaypoint() && !this->GetWaypointFlags().Test(OrderWaypointFlag::Reverse)));
+	if (waypoint) return this->IsType(OT_GOTO_WAYPOINT) && this->IsWaitTimetabled() && this->dest == station;
 	if (this->IsType(OT_LOADING_ADVANCE) && this->dest == station) return true;
 	bool is_dest_station = this->IsType(OT_GOTO_STATION) && this->dest == station;
 
@@ -4722,6 +4799,12 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
+
+	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
+	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
+	 * check the owner of the chain head could modify (and later execute) the
+	 * schedule that belongs to the other company's segment. */
+	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		InvalidateWindowData(WindowClass::VehicleOrderImportErrors, v->index);

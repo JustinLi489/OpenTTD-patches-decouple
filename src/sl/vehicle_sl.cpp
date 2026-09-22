@@ -545,38 +545,6 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 		}
 	}
 
-	/* R3R (TEMPORARY DIAGNOSTIC): unconditional load census. Written on every call
-	 * so that "savegame not loaded" can be told apart from "loaded but no bad
-	 * vehicle". Reports every train with an unresolved visual effect wherever it
-	 * sits in the chain (not only at chain heads), plus its chain head identity. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "=== LOADCENSUS-ENTER part_of_load=%d ===\n", (int)part_of_load);
-			unsigned int ntot = 0, nbad = 0;
-			for (const Vehicle *w : Vehicle::Iterate()) {
-				if (w->type != VehicleType::Train) continue;
-				ntot++;
-				const bool bad = !HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
-						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT;
-				if (!bad) continue;
-				nbad++;
-				const Train *wt = Train::From(w);
-				const Vehicle *hd = w->First();
-				fprintf(dbg, "LOADCENSUS-BAD idx=%d cv=%02X st=%02X et=%u prev=%d next=%d first=%d FE=%d FW=%d FWG=%d ENG=%d VIRT=%d ART=%d\n",
-						(int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype,
-						(unsigned int)w->engine_type.base(),
-						(int)(w->Previous() != nullptr ? w->Previous()->index.base() : -1),
-						(int)(w->Next() != nullptr ? w->Next()->index.base() : -1),
-						(int)(hd != nullptr ? hd->index.base() : -1),
-						(int)wt->IsFrontEngine(), (int)wt->IsFreeWagon(), (int)wt->IsFrontWagon(),
-						(int)wt->IsEngine(), (int)wt->IsVirtual(), (int)wt->IsArticGroupMember());
-			}
-			fprintf(dbg, "=== LOADCENSUS-LEAVE total=%u bad=%u ===\n", ntot, nbad);
-			fclose(dbg);
-		}
-	}
-
 	if (part_of_load && SlXvIsFeaturePresent(XSLFI_TEMPLATE_REPLACEMENT) && (_network_server || !_networking)) {
 		for (Train *t : Train::IterateFrontOnly()) {
 			si_v = t;
@@ -674,23 +642,6 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 		v->UpdatePosition();
 		if (v->type != VehicleType::Ship || v->Previous() == nullptr) v->UpdateViewport(false);
 		v->cargo.AssertCountConsistency();
-	}
-
-	/* R3R (TEMPORARY DIAGNOSTIC): second sampling point, after the virtual-vehicle
-	 * cleanup above, to catch chains (re)linked after the ConsistChanged() calls at
-	 * the top of this function. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			unsigned int nbad = 0;
-			for (const Vehicle *w : Vehicle::Iterate()) {
-				if (w->type != VehicleType::Train) continue;
-				if (!HasBit(w->vcache.cached_vis_effect, VE_ADVANCED_EFFECT) &&
-						GB(w->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT) == VE_TYPE_DEFAULT) nbad++;
-			}
-			fprintf(dbg, "=== LOADCENSUS-PHASE2END bad=%u ===\n", nbad);
-			fclose(dbg);
-		}
 	}
 
 	/* R3R (TEMPORARY DIAGNOSTIC): full train/station dump used to analyse
@@ -1362,6 +1313,9 @@ NamedSaveLoadTable GetVehicleDescription(VehicleType vt)
 		NSL("signal_speed_restriction", SLE_CONDVAR_X(Train, signal_speed_restriction,  SLE_UINT16,                  SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TRAIN_SPEED_ADAPTATION))),
 		NSL("critical_breakdown_count", SLE_CONDVAR_X(Train, critical_breakdown_count,  SLE_UINT8,                   SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_IMPROVED_BREAKDOWNS, 2))),
 
+		/* R3R KI-118 fix A: depot parking flag of the in-depot GOTO_COUPLE exemption. */
+		NSL("r3r_parked", SLE_CONDVAR(Train, r3r_parked, SLE_BOOL, SLV_R3R_PARKED, SL_MAX_VERSION)),
+
 		NSLT_STRUCT<TrainLookaheadStateStructHandler>("lookahead"),
 	};
 
@@ -1557,32 +1511,6 @@ static void Save_VEHS()
 void Load_VEHS()
 {
 	_cargo_count = 0;
-	int r3r_veh_count = 0;
-
-	{
-		FILE *r3rf = R3RFopenDbg("a");
-		if (r3rf != nullptr) {
-			fprintf(r3rf, "VEHS_ENTER is_table=%d hdr_len=%u pos=%u\n", SlIsTableChunk() ? 1 : 0, (unsigned)SlGetFieldLength(), (unsigned)SlGetBytesRead());
-			fclose(r3rf);
-		}
-#if R3R_PROBES
-		/* R3R (release audit 2026-09-19): the raw-byte dump writes a 16 KB
-		 * R3R_vehsraw.bin into the game directory. It is a one-off forensic aid
-		 * for the savegame-reference crash, so it must not exist in a release.
-		 * (The R3R_slref.log line above it is routed through R3RFopenDbg.) */
-		ReadBuffer *r3rrb = ReadBuffer::GetCurrent();
-		if (r3rrb != nullptr) {
-			r3rrb->CheckBytes(1);
-			size_t r3ravail = (size_t)(r3rrb->bufe - r3rrb->bufp);
-			if (r3ravail > 16384) r3ravail = 16384;
-			FILE *r3rf2 = fopen("R3R_vehsraw.bin", "wb");
-			if (r3rf2 != nullptr) {
-				fwrite(r3rrb->bufp, 1, r3ravail, r3rf2);
-				fclose(r3rf2);
-			}
-		}
-#endif
-	}
 
 	_cpp_packets.clear();
 	_veh_cpp_packets.clear();
@@ -1608,7 +1536,6 @@ void Load_VEHS()
 
 	int idx;
 	while ((idx = SlIterateArray()) != -1) {
-		r3r_veh_count++;
 		_old_order_item_ref = 0;
 
 		Vehicle *v;
@@ -1679,13 +1606,6 @@ void Load_VEHS()
 		}
 	}
 
-	{
-		FILE *r3rf = R3RFopenDbg("a");
-		if (r3rf != nullptr) {
-			fprintf(r3rf, "VEHS_DONE count=%d pool=%u\n", r3r_veh_count, (unsigned)Vehicle::GetPoolSize());
-			fclose(r3rf);
-		}
-	}
 }
 
 static void Ptrs_VEHS()

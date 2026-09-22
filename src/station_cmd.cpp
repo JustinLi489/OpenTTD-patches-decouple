@@ -2019,6 +2019,9 @@ CommandCost RemoveFromRailBaseStation(TileArea ta, std::vector<T *> &affected_st
 		MakeRailStationAreaSmaller(st);
 		UpdateStationSignCoord(st);
 
+		/* R3R: a removed rail tile must not linger in any station yard. */
+		if constexpr (std::is_same_v<T, Station>) st->R3RPruneYardTiles();
+
 		/* if we deleted the whole station, delete the train facility. */
 		if (st->train_station.tile == INVALID_TILE) {
 			st->facilities.Reset(StationFacility::Train);
@@ -2031,6 +2034,277 @@ CommandCost RemoveFromRailBaseStation(TileArea ta, std::vector<T *> &affected_st
 
 	total_cost.AddCost(quantity * removal_cost);
 	return total_cost;
+}
+
+/*
+ * R3R: station yard (站场).
+ *
+ * 这些函数只在两个时机被调用：
+ *  1) 玩家在车站 UI 里编辑场（点击平台）；
+ *  2) 列车真正选平台那一刻（寻路的 SetDestination 一次性调用）。
+ * 它们绝不会在每 tick 的列车逻辑里被反复调用，因此不会带来「大老远疯狂遍历站台」的开销。
+ */
+
+/** R3R: 该 tile 是否是所在铁路平台的「北端」(沿站台轴的第一节)。\a tile 必须是铁路车站 tile。 */
+static bool R3RIsPlatformNorthEnd(TileIndex tile)
+{
+	dbg_assert_tile(IsRailStationTile(tile), tile);
+	const DiagDirection north = GetRailStationAxis(tile) == Axis::X ? DiagDirection::NE : DiagDirection::NW;
+	return !IsCompatibleTrainStationTile(tile + TileOffsByDiagDir(north), tile);
+}
+
+void R3RCollectPlatformTiles(TileIndex tile, std::vector<TileIndex> &out)
+{
+	out.clear();
+	if (!IsRailStationTile(tile)) return;
+
+	const Axis axis = GetRailStationAxis(tile);
+	const DiagDirection north = axis == Axis::X ? DiagDirection::NE : DiagDirection::NW;
+	const DiagDirection south = axis == Axis::X ? DiagDirection::SW : DiagDirection::SE;
+
+	/* 先走到平台的北端 */
+	TileIndex start = tile;
+	while (true) {
+		const TileIndex prev = start + TileOffsByDiagDir(north);
+		if (!IsCompatibleTrainStationTile(prev, tile)) break;
+		start = prev;
+	}
+
+	/* 再从北端一路向南收集整条平台 */
+	for (TileIndex t = start; IsCompatibleTrainStationTile(t, tile); t += TileOffsByDiagDir(south)) {
+		out.push_back(t);
+	}
+}
+
+void R3REnumeratePlatforms(const Station *st, std::vector<TileIndex> &out)
+{
+	out.clear();
+	if (st == nullptr) return;
+	const TileArea &ta = st->train_station;
+	if (ta.tile == INVALID_TILE) return;
+
+	for (TileIndex t = ta.tile; t < ta.tile + ta.w * ta.h; t++) {
+		if (!st->TileBelongsToRailStation(t)) continue; // 跳过空洞 / 属于别的车站的 tile
+		if (!R3RIsPlatformNorthEnd(t)) continue;        // 每个平台只取北端一次
+		out.push_back(t);
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+const std::vector<TileIndex> &Station::R3RYardTiles(uint16_t yard) const
+{
+	static const std::vector<TileIndex> empty{};
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return empty;
+	return this->r3r_yards[yard - 1].tiles;
+}
+
+uint16_t Station::R3RAddYard()
+{
+	if (this->r3r_yards.size() >= R3R_MAX_YARDS) return R3R_YARD_NONE;
+	this->r3r_yards.emplace_back(); // shared_with 恒从 0（不回落）开始
+	return static_cast<uint16_t>(this->r3r_yards.size());
+}
+
+void Station::R3RClearYard(uint16_t yard)
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	this->r3r_yards[yard - 1].tiles.clear();
+}
+
+uint16_t Station::R3RYardSharedWith(uint16_t yard) const
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return R3R_YARD_NONE;
+	return this->r3r_yards[yard - 1].shared_with;
+}
+
+void Station::R3RSetYardSharedWith(uint16_t yard, uint16_t shared_with)
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	/* 回落目标必须是一个已存在的、且不是自己的场。 */
+	if (shared_with == yard || shared_with > this->R3RNumYards()) shared_with = R3R_YARD_NONE;
+	this->r3r_yards[yard - 1].shared_with = shared_with;
+}
+
+bool Station::R3RIsYardShared(uint16_t yard) const
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return false;
+	for (const R3RStationYard &y : this->r3r_yards) {
+		if (y.shared_with == yard) return true;
+	}
+	return false;
+}
+
+bool Station::R3RHasAnyYard() const
+{
+	for (const R3RStationYard &y : this->r3r_yards) {
+		if (!y.tiles.empty()) return true;
+	}
+	return false;
+}
+
+uint16_t Station::R3RGetYardOfTile(TileIndex tile) const
+{
+	for (size_t i = 0; i < this->r3r_yards.size(); i++) {
+		const std::vector<TileIndex> &vec = this->r3r_yards[i].tiles;
+		if (std::binary_search(vec.begin(), vec.end(), tile)) return static_cast<uint16_t>(i + 1);
+	}
+	return R3R_YARD_NONE;
+}
+
+void Station::R3RRemoveTileFromYards(TileIndex tile)
+{
+	for (R3RStationYard &y : this->r3r_yards) {
+		auto it = std::lower_bound(y.tiles.begin(), y.tiles.end(), tile);
+		if (it != y.tiles.end() && *it == tile) y.tiles.erase(it);
+	}
+}
+
+void Station::R3RSetTileYard(TileIndex tile, uint16_t yard)
+{
+	this->R3RRemoveTileFromYards(tile);
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+
+	std::vector<TileIndex> &vec = this->r3r_yards[yard - 1].tiles;
+	/* 保持有序 + 无重复，R3RGetYardOfTile() 依赖二分查找。 */
+	auto it = std::lower_bound(vec.begin(), vec.end(), tile);
+	if (it == vec.end() || *it != tile) vec.insert(it, tile);
+}
+
+void Station::R3RPruneYardTiles()
+{
+	for (R3RStationYard &y : this->r3r_yards) {
+		y.tiles.erase(std::remove_if(y.tiles.begin(), y.tiles.end(), [this](TileIndex t) {
+			return !this->TileBelongsToRailStation(t);
+		}), y.tiles.end());
+	}
+}
+
+void Station::R3RCollectYardTiles(uint16_t yard, std::vector<TileIndex> &out) const
+{
+	out.clear();
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	for (TileIndex t : this->r3r_yards[yard - 1].tiles) {
+		if (this->TileBelongsToRailStation(t)) out.push_back(t);
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+bool R3RStationYardIsFull(const Station *st, uint16_t yard)
+{
+	if (st == nullptr) return false;
+	const std::vector<TileIndex> &tiles = st->R3RYardTiles(yard);
+	if (tiles.empty()) return false;
+
+	bool has_platform = false;
+	for (TileIndex t : tiles) {
+		if (!st->TileBelongsToRailStation(t) || !R3RIsPlatformNorthEnd(t)) continue; // 每个平台只判一次
+		has_platform = true;
+
+		const DiagDirection south = GetRailStationAxis(t) == Axis::X ? DiagDirection::SW : DiagDirection::SE;
+		bool reserved = false;
+		for (TileIndex s = t; IsCompatibleTrainStationTile(s, t); s += TileOffsByDiagDir(south)) {
+			if (HasStationReservation(s)) { reserved = true; break; }
+		}
+		if (!reserved) return false; // 只要存在一个「空闲」平台，该场就未满
+	}
+	return has_platform;
+}
+
+void R3RCollectYardDestinationTiles(const Station *st, uint16_t yard, std::vector<TileIndex> &out)
+{
+	out.clear();
+	if (st == nullptr || yard == Station::R3R_YARD_NONE) return;
+
+	/* 只保留仍然有效的本车站铁路 tile（车站拆改后场列表可能短暂残留）。 */
+	st->R3RCollectYardTiles(yard, out);
+	if (out.empty()) return; // 该场没有任何有效 tile ⇒ 调用方按「整站」处理
+
+	/* 该场已满 ⇒ 并入**它自己的**「共享回落场」作为回落。多个场可以指定同一个
+	 * 共享场，于是「1/2 场共享一个 A 场」= 场1/场2 的 shared_with 都指向 A 场。 */
+	if (R3RStationYardIsFull(st, yard)) {
+		std::vector<TileIndex> shared;
+		st->R3RCollectYardTiles(st->R3RYardSharedWith(yard), shared);
+		out.insert(out.end(), shared.begin(), shared.end());
+		std::sort(out.begin(), out.end());
+		out.erase(std::unique(out.begin(), out.end()), out.end());
+	}
+}
+
+/**
+ * R3R: assign (or clear) the yard of a whole rail platform.
+ * @param flags operation to perform
+ * @param station_id station that owns the platform
+ * @param platform_tile any tile of the target platform (the UI passes the clicked tile)
+ * @param yard target yard ID (@see Station::R3R_YARD_NONE = remove it from every yard)
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RSetStationYard(DoCommandFlags flags, StationID station_id, TileIndex platform_tile, uint16_t yard)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+
+	/* 场 ID 必须已存在（0 = 不设场，任何场数下都合法）。 */
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (platform_tile >= Map::Size()) return CMD_ERROR;
+
+	std::vector<TileIndex> tiles;
+	R3RCollectPlatformTiles(platform_tile, tiles);
+	if (tiles.empty()) return CMD_ERROR;
+
+	/* 只允许操作本车站自己的铁路平台，拒绝跨站 / 非铁路 tile。 */
+	for (TileIndex t : tiles) {
+		if (!st->TileBelongsToRailStation(t)) return CMD_ERROR;
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		for (TileIndex t : tiles) st->R3RSetTileYard(t, yard);
+		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R: create a new yard, or set the shared fallback yard of an existing one.
+ * @param flags operation to perform
+ * @param station_id station to modify
+ * @param yard #Station::R3R_YARD_NONE to append a new yard, otherwise the existing yard to modify
+ * @param shared_with the yard \a yard falls back to when it is full
+ *        (#Station::R3R_YARD_NONE = no fallback; ignored when appending a new yard)
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RSetStationYardShared(DoCommandFlags flags, StationID station_id, uint16_t yard, uint16_t shared_with)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (yard == Station::R3R_YARD_NONE) {
+		/* Append a new (empty) yard. Yards are never removed, so existing yard IDs
+		 * stay stable and orders referencing them remain valid. */
+		if (st->R3RNumYards() >= Station::R3R_MAX_YARDS) return CMD_ERROR;
+		if (flags.Test(DoCommandFlag::Execute)) {
+			st->R3RAddYard();
+			InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+		}
+		return CommandCost();
+	}
+
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+	/* 回落目标要么是「无」，要么是一个已存在且不是自己的场。 */
+	if (shared_with != Station::R3R_YARD_NONE && (shared_with == yard || shared_with > st->R3RNumYards())) return CMD_ERROR;
+	if (flags.Test(DoCommandFlag::Execute)) {
+		st->R3RSetYardSharedWith(yard, shared_with);
+		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+	}
+	return CommandCost();
 }
 
 /**

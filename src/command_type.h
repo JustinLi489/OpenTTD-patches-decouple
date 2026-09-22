@@ -782,6 +782,10 @@ enum class Commands : uint8_t {
 	SetCoupleGroupAllowOthers,              ///< open/close a couple group for other companies (D6-①+D6-③: one switch: join + cross-company coupling)
 	RemoveCoupleGroup,                      ///< take a train segment out of one couple group
 
+	/* station_cmd.cpp (R3R station yards) */
+	SetR3RStationYard,                      ///< R3R: assign (or clear) the yard of a whole rail platform
+	SetR3RStationYardShared,                ///< R3R: create a new yard, or set/clear a yard's shared flag
+
 	End,                                    ///< Must ALWAYS be on the end of this list!! (period)
 };
 

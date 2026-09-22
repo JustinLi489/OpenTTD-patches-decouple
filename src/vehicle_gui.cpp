@@ -93,6 +93,51 @@ static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupAverageProfit
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupAverageOrderOccupancySorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupTimetableTypeSorter;
 
+/**
+ * R3R (KI-157): the "command control section" vehicle of a coupled chain.
+ *
+ * Player ruling 2026-09-22: the control section is the section with the lowest
+ * coupling ordinal -- i.e. the one the chain starts with -- and it is the
+ * section that carries the chain's dispatching orders. Section boundaries are
+ * the SegmentFront marks and the chain head always begins the first section,
+ * so the control section's head vehicle is simply the physical chain head.
+ *
+ * Restricted to primary train vehicles: only those stand for a whole chain in
+ * the vehicle list. Anything else (free wagons in depot lists, other vehicle
+ * types) is returned untouched.
+ */
+static const Vehicle *R3RControlSectionVehicle(const Vehicle *v)
+{
+	if (v->type != VehicleType::Train || !v->IsPrimaryVehicle()) return v;
+	return v->First();
+}
+
+/**
+ * R3R (KI-157): the vehicle of this chain that reaches its age limit first,
+ * i.e. the one with the smallest remaining lifetime (max_age - age).
+ *
+ * Player ruling 2026-09-22: a list row stands for the whole coupled chain, so
+ * its "age" must report the section that is about to exceed its limit rather
+ * than just the head vehicle. Ties keep the front-most vehicle so the shown
+ * number does not jump between vehicles of equal age.
+ */
+static const Vehicle *R3RFastestOverAgeVehicle(const Vehicle *v)
+{
+	if (v->type != VehicleType::Train) return v;
+	const Vehicle *best = nullptr;
+	for (const Vehicle *u = v; u != nullptr; u = u->Next()) {
+		/* Wagons have no life length (max_age stays 0), and R3R's fake engines
+		 * are ordinary wagons promoted to engines -- they keep that 0. Such a
+		 * vehicle never reaches an age limit, so it must not win this
+		 * "expires first" comparison, otherwise the whole row reads "0 year". */
+		if (u->max_age.base() == 0) continue;
+		if (best == nullptr || ClampTo<int32_t>(u->max_age - u->age) < ClampTo<int32_t>(best->max_age - best->age)) best = u;
+	}
+	/* No section of this chain has a life limit (a pure car-only formation):
+	 * keep showing the head, exactly what the list showed before. */
+	return (best != nullptr) ? best : v;
+}
+
 /** Wrapper to convert a VehicleIndividualSortFunction to a VehicleGroupSortFunction. @copydoc GUIList::Sorter */
 template <BaseVehicleListWindow::VehicleIndividualSortFunction func>
 static bool VehicleIndividualToGroupSorterWrapper(GUIVehicleGroup const &a, GUIVehicleGroup const &b)
@@ -1684,7 +1729,11 @@ static bool VehicleNameSorter(const Vehicle * const &a, const Vehicle * const &b
 /** Sort vehicles by their age. @copydoc GUIList::Sorter */
 static bool VehicleAgeSorter(const Vehicle * const &a, const Vehicle * const &b)
 {
-	auto r = a->age - b->age;
+	/* R3R (KI-157): a row stands for the whole chain, so sort by the same value
+	 * the row displays -- the age of the section that exceeds its limit first. */
+	const Vehicle *va = R3RFastestOverAgeVehicle(a);
+	const Vehicle *vb = R3RFastestOverAgeVehicle(b);
+	auto r = va->age - vb->age;
 	return (r != 0) ? r < 0 : VehicleNumberSorter(a, b);
 }
 
@@ -1772,7 +1821,10 @@ static bool VehicleLengthSorter(const Vehicle * const &a, const Vehicle * const 
 /** Sort vehicles by the time they can still live. @copydoc GUIList::Sorter */
 static bool VehicleTimeToLiveSorter(const Vehicle * const &a, const Vehicle * const &b)
 {
-	int r = ClampTo<int32_t>((a->max_age - a->age) - (b->max_age - b->age));
+	/* R3R (KI-157): same chain-wide口径 as the displayed value. */
+	const Vehicle *va = R3RFastestOverAgeVehicle(a);
+	const Vehicle *vb = R3RFastestOverAgeVehicle(b);
+	int r = ClampTo<int32_t>((va->max_age - va->age) - (vb->max_age - vb->age));
 	return (r != 0) ? r < 0 : VehicleNumberSorter(a, b);
 }
 
@@ -2060,6 +2112,8 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 		const GUIVehicleGroup &vehgroup = *it;
 		if (this->grouping == GB_NONE) {
 			const Vehicle *v = vehgroup.GetSingleVehicle();
+			/* R3R (KI-157): company shown for a chain is the control section's. */
+			const Vehicle *vc = R3RControlSectionVehicle(v);
 
 			std::array<StringParameter, 5> params = {
 				EconTime::UsingWallclockUnits() ? STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR,
@@ -2072,9 +2126,12 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 			StringID str;
 			switch (this->vehgroups.SortType()) {
 				case VST_AGE: {
-					str = (v->age + DAYS_IN_YEAR < v->max_age) ? STR_VEHICLE_LIST_AGE : STR_VEHICLE_LIST_AGE_RED;
-					params[3] = DateDeltaToYearDelta(v->age);
-					params[4] = DateDeltaToYearDelta(v->max_age);
+					/* R3R (KI-157): the row stands for the whole chain -- report the
+					 * section that is closest to exceeding its age limit. */
+					const Vehicle *va = R3RFastestOverAgeVehicle(v);
+					str = (va->age + DAYS_IN_YEAR < va->max_age) ? STR_VEHICLE_LIST_AGE : STR_VEHICLE_LIST_AGE_RED;
+					params[3] = DateDeltaToYearDelta(va->age);
+					params[4] = DateDeltaToYearDelta(va->max_age);
 					break;
 				}
 
@@ -2127,7 +2184,9 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 				}
 
 				case VST_TIME_TO_LIVE: {
-					auto years_remaining = (v->max_age / DAYS_IN_LEAP_YEAR) - (v->age / DAYS_IN_LEAP_YEAR);
+					/* R3R (KI-157): chain-wide口径 -- the section that expires first. */
+					const Vehicle *va = R3RFastestOverAgeVehicle(v);
+					auto years_remaining = (va->max_age / DAYS_IN_LEAP_YEAR) - (va->age / DAYS_IN_LEAP_YEAR);
 					str = (years_remaining > 1) ? STR_VEHICLE_LIST_TIME_TO_LIVE : ((years_remaining < 0) ? STR_VEHICLE_LIST_TIME_TO_LIVE_OVERDUE : STR_VEHICLE_LIST_TIME_TO_LIVE_RED);
 					params[3] = std::abs(years_remaining.base());
 					break;
@@ -2175,10 +2234,10 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 			DrawVehicleImage(v, {image_left, ir.top, image_right, ir.bottom}, selected_vehicle, EIT_IN_LIST, 0);
 			DrawString(tr.left, tr.right, ir.top + line_height - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom - 1, GetStringWithArgs(str, params), TextColour::Black);
 
-			/* company colour stripe along vehicle description row */
-			if (_settings_client.gui.show_vehicle_list_company_colour && v->owner != this->vli.company) {
+			/* company colour stripe along vehicle description row (R3R: control section) */
+			if (_settings_client.gui.show_vehicle_list_company_colour && vc->owner != this->vli.company) {
 				PixelColour ccolour{0};
-				Company *c = Company::Get(v->owner);
+				Company *c = Company::Get(vc->owner);
 				if (c != nullptr) {
 					ccolour = GetColourGradient(c->colour, Shade::Lighter);
 				}
@@ -2223,6 +2282,9 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 		switch (this->grouping) {
 			case GB_NONE: {
 				const Vehicle *v = vehgroup.GetSingleVehicle();
+				/* R3R (KI-157): name / group shown for a chain are the control
+				 * section's (the section with the lowest coupling ordinal). */
+				const Vehicle *vc = R3RControlSectionVehicle(v);
 
 				if (v->vehicle_flags.Test(VehicleFlag::PathfinderLost)) {
 					DrawSprite(SPR_WARNING_SIGN, PAL_NONE, vehicle_button_x, ir.top + GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal + profit.height);
@@ -2240,26 +2302,26 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 						vehicle_cargoes.Set(u->cargo_type);
 					}
 
-					if (!v->name.empty()) {
+					if (!vc->name.empty()) {
 						/* The vehicle got a name so we will print it and the cargoes */
 						DrawString(tr.left, tr.right, ir.top,
-								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_VEHICLE_NAME, v->index, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
+								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_VEHICLE_NAME, vc->index, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
 								TextColour::Black, SA_LEFT, false, FontSize::Small);
-					} else if (v->group_id != DEFAULT_GROUP) {
+					} else if (vc->group_id != DEFAULT_GROUP) {
 						/* The vehicle has no name, but is member of a group, so print group name and the cargoes */
 						DrawString(tr.left, tr.right, ir.top,
-								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_GROUP_NAME, v->group_id.base() | GROUP_NAME_HIERARCHY, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
+								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_GROUP_NAME, vc->group_id.base() | GROUP_NAME_HIERARCHY, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
 								TextColour::Black, SA_LEFT, false, FontSize::Small);
 					} else {
 						/* The vehicle has no name, and is not a member of a group, so just print the cargoes */
 						DrawString(tr.left, tr.right, ir.top, GetString(STR_VEHICLE_LIST_CARGO, vehicle_cargoes), TextColour::Black, SA_LEFT, false, FontSize::Small);
 					}
-				} else if (!v->name.empty()) {
+				} else if (!vc->name.empty()) {
 					/* The vehicle got a name so we will print it */
-					DrawString(tr.left, tr.right, ir.top, GetString(STR_VEHICLE_NAME, v->index), TextColour::Black, SA_LEFT, false, FontSize::Small);
-				} else if (v->group_id != DEFAULT_GROUP) {
+					DrawString(tr.left, tr.right, ir.top, GetString(STR_VEHICLE_NAME, vc->index), TextColour::Black, SA_LEFT, false, FontSize::Small);
+				} else if (vc->group_id != DEFAULT_GROUP) {
 					/* The vehicle has no name, but is member of a group, so print group name */
-					DrawString(tr.left, tr.right, ir.top, GetString(STR_GROUP_NAME, v->group_id.base() | GROUP_NAME_HIERARCHY), TextColour::Black, SA_LEFT, false, FontSize::Small);
+					DrawString(tr.left, tr.right, ir.top, GetString(STR_GROUP_NAME, vc->group_id.base() | GROUP_NAME_HIERARCHY), TextColour::Black, SA_LEFT, false, FontSize::Small);
 				}
 
 				if (show_orderlist) DrawSmallOrderList(v, olr.left, olr.right, ir.top + GetCharacterHeight(FontSize::Small), this->order_arrow_width, v->cur_real_order_index);
@@ -4660,7 +4722,7 @@ public:
 					/* R3R: the vehicle-view turn-around button must force a physical
 					 * first/last end-swap instead of backing up or flipping only the
 					 * driving direction. */
-					Command<Commands::ReverseTrainDirection>::Post(_vehicle_msg_translation_table[VCT_CMD_TURN_AROUND][v->type], v->tile, v->index, false, true);
+					Command<Commands::ReverseTrainDirection>::Post(_vehicle_msg_translation_table[VCT_CMD_TURN_AROUND][v->type], v->tile, v->index, false);
 				}
 				break;
 			case WID_VV_FORCE_PROCEED: // force proceed
@@ -4909,6 +4971,11 @@ static WindowDesc _train_view_desc(__FILE__, __LINE__,
  */
 void ShowVehicleViewWindow(const Vehicle *v)
 {
+	/* R3R: the vehicle view only ever operates on the front of a consist (same rule as VehicleClicked).
+	 * Opening it on an inner vehicle of a train would break the `this == this->First()` assertion in
+	 * IsStoppedInDepot (vehicle_base.h) on the next UpdatePlanes. */
+	if (v->type == VehicleType::Train) v = v->First();
+
 	AllocateWindowDescFront<VehicleViewWindow>((v->type == VehicleType::Train) ? _train_view_desc : _vehicle_view_desc, v->index);
 }
 

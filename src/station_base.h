@@ -930,6 +930,27 @@ public:
 	CargoTypes station_cargo_history_cargoes{};                                              ///< Bitmask of cargoes in station_cargo_history
 	std::vector<std::array<uint16_t, MAX_STATION_CARGO_HISTORY_DAYS>> station_cargo_history; ///< Station history of waiting cargo, dynamic range compressed (see RXCompressUint)
 
+	/* R3R: station yard (站场). 一个「场」是若干铁路平台的集合（一个平台的全部 tile 恒属于
+	 * 同一个场）。订单里的场 ID = 1 + 场的下标；0 表示整站（不设场）。
+	 * 场列表按下标寻址，删场只清空其内容而不移动下标，以免已有订单的场 ID 失效。
+	 * 它不走车站表(STNN)存档，而是独立 chunk "SYRD"（见 src/sl/station_yard_sl.cpp），
+	 * 这样本 fork 永不改动与上游共享的车站表布局。 */
+	struct R3RStationYard {
+		std::vector<TileIndex> tiles; ///< 本场的铁路车站 tile（升序、无重复）
+		/* 本场停满时允许回落的「共享场」ID（0 = R3R_YARD_NONE，不回落）。
+		 * 多个场可以指向同一个共享场，这就是「1/2 场共享一个 A 场」的表达方式：
+		 * 场1.shared_with = 场2.shared_with = A场。回落只做一层，不做链式展开。 */
+		uint16_t shared_with = 0;
+	};
+	std::vector<R3RStationYard> r3r_yards{}; ///< R3R: 场的列表（有效场 ID = 下标 + 1）
+
+	/* R3R: [存档兼容] SYRD v1 的三个场列表。v2 起场数据统一编码进 r3r_yard_a（见
+	 * src/sl/station_yard_sl.cpp），r3r_yard_b / r3r_yard_shared 恒为空：保留它们只是
+	 * 为了不改动 SYRD 的字段布局。读 v1 存档时由这三者迁移出 r3r_yards。 */
+	std::vector<TileIndex> r3r_yard_a{};      ///< R3R: [存档] v1=A场；v2=编码后的全部场数据
+	std::vector<TileIndex> r3r_yard_b{};      ///< R3R: [存档] v1=B场（v2 恒空）
+	std::vector<TileIndex> r3r_yard_shared{}; ///< R3R: [存档] v1=共用场（v2 恒空）
+
 	Station(StationID index, TileIndex tile = INVALID_TILE);
 	~Station() override;
 
@@ -949,6 +970,41 @@ public:
 
 	uint GetPlatformLength(TileIndex tile, DiagDirection dir) const override;
 	uint GetPlatformLength(TileIndex tile) const override;
+
+	/* R3R: station yard (站场) 管理接口，实现见 src/station_cmd.cpp。
+	 * 场 ID 语义：0 = 不设场（订单按整站处理）；k(>=1) = r3r_yards[k - 1]。
+	 * 场数量不限（受 16 位 order 存储上限约束，最多 65534 个）。 */
+	static constexpr uint16_t R3R_YARD_NONE = 0; ///< R3R: 无场，订单按整站处理
+	static constexpr uint16_t R3R_MAX_YARDS = 65534; ///< R3R: 单车站场数量上限
+
+	/* R3R: [存档兼容] SYRD v1 的三个固定场。v2 起场数据统一编码进 r3r_yard_a，
+	 * 读 v1 存档时按「A→场1、B→场2、共用→场3(shared)」迁移。 */
+	static constexpr uint16_t R3R_YARD_A      = 1; ///< R3R: [存档兼容] v1 A场 == 场1
+	static constexpr uint16_t R3R_YARD_B      = 2; ///< R3R: [存档兼容] v1 B场 == 场2
+	static constexpr uint16_t R3R_YARD_SHARED = 3; ///< R3R: [存档兼容] v1 共用场 == 场3
+
+	/** R3R: 场数量（有效场 ID 为 1..R3RNumYards()）。 */
+	uint16_t R3RNumYards() const { return static_cast<uint16_t>(this->r3r_yards.size()); }
+	/** R3R: 新建一个场并返回其 ID（达到上限时返回 R3R_YARD_NONE）。 */
+	uint16_t R3RAddYard();
+	/** R3R: 清空某个场的全部 tile（保留场本身与其下标，避免已有订单的场 ID 失效）。 */
+	void     R3RClearYard(uint16_t yard);
+	/** R3R: 某个场停满时的「共享回落场」（R3R_YARD_NONE = 不回落）。 */
+	uint16_t R3RYardSharedWith(uint16_t yard) const;
+	/** R3R: 设置某个场的「共享回落场」（R3R_YARD_NONE = 取消回落）。 */
+	void     R3RSetYardSharedWith(uint16_t yard, uint16_t shared_with);
+	/** R3R: 某个场是否被别的场指定为共享回落场（仅用于 UI 标注）。 */
+	bool     R3RIsYardShared(uint16_t yard) const;
+
+	const std::vector<TileIndex> &R3RYardTiles(uint16_t yard) const;
+	uint16_t R3RGetYardOfTile(TileIndex tile) const;
+	void    R3RSetTileYard(TileIndex tile, uint16_t yard);
+	void    R3RRemoveTileFromYards(TileIndex tile);
+	void    R3RPruneYardTiles();
+	bool    R3RHasAnyYard() const;
+	/** R3R: 收集某个场中仍然有效的铁路 tile（升序、无重复）。 */
+	void    R3RCollectYardTiles(uint16_t yard, std::vector<TileIndex> &out) const;
+
 	void RecomputeCatchment(bool no_clear_nearby_lists = false);
 	static void RecomputeCatchmentForAll();
 
@@ -1022,6 +1078,32 @@ public:
 };
 
 void RebuildStationKdtree();
+
+/* R3R: station yard (站场) helpers, implementation in src/station_cmd.cpp. */
+
+/** R3R: 收集 \a tile 所在铁路平台的**全部** tile（沿站台轴双向扫描），\a out 先被清空。 */
+void R3RCollectPlatformTiles(TileIndex tile, std::vector<TileIndex> &out);
+
+/**
+ * R3R: 枚举 \a st 的全部铁路平台，\a out 存各平台的「北端」tile（每个平台一项，按 tile 升序）。
+ * 供站场 UI 逐平台划场使用，\a out 先被清空。
+ */
+void R3REnumeratePlatforms(const Station *st, std::vector<TileIndex> &out);
+
+/**
+ * R3R: 计算一个「带场」的 GOTO_STATION 订单允许停靠的 tile 集合（一次性）。
+ * - \a yard == R3R_YARD_NONE，或该场没有任何 tile ⇒ \a out 为空（调用方应视为「整站」）。
+ * - 若该场已满（全部平台都被预留）⇒ 再并入它的「共享回落场」的 tile 作为回落。
+ * \a out 按 tile 升序且无重复。
+ */
+void R3RCollectYardDestinationTiles(const Station *st, uint16_t yard, std::vector<TileIndex> &out);
+
+/**
+ * R3R: 判断 \a yard 是否「满」= 该场内每一个平台的每一节 tile 都被预留。
+ * 这是一次性判定（只在列车选平台时调用），不会在每 tick 遍历站台。
+ * \a yard 无任何平台时返回 false。
+ */
+bool R3RStationYardIsFull(const Station *st, uint16_t yard);
 
 using ForAllStationsAroundTilesFunc = bool(Station *, TileIndex);
 using ForAllStationsAroundTilesIntlFunc = void(Station *, const TileArea &, uintptr_t);

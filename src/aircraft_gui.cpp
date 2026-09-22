@@ -73,6 +73,12 @@ void DrawAircraftImage(const Vehicle *v, const Rect &r, VehicleID selection, Eng
 {
 	bool rtl = _current_text_dir == TD_RTL;
 
+	/* R3R (KI-135): nothing can be visible in a degenerate rect; bail out so a
+	 * broken layout cannot turn into a nonsensical draw position (see
+	 * DrawRoadVehImage() for the rect that tripped the assertion in
+	 * FillDrawPixelInfo()). */
+	if (r.Width() <= 0 || r.Height() <= 0) return;
+
 	VehicleSpriteSeq seq;
 	v->GetImage(rtl ? Direction::E : Direction::W, image_type, &seq);
 

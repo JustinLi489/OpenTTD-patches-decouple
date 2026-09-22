@@ -32,6 +32,19 @@ enum StationViewWidgets : WidgetID {
 	WID_SV_CATCHMENT,          ///< Toggle catchment area highlight.
 	WID_SV_DEPARTURES,         ///< Departures button.
 	WID_SV_HISTORY,            ///< Cargo history button.
+	WID_SV_R3R_YARDS,          ///< R3R: open the station yard management window.
+};
+
+/** Widgets of the #StationYardWindow class (R3R station yard management). */
+enum StationYardWidgets : WidgetID {
+	WID_SY_CAPTION,      ///< Caption of the window.
+	WID_SY_LIST,         ///< List of platforms.
+	WID_SY_SCROLLBAR,    ///< Scrollbar of the platform list.
+	WID_SY_YARD_SEL,     ///< R3R: select which yard the buttons below apply to (0 = no yard / whole station).
+	WID_SY_ASSIGN,       ///< R3R: assign the selected platform to the selected yard.
+	WID_SY_NEW_YARD,     ///< R3R: create a new yard and select it.
+	WID_SY_SHARED_SEL,   ///< R3R: choose the shared fallback yard of the selected yard (0 = none).
+	WID_SY_LOCATE,       ///< Scroll the main view to the selected platform.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

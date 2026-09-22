@@ -235,6 +235,12 @@ CommandCost CmdBuildVehicle(DoCommandFlags flags, TileIndex tile, EngineID eid, 
 			}
 
 			Company::Get(v->owner)->freeunits[v->type].UseID(v->unitnumber);
+			/* R3R (KI-147 rev.3) 诊断探针:每次成功购车落一行,给出本次分到的号以及
+			 * 池子里下次会分到的号 —— 复测"卖出耦合的1/2号列车后买新车"时,若
+			 * free_next 不是 1,说明池里还有没回收的记录,据此定位是哪条释放路径漏了。 */
+			R3RDbgWrite("UNIT-NEW id=%u type=%u owner=%u free_next=%u\n",
+					v->unitnumber, (uint)v->type, (uint)v->owner.base(),
+					Company::Get(v->owner)->freeunits[v->type].NextID());
 		}
 
 
@@ -331,6 +337,11 @@ static void R3RStopChainInDepot(Train *t)
 
 	t->StopSeparation();
 	t->vehstatus.Set(VehState::Stopped);
+	/* R3R KI-118 fix A: tag the stop as "parked by an R3R depot tool". Only a
+	 * train carrying this flag is granted the in-depot GOTO_COUPLE exemption in
+	 * TrainLocoHandler; a train the player stopped (or a freshly bought,
+	 * never-started train) has the flag clear and therefore never auto-couples. */
+	t->r3r_parked = true;
 	/* Prevent any attempt to update the timetable for the current order now
 	 * that the chain is stopped in its depot (same guard as CmdStartStopVehicle). */
 	t->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
@@ -358,7 +369,7 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 	fprintf(dbg, "MAKESEG %s head=%d\n", tag, (int)head->index.base());
 	int i = 0;
 	for (const Train *w = head; w != nullptr; w = w->Next()) {
-		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d flip=%d) eng=%d\n",
+		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d) eng=%d\n",
 			tag,
 			(int)w->index.base(),
 			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
@@ -372,7 +383,6 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 			w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
 			w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
 			w->flags.Test(VehicleRailFlag::SegmentFront) ? 1 : 0,
-			w->flags.Test(VehicleRailFlag::ForceFlipReverse) ? 1 : 0,
 			(int)w->engine_type.base());
 		if (++i > 60) break;
 	}
@@ -516,6 +526,14 @@ static void SetSegmentTailFakeEngine(Train *seg)
 	/* A single-vehicle chain has no distinct tail to promote; a tail that is
 	 * already an engine (e.g. a second real locomotive) is left untouched. */
 	if (last == seg || last->IsEngine()) return;
+	/* R3R: never promote the rear half of a dual-headed engine (IsMultiheaded()
+	 * with the engine bit deliberately cleared, i.e. IsRearDualheaded()). It
+	 * must stay a non-engine: giving it the engine bit would make *both* halves
+	 * of the dual head look like front engines, and NormaliseDualHeads() would
+	 * then move the two halves behind each other for ever -- an infinite loop
+	 * that freezes the game without writing a crash log. Such a rear half can
+	 * never lead a chain anyway. */
+	if (last->IsRearDualheaded()) return;
 	last->SetEngine();
 	last->ClearWagon();
 	last->ClearFreeWagon();
@@ -697,7 +715,14 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 				 * schedule or a number). */
 				if (seg->orders != nullptr) DeleteVehicleOrders(seg);
 				if (seg->unitnumber != 0) Company::Get(seg->owner)->freeunits[VehicleType::Train].ReleaseID(seg->unitnumber);
+				/* R3R (KI-147 rev.3): 挂车时借出并暂存的车号也可能挂在本车上。头车在
+				 * 这里就要丢掉 front 身份,PreDestructor 的备份回收(仅 FrontEngine)
+				 * 之后再也轮不到它,不在这里回收就是永久泄漏。 */
+				if (seg->unitnumber_backup != 0 && seg->unitnumber_backup != seg->unitnumber) {
+					Company::Get(seg->owner)->freeunits[VehicleType::Train].ReleaseID(seg->unitnumber_backup);
+				}
 				seg->unitnumber = 0;
+				seg->unitnumber_backup = 0;
 				GroupStatistics::CountVehicle(seg, -1);
 				R3RDestroyCarOnlyFormation(seg);
 				UpdateTrainGroupID(seg);
@@ -724,7 +749,12 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 		if (front->orders != nullptr) DeleteVehicleOrders(front);
 		/* Release the unit number back into the company pool. */
 		if (front->unitnumber != 0) Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber);
+		/* R3R (KI-147 rev.3): 同上,借出暂存的车号也要一起回收。 */
+		if (front->unitnumber_backup != 0 && front->unitnumber_backup != front->unitnumber) {
+			Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber_backup);
+		}
 		front->unitnumber = 0;
+		front->unitnumber_backup = 0;
 		GroupStatistics::CountVehicle(front, -1);
 		front->ClearSegmentFront();
 		R3RDestroyCarOnlyFormation(front);
@@ -1223,6 +1253,11 @@ CommandCost CmdStartStopVehicle(DoCommandFlags flags, VehicleID veh_id, bool eva
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		if (v->IsStoppedInDepot() && !flags.Test(DoCommandFlag::AutoReplace)) DeleteVehicleNews(veh_id, AdviceType::VehicleWaiting);
+
+		/* R3R KI-118 fix A: a manual Start/Stop always means "the player took
+		 * over", so the depot parking flag set by R3R's own depot tools is
+		 * cleared here (both on start and on stop). */
+		if (v->type == VehicleType::Train) Train::From(v)->r3r_parked = false;
 
 		v->StopSeparation();
 
@@ -1905,6 +1940,10 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 	Vehicle *w = nullptr;
 	Vehicle *w_front = nullptr;
 	Vehicle *w_rear = nullptr;
+	/* R3R (KI-129): set when a pseudo-engine identity had to be rebuilt on a
+	 * cloned car which is not the clone's head; the chain head is then refreshed
+	 * once after the loop. */
+	bool r3r_identity_rebuilt = false;
 
 	/*
 	 * v_front is the front engine in the original vehicle
@@ -1966,15 +2005,6 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			if (!veh_id.has_value()) return CMD_ERROR;
 			w = Vehicle::Get(*veh_id);
 
-			/* R3R: cloning a car-only formation front (wagon-as-engine). The
-			 * freshly built wagon defaults to a free wagon; promote it back to a
-			 * formation front so the clone is again a couplable formation —
-			 * otherwise cloning one "fails" (produces a loose wagon chain, or the
-			 * copy can't be used as a waiting formation). */
-			if (v->type == VehicleType::Train && R3RIsCarOnlyFormation(Train::From(v)) && w->type == VehicleType::Train) {
-				Train::From(w)->SetFrontEngine();
-			}
-
 			if (v->type == VehicleType::Train && Train::From(v)->flags.Test(VehicleRailFlag::Flipped)) {
 				/* Only copy the reverse state if neither old or new vehicle implements reverse-on-build probability callback. */
 				if (!TestVehicleBuildProbability(v, BuildProbabilityType::Reversed).has_value() &&
@@ -1983,9 +2013,19 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				}
 			}
 
-			if (v->type == VehicleType::Train && !v->IsFrontEngine()) {
-				/* this s a train car
-				 * add this unit to the end of the train */
+			if (v->type == VehicleType::Train && v != v_front) {
+				/* this is a train car
+				 * add this unit to the end of the train
+				 *
+				 * R3R (KI-129): the test is v != v_front instead of
+				 * !v->IsFrontEngine(). In R3R a segment front is a "fake engine":
+				 * a wagon carrying GVSF_ENGINE|GVSF_FRONT located *inside* a
+				 * chain. With the native test it looked like a front engine, took
+				 * the else branch below and overwrote w_front with itself, so
+				 * cloning "locomotive + branch" returned the wrong head, pointed
+				 * AddVehicleToGroup at the wrong car and started the refit loop at
+				 * the wrong vehicle. The clone's head is by definition the first
+				 * vehicle of the source chain, i.e. v == v_front. */
 				CommandCost result = Command<Commands::MoveRailVehicle>::Do(flags, w->index, w_rear->index, MoveRailVehicleFlags::MoveChain);
 				if (result.Failed()) {
 					/* The train can't be joined to make the same consist as the original.
@@ -2001,11 +2041,53 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				w->SetServiceIntervalIsCustom(v->ServiceIntervalIsCustom());
 				w->SetServiceIntervalIsPercent(v->ServiceIntervalIsPercent());
 			}
+
+			/* R3R (KI-129): rebuild pseudo-engine identities on the clone.
+			 *
+			 * A "fake engine" is a wagon carrying the engine/front bits (car-only
+			 * formation front, segment front, segment rear) -- see
+			 * R3RIsCarOnlyFormation(). The freshly built clone is always a plain
+			 * wagon, so without this the copy silently loses those bits: the clone
+			 * of a car-only formation stops being recognised as a couplable
+			 * formation and the copy of a segment front becomes an ordinary car.
+			 * (The previous R3R patch only did SetFrontEngine(), which left the
+			 * clone as a free wagon with a front bit -- not an engine, so
+			 * R3RIsCarOnlyFormation() did not recognise it either.)
+			 *
+			 * This must run AFTER MoveRailVehicle: giving the vehicle the engine
+			 * bit first would make MoveRailVehicle treat the new car as an engine
+			 * and refuse to attach it.
+			 *
+			 * Only the head can run ConsistChanged(); for a pseudo engine further
+			 * down the chain the flags are restored here and the whole chain is
+			 * reconsisted once after the loop. */
+			if (v->type == VehicleType::Train && w->type == VehicleType::Train && R3RIsCarOnlyFormation(Train::From(v))) {
+				Train *const src = Train::From(v);
+				Train *const dst = Train::From(w);
+				dst->SetEngine();
+				dst->ClearWagon();
+				dst->ClearFreeWagon();
+				/* A segment rear pseudo engine deliberately carries no front bit;
+				 * mirror the source instead of unconditionally setting it. */
+				if (src->IsFrontEngine()) dst->SetFrontEngine();
+				if (v == v_front) {
+					dst->ConsistChanged(CCF_ARRANGE);
+				} else {
+					r3r_identity_rebuilt = true;
+				}
+			}
 			w_rear = w; // trains needs to know the last car in the train, so they can add more in next loop
 		}
 	} while (v->type == VehicleType::Train && (v = v->GetNextVehicle()) != nullptr);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		/* R3R (KI-129): refresh the clone after pseudo-engine identities were
+		 * restored on cars that are not the head (see above). ConsistChanged()
+		 * may only be called on a chain head, hence it is deferred to here. */
+		if (r3r_identity_rebuilt && w_front != nullptr && w_front->type == VehicleType::Train) {
+			Train::From(w_front)->ConsistChanged(CCF_ARRANGE);
+		}
+
 		/* for trains this needs to be the front engine due to the callback function */
 		total_cost.SetResultData(w_front->index);
 	}

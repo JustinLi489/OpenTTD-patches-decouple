@@ -360,6 +360,7 @@ static const std::vector<ChunkHandler> &ChunkHandlers()
 	extern const ChunkHandlerTable _persistent_storage_chunk_handlers;
 	extern const ChunkHandlerTable _trace_restrict_chunk_handlers;
 	extern const ChunkHandlerTable _couple_group_chunk_handlers;
+	extern const ChunkHandlerTable _station_yard_chunk_handlers;
 	extern const ChunkHandlerTable _signal_chunk_handlers;
 	extern const ChunkHandlerTable _plan_chunk_handlers;
 	extern const ChunkHandlerTable _template_replacement_chunk_handlers;
@@ -394,6 +395,7 @@ static const std::vector<ChunkHandler> &ChunkHandlers()
 		_town_chunk_handlers,
 		_sign_chunk_handlers,
 		_station_chunk_handlers,
+		_station_yard_chunk_handlers,
 		_company_chunk_handlers,
 		_ai_chunk_handlers,
 		_game_chunk_handlers,
@@ -1541,14 +1543,6 @@ void *IntToReference(size_t index, SLRefType rt)
 		case REF_VEHICLE_OLD:
 		case REF_VEHICLE:
 			if (Vehicle::IsValidID(index)) return Vehicle::Get(index);
-			{
-				FILE *r3rf = R3RFopenDbg("a");
-				if (r3rf != nullptr) {
-					fprintf(r3rf, "INVALID_REF_VEHICLE raw_index=%u zero_based=%u pool_size=%u arr_index=%d chunk=%u\n",
-							(unsigned)index + 1, (unsigned)index, (unsigned)Vehicle::GetPoolSize(), _sl.array_index, (unsigned)_sl.current_chunk_id);
-					fclose(r3rf);
-				}
-			}
 			SlErrorCorruptWithChunk("Referencing invalid Vehicle");
 
 		case REF_TEMPLATE_VEHICLE:
@@ -3100,24 +3094,6 @@ static void SlLoadChunks()
 			}
 		}
 		Debug(sl, 3, "Loaded chunk {} ({} bytes)", ChunkIDDumper()(id), SlGetBytesRead() - read);
-		{
-			FILE *r3rf = R3RFopenDbg("a");
-			if (r3rf != nullptr) {
-				fprintf(r3rf, "CHUNKLOAD%c%c%c%c pool=%u arr=%d pos=%d\n",
-						(int)(id & 0xFF), (int)((id >> 8) & 0xFF), (int)((id >> 16) & 0xFF), (int)((id >> 24) & 0xFF),
-						(unsigned)Vehicle::GetPoolSize(), _sl.array_index, (int)SlGetBytesRead());
-				fclose(r3rf);
-			}
-		}
-	}
-
-	{
-		FILE *r3rf = R3RFopenDbg("a");
-		if (r3rf != nullptr) {
-			fprintf(r3rf, "AFTER_LOADCHUNKS pool=%u valid0=%d valid1=%d\n",
-					(unsigned)Vehicle::GetPoolSize(), Vehicle::IsValidID(0) ? 1 : 0, Vehicle::IsValidID(1) ? 1 : 0);
-			fclose(r3rf);
-		}
 	}
 }
 
@@ -3164,15 +3140,6 @@ static void SlFixPointers()
 	}
 
 	_sl.action = SLA_PTRS;
-
-	{
-		FILE *r3rf = R3RFopenDbg("a");
-		if (r3rf != nullptr) {
-			fprintf(r3rf, "BEFORE_PTRS upstream_mode=%d pool=%u valid0=%d valid1=%d\n",
-					_sl_upstream_mode ? 1 : 0, (unsigned)Vehicle::GetPoolSize(), Vehicle::IsValidID(0) ? 1 : 0, Vehicle::IsValidID(1) ? 1 : 0);
-			fclose(r3rf);
-		}
-	}
 
 	for (auto &ch : ChunkHandlers()) {
 		_sl.current_chunk_id = ch.id;

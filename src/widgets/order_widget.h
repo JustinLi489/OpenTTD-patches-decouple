@@ -32,7 +32,6 @@ enum OrderWidgets : WidgetID {
 	WID_O_DEPOT_ACTION,              ///< Dropdown to select the depot action (stop, service if needed, unbunch).
 	WID_O_REFIT_DROPDOWN,            ///< Open refit options.
 	WID_O_REVERSE,                   ///< Select waypoint reverse type
-	WID_O_REVERSE_AT_STATION,        ///< Toggle reversing the consist on arrival at this station order (R3R)
 	WID_O_COND_VARIABLE,             ///< Choose condition variable.
 	WID_O_COND_COMPARATOR,           ///< Choose condition type.
 	WID_O_COND_VALUE,                ///< Choose condition value.
@@ -55,6 +54,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_COUNTER_VALUE,             ///< Choose counter value.
 	WID_O_TEXT_LABEL,                ///< Choose text label.
 	WID_O_DEPARTURE_VIA_TYPE,        ///< Choose departure board via subtype.
+	WID_O_R3R_YARD,                  ///< R3R: choose the destination yard of a station order (whole station, or any yard of the destination station).
 	WID_O_SEL_COND_VALUE,            ///< Widget for conditional value or conditional cargo type.
 	WID_O_SEL_COND_AUX,              ///< Widget for auxiliary conditional cargo type. WID_O_SEL_COND_AUX... IDs must be sequential.
 	WID_O_SEL_COND_AUX2,             ///< Widget for auxiliary conditional via button.
@@ -66,6 +66,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_SEL_TOP_RIGHT,             ///< #NWID_SELECTION widget for right part of the top row of the 'your train' order window.
 	WID_O_SEL_TOP_ROW_GROUNDVEHICLE, ///< #NWID_SELECTION widget for the top row of the 'your train' order window.
 	WID_O_SEL_TOP_ROW,               ///< #NWID_SELECTION widget for the top row of the 'your non-trains' order window.
+	WID_O_SEL_TOP_YARD,              ///< R3R: #NWID_SELECTION widget to show/hide the destination yard dropdown of the top row.
 	WID_O_SEL_BOTTOM_MIDDLE,         ///< #NWID_SELECTION widget for the middle part of the bottom row of the 'your train' order window.
 	WID_O_SEL_SHARED,                ///< #NWID_SELECTION widget for WID_O_SHARED_ORDER_LIST and WID_O_ADD_VEH_GROUP
 	WID_O_SHARED_ORDER_LIST,         ///< Open list of shared vehicles.

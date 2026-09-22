@@ -30,5 +30,7 @@ DEF_CMD_TUPLE_NT(Commands::MoveStationName,                CmdMoveStationName,  
 DEF_CMD_TUPLE_NT(Commands::OpenCloseAirport,               CmdOpenCloseAirport,                      {}, CommandType::RouteManagement,       CmdDataT<StationID>)
 DEF_CMD_TUPLE_NT(Commands::ExchangeStationNames,           CmdExchangeStationNames,                  {}, CommandType::OtherManagement,       CmdDataT<StationID, StationID>)
 DEF_CMD_TUPLE_NT(Commands::SetStationCargoAllowedSupply,   CmdSetStationCargoAllowedSupply,          {}, CommandType::OtherManagement,       CmdDataT<StationID, CargoType, bool>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RStationYard,              CmdR3RSetStationYard,                     {}, CommandType::OtherManagement,       CmdDataT<StationID, TileIndex, uint16_t>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RStationYardShared,        CmdR3RSetStationYardShared,               {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint16_t>)
 
 #endif /* STATION_CMD_H */

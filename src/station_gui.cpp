@@ -963,9 +963,12 @@ static constexpr std::initializer_list<NWidgetPart> _nested_station_view_widgets
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_ROADVEHS), SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1), SetStringTip(STR_LORRY, STR_STATION_VIEW_SCHEDULED_ROAD_VEHICLES_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_SHIPS), SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1), SetStringTip(STR_SHIP, STR_STATION_VIEW_SCHEDULED_SHIPS_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_PLANES),  SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1), SetStringTip(STR_PLANE, STR_STATION_VIEW_SCHEDULED_AIRCRAFT_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_R3R_YARDS), SetMinimalSize(45, 12), SetResize(1, 0), SetFill(1, 1), SetStringTip(STR_R3R_YARD_BUTTON, STR_R3R_YARD_BUTTON_TOOLTIP),
 		NWidget(WWT_RESIZEBOX, Colours::Grey),
 	EndContainer(),
 };
+
+void ShowStationYardWindow(StationID station);
 
 enum SortOrder : uint8_t {
 	SO_DESCENDING,
@@ -2250,6 +2253,11 @@ struct StationViewWindow : public Window {
 				break;
 			}
 
+			case WID_SV_R3R_YARDS: {
+				ShowStationYardWindow((StationID)this->window_number);
+				break;
+			}
+
 			case WID_SV_DEPARTURES: {
 				ShowDeparturesWindow((StationID)this->window_number);
 				break;
@@ -3114,4 +3122,302 @@ bool ShouldShowBaseStationViewportLabel(const BaseStation *bst)
 	if (Waypoint::IsExpected(bst) && HasBit(Waypoint::From(bst)->waypoint_flags, WPF_HIDE_LABEL) && _settings_client.gui.allow_hiding_waypoint_labels &&
 			!HasBit(_extra_display_opt, XDO_SHOW_HIDDEN_SIGNS)) return false;
 	return true;
+}
+
+/** R3R: layout of the station yard (站场) management window. */
+static constexpr NWidgetPart _nested_station_yard_widgets[] = {
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_CLOSEBOX, Colours::Grey),
+		NWidget(WWT_CAPTION, Colours::Grey, WID_SY_CAPTION), SetStringTip(STR_R3R_YARD_CAPTION, STR_TOOLTIP_WINDOW_TITLE_DRAG_THIS),
+		NWidget(WWT_SHADEBOX, Colours::Grey),
+		NWidget(WWT_DEFSIZEBOX, Colours::Grey),
+		NWidget(WWT_STICKYBOX, Colours::Grey),
+	EndContainer(),
+
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_PANEL, Colours::Grey, WID_SY_LIST), SetMinimalSize(260, 130), SetResize(1, 10), SetToolTip(STR_R3R_YARD_LIST_TOOLTIP), SetScrollbar(WID_SY_SCROLLBAR), EndContainer(),
+		NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_SY_SCROLLBAR),
+	EndContainer(),
+
+	NWidget(NWID_HORIZONTAL),
+		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SY_YARD_SEL), SetMinimalSize(90, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_YARD_NAME_NONE, STR_R3R_YARD_SEL_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_ASSIGN), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_ASSIGN, STR_R3R_YARD_ASSIGN_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_NEW_YARD), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_NEW, STR_R3R_YARD_NEW_TOOLTIP),
+		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SY_SHARED_SEL), SetMinimalSize(80, 12), SetStringTip(STR_R3R_YARD_SHARED, STR_R3R_YARD_SHARED_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_LOCATE), SetMinimalSize(50, 12), SetStringTip(STR_R3R_YARD_LOCATE, STR_R3R_YARD_LOCATE_TOOLTIP),
+		NWidget(WWT_RESIZEBOX, Colours::Grey),
+	EndContainer(),
+};
+
+static WindowDesc _station_yard_desc(__FILE__, __LINE__,
+	WindowPosition::Automatic, "r3r_station_yard", 380, 200,
+	WindowClass::StationYard, WindowClass::None,
+	{}, _nested_station_yard_widgets
+);
+
+/**
+ * R3R: window which assigns the rail platforms of one station to any of its
+ * yards (站场), creates new yards and picks each yard's shared fallback yard.
+ *
+ * The list shows one row per platform; a whole platform is always assigned
+ * together (the command resolves the platform from the clicked tile).
+ */
+struct StationYardWindow : Window {
+private:
+	Scrollbar *scroll = nullptr;      ///< Scrollbar of the platform list.
+	StationID station_id;             ///< The station whose yards are managed.
+	std::vector<TileIndex> platforms; ///< North end of each platform.
+	std::vector<uint16_t> platform_yards; ///< Yard of each entry of #platforms.
+	int selected = -1;                ///< Selected index into #platforms, or -1.
+	uint16_t sel_yard = Station::R3R_YARD_NONE; ///< Yard the toolbar buttons apply to (0 = no yard / whole station).
+
+	/** Rebuild the platform list from the station, keeping the selection if possible. */
+	void RebuildPlatforms()
+	{
+		const TileIndex old = this->GetSelectedTile();
+
+		this->platforms.clear();
+		this->platform_yards.clear();
+
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st != nullptr) {
+			R3REnumeratePlatforms(st, this->platforms);
+			this->platform_yards.reserve(this->platforms.size());
+			for (TileIndex t : this->platforms) this->platform_yards.push_back(st->R3RGetYardOfTile(t));
+		}
+		this->scroll->SetCount(this->platforms.size());
+
+		this->selected = -1;
+		if (old != INVALID_TILE) {
+			auto it = std::find(this->platforms.begin(), this->platforms.end(), old);
+			if (it != this->platforms.end()) this->selected = static_cast<int>(std::distance(this->platforms.begin(), it));
+		}
+		if (this->selected < 0 && !this->platforms.empty()) this->selected = 0;
+		if (this->selected >= 0) this->scroll->ScrollTowards(this->selected);
+	}
+
+	/** The north-end tile of the selected platform, or INVALID_TILE. */
+	TileIndex GetSelectedTile() const
+	{
+		if (this->selected < 0 || this->selected >= static_cast<int>(this->platforms.size())) return INVALID_TILE;
+		return this->platforms[this->selected];
+	}
+
+	/** Whether the local company may edit the yards of this station. */
+	bool CanEdit() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		return st != nullptr && Company::IsValidID(st->owner) && st->owner == _local_company;
+	}
+
+	/** The (translated) label of \a yard at the managed station. */
+	std::string YardLabel(uint16_t yard) const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (yard == Station::R3R_YARD_NONE || st == nullptr || yard > st->R3RNumYards()) return GetString(STR_R3R_YARD_NAME_NONE);
+		return st->R3RIsYardShared(yard) ? GetString(STR_R3R_YARD_NAME_N_SHARED, yard) : GetString(STR_R3R_YARD_NAME_N, yard);
+	}
+
+	/** Assign the selected platform to \a yard (or clear it for #Station::R3R_YARD_NONE). */
+	void SetYardOfSelected(uint16_t yard)
+	{
+		const TileIndex t = this->GetSelectedTile();
+		if (t == INVALID_TILE || !this->CanEdit()) return;
+		Command<Commands::SetR3RStationYard>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, t, yard);
+		this->RebuildPlatforms();
+		this->SetDirty();
+	}
+
+	/** Create a new yard and select it as the current edit target. */
+	void NewYard()
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || !this->CanEdit() || st->R3RNumYards() >= Station::R3R_MAX_YARDS) return;
+		this->sel_yard = static_cast<uint16_t>(st->R3RNumYards() + 1);
+		Command<Commands::SetR3RStationYardShared>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, Station::R3R_YARD_NONE, Station::R3R_YARD_NONE);
+		this->SetDirty();
+	}
+
+	/** The shared fallback yard of the currently selected yard. */
+	uint16_t SelectedSharedYard() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr) return Station::R3R_YARD_NONE;
+		return st->R3RYardSharedWith(this->sel_yard);
+	}
+
+	/** Set the shared fallback yard of the currently selected yard (#Station::R3R_YARD_NONE = none). */
+	void SetSharedYardOfSelected(uint16_t shared_with)
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || !this->CanEdit() || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return;
+		if (shared_with == this->sel_yard) return; // 不能回落给自己
+		Command<Commands::SetR3RStationYardShared>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->sel_yard, shared_with);
+		this->SetDirty();
+	}
+
+public:
+	StationYardWindow(WindowDesc &desc, StationID station) : Window(desc), station_id(station)
+	{
+		this->CreateNestedTree();
+		this->scroll = this->GetScrollbar(WID_SY_SCROLLBAR);
+		this->FinishInitNested(station);
+	}
+
+	void OnInit() override
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st != nullptr) this->owner = st->owner;
+		this->RebuildPlatforms();
+	}
+
+	void UpdateWidgetSize(WidgetID widget, Dimension &size, const Dimension &padding, Dimension &fill, Dimension &resize) override
+	{
+		if (widget == WID_SY_LIST) {
+			resize.height = GetCharacterHeight(FontSize::Normal) + 2;
+			size.height = resize.height * 8 + WidgetDimensions::scaled.framerect.Vertical();
+		}
+	}
+
+	void DrawWidget(const Rect &r, WidgetID widget) const override
+	{
+		if (widget != WID_SY_LIST) return;
+
+		const Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
+		if (this->platforms.empty()) {
+			DrawString(ir.left, ir.right, ir.top, STR_R3R_YARD_EMPTY);
+			return;
+		}
+
+		int y = ir.top;
+		for (int i = this->scroll->GetPosition(); i < static_cast<int>(this->platforms.size()) && this->scroll->IsVisible(i); i++, y += this->resize.step_height) {
+			if (i == this->selected) GfxFillRect(r.left + 1, y, r.right, y + this->resize.step_height - 1, PC_DARK_GREY);
+			const TileIndex t = this->platforms[i];
+			std::string text = GetString(STR_R3R_YARD_LIST_ITEM, i + 1, TileX(t), TileY(t));
+			text += ' ';
+			text += this->YardLabel(this->platform_yards[i]);
+			DrawString(ir.left, ir.right, y, text);
+		}
+	}
+
+	void OnResize() override
+	{
+		this->scroll->SetCapacityFromWidget(this, WID_SY_LIST, WidgetDimensions::scaled.framerect.Vertical());
+	}
+
+	/** R3R: label of the shared fallback dropdown button ("共享: …"). */
+	std::string SharedYardLabel() const
+	{
+		const uint16_t fb = this->SelectedSharedYard();
+		if (fb == Station::R3R_YARD_NONE) return GetString(STR_R3R_YARD_SHARED_NONE);
+		return GetString(STR_R3R_YARD_NAME_N, fb);
+	}
+
+	/** R3R: show the label of the currently selected yard on the dropdown button. */
+	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
+	{
+		if (widget == WID_SY_YARD_SEL) return this->YardLabel(this->sel_yard);
+		if (widget == WID_SY_SHARED_SEL) return GetString(STR_R3R_YARD_SHARED_SEL, this->SharedYardLabel());
+		return this->Window::GetWidgetString(widget, stringid);
+	}
+
+	void OnPaint() override
+	{
+		const bool can_edit = this->CanEdit();
+		const bool has_sel = this->GetSelectedTile() != INVALID_TILE;
+		const Station *st = Station::GetIfValid(this->station_id);
+		const uint16_t num_yards = (st != nullptr) ? st->R3RNumYards() : 0;
+		const bool sel_yard_valid = this->sel_yard != Station::R3R_YARD_NONE && this->sel_yard <= num_yards;
+
+		this->SetWidgetDisabledState(WID_SY_YARD_SEL, !can_edit);
+		this->SetWidgetDisabledState(WID_SY_ASSIGN, !can_edit || !has_sel);
+		this->SetWidgetDisabledState(WID_SY_NEW_YARD, !can_edit || num_yards >= Station::R3R_MAX_YARDS);
+		this->SetWidgetDisabledState(WID_SY_SHARED_SEL, !can_edit || !sel_yard_valid);
+		this->SetWidgetDisabledState(WID_SY_LOCATE, !has_sel);
+		this->DrawWidgets();
+	}
+
+	void OnInvalidateData(int data = 0, bool gui_scope = true) override
+	{
+		if (!gui_scope) return;
+		this->RebuildPlatforms();
+		this->SetDirty();
+	}
+
+	void OnClick(Point pt, WidgetID widget, int click_count) override
+	{
+		switch (widget) {
+			case WID_SY_LIST: {
+				const int sel = this->scroll->GetScrolledRowFromWidget(pt.y, this, WID_SY_LIST, WidgetDimensions::scaled.framerect.top);
+				if (sel == INT_MAX || sel >= static_cast<int>(this->platforms.size())) break;
+				if (sel != this->selected) {
+					this->selected = sel;
+					this->SetDirty();
+				}
+				break;
+			}
+
+			case WID_SY_YARD_SEL: {
+				DropDownList list;
+				list.push_back(MakeDropDownListStringItem(GetString(STR_R3R_YARD_NAME_NONE), Station::R3R_YARD_NONE, false));
+				const Station *st = Station::GetIfValid(this->station_id);
+				if (st != nullptr) {
+					for (uint16_t y = 1; y <= st->R3RNumYards(); y++) {
+						list.push_back(MakeDropDownListStringItem(this->YardLabel(y), y, false));
+					}
+				}
+				ShowDropDownList(this, std::move(list), this->sel_yard, WID_SY_YARD_SEL, 0, {});
+				break;
+			}
+
+			case WID_SY_ASSIGN:
+				this->SetYardOfSelected(this->sel_yard);
+				break;
+
+			case WID_SY_NEW_YARD:
+				this->NewYard();
+				break;
+
+			case WID_SY_SHARED_SEL: {
+				DropDownList list;
+				list.push_back(MakeDropDownListStringItem(GetString(STR_R3R_YARD_SHARED_NONE), Station::R3R_YARD_NONE, false));
+				const Station *st = Station::GetIfValid(this->station_id);
+				if (st != nullptr) {
+					/* 回流目标不能是自己，因此列表里跳过当前选中的场。 */
+					for (uint16_t y = 1; y <= st->R3RNumYards(); y++) {
+						if (y == this->sel_yard) continue;
+						list.push_back(MakeDropDownListStringItem(GetString(STR_R3R_YARD_NAME_N, y), y, false));
+					}
+				}
+				ShowDropDownList(this, std::move(list), this->SelectedSharedYard(), WID_SY_SHARED_SEL, 0, {});
+				break;
+			}
+
+			case WID_SY_LOCATE: {
+				const TileIndex t = this->GetSelectedTile();
+				if (t != INVALID_TILE) ScrollMainWindowToTile(t);
+				break;
+			}
+
+			default:
+				break;
+		}
+	}
+
+	void OnDropdownSelect(WidgetID widget, int index, int) override
+	{
+		if (widget == WID_SY_YARD_SEL && index >= 0 && index <= Station::R3R_MAX_YARDS) {
+			this->sel_yard = static_cast<uint16_t>(index);
+			this->SetDirty();
+		} else if (widget == WID_SY_SHARED_SEL && index >= 0 && index <= Station::R3R_MAX_YARDS) {
+			this->SetSharedYardOfSelected(static_cast<uint16_t>(index));
+		}
+	}
+};
+
+/** R3R: open (or bring to the front) the yard management window of \a station. */
+void ShowStationYardWindow(StationID station)
+{
+	if (BringWindowToFrontById(WindowClass::StationYard, station) != nullptr) return;
+	new StationYardWindow(_station_yard_desc, station);
 }

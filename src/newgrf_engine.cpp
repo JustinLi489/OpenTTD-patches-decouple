@@ -477,6 +477,18 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 		if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
 	}
 
+	/* R3R (segment-flip mirror): a segment which was logically reversed
+	 * (R3RFlipChainBySegments) has its chain order swapped inside the segment while
+	 * every vehicle keeps its physical position. Report the pre-flip rank -- i.e.
+	 * swap the "before" and "after" counters -- so a NewGRF which selects sprites
+	 * from "position in consist" still keeps each vehicle's head/middle/tail face
+	 * after the flip (the segment length in the high word is unchanged). */
+	if (v->type == VehicleType::Train && static_cast<const Train *>(v)->IsSegmentFlipped()) {
+		const uint8_t tmp = chain_before;
+		chain_before = chain_after;
+		chain_after = tmp;
+	}
+
 	return chain_before | chain_after << 8 | (chain_before + chain_after + consecutive) << 16;
 }
 
@@ -801,6 +813,22 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 				for (const Vehicle *u = v; u->IsArticGroupMember(); u = u->Previous()) artic_before++;
 				uint8_t artic_after = 0;
 				for (const Vehicle *u = v; u->HasArticulatedPart(); u = u->Next()) artic_after++;
+				/* R3R (segment-flip mirror): a de-articulated group inside a
+				 * logically reversed segment has its chain order flipped (and its
+				 * group-head role moved to the other end). Report the pre-flip rank
+				 * by swapping the two bytes, so the NewGRF keeps selecting the same
+				 * face for each section of the former articulated train.
+				 * Only de-articulated groups are mirrored: a *real* articulated
+				 * group is an atomic block whose internal order never changes, so
+				 * its 0x4D is already the pre-flip value. */
+				if (v->type == VehicleType::Train) {
+					const Train *t = static_cast<const Train *>(v);
+					if (t->IsSegmentFlipped() && t->HasDearticulatedGroupRole()) {
+						const uint8_t tmp = artic_before;
+						artic_before = artic_after;
+						artic_after = tmp;
+					}
+				}
 				v->grf_cache.position_in_vehicle = artic_before | artic_after << 8;
 				SetBit(v->grf_cache.cache_valid, NCVV_POSITION_IN_VEHICLE);
 			}

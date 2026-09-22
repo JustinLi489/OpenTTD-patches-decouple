@@ -772,6 +772,46 @@ static const StringID _order_depot_action_dropdown[] = {
 	STR_ORDER_DROP_SELL_DEPOT,
 };
 
+/**
+ * R3R: human readable label of a destination yard.
+ * @param st Destination station (may be nullptr / yard may not exist any more).
+ * @param yard Yard ID (0 = whole station).
+ */
+static std::string R3RYardLabel(const Station *st, uint16_t yard)
+{
+	if (yard == Station::R3R_YARD_NONE || st == nullptr || yard > st->R3RNumYards()) {
+		return GetString(STR_ORDER_R3R_YARD_WHOLE);
+	}
+	return st->R3RIsYardShared(yard) ? GetString(STR_ORDER_R3R_YARD_NAMED_SHARED, yard)
+	                                 : GetString(STR_ORDER_R3R_YARD_NAMED, yard);
+}
+
+/**
+ * R3R: build the destination-yard drop down for a station order.
+ * The list contains "whole station" plus every yard that currently exists at the
+ * order's destination station; the item's result value is the yard ID itself.
+ * @param order The order being edited (may be nullptr).
+ * @param[out] selected Receives the yard ID that should be pre-selected.
+ */
+static DropDownList R3RYardDropDownList(const Order *order, int &selected)
+{
+	DropDownList list;
+	list.push_back(MakeDropDownListStringItem(GetString(STR_ORDER_R3R_YARD_WHOLE), Station::R3R_YARD_NONE, false));
+
+	selected = Station::R3R_YARD_NONE;
+	if (order == nullptr || !order->IsType(OT_GOTO_STATION)) return list;
+
+	const uint16_t cur = order->GetR3RYard();
+	const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+	if (st == nullptr) return list;
+
+	for (uint16_t yard = 1; yard <= st->R3RNumYards(); yard++) {
+		list.push_back(MakeDropDownListStringItem(R3RYardLabel(st, yard), yard, false));
+		if (yard == cur) selected = yard;
+	}
+	return list;
+}
+
 static int DepotActionStringIndex(const Order *order)
 {
 	if (order->GetDepotActionType() & ODATFB_SELL) {
@@ -1653,6 +1693,10 @@ private:
 		DP_RIGHT_EMPTY     = 0, ///< Display an empty panel in the right button of the top row of the train/rv order window.
 		DP_RIGHT_REFIT     = 1, ///< Display 'refit' in the right button of the top  row of the train/rv order window.
 
+		/* WID_O_SEL_TOP_YARD (R3R) */
+		DP_YARD_EMPTY      = 0, ///< R3R: no yard button (not a train station order).
+		DP_YARD_DROPDOWN   = 1, ///< R3R: show the destination yard dropdown.
+
 		/* WID_O_SEL_TOP_ROW */
 		DP_ROW_LOAD        = 0, ///< Display 'load' / 'unload' / 'refit' buttons in the top row of the ship/airplane order window.
 		DP_ROW_DEPOT       = 1, ///< Display 'refit' / 'service' buttons in the top row of the ship/airplane order window.
@@ -2460,7 +2504,6 @@ public:
 		/* First row. */
 		this->RaiseWidget(WID_O_FULL_LOAD);
 		this->RaiseWidget(WID_O_UNLOAD);
-		if (this->vehicle->IsGroundVehicle()) this->RaiseWidget(WID_O_REVERSE_AT_STATION);
 
 		/* Selection widgets. */
 		/* Train or road vehicle. */
@@ -2471,6 +2514,12 @@ public:
 		/* Ship or airplane. */
 		NWidgetStacked *row_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_TOP_ROW);
 		assert(row_sel != nullptr || (train_row_sel != nullptr && left_sel != nullptr && middle_sel != nullptr && right_sel != nullptr));
+
+		/* R3R: show the destination yard dropdown only for rail station orders. */
+		if (NWidgetStacked *yard_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_TOP_YARD); yard_sel != nullptr) {
+			const bool show = this->vehicle->type == VehicleType::Train && order != nullptr && order->IsType(OT_GOTO_STATION);
+			yard_sel->SetDisplayedPlane(show ? DP_YARD_DROPDOWN : DP_YARD_EMPTY);
+		}
 
 		NWidgetStacked *aux_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_COND_AUX);
 		NWidgetStacked *aux2_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_COND_AUX2);
@@ -2517,8 +2566,6 @@ public:
 				right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 				this->DisableWidget(WID_O_NON_STOP);
 				this->RaiseWidget(WID_O_NON_STOP);
-				this->DisableWidget(WID_O_REVERSE_AT_STATION);
-				this->RaiseWidget(WID_O_REVERSE_AT_STATION);
 			}
 			this->DisableWidget(WID_O_FULL_LOAD);
 			this->DisableWidget(WID_O_UNLOAD);
@@ -2561,7 +2608,6 @@ public:
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
 					this->DisableWidget(WID_O_REFIT);
-					if (this->vehicle->IsGroundVehicle()) this->DisableWidget(WID_O_REVERSE_AT_STATION);
 					this->EnableWidget(WID_O_MGMT_BTN);
 					break;
 
@@ -2575,12 +2621,6 @@ public:
 						right_sel->SetDisplayedPlane(DP_RIGHT_REFIT);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
-						/* R3R: reverse-on-arrival. Only for trains that actually stop at the destination. */
-						this->EnableWidget(WID_O_REVERSE_AT_STATION);
-						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION,
-								this->vehicle->type != VehicleType::Train || (order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION) != 0);
-						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtStation());
-						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_STATION_TOOLTIP);
 					}
 					this->SetWidgetLoweredState(WID_O_FULL_LOAD, order->GetLoadType() == OrderLoadType::FullLoadAny);
 					this->SetWidgetLoweredState(WID_O_UNLOAD, order->GetUnloadType() == OrderUnloadType::Unload);
@@ -2605,12 +2645,7 @@ public:
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
 						this->EnableWidget(WID_O_REVERSE);
 						this->SetWidgetLoweredState(WID_O_REVERSE, order->GetWaypointFlags().Test(OrderWaypointFlag::Reverse));
-						/* R3R: stop-on-waypoint reverse. Trains only, and only for waypoints (rail-only). */
-						this->EnableWidget(WID_O_REVERSE_AT_STATION);
-						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION, this->vehicle->type != VehicleType::Train);
-						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtWaypoint());
-						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_WAYPOINT_TOOLTIP);
-						}
+					}
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
 					break;
@@ -2625,12 +2660,7 @@ public:
 						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
-						/* R3R: reverse the consist in the depot of this depot order. Trains only. */
-						this->EnableWidget(WID_O_REVERSE_AT_STATION);
-						this->SetWidgetDisabledState(WID_O_REVERSE_AT_STATION, this->vehicle->type != VehicleType::Train);
-						this->SetWidgetLoweredState(WID_O_REVERSE_AT_STATION, order->HasReverseAtDepot());
-						this->GetWidget<NWidgetCore>(WID_O_REVERSE_AT_STATION)->SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_DEPOT_TOOLTIP);
-						}
+					}
 						/* Disable refit button if the order is no 'always go' order.
 					 * However, keep the service button enabled for refit-orders to allow clearing refits (without knowing about ctrl). */
 					this->SetWidgetDisabledState(WID_O_REFIT,
@@ -2799,7 +2829,6 @@ public:
 						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
 						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
 						this->DisableWidget(WID_O_NON_STOP);
-						this->DisableWidget(WID_O_REVERSE_AT_STATION);
 					}
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
@@ -3107,6 +3136,14 @@ public:
 				} else {
 					return GetString(STR_ORDER_DROP_GO_ALWAYS_DEPOT);
 				}
+			}
+
+			case WID_O_R3R_YARD: { // R3R: destination yard of a rail station order
+				VehicleOrderID sel = this->OrderGetSel();
+				const Order *order = this->vehicle->GetOrder(sel);
+				if (order == nullptr || !order->IsType(OT_GOTO_STATION)) return {};
+				const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+				return R3RYardLabel(st, order->GetR3RYard());
 			}
 
 			case WID_O_OCCUPANCY_TOGGLE:
@@ -3451,6 +3488,13 @@ public:
 						WID_O_DEPOT_ACTION, 0, _settings_client.gui.show_depot_sell_gui ? 0 : (1 << DA_SELL), 0, DDSF_SHARED);
 				break;
 
+			case WID_O_R3R_YARD: { // R3R: choose the destination yard
+				int selected;
+				DropDownList list = R3RYardDropDownList(this->vehicle->GetOrder(this->OrderGetSel()), selected);
+				ShowDropDownList(this, std::move(list), selected, WID_O_R3R_YARD, 0, {}, DDSF_SHARED);
+				break;
+			}
+
 			case WID_O_REFIT_DROPDOWN: {
 				const Order *o = this->vehicle->GetOrder(this->OrderGetSel());
 				if (o != nullptr && o->IsType(OT_DECOUPLE)) {
@@ -3588,20 +3632,6 @@ public:
 				if (order == nullptr) break;
 
 				this->ModifyOrder(sel_ord, MOF_WAYPOINT_FLAGS, order->GetWaypointFlags().Flip(OrderWaypointFlag::Reverse).base());
-				break;
-			}
-
-			case WID_O_REVERSE_AT_STATION: {
-				VehicleOrderID sel_ord = this->OrderGetSel();
-				const Order *order = this->vehicle->GetOrder(sel_ord);
-
-				if (order == nullptr) break;
-
-				/* R3R: this button toggles the reverse flag of the selected order,
-				 * which is a station order, a depot order or a waypoint order. */
-				const bool is_on = (order->GetType() == OT_GOTO_DEPOT) ? order->HasReverseAtDepot() :
-						(order->GetType() == OT_GOTO_WAYPOINT) ? order->HasReverseAtWaypoint() : order->HasReverseAtStation();
-				this->ModifyOrder(sel_ord, MOF_REVERSE_AT_STATION, is_on ? 0 : 1);
 				break;
 			}
 
@@ -4025,6 +4055,12 @@ public:
 
 			case WID_O_DEPOT_ACTION:
 				this->OrderClick_Service(index);
+				break;
+
+			case WID_O_R3R_YARD: // R3R: set the destination yard of the selected station order
+				if (index >= 0 && index <= Station::R3R_MAX_YARDS) {
+					this->ModifyOrder(this->OrderGetSel(), MOF_R3R_YARD, static_cast<uint16_t>(index));
+				}
 				break;
 
 			case WID_O_REFIT_DROPDOWN: {
@@ -4619,9 +4655,12 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_REFIT_DROPDOWN), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_REFIT_AUTO, STR_ORDER_REFIT_AUTO_TOOLTIP), SetResize(1, 0),
 				EndContainer(),
-				/* R3R: reverse the consist on arrival at a station order. Only enabled for GOTO_STATION orders of trains. */
-				NWidget(WWT_TEXTBTN, Colours::Grey, WID_O_REVERSE_AT_STATION), SetMinimalSize(60, 12), SetFill(1, 0),
-														SetStringTip(STR_ORDER_REVERSE, STR_ORDER_REVERSE_AT_STATION_TOOLTIP), SetResize(1, 0),
+				/* R3R: destination yard of a rail station order. Only shown for GOTO_STATION orders of trains. */
+				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_YARD),
+					NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(60, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_R3R_YARD), SetMinimalSize(60, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_R3R_YARD_WHOLE, STR_ORDER_R3R_YARD_TOOLTIP), SetResize(1, 0),
+				EndContainer(),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 				NWidget(WWT_DROPDOWN, Colours::Grey, WID_O_COND_VARIABLE), SetMinimalSize(124, 12), SetFill(1, 0),

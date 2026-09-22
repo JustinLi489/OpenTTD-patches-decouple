@@ -3950,6 +3950,34 @@ STR_STATION_VIEW_SCHEDULED_ROAD_VEHICLES_TOOLTIP                :{BLACK}显示�
 STR_STATION_VIEW_SCHEDULED_AIRCRAFT_TOOLTIP                     :{BLACK}显示所有调度计划中含有此机场的飞机
 STR_STATION_VIEW_SCHEDULED_SHIPS_TOOLTIP                        :{BLACK}显示所有调度计划中含有此码头的船只
 
+# R3R 站场
+STR_R3R_YARD_BUTTON                                             :{BLACK}站场
+STR_R3R_YARD_BUTTON_TOOLTIP                                     :{BLACK}将本车站的铁路站台划入某个场
+STR_R3R_YARD_CAPTION                                            :{WHITE}{STATION} - 站场
+STR_R3R_YARD_LIST_TOOLTIP                                       :{BLACK}每行一个铁路站台。选中站台后用下方按钮将其划入某个场
+STR_R3R_YARD_LIST_ITEM                                          :{BLACK}站台 {NUM}:({NUM}, {NUM})
+STR_R3R_YARD_EMPTY                                              :{BLACK}本车站没有铁路站台
+STR_R3R_YARD_NAME_NONE                                          :{BLACK}(整站)
+STR_R3R_YARD_NAME_N                                             :{BLACK}[{NUM} 场]
+STR_R3R_YARD_NAME_N_SHARED                                      :{BLACK}[{NUM} 场·共享]
+STR_R3R_YARD_SEL_TOOLTIP                                        :{BLACK}右侧按钮所作用的场
+STR_R3R_YARD_ASSIGN                                             :{BLACK}划入
+STR_R3R_YARD_ASSIGN_TOOLTIP                                     :{BLACK}将选中的站台划入当前选中的场
+STR_R3R_YARD_NEW                                                :{BLACK}新建场
+STR_R3R_YARD_NEW_TOOLTIP                                        :{BLACK}在本车站新建一个空场并选中它
+STR_R3R_YARD_SHARED                                             :{BLACK}共享
+STR_R3R_YARD_SHARED_TOOLTIP                                     :{BLACK}选择当前选中的场停满时要回落到哪个场。{}多个场可以选同一个场，例如 1 场与 2 场都回落到 3 场
+STR_R3R_YARD_SHARED_NONE                                        :{BLACK}无
+STR_R3R_YARD_SHARED_SEL                                         :{BLACK}共享: {STRING}
+STR_R3R_YARD_LOCATE                                             :{BLACK}定位
+STR_R3R_YARD_LOCATE_TOOLTIP                                     :{BLACK}将主视图滚动到选中的站台
+
+# R3R:目的地场(订单窗口)
+STR_ORDER_R3R_YARD_WHOLE                                        :整站
+STR_ORDER_R3R_YARD_NAMED                                        :{NUM} 场
+STR_ORDER_R3R_YARD_NAMED_SHARED                                 :{NUM} 场(共享)
+STR_ORDER_R3R_YARD_TOOLTIP                                      :{BLACK}本订单在目的车站的哪个场停靠
+
 STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}编辑车站标志
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}关闭机场
@@ -4720,11 +4748,6 @@ STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :等待挂接
 STR_ORDER_COUPLE_ANY                                            :挂接任意
 STR_ORDER_COUPLE_EMPTY                                          :挂接空车
 STR_ORDER_COUPLE_FULL                                           :挂接满载
-
-# R3R "到站调向" 字符串
-STR_ORDER_REVERSE_AT_STATION_TOOLTIP                             :{BLACK}列车到达此站后原地调向再驶出, 使车头朝向另一方向。常用于"前往并挂接"命令之前, 让车组以正向姿态接近耦合点。
-STR_ORDER_REVERSE_AT_DEPOT_TOOLTIP                               :{BLACK}列车进入此车库后原地调向, 出库时车头朝向另一方向。贯通式车库可借此作为调向点使用。
-STR_ORDER_REVERSE_AT_WAYPOINT_TOOLTIP                            :{BLACK}列车停靠在此路点后原地调向, 然后反向驶出。不必让整列车驶过路点, 即可把路点当作调向点使用。
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}不停车

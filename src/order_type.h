@@ -338,7 +338,7 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_COND_STATION_ID, ///< The station ID to set the condition to.
 	MOF_COND_DESTINATION,///< Change the destination of a conditional order.
 	MOF_WAYPOINT_FLAGS,  ///< Change the waypoint flags
-	MOF_REVERSE_AT_STATION, ///< R3R: Change the reverse-on-arrival flag of a station order, or the reverse-at-depot flag of a depot order.
+	MOF_REVERSE_AT_STATION, ///< RETIRED (R3R): former reverse-on-arrival flag setter. Kept as a placeholder so the values below stay stable.
 	MOF_CARGO_TYPE_UNLOAD, ///< Passes an OrderUnloadType and a CargoType.
 	MOF_CARGO_TYPE_LOAD,   ///< Passes an OrderLoadType and a CargoType.
 	MOF_SLOT,            ///< Change the slot value
@@ -351,6 +351,7 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_LABEL_TEXT,      ///< Change the label text value
 	MOF_DEPARTURES_SUBTYPE, ///< Change the label departures subtype
 	MOF_DECOUPLE_BOUNDARY, ///< R3R: change the segment boundary of a decouple order.
+	MOF_R3R_YARD,        ///< R3R: change the destination yard of a station order.
 	MOF_END
 };
 

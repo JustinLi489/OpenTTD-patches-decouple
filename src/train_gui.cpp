@@ -18,6 +18,7 @@
 #include "zoom_func.h"
 #include "settings_type.h"
 #include "core/backup_type.hpp"
+#include "r3r_perf.h"
 
 #include "table/strings.h"
 
@@ -127,6 +128,19 @@ void DrawTrainImage(const Train *v, const Rect &r, VehicleID selection, EngineIm
 	int highlight_l = 0;
 	int highlight_r = 0;
 	int max_width = r.Width();
+
+	/* R3R (KI-135): a degenerate (zero or negative sized) rect trips the
+	 * assertion inside FillDrawPixelInfo() before it can return false. Nothing
+	 * can be visible in such a rect, so bail out; see DrawRoadVehImage() for the
+	 * reasoning and for the probe-line cap. */
+	if (max_width <= 0 || r.Height() <= 0) {
+		static int r3r_degenerate_logged = 0;
+		if (r3r_degenerate_logged < 16) {
+			r3r_degenerate_logged++;
+			R3RDbgWrite("GUI-DEGEN-RECT train left=%d top=%d right=%d bottom=%d\n", (int)r.left, (int)r.top, (int)r.right, (int)r.bottom);
+		}
+		return;
+	}
 
 	if (!FillDrawPixelInfo(&tmp_dpi, r)) return;
 

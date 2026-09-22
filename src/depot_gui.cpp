@@ -40,6 +40,7 @@
 #include "couple_group.h"
 #include "couple_group_gui.h"
 #include "tbtr_template_vehicle_cmd.h"
+#include "r3r_perf.h"
 
 #include "widgets/depot_widget.h"
 
@@ -159,6 +160,13 @@ void CcCloneVehicle(const CommandCost &result)
 static const Train *TrainDepotGetSegmentFront(const Train *v)
 {
 	if (v == nullptr) return nullptr;
+	/* R3R: a vehicle sitting between the two halves of a dual-headed engine is a
+	 * normal member of the segment like every other vehicle in it. It must not be
+	 * draggable on its own (the whole segment is dragged instead), otherwise the
+	 * segment could be torn apart from the inside. Older saves whose dual-head
+	 * halves are separated by wagons are repaired by pulling the halves back
+	 * together (NormaliseDualHeads / R3RIsInsideSegment), not by letting the
+	 * player split the segment. */
 	/* A vehicle sitting on the segment's own right boundary still belongs to it. */
 	const bool at_segment_back = v->IsSegmentBack();
 	for (const Train *t = v; t != nullptr; t = t->Previous()) {
@@ -580,6 +588,22 @@ struct DepotWindow : Window {
 		Rect text = r.Shrink(RectPadding::zero, WidgetDimensions::scaled.matrix).Indent(this->tag_width, rtl); /* Ract for text elements, horizontal is already applied. */
 		Rect image = r.Indent(this->tag_width, rtl).Indent(this->header_width, rtl).Indent(this->count_width, !rtl); /* Rect for vehicle images */
 
+		/* R3R (KI-135): the depot window used to crash while drawing a road vehicle
+		 * because this rect came out empty (the assertion in FillDrawPixelInfo()).
+		 * The image drawing now bails out on a degenerate rect, but the layout
+		 * itself is still wrong; record the geometry that produced it (probe
+		 * enabled test build, capped) so the real cause can be fixed. */
+		if (image.Width() <= 0 || image.Height() <= 0) {
+			static int r3r_degenerate_logged = 0;
+			if (r3r_degenerate_logged < 16) {
+				r3r_degenerate_logged++;
+				R3RDbgWrite("GUI-DEGEN-RECT depot type=%d cell=%d,%d,%d,%d image=%d,%d,%d,%d tag=%u header=%u count=%u cols=%u\n",
+						(int)this->type, r.left, r.top, r.right, r.bottom,
+						image.left, image.top, image.right, image.bottom,
+						(unsigned int)this->tag_width, (unsigned int)this->header_width, (unsigned int)this->count_width, (unsigned int)this->num_columns);
+			}
+		}
+
 		switch (v->type) {
 			case VehicleType::Train: {
 				const Train *u = Train::From(v);
@@ -848,6 +872,14 @@ struct DepotWindow : Window {
 			}
 
 			case DepotGUIAction::ShowVehicle: // show info window
+				/* R3R: the depot lists can hand us a vehicle which is not the head of
+				 * its chain (a single wagon of a loose wagon chain, or a list entry
+				 * generated before the vehicle got coupled into a longer chain).
+				 * ShowVehicleViewWindow() asserts that the given vehicle is the chain
+				 * head (Vehicle::IsStoppedInDepot(), vehicle_base.h:669), so resolve
+				 * the head and refuse anything which is not a proper chain head. */
+				if (result.vehicle->First() != result.vehicle) break;
+				if (result.vehicle->type == VehicleType::Train && Train::From(result.vehicle)->IsFreeWagon()) break;
 				ShowVehicleViewWindow(result.vehicle);
 				break;
 
@@ -1065,7 +1097,14 @@ struct DepotWindow : Window {
 					if (result.action == DepotGUIAction::DragVehicle && result.vehicle != nullptr) {
 						/* R3R: do not open a window for loose wagons (FreeWagon) —
 						 * double-clicking a non-engine wagon chain in the depot does
-						 * nothing (falls through to the normal selection click). */
+						 * nothing (falls through to the normal selection click).
+						 * The list entry can additionally be a vehicle which is not the
+						 * head of its chain any more (a single wagon of a loose chain,
+						 * or an entry generated before the chain got extended by a
+						 * couple). Opening the vehicle view asserts on such a vehicle
+						 * (Vehicle::IsStoppedInDepot(), vehicle_base.h:669), so require
+						 * the chain head here as well. */
+						if (result.vehicle->First() != result.vehicle) break;
 						if (result.vehicle->type == VehicleType::Train && Train::From(result.vehicle)->IsFreeWagon()) break;
 						this->sel = VehicleID::Invalid();
 						ResetObjectToPlace();
@@ -1431,7 +1470,7 @@ struct DepotWindow : Window {
 				if (this->type == VehicleType::Train) {
 					if (result.action == DepotGUIAction::DragVehicle && sel != VehicleID::Invalid()) {
 						if (result.wagon != nullptr && result.wagon->index == sel && _ctrl_pressed) {
-							Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true, false);
+							Command<Commands::ReverseTrainDirection>::Post(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE, Vehicle::Get(sel)->tile, Vehicle::Get(sel)->index, true);
 						} else if (result.wagon == nullptr || result.wagon->index != sel) {
 							this->vehicle_over = VehicleID::Invalid();
 							TrainDepotMoveVehicle(result.wagon, sel, result.vehicle);

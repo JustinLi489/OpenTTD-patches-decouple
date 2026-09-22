@@ -21,6 +21,7 @@
 #include "../../misc/dbg_helpers.h"
 #include "../../r3r_perf.h"
 #include "../../couple_group.h"
+#include "../../pbs.h"
 
 #include "../../safeguards.h"
 
@@ -191,7 +192,104 @@ private:
 			if (!TryReserveRailTrack(tile, TrackdirToTrack(td))) {
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d\n", (int)TileX(tile), (int)TileY(tile), (int)td);
+					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d want=%d type=%d tbits=0x%X res=0x%X plain=%d depot=%d st=%d\n",
+						(int)TileX(tile), (int)TileY(tile), (int)td, (int)TrackdirToTrack(td),
+						(int)GetTileType(tile), (unsigned)GetTrackBits(tile), (unsigned)GetReservedTrackbits(tile),
+						(int)IsPlainRail(tile), (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile));
+					const uint8_t rb = (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK);
+					Train *coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
+					for (Track tk = TRACK_BEGIN; tk != TRACK_END; tk++) {
+						if (!HasBit(rb, tk)) continue;
+						Train *owner = GetTrainForReservation(tile, tk);
+						if (owner == nullptr) {
+							fprintf(dbg, "FSCP-RES tile=%d,%d tk=%d owner=-1\n",
+								(int)TileX(tile), (int)TileY(tile), (int)tk);
+							continue;
+						}
+						/* R3R (KI-162 probe): the blocker is named, but not yet
+						 * classified. These columns decide whether the owner is
+						 * (a) still rolling / shrinking its reservation while it
+						 * clears the coupler's path, or (b) already standing still
+						 * and merely holding its own forward reservation.
+						 * ostop/ospd = parked?  oend = where the owner's own
+						 * reservation ends, othru = does it really pass through
+						 * this tile, octgt/ocplok = is the owner the coupler's
+						 * legitimate couple target at all. */
+						Train *oh = const_cast<Train *>(owner->First());
+						const PBSTileInfo oend = FollowTrainReservation(oh, nullptr);
+						fprintf(dbg, "FSCP-RES tile=%d,%d tk=%d owner=%d otile=%d,%d odir=%d ospd=%d ostop=%d ord=%d oroi=%d oend=%d,%d oendtd=%d othru=%d octgt=%d ocplok=%d cpl=%d,%d\n",
+							(int)TileX(tile), (int)TileY(tile), (int)tk, (int)oh->index.base(),
+							(int)TileX(oh->tile), (int)TileY(oh->tile), (int)oh->direction, (int)oh->cur_speed,
+							(int)oh->vehstatus.Test(VehState::Stopped), (int)oh->current_order.GetType(), (int)oh->cur_real_order_index,
+							(int)TileX(oend.tile), (int)TileY(oend.tile), (int)oend.trackdir,
+							(int)TrainReservationPassesThroughTile(oh, tile),
+							(int)R3RIsCoupleTarget(oh), (int)R3RCoupleAllowed(coupler, oh),
+							(int)TileX(coupler->tile), (int)TileY(coupler->tile));
+					}
+					/* R3R (KI-162 probe, round 2; SEMANTICS CORRECTED in round 91):
+					 * Neither API here can answer "who reserved this tile".
+					 *  - GetTrainForReservation() ("owner=" above) follows the
+					 *    reservation to one end and names the train standing there,
+					 *    and on station tiles it scans the whole platform (pbs.cpp
+					 *    CheckTrainsOnTrack), so it can even name a train on another
+					 *    track. See KI-162 round 90.
+					 *  - TrainReservationPassesThroughTile() (this block) walks the
+					 *    *contiguous* run of reserved trackbits starting at the
+					 *    train's moving front (pbs.cpp FollowReservationEnumerate;
+					 *    the reserved bits are global and carry no owner). A train
+					 *    parked on that run therefore "reaches" the tile *through
+					 *    someone else's* reservation and is listed as well. It means
+					 *    "this chain's reservation reaches the tile", NOT "this
+					 *    chain holds the reservation" -- do not read it as ownership.
+					 * Verified in round 91: at 60,53 the parked consist veh=1 was
+					 * listed next to the actually holding loco veh=0, while the
+					 * consist's own reservation only covered 60,48..60,51.
+					 * The reliable ownership evidence is the FSCP-VEH line below (a
+					 * train physically standing on the tile) plus the owner's
+					 * ord/dir/spd. REACH-NONE keeps its meaning: no chain can reach
+					 * this tile along a contiguous reservation at all, which would be
+					 * a genuinely stale/orphan reservation. */
+					{
+						static TileIndex s_fscp_reach_none_tile = INVALID_TILE;
+						uint reach_hits = 0;
+						for (Train *tr : Train::Iterate()) {
+							if (tr->First() != tr) continue;
+							if (!TrainReservationPassesThroughTile(tr, tile)) continue;
+							reach_hits++;
+							const PBSTileInfo tend = FollowTrainReservation(tr, nullptr);
+							Train *gtr = nullptr;
+							for (Track tk2 = TRACK_BEGIN; tk2 != TRACK_END; tk2++) {
+								if (!HasBit(rb, tk2)) continue;
+								Train *g = GetTrainForReservation(tile, tk2);
+								if (g != nullptr) { gtr = g->First(); break; }
+							}
+							fprintf(dbg, "FSCP-REACH tile=%d,%d veh=%d ord=%d roi=%d pos=%d,%d dir=%d spd=%d stopped=%d seg=%d cplok=%d ctgt=%d end=%d,%d endtd=%d isGtr=%d cpl=%d,%d\n",
+								(int)TileX(tile), (int)TileY(tile), (int)tr->index.base(),
+								(int)tr->current_order.GetType(), (int)tr->cur_real_order_index,
+								(int)TileX(tr->tile), (int)TileY(tr->tile), (int)tr->direction,
+								(int)tr->cur_speed, (int)tr->vehstatus.Test(VehState::Stopped),
+								(int)tr->IsSegmentFront(), (int)R3RCoupleAllowed(coupler, tr),
+								(int)R3RIsCoupleTarget(tr),
+								(int)TileX(tend.tile), (int)TileY(tend.tile), (int)tend.trackdir,
+								(int)(gtr == tr),
+								(int)TileX(coupler->tile), (int)TileY(coupler->tile));
+						}
+						if (reach_hits == 0) {
+							if (s_fscp_reach_none_tile != tile) {
+								s_fscp_reach_none_tile = tile;
+								fprintf(dbg, "FSCP-REACH-NONE tile=%d,%d (no chain reaches this tile along a contiguous reservation)\n",
+									(int)TileX(tile), (int)TileY(tile));
+							}
+						} else {
+							s_fscp_reach_none_tile = INVALID_TILE;
+						}
+					}
+					for (Train *tr : VehiclesOnTile<VehicleType::Train>(tile)) {
+						fprintf(dbg, "FSCP-VEH tile=%d,%d veh=%d track=0x%X dir=%d front=%d ord=%d\n",
+							(int)TileX(tile), (int)TileY(tile), (int)tr->index.base(),
+							(unsigned)tr->track, (int)tr->direction, (int)tr->IsFrontEngine(),
+							(int)tr->current_order.GetType());
+					}
 					fclose(dbg);
 				}
 				return false;
@@ -602,6 +700,47 @@ public:
 };
 
 /**
+ * R3R: does the waiting consist's tile (target) lie on the station stretch the
+ * TrackFollower skipped over in its last step?
+ *
+ * A rail TrackFollower jumps from the platform entry tile straight to the far
+ * end of the platform in a single step (CFollowTrackT::CanEnterNewTile), so a
+ * consist parked on the platform would be skipped entirely. The exact stretch
+ * is reconstructible from the follower's own state: it starts one step from
+ * old_tile in the follower's exit direction and covers tiles_skipped + 1 tiles,
+ * ending on new_tile.
+ *
+ * A previous version scanned along the platform axis in *both* directions with
+ * a pure coordinate comparison, unbounded by the follower's real step, so any
+ * tile that merely shared the axis line - e.g. the consist standing at another
+ * station on the same row/column - was mistaken for the skipped target. That
+ * produced a bogus "already reached" result and, in the tracer below, a
+ * departure direction (and reservation) leading away from the consist.
+ *
+ * @param old_tile      Tile the follower started from.
+ * @param new_tile      Tile the follower landed on (far end of the platform).
+ * @param exitdir       Direction of travel used by the follower.
+ * @param tiles_skipped Number of tiles the follower jumped over.
+ * @param target        Tile to look for on the skipped stretch.
+ * @return true iff target lies on the tiles the follower skipped over.
+ */
+static bool R3RSkippedStationStretchContains(TileIndex old_tile, TileIndex new_tile, DiagDirection exitdir, int tiles_skipped, TileIndex target)
+{
+	if (tiles_skipped <= 0 || !IsValidDiagDirection(exitdir)) return false;
+	const TileIndexDiff step = TileOffsByDiagDir(exitdir);
+	TileIndex t = old_tile;
+	for (int i = 0; i <= tiles_skipped; ++i) {
+		t += step;
+		/* Every skipped tile belongs to the same platform; anything else means
+		 * the follower did not leap a station and the stretch is not valid. */
+		if (!IsRailStationTile(t)) return false;
+		if (t == target) return true;
+		if (t == new_tile) break;
+	}
+	return false;
+}
+
+/**
  * Follow class for the "couple pathfinder": standard rail following used to
  * search for the nearest waiting consist (see CYapfDestinationTrainRailT).
  */
@@ -625,28 +764,8 @@ public:
 	inline void PfFollowNode(Node &old_node)
 	{
 		/* R3R: a depot tile is a dead end - never extend a path through it. */
-		{
-			const bool is_depot = IsRailDepotTile(old_node.GetLastTile());
-			if (is_depot || (TileX(old_node.GetLastTile()) == 38 && TileY(old_node.GetLastTile()) == 27)) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "DEPOTCHK t=%d,%d isDepot=%d isRailway=%d parent=%s\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)is_depot, (int)IsTileType(old_node.GetLastTile(), TileType::Railway), old_node.parent != nullptr ? "y" : "n");
-					fclose(dbg);
-				}
-			}
-		}
 		if (IsRailDepotTile(old_node.GetLastTile()) && old_node.parent != nullptr) return;
 		TrackFollower F(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
-		if (Yapf().GetVehicle()->current_order.IsType(OT_GOTO_COUPLE)) {
-			TrackFollower F2(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
-			if (F2.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-FOLLOW from=%d,%d td=%d to=%d,%d tdbits=0x%x\n", (int)TileX(old_node.GetLastTile()), (int)TileY(old_node.GetLastTile()), (int)old_node.GetLastTrackdir(), (int)TileX(F2.new_tile), (int)TileY(F2.new_tile), (unsigned)F2.new_td_bits);
-					fclose(dbg);
-				}
-			}
-		}
 		if (F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
 			Yapf().AddMultipleNodes(&old_node, F);
 		}
@@ -814,24 +933,14 @@ public:
 			if (!f2.Follow(cur, cur_td)) return false;
 			/* R3R: TrackFollower leaps a whole platform in one step, so the
 			 * consist head (tg) lying on that platform stretch would be skipped.
-			 * If tg is on the platform segment between cur and f2.new_tile, treat
-			 * it as reached. */
-			if (IsRailStationTile(f2.new_tile)) {
-				const Axis axis = GetRailStationAxis(f2.new_tile);
-				const TileIndexDiff delta = TileOffsByAxis(axis);
-				TileIndex tt = cur;
-				for (int i = 0; i < 32; ++i) {
-					tt += delta;
-					if (tt == f2.new_tile) break;
-					if (tt == tg) return true;
-				}
-				tt = cur;
-				for (int i = 0; i < 32; ++i) {
-					tt -= delta;
-					if (tt == f2.new_tile) break;
-					if (tt == tg) return true;
-				}
-			}
+			 * Reconstruct the exact stretch the follower jumped over (its exit
+			 * direction plus tiles_skipped) and treat tg as reached when it lies
+			 * on it. Do NOT scan along the platform axis in both directions: any
+			 * tile merely sharing the axis line (e.g. the consist standing at a
+			 * neighbouring station on the same row) was mistaken for the target,
+			 * which handed the walk-back a bogus departure direction pointing
+			 * away from the consist. */
+			if (f2.is_station && R3RSkippedStationStretchContains(cur, f2.new_tile, f2.exitdir, f2.tiles_skipped, tg)) return true;
 			TrackdirBits tdb2 = f2.new_td_bits;
 			if (tdb2 == TRACKDIR_BIT_NONE) return false;
 			if (KillFirstBit(tdb2) == TRACKDIR_BIT_NONE) {
@@ -874,6 +983,17 @@ public:
 							fclose(dbg);
 						}
 					}
+					/* R3R: reserve a track only when the tile really carries it. Some of
+					 * the tracks collected below are derived from the platform axis or
+					 * from the trackdir the loco leaves with, which can land on tiles
+					 * that do not carry that track at all (platform end, rail removed,
+					 * tile of another axis). Reserving there would trip the assertion
+					 * in TryReserveRailTrack (pbs.cpp:144/145), so look at the tile's
+					 * track bits first and skip tiles that cannot hold the track. */
+					auto reserve_if_present = [](TileIndex t, Track trk) {
+						const TrackBits bits = TrackdirBitsToTrackBits(GetTileTrackdirBits(t, ::TransportType::TRANSPORT_RAIL, 0));
+						if ((bits & TrackToTrackBits(trk)) != 0) TryReserveRailTrack(t, trk);
+					};
 					if (depth > 512) return false;
 					if (cur == tg) return true;
 					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) rp_last_tile = cur;
@@ -883,56 +1003,34 @@ public:
 					if (IsRailDepotTile(cur) && cur != st) return false;
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
-					if (IsRailStationTile(f3.new_tile)) {
+					if (f3.is_station && f3.tiles_skipped > 0 && R3RSkippedStationStretchContains(cur, f3.new_tile, f3.exitdir, f3.tiles_skipped, tg)) {
 						const Axis axis = GetRailStationAxis(f3.new_tile);
-						const TileIndexDiff delta = TileOffsByAxis(axis);
+						const TileIndexDiff step = TileOffsByDiagDir(f3.exitdir);
 						const Track plat_track = AxisToTrack(axis);
-						TileIndex tt = cur;
-						for (int i = 0; i < 32; ++i) {
-							tt += delta;
-							if (tt == f3.new_tile) break;
-							if (tt == tg) {
-								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
-								}
-								/* R3R: also reserve the platform tiles between the loco and
-								 * the consist - the loco must drive over them to reach the
-								 * coupling point. Normally the consist holds a
-								 * whole-platform reservation, in which case these tiles are
-								 * already reserved (TryReserveRailTrack fails harmlessly);
-								 * when it does not, this keeps the loco's own path
-								 * contiguous so it can still reach the consist. */
-								for (TileIndex p = cur; p != tt;) {
-									p += delta;
-									if (p == tt || p == f3.new_tile) break;
-									TryReserveRailTrack(p, plat_track);
-								}
-								return true;
-							}
+						if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+							TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
 						}
-						tt = cur;
-						for (int i = 0; i < 32; ++i) {
-							tt -= delta;
-							if (tt == f3.new_tile) break;
-							if (tt == tg) {
-								if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-									TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
-								}
-								for (TileIndex p = cur; p != tt;) {
-									p -= delta;
-									if (p == tt || p == f3.new_tile) break;
-									TryReserveRailTrack(p, plat_track);
-								}
-								return true;
-							}
+						/* R3R: also reserve the platform tiles between the loco and
+						 * the consist - the loco must drive over them to reach the
+						 * coupling point. Normally the consist holds a
+						 * whole-platform reservation, in which case these tiles are
+						 * already reserved (TryReserveRailTrack fails harmlessly);
+						 * when it does not, this keeps the loco's own path
+						 * contiguous so it can still reach the consist. */
+						TileIndex p = cur;
+						p += step;
+						for (; p != tg; p += step) {
+							if (!IsRailStationTile(p)) break;
+							reserve_if_present(p, plat_track);
 						}
+						return true;
 					}
 					TrackdirBits tdb3 = f3.new_td_bits;
 					if (tdb3 == TRACKDIR_BIT_NONE) return false;
 					if (KillFirstBit(tdb3) == TRACKDIR_BIT_NONE) {
 						if (rp(f3.new_tile, FindFirstTrackdir(tdb3), depth + 1)) {
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								reserve_if_present(cur, TrackdirToTrack(cur_td));
 							}
 							/* R3R: also reserve the entry track of the next tile - the loco needs the
 							 * track it drives INTO, not just the one it leaves. Only reserve if the tile
@@ -952,7 +1050,7 @@ public:
 					for (TrackdirBits tb = tdb3; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
 						if (rp(f3.new_tile, (Trackdir)FindFirstBit(tb), depth + 1)) {
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+								reserve_if_present(cur, TrackdirToTrack(cur_td));
 							}
 							/* R3R: also reserve the entry track of the next tile, but only if
 							 * the tile actually has that track (avoids the pbs.cpp:144 assertion
@@ -986,17 +1084,7 @@ public:
 				if (dbg != nullptr) {
 					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
 							(int)v->index.base(), (int)reserved, (int)next_trackdir);
-					fprintf(dbg, "CHKRES 38,37=0x%x 38,36=0x%x 38,35=0x%x 38,34=0x%x 39,34=0x%x 39,33=0x%x 39,32=0x%x 39,31=0x%x 39,30=0x%x\n",
-							(unsigned)GetReservedTrackbits(TileXY(38, 37)),
-							(unsigned)GetReservedTrackbits(TileXY(38, 36)),
-							(unsigned)GetReservedTrackbits(TileXY(38, 35)),
-							(unsigned)GetReservedTrackbits(TileXY(38, 34)),
-							(unsigned)GetReservedTrackbits(TileXY(39, 34)),
-							(unsigned)GetReservedTrackbits(TileXY(39, 33)),
-							(unsigned)GetReservedTrackbits(TileXY(39, 32)),
-							(unsigned)GetReservedTrackbits(TileXY(39, 31)),
-							(unsigned)GetReservedTrackbits(TileXY(39, 30)));
-					fclose(dbg);
+							fclose(dbg);
 				}
 			}
 			return reserved ? next_trackdir : INVALID_TRACKDIR;

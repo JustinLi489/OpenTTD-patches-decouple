@@ -1,5 +1,13 @@
 @echo off
 setlocal
+echo ==================================================================
+echo  NOTE 2026-09-20: this is the INCREMENTAL release build.
+echo  It does NOT delete stale .obj files, so after any src\*.h change
+echo  it can link a MIXED binary (KI-15).
+echo  For a guaranteed FULL rebuild, double-click instead:
+echo      R3R_release_fullbuild.cmd
+echo ==================================================================
+echo.
 title R3R RelWithDebInfo build (build-release)
 
 rem ============================================================

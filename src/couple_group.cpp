@@ -12,6 +12,8 @@
 
 #include "train.h"
 #include "vehicle_base.h"
+#include "depot_map.h"
+#include "station_map.h"
 #include "core/pool_func.hpp"
 
 #include "safeguards.h"
@@ -225,6 +227,44 @@ void R3RClearCoupleGroupsOfSegment(Train *v)
 bool R3RCoupleAllowed(const Train *coupler, const Train *target)
 {
 	if (coupler == nullptr || target == nullptr) return false;
+
+	/* R3R (KI-165): the order's own destination is the first half of the permit.
+	 *
+	 * A GOTO_COUPLE order stores the station (or depot) the consist waits at --
+	 * that is what "go to and couple" picks in the order window and what the
+	 * order list prints ("go to and couple at <station>"). The destination was
+	 * never consulted when candidates were resolved, so any platform or depot
+	 * holding a waiting consist was accepted. Observed 2026-09-22: loco veh=0
+	 * held GOTO_COUPLE station 0 (60,48-60,51) but was routed to station 2
+	 * (60,58-60,61) and reported COUPLE-OK there, merely because the waiting
+	 * consist stood at station 2 -- exactly the "it coupled where it has no
+	 * order to couple" complaint.
+	 *
+	 * This function is the one place all three resolution levels ask: the couple
+	 * pathfinder's destination test (yapf_destrail.hpp PfDetectDestination), the
+	 * back-walk safety test which decides whose occupied tiles the couple path
+	 * may pass through (yapf_rail.cpp CheckSafePositionOnNode), and the arrival
+	 * gate in TrainCoupleHandler (R3RCanCoupleNow -> reject=dest-mismatch).
+	 * Enforcing it here therefore keeps "the target the path was planned for" and
+	 * "the coupling that is finally executed" in agreement. */
+	const Order &order = coupler->current_order;
+	if (order.IsType(OT_GOTO_COUPLE)) {
+		const DestinationID dest = order.GetDestination();
+		if (order.GetCoupleIsDepot()) {
+			/* Depot order: only a candidate standing on a tile of the named depot
+			 * is refused here. A candidate in a depot or on the approach track
+			 * just outside the depot mouth (which is no longer a depot tile) keeps
+			 * the old tile-agnostic behaviour -- that track is where a consist
+			 * regularly waits, and a "couple at depot" order cannot name it. */
+			if (IsRailDepotTile(target->tile) && GetDepotIndex(target->tile) != dest.ToDepotID()) return false;
+		} else {
+			/* Station order: a candidate parked at some *other* station is not a
+			 * candidate at all. Candidates in a depot, or off any permanent way,
+			 * are untouched -- see R3RCoupleTargetAtOrderStation() in
+			 * train_cmd.cpp, which labels the rejection and must stay in sync. */
+			if (IsRailStationTile(target->tile) && GetStationIndex(target->tile) != dest.ToStationID()) return false;
+		}
+	}
 
 	const CoupleGroupMask coupler_groups = R3RGetCoupleGroupsOfSegment(coupler);
 	const CoupleGroupMask target_groups = R3RGetCoupleGroupsOfSegment(target);

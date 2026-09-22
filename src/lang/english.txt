@@ -3967,6 +3967,34 @@ STR_STATION_VIEW_SCHEDULED_ROAD_VEHICLES_TOOLTIP                :{BLACK}Show all
 STR_STATION_VIEW_SCHEDULED_AIRCRAFT_TOOLTIP                     :{BLACK}Show all aircraft which have this station on their schedule
 STR_STATION_VIEW_SCHEDULED_SHIPS_TOOLTIP                        :{BLACK}Show all ships which have this station on their schedule
 
+# R3R station yards (站场)
+STR_R3R_YARD_BUTTON                                             :{BLACK}Yards
+STR_R3R_YARD_BUTTON_TOOLTIP                                     :{BLACK}Assign the rail platforms of this station to a yard
+STR_R3R_YARD_CAPTION                                            :{WHITE}{STATION} - Yards
+STR_R3R_YARD_LIST_TOOLTIP                                       :{BLACK}Each row is one rail platform. Select a platform and use the buttons below to assign it to a yard
+STR_R3R_YARD_LIST_ITEM                                          :{BLACK}Platform {NUM}: ({NUM}, {NUM})
+STR_R3R_YARD_EMPTY                                              :{BLACK}This station has no rail platforms
+STR_R3R_YARD_NAME_NONE                                          :{BLACK}(whole station)
+STR_R3R_YARD_NAME_N                                             :{BLACK}[Yard {NUM}]
+STR_R3R_YARD_NAME_N_SHARED                                      :{BLACK}[Yard {NUM}, shared]
+STR_R3R_YARD_SEL_TOOLTIP                                        :{BLACK}The yard that the buttons to the right apply to
+STR_R3R_YARD_ASSIGN                                             :{BLACK}Assign
+STR_R3R_YARD_ASSIGN_TOOLTIP                                     :{BLACK}Assign the selected platform to the selected yard
+STR_R3R_YARD_NEW                                                :{BLACK}New yard
+STR_R3R_YARD_NEW_TOOLTIP                                        :{BLACK}Create a new empty yard at this station and select it
+STR_R3R_YARD_SHARED                                             :{BLACK}Shared
+STR_R3R_YARD_SHARED_TOOLTIP                                     :{BLACK}Choose the yard the selected yard falls back to when it is full.{}{}Several yards may pick the same yard here, e.g. yards 1 and 2 both falling back to yard 3
+STR_R3R_YARD_SHARED_NONE                                        :{BLACK}none
+STR_R3R_YARD_SHARED_SEL                                         :{BLACK}Shared: {STRING}
+STR_R3R_YARD_LOCATE                                             :{BLACK}Locate
+STR_R3R_YARD_LOCATE_TOOLTIP                                     :{BLACK}Scroll the main view to the selected platform
+
+# R3R: destination yard of a station order (order window)
+STR_ORDER_R3R_YARD_WHOLE                                        :Whole station
+STR_ORDER_R3R_YARD_NAMED                                        :Yard {NUM}
+STR_ORDER_R3R_YARD_NAMED_SHARED                                 :Yard {NUM} (shared)
+STR_ORDER_R3R_YARD_TOOLTIP                                      :{BLACK}Which yard of the destination station this order stops at
+
 STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}Edit station sign
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}Close airport
@@ -4737,11 +4765,6 @@ STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :Wait for coupli
 STR_ORDER_COUPLE_ANY                                            :Couple any
 STR_ORDER_COUPLE_EMPTY                                          :Couple empty
 STR_ORDER_COUPLE_FULL                                           :Couple full
-
-# R3R "reverse on arrival" strings
-STR_ORDER_REVERSE_AT_STATION_TOOLTIP                             :{BLACK}Reverse the consist in place when it arrives at this station, so it departs facing the other way. Useful before a "Go to and couple" order to approach the coupling point nose-first.
-STR_ORDER_REVERSE_AT_DEPOT_TOOLTIP                               :{BLACK}Reverse the consist inside this depot order's depot, so it drives out facing the other way. A drive-through depot then acts as a turning point.
-STR_ORDER_REVERSE_AT_WAYPOINT_TOOLTIP                            :{BLACK}Stop the consist on this waypoint and reverse it in place, so it drives back out the way it came. Lets a waypoint act as a turning point without the consist having to fully pass it.
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}Non-stop

@@ -44,6 +44,7 @@ add_files(
     signal_sl.cpp
     signs_sl.cpp
     station_sl.cpp
+    station_yard_sl.cpp
     storage_sl.cpp
     strings_sl.cpp
     story_sl.cpp

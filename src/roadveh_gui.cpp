@@ -16,6 +16,7 @@
 #include "vehicle_gui_base.h"
 #include "string_func.h"
 #include "zoom_func.h"
+#include "r3r_perf.h"
 
 #include "table/strings.h"
 
@@ -123,6 +124,22 @@ void DrawRoadVehImage(const Vehicle *v, const Rect &r, VehicleID selection, Engi
 
 	DrawPixelInfo tmp_dpi;
 	int max_width = r.Width();
+
+	/* R3R (KI-135): a degenerate (zero or negative sized) rect trips the
+	 * assertion inside FillDrawPixelInfo() before it can return false, which
+	 * crashed the game when opening a road vehicle depot / the purchase window.
+	 * Nothing can be visible in such a rect, so bail out. The probe line is the
+	 * only way to find out which caller computes the broken geometry (it is
+	 * compiled in the probe-enabled test build only, and capped so a repaint
+	 * loop cannot flood R3R_debug.log). */
+	if (max_width <= 0 || r.Height() <= 0) {
+		static int r3r_degenerate_logged = 0;
+		if (r3r_degenerate_logged < 16) {
+			r3r_degenerate_logged++;
+			R3RDbgWrite("GUI-DEGEN-RECT roadveh left=%d top=%d right=%d bottom=%d\n", (int)r.left, (int)r.top, (int)r.right, (int)r.bottom);
+		}
+		return;
+	}
 
 	if (!FillDrawPixelInfo(&tmp_dpi, r)) return;
 

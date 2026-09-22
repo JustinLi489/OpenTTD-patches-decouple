@@ -1185,6 +1185,24 @@ void Vehicle::PreDestructor()
 
 	Company::Get(this->owner)->freeunits[this->type].ReleaseID(this->unitnumber);
 
+	/* R3R (KI-147): while a train is coupled onto another one it lends its own
+	 * unit number out and parks it in unitnumber_backup (see Couple() /
+	 * unitnumber_backup). That parked number is still marked as used in the
+	 * company's pool, but no vehicle points at it any more, so nothing else will
+	 * ever release it -- destroying the merged train (e.g. selling two coupled
+	 * segments at once) used to leak exactly one unit id per coupled pair, which
+	 * is why train numbers kept creeping upwards until the 65000s on a long-run
+	 * game. Only the chain head can be in that state (rev.3: use
+	 * IsPrimaryVehicle() so a car-only formation head -- a FrontWagon -- is
+	 * covered too), and only when the parked number differs from the live number
+	 * (a non-front member stores a plain copy of the number its head already
+	 * holds, which must NOT be released here). */
+	if (this->type == VehicleType::Train && this->IsPrimaryVehicle() &&
+			this->unitnumber_backup != 0 && this->unitnumber_backup != this->unitnumber) {
+		Company::Get(this->owner)->freeunits[this->type].ReleaseID(this->unitnumber_backup);
+		R3RDbgWrite("UNIT-RELBK bk=%u id=%u\n", this->unitnumber_backup, this->unitnumber);
+	}
+
 	if (this->type == VehicleType::Aircraft && this->IsPrimaryVehicle()) {
 		Aircraft *a = Aircraft::From(this);
 		Station *st = GetTargetAirportIfValid(a);
@@ -4162,7 +4180,7 @@ CommandCost Vehicle::SendToDepot(DoCommandFlags flags, DepotCommandFlags command
 
 		/* If there is no depot in front and the train is not already reversing, reverse automatically (trains only) */
 		if (this->type == VehicleType::Train && (closest_depot.reverse != Train::From(this)->flags.Test(VehicleRailFlag::Reversing))) {
-			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, this->index, false, false);
+			Command<Commands::ReverseTrainDirection>::Do(DoCommandFlag::Execute, this->index, false);
 		}
 
 		if (this->type == VehicleType::Aircraft) {

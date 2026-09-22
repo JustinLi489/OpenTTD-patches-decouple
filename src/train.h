@@ -48,9 +48,10 @@ enum class VehicleRailFlag : uint8_t {
 	ConsistSpeedReduction     = 20, ///< One or more vehicles in this consist may be in a depot or on a bridge (may be false positive but not false negative).
 	PendingSpeedRestriction   = 21, ///< This vehicle has one or more pending speed restriction changes.
 	SpeedAdaptationExempt     = 22, ///< This vehicle is exempt from train speed adaptation.
-	ForceFlipReverse          = 23, ///< R3R: player pressed the turn-around button; the train must end-swap (first/last swap) rather than back up.
+	ForceFlipReverse          = 23, ///< R3R: RETIRED. Was "force a physical first/last end-swap instead of backing up" (vehicle-view turn-around button / order reverse-on-arrival). Removed because a whole-chain swap is invalid for multi-segment chains. The slot is kept reserved so the saved rail-flag bit layout (ArticGroupHead=24, ...) is unchanged; do not reuse.
 	ArticGroupHead            = 24, ///< R3R: head (parent) role of a de-articulated group; real artic groups derive this from subtype and never carry this bit.
 	ArticGroupMember          = 25, ///< R3R: member (part) role of a de-articulated group; real artic parts derive this from subtype and never carry this bit.
+	SegmentFlipped            = 26, ///< R3R: the segment this vehicle belongs to was logically reversed (R3RFlipChainBySegments); in-segment / in-group position variables are mirrored so NewGRF keeps the pre-flip values.
 };
 using VehicleRailFlags = EnumBitSet<VehicleRailFlag, uint32_t>;
 
@@ -206,6 +207,28 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	/** Clear the de-articulated group member role. */
 	void ClearArticGroupMember() { this->flags.Reset(VehicleRailFlag::ArticGroupMember); }
 
+	/** R3R: whether this vehicle carries an explicit de-articulated group role bit. */
+	bool HasDearticulatedGroupRole() const
+	{
+		return this->flags.Test(VehicleRailFlag::ArticGroupHead) || this->flags.Test(VehicleRailFlag::ArticGroupMember);
+	}
+
+	/**
+	 * R3R: whether the segment this vehicle belongs to was logically reversed.
+	 * The reversal swaps the chain order inside each segment (and therefore the
+	 * order inside every de-articulated group it holds) while leaving the physical
+	 * positions untouched; the in-segment / in-group position variables must be
+	 * mirrored so a NewGRF which selects sprites from "position in consist" /
+	 * "position in articulated vehicle" keeps the faces it had before the flip.
+	 */
+	bool IsSegmentFlipped() const { return this->flags.Test(VehicleRailFlag::SegmentFlipped); }
+	/** Mark the vehicle's segment as logically reversed. */
+	void SetSegmentFlipped() { this->flags.Set(VehicleRailFlag::SegmentFlipped); }
+	/** Clear the segment-reversed marker. */
+	void ClearSegmentFlipped() { this->flags.Reset(VehicleRailFlag::SegmentFlipped); }
+	/** Toggle the segment-reversed marker (self-inverse: flipping back clears it). */
+	void FlipSegmentFlipped() { this->flags.Flip(VehicleRailFlag::SegmentFlipped); }
+
 	/* R3R de-articulated-group baked overrides. UINT16_MAX means "no override" (fall
 	 * back to the vehicle record / normal rules). Set by DearticulateChainWithSnapshot
 	 * to keep consist statistics conserved after an artic group is split into real
@@ -214,6 +237,15 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	uint16_t weight_override = UINT16_MAX;
 	uint16_t power_override = UINT16_MAX;
 	uint16_t max_speed_override = UINT16_MAX;
+
+	/* R3R KI-118 fix A: set when this train was auto-stopped in a depot by one of
+	 * R3R's own depot editing tools (R3RStopChainInDepot, called by MakeSegment /
+	 * DemoteSegment). The in-depot GOTO_COUPLE exemption in TrainLocoHandler is
+	 * granted only to a train carrying this flag, so a train the player stopped
+	 * -- or a freshly bought, never-started train -- no longer auto-couples
+	 * inside its target depot. Cleared when the player starts/stops the train
+	 * manually, and when the couple it was parked for succeeds. */
+	bool r3r_parked = false;
 
 	TrainCache tcache{};
 
