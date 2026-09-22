@@ -15,7 +15,8 @@
 
 | 项 | 值 |
 |---|---|
-| git tag | `r3r-stable-2026-09-22`（分支 `feature/decouple`） |
+| git commit | `1ce54c475f1615f579e0a9b850145180643bda6d`（2026-09-22 23:16:24 +0800，49 files / +5222 −664） |
+| git tag | `r3r-stable-2026-09-22`（分支 `feature/decouple`，附注标签） |
 | 上一稳定版 | `eac73849b7` = tag `r3r-stable-2026-09-19` |
 | 快照目录 | `build\r3r_stable_2026-09-22\`（`src\` 41 个改动文件 + `openttd.exe` + `README.txt`） |
 | exe | `build\openttd.exe` @ 2026-09-22 21:52:43（50 791 936 B，内测版 Debug，探针默认 ON） |
