@@ -2073,6 +2073,16 @@ static void LoadUnloadVehicle(Vehicle *front)
 
 	SCOPE_INFO_FMT([&], "LoadUnloadVehicle: {}, {}, {}, 0x{:X}", StationInfoDumper(st), VehicleInfoDumper(front), VehicleInfoDumper(station_vehicle), station_tile);
 
+	/* R3R: 检修所（workshop，场）—— 停在检修所 tile 上的列车只做停靠，不装卸货、
+	 * 不结算运费、也不会为等货停留。这里与下方「列车在站内掉头」的早退路径同构：
+	 * 直接标记装卸已完成并让列车尽快离站（cargo_payment 会在 LeaveStation 里释放）。 */
+	if (front->type == VehicleType::Train && IsRailStationTile(station_tile) &&
+			GetStationIndex(station_tile) == st->index && st->R3RIsWorkshopTile(station_tile)) {
+		front->vehicle_flags.Set(VehicleFlag::LoadingFinished);
+		front->load_unload_ticks = 1;
+		return;
+	}
+
 	bool pull_through_mode = false;
 	bool load_unload_not_yet_in_station = false;
 	bool unload_payment_not_yet_in_station = false;

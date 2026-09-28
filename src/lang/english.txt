@@ -3988,6 +3988,26 @@ STR_R3R_YARD_SHARED_NONE                                        :{BLACK}none
 STR_R3R_YARD_SHARED_SEL                                         :{BLACK}Shared: {STRING}
 STR_R3R_YARD_LOCATE                                             :{BLACK}Locate
 STR_R3R_YARD_LOCATE_TOOLTIP                                     :{BLACK}Scroll the main view to the selected platform
+STR_R3R_YARD_WORKSHOP                                           :{BLACK}Workshop
+STR_R3R_YARD_WORKSHOP_TOOLTIP                                   :{BLACK}Turn the selected yard into a workshop. A workshop yard does not attract, produce or accept cargo, trains stopping there do not load or unload, and a train whose order explicitly targets this yard is serviced on arrival
+STR_R3R_YARD_WORKSHOP_SET                                       :{BLACK}Workshop: yes
+STR_R3R_YARD_WORKSHOP_NONE                                      :{BLACK}Workshop: no
+STR_R3R_YARD_NAME_N_WORKSHOP                                    :{BLACK}[Yard {NUM}, workshop]
+STR_R3R_YARD_NAME_N_SHARED_WORKSHOP                             :{BLACK}[Yard {NUM}, shared, workshop]
+STR_ERROR_R3R_YARD_WORKSHOP_EMPTY                               :{WHITE}This yard has no platforms
+STR_R3R_YARD_RENAME                                             :{BLACK}Rename
+STR_R3R_YARD_RENAME_TOOLTIP                                     :{BLACK}Give the selected yard a name of its own. Clear the name to fall back to the default "yard n" label
+STR_R3R_YARD_QUERY_RENAME                                       :{WHITE}Rename yard
+STR_R3R_YARD_DELETE                                             :{BLACK}Delete
+STR_R3R_YARD_DELETE_TOOLTIP                                     :{BLACK}Delete the selected yard. Its platforms go back to the whole station, and the yards behind it are renumbered
+STR_R3R_YARD_QUERY_DELETE_CAPTION                               :{WHITE}Delete yard
+STR_R3R_YARD_QUERY_DELETE                                       :{WHITE}Delete {STRING}?{}{}Its platforms go back to the whole station, and the yards behind it are renumbered, so orders pointing at those yards follow the new numbers
+STR_R3R_YARD_NAME_CUSTOM                                        :{BLACK}[{STRING}]
+STR_R3R_YARD_NAME_CUSTOM_SHARED                                 :{BLACK}[{STRING}, shared]
+STR_R3R_YARD_NAME_CUSTOM_WORKSHOP                               :{BLACK}[{STRING}, workshop]
+STR_R3R_YARD_NAME_CUSTOM_SHARED_WORKSHOP                        :{BLACK}[{STRING}, shared, workshop]
+STR_ORDER_R3R_YARD_CUSTOM                                       :{STRING}
+STR_ORDER_R3R_YARD_CUSTOM_SHARED                                :{STRING} (shared)
 
 # R3R: destination yard of a station order (order window)
 STR_ORDER_R3R_YARD_WHOLE                                        :Whole station
@@ -4765,6 +4785,15 @@ STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :Wait for coupli
 STR_ORDER_COUPLE_ANY                                            :Couple any
 STR_ORDER_COUPLE_EMPTY                                          :Couple empty
 STR_ORDER_COUPLE_FULL                                           :Couple full
+STR_ORDER_COUPLE_SIDE                                           :{BLACK}Attach
+STR_ORDER_COUPLE_SIDE_FRONT                                     :in front
+STR_ORDER_COUPLE_SIDE_REAR                                      :behind
+STR_ORDER_COUPLE_SIDE_SEL                                       :{BLACK}Attach: {STRING}
+STR_ORDER_COUPLE_SIDE_TOOLTIP                                   :{BLACK}Which side of the coupled train this train is attached on, in terms of the resulting chain order: 'in front' gives [this train][coupled train], 'behind' gives [coupled train][this train]
+STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}Temporary group: {STRING}
+STR_ORDER_COUPLE_TEMP_GROUP_NONE                                :None
+STR_ORDER_COUPLE_TEMP_GROUP_NAMED                               :Group {NUM}
+STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP                             :{BLACK}Couple group this train temporarily joins while it runs this order, on top of the groups its segment really belongs to. It couples onto that group's stock and loses the temporary membership once the coupling succeeded.
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}Non-stop
@@ -6128,11 +6157,12 @@ STR_BADGE_CONFIG_NAME                                           :Name
 STR_BADGE_FILTER_ANY_LABEL                                      :Any {STRING}
 STR_ORDER_DECOUPLE_QUERY_TAIL                                  :Release last N segments...
 STR_ORDER_DECOUPLE_QUERY_HEAD                                  :Split between segment N and segment N+1...
-STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :Number of trailing segments to release
-STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :Head segment to split after
+STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :Number of trailing segments to release (0 counts as 1)
+STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :Head segment to split after (0 counts as 1)
 
 STR_DEPOT_CHAIN_LOOSE                                          :Loose chain
 STR_DEPOT_CHAIN_SEGMENT_POS                                    :Segment {NUM}/{NUM}
+STR_R3R_TEMP_COUPLE_GROUP                                      :temp couple group
 
 STR_COUPLE_GROUP_CAPTION                                        :{WHITE}Couple groups
 STR_COUPLE_GROUP_GROUPS_TOOLTIP                                 :Couple groups
@@ -6152,7 +6182,7 @@ STR_COUPLE_GROUP_SEGMENT_ALSO_IN                                :also in: {RAW_S
 STR_COUPLE_GROUP_QUERY_NEW                                      :Name of the new couple group
 STR_COUPLE_GROUP_QUERY_RENAME                                   :New name of the couple group
 STR_COUPLE_GROUP_QUERY_DELETE_CAPTION                           :{WHITE}Delete couple group
-STR_COUPLE_GROUP_QUERY_DELETE                                   :Are you sure you want to delete couple group '{RAW_STRING}'? Its segments become unassigned.
+STR_COUPLE_GROUP_QUERY_DELETE                                   :Are you sure you want to delete couple group '{RAW_STRING}' and every group below it? Their segments become unassigned.
 
 STR_DEPOT_CHAIN_GROUP_OWNER                                     :{RAW_STRING} (owner {NUM}/{NUM})
 STR_DEPOT_CHAIN_NO_GROUP                                        :no group

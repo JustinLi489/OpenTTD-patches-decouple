@@ -18,6 +18,7 @@
 #include "water_map.h"
 #include "signal_type.h"
 #include "tunnelbridge_map.h"
+#include "r3r_resv_probes.h"
 
 
 /** Different types of Rail-related tiles */
@@ -240,6 +241,18 @@ inline void SetTrackReservation(TileIndex t, TrackBits b)
 {
 	dbg_assert_tile(IsPlainRailTile(t), t);
 	dbg_assert(!TracksOverlap(b));
+#if R3R_PROBES
+	/* R3R (KI-207): a plain rail tile's reservation lives in this field and nowhere
+	 * else, so a ghost on plain rail can only be created or freed right here. Tracing
+	 * from inside the setter (rather than from TryReserveRailTrack) also catches the
+	 * callers that never go through pbs.cpp: track removal, crossing-to-rail
+	 * conversion, load-time clearing. Logged only when the value actually changes. */
+	const TrackBits r3r_old = GetRailReservationTrackBits(t);
+	if (r3r_old != b) {
+		R3RResvWatchLog(r3r_old == TRACK_BIT_NONE ? "SET-RAIL" : (b == TRACK_BIT_NONE ? "CLEAR-RAIL" : "CHG-RAIL"),
+				t, FindFirstTrack(b != TRACK_BIT_NONE ? b : r3r_old));
+	}
+#endif
 	Track track = RemoveFirstTrack(&b);
 	SB(_m[t].m2, 8, 3, track == INVALID_TRACK ? 0 : track + 1);
 	AssignBit(_m[t].m2, 11, b != TRACK_BIT_NONE);
@@ -299,6 +312,9 @@ inline bool HasDepotReservation(TileIndex t)
 inline void SetDepotReservation(TileIndex t, bool b)
 {
 	dbg_assert_tile(IsRailDepot(t), t);
+#if R3R_PROBES
+	if (HasDepotReservation(t) != b) R3RResvWatchLog(b ? "SET-DEPOT" : "CLEAR-DEPOT", t); // R3R (KI-207)
+#endif
 	AssignBit(_m[t].m5, 4, b);
 }
 

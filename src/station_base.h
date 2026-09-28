@@ -932,7 +932,8 @@ public:
 
 	/* R3R: station yard (站场). 一个「场」是若干铁路平台的集合（一个平台的全部 tile 恒属于
 	 * 同一个场）。订单里的场 ID = 1 + 场的下标；0 表示整站（不设场）。
-	 * 场列表按下标寻址，删场只清空其内容而不移动下标，以免已有订单的场 ID 失效。
+	 * 场列表按下标寻址，因此「删除场」会移动其后各场的下标：删场必须同时把全图订单里
+	 * 指向本车站的场 ID 重编号（见 CmdR3RRemoveStationYard），否则订单会悄悄指向另一个场。
 	 * 它不走车站表(STNN)存档，而是独立 chunk "SYRD"（见 src/sl/station_yard_sl.cpp），
 	 * 这样本 fork 永不改动与上游共享的车站表布局。 */
 	struct R3RStationYard {
@@ -941,6 +942,13 @@ public:
 		 * 多个场可以指向同一个共享场，这就是「1/2 场共享一个 A 场」的表达方式：
 		 * 场1.shared_with = 场2.shared_with = A场。回落只做一层，不做链式展开。 */
 		uint16_t shared_with = 0;
+		/* R3R: 检修所（workshop）。为 true 时本场不再吸引/产生/接受货物，停在
+		 * 本场 tile 的车跳过装卸货、只做停靠，且当车辆的订单目的地明确是本场时
+		 * 触发一次进厂检修（VehicleServiceInDepot）。 */
+		bool is_workshop = false;
+		/* R3R: 玩家给这个场起的名字（UTF-8）。空 = 未命名，界面一律显示默认的
+		 * 「N 场」。名字只是标签，不参与寻路/占用判定，也不要求全局唯一。 */
+		std::string name;
 	};
 	std::vector<R3RStationYard> r3r_yards{}; ///< R3R: 场的列表（有效场 ID = 下标 + 1）
 
@@ -987,14 +995,28 @@ public:
 	uint16_t R3RNumYards() const { return static_cast<uint16_t>(this->r3r_yards.size()); }
 	/** R3R: 新建一个场并返回其 ID（达到上限时返回 R3R_YARD_NONE）。 */
 	uint16_t R3RAddYard();
+	/** R3R: 删除某个场（失败返回 false）。它只做数据搬运：tile 随场一起消失、
+	 * 回落目标被修正、其后各场的 ID 前移一位。订单里的场 ID 由命令层统一重编号
+	 * （CmdR3RRemoveStationYard），所以调用者必须先做重编号再调用本函数。 */
+	bool     R3RRemoveYard(uint16_t yard);
 	/** R3R: 清空某个场的全部 tile（保留场本身与其下标，避免已有订单的场 ID 失效）。 */
 	void     R3RClearYard(uint16_t yard);
+	/** R3R: 某个场的玩家自定义名称（未命名/无效场返回空串）。 */
+	const std::string &R3RGetYardName(uint16_t yard) const;
+	/** R3R: 设置某个场的名称（空串 = 恢复未命名）。 */
+	void     R3RSetYardName(uint16_t yard, const std::string &name);
 	/** R3R: 某个场停满时的「共享回落场」（R3R_YARD_NONE = 不回落）。 */
 	uint16_t R3RYardSharedWith(uint16_t yard) const;
 	/** R3R: 设置某个场的「共享回落场」（R3R_YARD_NONE = 取消回落）。 */
 	void     R3RSetYardSharedWith(uint16_t yard, uint16_t shared_with);
 	/** R3R: 某个场是否被别的场指定为共享回落场（仅用于 UI 标注）。 */
 	bool     R3RIsYardShared(uint16_t yard) const;
+	/** R3R: 某个场是否为检修所（不接货、不装卸、到访即检修）。 */
+	bool     R3RIsYardWorkshop(uint16_t yard) const;
+	/** R3R: 设置某个场是否为检修所。 */
+	void     R3RSetYardWorkshop(uint16_t yard, bool workshop);
+	/** R3R: tile 是否位于检修所场内（无场/无效 tile 返回 false）。 */
+	bool     R3RIsWorkshopTile(TileIndex tile) const;
 
 	const std::vector<TileIndex> &R3RYardTiles(uint16_t yard) const;
 	uint16_t R3RGetYardOfTile(TileIndex tile) const;

@@ -18,10 +18,105 @@
 #include "train_speed_adaptation.h"
 #include "bridge_signal_map.h"
 #include "r3r_perf.h"
+#include "train.h"
 
 #include "table/strings.h"
 
+#include <vector>
+
 #include "safeguards.h"
+
+#if R3R_PROBES
+/*
+ * R3R (KI-207, 2026-09-25): reservation-origin tracing for ghost reservations.
+ *
+ * Both directions of every reservation change to a *watched* tile are logged with
+ * the phase the game was in at that moment (see R3RResvPhaseGuard in pbs.h).
+ *
+ * The writes are reported by the six map-accessor setters that own the reservation
+ * bits (see r3r_resv_probes.h), not by the call sites: that makes the trace complete
+ * by construction, including paths nobody thought of (load-time clearing, depot
+ * sell, track removal, tile conversion, ...).
+ *
+ * The watch list is loaded once, lazily:
+ *   - the tiles the player reported as ghosts are compiled in as defaults, so a
+ *     plain rebuild is already a usable trap;
+ *   - "r3r_resv_watch.txt" in the game working directory (next to R3R_debug.log)
+ *     adds more tiles without a rebuild: one "x y" per line, '#' comments out.
+ *
+ * Nothing here runs in a build with the probes off (R3R_PROBES == 0).
+ */
+const char *r3r_resv_phase = "misc";
+
+/* R3R (KI-207): the train that is doing the reserving right now, if the caller knows
+ * it (see R3RResvPhaseGuard). Logged together with the phase so a watched tile names
+ * both the code path *and* the vehicle that booked it. Held as an ID, not a pointer:
+ * this is reached from inside the map setters, where a raw pointer could name a train
+ * that has already been deleted. */
+VehicleID r3r_resv_actor = VehicleID::Invalid();
+
+static const std::vector<TileIndex> &R3RWatchedResvTiles()
+{
+	static const std::vector<TileIndex> tiles = []() {
+		std::vector<TileIndex> v;
+		/* Reported by the player (KI-205 "60,16" / KI-207 "57,49"). */
+		v.push_back(TileXY(60, 16));
+		v.push_back(TileXY(57, 49));
+		FILE *f = fopen("r3r_resv_watch.txt", "r");
+		if (f != nullptr) {
+			char line[128];
+			while (fgets(line, sizeof(line), f) != nullptr) {
+				for (char *p = line; *p != '\0'; p++) {
+					if (*p == '#' || *p == '\r' || *p == '\n') { *p = '\0'; break; }
+				}
+				int x = -1, y = -1;
+				if (sscanf(line, "%d %d", &x, &y) == 2 && x >= 0 && y >= 0 && x < (int)Map::SizeX() && y < (int)Map::SizeY()) {
+					v.push_back(TileXY(x, y));
+				}
+			}
+			fclose(f);
+		}
+		return v;
+	}();
+	return tiles;
+}
+
+bool R3RIsWatchedResvTile(TileIndex tile)
+{
+	for (TileIndex t : R3RWatchedResvTiles()) {
+		if (t == tile) return true;
+	}
+	return false;
+}
+
+/**
+ * Log one reservation state change on a watched tile, tagged with the phase and the
+ * acting train.
+ *
+ * "actor" is the vehicle the caller was working on (a locomotive booking its path,
+ * a consist sitting on its platform, the release sweep, ...). "head" is that
+ * vehicle's chain head at that instant -- the ownership question is always asked
+ * about the head, so seeing actor != head is itself a finding: a chain edit moved
+ * the identity between booking the bit and freeing it.
+ *
+ * Called from the six map-accessor setters (see r3r_resv_probes.h), i.e. from the
+ * hottest path in the game; hence the switch check first, so a plain run never walks
+ * the watch list.
+ */
+void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
+{
+	if (!R3RDbgOn()) return;
+	if (!R3RIsWatchedResvTile(tile)) return;
+	int actor = -1;
+	int head = -1;
+	if (const Vehicle *v = Vehicle::GetIfValid(r3r_resv_actor); v != nullptr) {
+		actor = (int)v->index.base();
+		if (const Vehicle *h = v->First(); h != nullptr) head = (int)h->index.base();
+	}
+	R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
+			kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
+}
+#endif /* R3R_PROBES */
 
 /**
  * Get the reserved trackbits for any tile, regardless of type.
@@ -71,7 +166,7 @@ void SetRailStationPlatformReservation(TileIndex start, DiagDirection dir, bool 
 	assert_tile(GetRailStationAxis(start) == DiagDirToAxis(dir), start);
 
 	do {
-		SetRailStationReservation(tile, b);
+		SetRailStationReservation(tile, b); // R3R (KI-207): traced inside the setter
 		MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 		tile = TileAdd(tile, diff);
 	} while (IsCompatibleTrainStationTile(tile, start));
@@ -138,6 +233,11 @@ bool TryReserveRailTrackdir(const Train *v, TileIndex tile, Trackdir td, bool tr
  * @param trigger_stations whether to call station randomisation trigger
  * @return \c true if reservation was successful, i.e. the track was
  *     free and didn't cross any other reserved tracks.
+ *
+ * R3R (KI-207): every branch below only writes through the map-accessor setters,
+ * which report the change themselves -- no probe here on purpose, so that the trace
+ * cannot go blind on paths that bypass this function (ReadSavegame, tile conversion,
+ * track removal, ...). See r3r_resv_probes.h.
  */
 bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 {
@@ -233,6 +333,10 @@ void UnreserveRailTrackdir(TileIndex tile, Trackdir td)
  * Lift the reservation of a specific track on a tile
  * @param tile the tile
  * @param t the track
+ *
+ * R3R (KI-207): as in TryReserveRailTrack(), the log comes from the map-accessor
+ * setters, so it also covers every path that clears a reservation without coming
+ * through here.
  */
 void UnreserveRailTrack(TileIndex tile, Track t)
 {
@@ -1374,6 +1478,161 @@ void FillTrainReservationLookAhead(Train *v)
 }
 
 /**
+ * R3R: one direction of the "who owns this reserved path" walk, starting at
+ * (tile, trackdir) and only walking towards that direction. Extracted verbatim
+ * from GetTrainForReservation() below so that GetTrainForWholeTileReservation()
+ * can ask the very same question for a tile whose reservation is a whole-tile
+ * bit (a station platform or waypoint) instead of a plain rail track.
+ *
+ * FollowReservation() ignores one-way signals here on purpose: one of the two
+ * search directions of a caller is always the "wrong" way round.
+ *
+ * @return The train owning the path, or nullptr if the path is stray.
+ */
+#if R3R_PROBES
+/**
+ * R3R (KI-210, diagnosis): explain one direction of the ownership walk above.
+ *
+ * The bug it exists for: a reservation that a train booked *this tick* (a live
+ * booking) got attributed to the parked consist whose stale route happened to
+ * join it, and the waiter purge then released it -- the player sees the preview
+ * blink on and off every tick. The walk itself is the engine's own and cannot be
+ * instrumented without touching it, but every *answer* can be logged: which tile
+ * the walk ended on and by which of the three ways the train was found.
+ *
+ * @param start     tile the walk started from (== the queried reservation bit).
+ * @param start_td  trackdir of that first direction.
+ * @param res_tile  tile FollowReservation() stopped on.
+ * @param res_td    trackdir it stopped with.
+ * @param how       "blocked" / "direct" / "platform" / "tunnel" / "none".
+ * @param found     train that was accepted as the owner (nullptr if none).
+ * @param found_on  tile that train was found on (only for "platform").
+ */
+static void R3RResvWalkLog(TileIndex start, Trackdir start_td, TileIndex res_tile, Trackdir res_td,
+		const char *how, const Train *found, TileIndex found_on = INVALID_TILE)
+{
+	if (!R3RDbgOn()) return;
+	if (!R3RIsWatchedResvTile(start)) return;
+
+	int owner = -1;
+	int head  = -1;
+	if (found != nullptr) {
+		owner = (int)found->index.base();
+		const Train *const f = found->First();
+		head = f != nullptr ? (int)f->index.base() : -1;
+	}
+	R3RDbgWrite("RESV-WALK start=%d,%d td=%u phase=%s how=%s end=%d,%d/td%u found=%d,%d owner=veh%d head=veh%d\n",
+			(int)TileX(start), (int)TileY(start), (unsigned)start_td, r3r_resv_phase, how,
+			(int)TileX(res_tile), (int)TileY(res_tile), (unsigned)res_td,
+			(int)TileX(found_on), (int)TileY(found_on), owner, head);
+}
+#endif /* R3R_PROBES */
+
+static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, RailTypes rts)
+{
+	/* If the tile has a one-way block signal in the current trackdir, skip the
+	 * search in this direction as the reservation can't come from this side.*/
+	if (HasOnewaySignalBlockingTrackdir(tile, ReverseTrackdir(trackdir)) && !HasPbsSignalOnTrackdir(tile, trackdir)) {
+#if R3R_PROBES
+		R3RResvWalkLog(tile, trackdir, tile, trackdir, "blocked", nullptr);
+#endif
+		return nullptr;
+	}
+
+	FindTrainOnTrackInfo ftoti;
+	ftoti.res = FollowReservation(GetTileOwner(tile), rts, tile, trackdir, FRF_IGNORE_ONEWAY, nullptr, nullptr);
+
+	CheckTrainsOnTrack(ftoti, ftoti.res.tile);
+	if (ftoti.best != nullptr) {
+#if R3R_PROBES
+		R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "direct", ftoti.best);
+#endif
+		return ftoti.best;
+	}
+
+	/* Special case for stations: check the whole platform for a vehicle. */
+	if (IsRailStationTile(ftoti.res.tile)) {
+		TileIndexDiff diff = TileOffsByDiagDir(TrackdirToExitdir(ReverseTrackdir(ftoti.res.trackdir)));
+		for (TileIndex st_tile = ftoti.res.tile + diff; IsCompatibleTrainStationTile(st_tile, ftoti.res.tile); st_tile += diff) {
+			CheckTrainsOnTrack(ftoti, st_tile);
+			if (ftoti.best != nullptr) {
+#if R3R_PROBES
+				R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "platform", ftoti.best, st_tile);
+#endif
+				return ftoti.best;
+			}
+		}
+	}
+
+	if (IsTileType(ftoti.res.tile, TileType::TunnelBridge) && IsTrackAcrossTunnelBridge(ftoti.res.tile, TrackdirToTrack(ftoti.res.trackdir))) {
+		if (IsTunnelBridgeWithSignalSimulation(ftoti.res.tile)) {
+			/* Special case for signalled bridges/tunnels: find best train on bridge/tunnel if exit reserved. */
+			if (IsTunnelBridgeSignalSimulationExit(ftoti.res.tile) && !(IsTunnelBridgeEffectivelyPBS(ftoti.res.tile) && GetTunnelBridgeExitSignalState(ftoti.res.tile) == SignalState::Red)) {
+				ftoti.best = GetTrainClosestToTunnelBridgeEnd(ftoti.res.tile, GetOtherTunnelBridgeEnd(ftoti.res.tile));
+			}
+		} else {
+			/* Special case for bridges/tunnels: check the other end as well. */
+			CheckTrainsOnTrack(ftoti, GetOtherTunnelBridgeEnd(ftoti.res.tile));
+		}
+		if (ftoti.best != nullptr) {
+#if R3R_PROBES
+			R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "tunnel", ftoti.best,
+					GetOtherTunnelBridgeEnd(ftoti.res.tile));
+#endif
+			return ftoti.best;
+		}
+	}
+
+#if R3R_PROBES
+	R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "none", nullptr);
+#endif
+	return nullptr;
+}
+
+/**
+ * R3R (KI-210): the "first train on the path" flavour of the walk above.
+ *
+ * FollowReservation() answers the question "which train stands at the *end* of
+ * this reserved path" -- and that answer is only as good as the assumption that
+ * the whole path belongs to one booking. Which breaks exactly when a *live*
+ * booking is appended to a stale one: the parked consist's dead route and the
+ * locomotive's fresh route are one continuous run of reserved bits, so walking
+ * from a bit of the fresh part runs through the stale part and lands on the
+ * parked consist. The purge then frees the locomotive's own bits -- the player
+ * watches the preview blink on and off every tick (KI-210; log: 24 books
+ * 37,9/37,10/38,10, the walk from 37,9 ends on 27,9 at the parked consist 6,
+ * and 6's waiter purge frees all three).
+ *
+ * This walk stops at the *nearest* train instead: the first tile along the path
+ * that has a train standing on it. A booking can only ever be joined to another
+ * one at a train, never through it, so the first train met is the one the
+ * queried bit really belongs to -- and for the stale part of the route it is the
+ * parked consist itself, which is exactly what the purge wants to know. The
+ * walk is deliberately conservative: when the nearest train is somebody else,
+ * the bit is not attributed to the consist asking and is left alone.
+ *
+ * @return The first train met along the path, or nullptr if there is none.
+ */
+static Train *R3RFollowReservationToNearbyTrain(TileIndex tile, Trackdir trackdir, RailTypes rts)
+{
+	/* If the tile has a one-way block signal in the current trackdir, skip the
+	 * search in this direction as the reservation can't come from this side.*/
+	if (HasOnewaySignalBlockingTrackdir(tile, ReverseTrackdir(trackdir)) && !HasPbsSignalOnTrackdir(tile, trackdir)) {
+		return nullptr;
+	}
+
+	Train *hit = nullptr;
+	FollowReservationEnumerate(GetTileOwner(tile), rts, tile, trackdir, FRF_IGNORE_ONEWAY,
+			[&hit](TileIndex t, Trackdir) -> bool {
+				Vehicle *v = GetFirstVehicleOnTile(t, VehicleType::Train);
+				if (v == nullptr) return false;
+				hit = static_cast<Train *>(v);
+				return true; /* Stop here: this is the train the path really runs into. */
+			});
+	return hit;
+}
+
+/**
  * Find the train which has reserved a specific path.
  *
  * @param tile A tile on the path.
@@ -1391,50 +1650,197 @@ Train *GetTrainForReservation(TileIndex tile, Track track)
 	 * have a train on it. We need FollowReservation to ignore one-way signals
 	 * here, as one of the two search directions will be the "wrong" way. */
 	for (int i = 0; i < 2; ++i, trackdir = ReverseTrackdir(trackdir)) {
-		/* If the tile has a one-way block signal in the current trackdir, skip the
-		 * search in this direction as the reservation can't come from this side.*/
-		if (HasOnewaySignalBlockingTrackdir(tile, ReverseTrackdir(trackdir)) && !HasPbsSignalOnTrackdir(tile, trackdir)) continue;
-
-		FindTrainOnTrackInfo ftoti;
-		ftoti.res = FollowReservation(GetTileOwner(tile), rts, tile, trackdir, FRF_IGNORE_ONEWAY, nullptr, nullptr);
-
-		CheckTrainsOnTrack(ftoti, ftoti.res.tile);
-		if (ftoti.best != nullptr) return ftoti.best;
-
-		/* Special case for stations: check the whole platform for a vehicle. */
-		if (IsRailStationTile(ftoti.res.tile)) {
-			TileIndexDiff diff = TileOffsByDiagDir(TrackdirToExitdir(ReverseTrackdir(ftoti.res.trackdir)));
-			for (TileIndex st_tile = ftoti.res.tile + diff; IsCompatibleTrainStationTile(st_tile, ftoti.res.tile); st_tile += diff) {
-				CheckTrainsOnTrack(ftoti, st_tile);
-				if (ftoti.best != nullptr) return ftoti.best;
-			}
-		}
-
-		if (IsTileType(ftoti.res.tile, TileType::TunnelBridge) && IsTrackAcrossTunnelBridge(ftoti.res.tile, TrackdirToTrack(ftoti.res.trackdir))) {
-			if (IsTunnelBridgeWithSignalSimulation(ftoti.res.tile)) {
-				/* Special case for signalled bridges/tunnels: find best train on bridge/tunnel if exit reserved. */
-				if (IsTunnelBridgeSignalSimulationExit(ftoti.res.tile) && !(IsTunnelBridgeEffectivelyPBS(ftoti.res.tile) && GetTunnelBridgeExitSignalState(ftoti.res.tile) == SignalState::Red)) {
-					ftoti.best = GetTrainClosestToTunnelBridgeEnd(ftoti.res.tile, GetOtherTunnelBridgeEnd(ftoti.res.tile));
-				}
-			} else {
-				/* Special case for bridges/tunnels: check the other end as well. */
-				CheckTrainsOnTrack(ftoti, GetOtherTunnelBridgeEnd(ftoti.res.tile));
-			}
-			if (ftoti.best != nullptr) return ftoti.best;
-		}
+		if (Train *t = R3RFollowReservationToOwner(tile, trackdir, rts)) return t;
 	}
 
 	return nullptr;
 }
 
+/**
+ * R3R (KI-207c): owner of a reservation that is stored as a *whole tile* bit --
+ * a rail station platform (which includes a waypoint), i.e. exactly the tiles
+ * GetTrainForReservation() above cannot be asked about, because its first line
+ * asserts the *plain rail* reservation bit (rail_map.h:168).
+ *
+ * Which is the asymmetry that creates the ghosts the player reported: the setter
+ * TryReserveRailTrack() dispatches on HasStationRail(tile), which includes
+ * waypoints, while every *release* of a platform goes through
+ * SetRailStationPlatformReservation(), whose call sites are all guarded by
+ * IsRailStationTile() -- waypoints excluded. A consist parked on a waypoint by
+ * the R3R platform waiter therefore reserves that waypoint tile and, if the
+ * reservation is ever orphaned, nothing in the engine can ever clear it again.
+ *
+ * The walk itself is the engine's own (same helper GetTrainForReservation() uses);
+ * only the entry differs: instead of one plain rail track, every track the tile
+ * reserves is followed in both directions. A train standing on the tile is the
+ * owner by definition.
+ *
+ * @param tile A tile whose reservation is a whole-tile bit (station / waypoint).
+ * @return The vehicle holding the reservation, or nullptr if it is stray.
+ */
+Train *GetTrainForWholeTileReservation(TileIndex tile)
+{
+	if (!IsValidTile(tile)) return nullptr;
+
+	/* A train standing on the tile owns its reservation by definition. */
+	if (Vehicle *v = GetFirstVehicleOnTile(tile, VehicleType::Train)) return static_cast<Train *>(v);
+
+	const TrackBits bits = GetReservedTrackbits(tile);
+	if (bits == TRACK_BIT_NONE) return nullptr;
+
+	const RailType rt = GetTileRailType(tile);
+	if (rt == INVALID_RAILTYPE) return nullptr;
+	const RailTypes rts = GetRailTypeInfo(rt)->indirect_compatible_railtypes;
+
+	for (Track track = TRACK_BEGIN; track < TRACK_END; track++) {
+		if (!HasBit(bits, track)) continue;
+		Trackdir trackdir = TrackToTrackdir(track);
+		for (int i = 0; i < 2; ++i, trackdir = ReverseTrackdir(trackdir)) {
+			if (Train *t = R3RFollowReservationToOwner(tile, trackdir, rts)) return t;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * R3R (KI-210): GetTrainForReservation() with the *nearest* train as the answer
+ * instead of the train at the far end of the path -- see
+ * R3RFollowReservationToNearbyTrain() for why the difference matters. Used by
+ * the chain-edit reservation purge, which must never free a bit that a live
+ * booking of another train happens to have joined to its own stale route.
+ */
+Train *GetR3RReservationOwnerNearby(TileIndex tile, Track track)
+{
+	assert_msg_tile(HasReservedTracks(tile, TrackToTrackBits(track)), tile, "track: {:X}", track);
+	Trackdir trackdir = TrackToTrackdir(track);
+
+	const RailTypes rts = GetRailTypeInfo(GetTileRailTypeByTrack(tile, track))->indirect_compatible_railtypes;
+
+	for (int i = 0; i < 2; ++i, trackdir = ReverseTrackdir(trackdir)) {
+		if (Train *t = R3RFollowReservationToNearbyTrain(tile, trackdir, rts)) return t;
+	}
+
+	return nullptr;
+}
+
+/**
+ * R3R (KI-210): GetTrainForWholeTileReservation() with the *nearest* train as
+ * the answer instead of the train at the far end of the path (station platform /
+ * waypoint flavour, for the same caller and the same reason).
+ */
+Train *GetR3RWholeTileReservationOwnerNearby(TileIndex tile)
+{
+	if (!IsValidTile(tile)) return nullptr;
+
+	/* A train standing on the tile owns its reservation by definition. */
+	if (Vehicle *v = GetFirstVehicleOnTile(tile, VehicleType::Train)) return static_cast<Train *>(v);
+
+	const TrackBits bits = GetReservedTrackbits(tile);
+	if (bits == TRACK_BIT_NONE) return nullptr;
+
+	const RailType rt = GetTileRailType(tile);
+	if (rt == INVALID_RAILTYPE) return nullptr;
+	const RailTypes rts = GetRailTypeInfo(rt)->indirect_compatible_railtypes;
+
+	for (Track track = TRACK_BEGIN; track < TRACK_END; track++) {
+		if (!HasBit(bits, track)) continue;
+		Trackdir trackdir = TrackToTrackdir(track);
+		for (int i = 0; i < 2; ++i, trackdir = ReverseTrackdir(trackdir)) {
+			if (Train *t = R3RFollowReservationToNearbyTrain(tile, trackdir, rts)) return t;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * R3R (KI-207): release every plain-rail reservation bit that answers to nobody.
+ *
+ * The criterion is the engine's own: GetTrainForReservation() follows the reserved
+ * path from the queried bit to both ends and returns the train standing at one of
+ * them, or nullptr when the path is stray. A stray bit is therefore, by the
+ * engine's own measure, dead -- nothing is going to consume it -- yet it keeps
+ * blocking other trains and keeps painting the reservation preview.
+ *
+ * Two passes, for the reason documented at R3RReleaseChainReservations(): freeing
+ * while scanning cuts the path of everything behind the freed bit, so the rest of
+ * the scan would answer "nobody" for bits that in fact still belong to a train.
+ * Pass 1 only collects, pass 2 frees.
+ *
+ * The same guards as that function: never a tile a train is standing on. Plain rail
+ * is handled per track bit; a station platform / waypoint is handled as the
+ * whole-tile bit that it is (KI-207c -- a depot or crossing reservation is state
+ * protecting the vehicle standing there and is left alone). Exposed as the console
+ * command 'r3r_resv_purge' so a save with ghosts inherited from an older build can
+ * be cleaned on demand; the periodic reservation audit does the same thing on its own
+ * once a bit has been stray for R3R_RESV_REAP_AUDITS audits.
+ *
+ * @return Number of released reservations (track bits / whole tiles).
+ */
+uint R3RPurgeStrayReservations()
+{
+	struct R3RResvBit { TileIndex tile; Track track; bool whole_tile; };
+	std::vector<R3RResvBit> doomed;
+
+	for (TileIndex t(0); t < Map::Size(); t++) {
+		if (GetFirstVehicleOnTile(t, VehicleType::Train) != nullptr) continue;
+
+		/* KI-207c: a rail station platform or waypoint carries a whole-tile
+		 * reservation. Nothing in the engine can release one (every release site is
+		 * guarded by IsRailStationTile(), which excludes waypoints), so a stale one
+		 * is a permanent ghost on exactly that tile. */
+		if (GetTileType(t) == TileType::Station && HasStationRail(t)) {
+			if (!HasStationReservation(t)) continue;
+			if (GetTrainForWholeTileReservation(t) != nullptr) continue;
+			doomed.push_back({t, TRACK_BEGIN, true});
+			continue;
+		}
+
+		if (GetTileType(t) != TileType::Railway || !IsPlainRailTile(t)) continue;
+		const TrackBits bits = GetRailReservationTrackBits(t);
+		if (bits == TRACK_BIT_NONE) continue;
+
+		for (Track track = TRACK_BEGIN; track < TRACK_END; track++) {
+			if (!HasBit(bits, track)) continue;
+			if (HasReservedTracks(t, TrackToTrackBits(track)) && GetTrainForReservation(t, track) != nullptr) continue;
+			doomed.push_back({t, track, false});
+		}
+	}
+
+	uint freed = 0;
+	for (const R3RResvBit &rec : doomed) {
+		/* Nothing runs between the passes, but validate anyway: the map must never
+		 * be touched through a stale record. */
+		if (rec.whole_tile) {
+			if (GetTileType(rec.tile) != TileType::Station || !HasStationRail(rec.tile)) continue;
+			if (!HasStationReservation(rec.tile)) continue;
+			const TrackBits rail_bits = GetStationReservationTrackBits(rec.tile);
+			if (rail_bits == TRACK_BIT_NONE) continue;
+
+			UnreserveRailTrack(rec.tile, FindFirstTrack(rail_bits));
+			freed++;
+			R3RDbgWrite("RESV-PURGE tile=%d,%d track=stn kind=%s\n",
+					(int)TileX(rec.tile), (int)TileY(rec.tile), IsRailWaypointTile(rec.tile) ? "WAYPOINT" : "STATION");
+			continue;
+		}
+
+		if (GetTileType(rec.tile) != TileType::Railway || !IsPlainRailTile(rec.tile)) continue;
+		if (!HasBit(GetRailReservationTrackBits(rec.tile), rec.track)) continue;
+
+		UnreserveRailTrack(rec.tile, rec.track);
+		freed++;
+		R3RDbgWrite("RESV-PURGE tile=%d,%d track=%u\n",
+				(int)TileX(rec.tile), (int)TileY(rec.tile), (uint)rec.track);
+	}
+	return freed;
+}
+
 CommandCost CheckTrainReservationPreventsTrackModification(TileIndex tile, Track track)
 {
-	if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC && !_settings_game.vehicle.track_edit_ignores_realistic_braking) {
+	if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC && _settings_game.vehicle.track_edit_ignores_realistic_braking) {
 		return CheckTrainReservationPreventsTrackModification(GetTrainForReservation(tile, track));
 	}
 	return CommandCost();
 }
-
 CommandCost CheckTrainReservationPreventsTrackModification(const Train *v)
 {
 	if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC && !_settings_game.vehicle.track_edit_ignores_realistic_braking &&
@@ -1533,6 +1939,80 @@ bool TrainReservationPassesThroughTile(const Train *v, TileIndex search_tile)
 		return false;
 	});
 	return found;
+}
+
+/**
+ * R3R (KI-211, fenced in KI-211c/211d): the tiles a train's own booking covers --
+ * see pbs.h for why the walk is fenced at the first train, leaves in both
+ * directions and refuses to start on a shared tile.
+ *
+ * Three shapes of the same failure drove the three rounds, each one hiding behind
+ * the previous fix: a walk that asks the map for an owner crosses onto a
+ * neighbour's booking whenever the two touch (KI-210: the locomotive's live route
+ * was freed by the parked consist's purge); a walk that starts inside our own
+ * booking but does not stop at the neighbour collects the neighbour's bits as
+ * ours (KI-211: the parked waiter on 33,9 collected 34,9 .. 38,10 of the
+ * locomotive standing next to it, and -- paired with a far-end owner lookup that
+ * answered "the waiter" -- freed that live route); and a walk that *does* stop at
+ * the neighbour is still blind when the neighbour is standing on the very tile
+ * the walk starts from (KI-211d, the field log of the same waiter: veh 24 had
+ * just decoupled and stood on 33,9 together with the consist's head 6 and 7, its
+ * nose already on 34,9, so the walk left the shared tile -- skipped by design as
+ * "our own tile" -- and stepped straight onto 24's booking, where the fence,
+ * which only looks at tiles the walk *enters*, had nothing to see).
+ *
+ * Hence the start-tile guard below: two trains on one tile make the bits leaving
+ * it ambiguous (the engine does not record which train booked a bit), so this
+ * vehicle contributes no path at all. Conservative on purpose -- a stale bit of
+ * ours may stay on the map for a while longer, but a live route of the neighbour
+ * is never collected and therefore never freed.
+ *
+ * The start tile of each walk is not reported: it is the vehicle's own tile, and
+ * a caller matching tiles would only have to filter it back out.
+ *
+ * @param v The train whose reservation is walked.
+ * @param handler Called once per tile on the path.
+ * @param ctx Opaque pointer passed through to the handler.
+ */
+void R3RCollectReservedPathTiles(const Train *v, R3RResvTileHandler handler, void *ctx)
+{
+	const Train *const chain_head = v->First();
+
+	for (const Train *w = v; w != nullptr; w = w->Next()) {
+		/* KI-211d: a tile may hold two trains (a just-decoupled locomotive usually
+		 * stands on the same tile as the consist it left). The reservation bits
+		 * leaving such a tile cannot be attributed to us, so do not walk.
+		 * Walk the *tile's* vehicle list here: GetFirstVehicleOnTile() alone only
+		 * reports its head, and the head may well be ourselves -- which is how the
+		 * nearest-train gate above was fooled in the field log. Train::From() is
+		 * only ever applied to a non-null pointer on purpose: it asserts on the
+		 * vehicle's type. */
+		bool shared_tile = false;
+		for (const Vehicle *vt = GetFirstVehicleOnTile(w->tile, VehicleType::Train); vt != nullptr; vt = vt->HashTileNext()) {
+			if (Train::From(vt)->First() != chain_head) {
+				shared_tile = true;
+				break;
+			}
+		}
+		if (shared_tile) continue;
+
+		const Trackdir own_td = w->GetVehicleTrackdir();
+		for (int i = 0; i < 2; i++) {
+			bool first = true;
+			FollowReservationEnumerate(w->owner, w->GetIndirectCompatibleRailTypes(), w->tile,
+					i == 0 ? own_td : ReverseTrackdir(own_td), FRF_NONE,
+					[&](TileIndex tile, Trackdir trackdir) -> bool {
+						if (first) {
+							first = false;
+							return false;
+						}
+						/* A booking ends where the next train begins (see above). */
+						if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr) return true;
+						handler(tile, trackdir, ctx);
+						return false;
+					});
+		}
+	}
 }
 
 /**

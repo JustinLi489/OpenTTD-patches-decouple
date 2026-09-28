@@ -22,6 +22,7 @@
 #include "vehicle_type.h"
 #include "cargotype.h"
 #include "company_type.h"
+#include "couple_group_type.h"
 #include "date_type.h"
 #include "gfx_type.h"
 #include "sl/saveload_common.h"
@@ -79,6 +80,8 @@ void ClearOrderDestinationRefcountMap();
  * OrderConditionVariable::CargoLoadPercentage: Cargo percentage comparison value
  * OrderConditionVariable::DispatchSlot: Bits 0-15: Dispatch schedule ID
  * OrderConditionVariable::Percent: Bits 0-7: Jump counter
+ * OT_GOTO_COUPLE: Bits 0-15: Trace restrict slot ID, Bits 16-31: temporary couple group ID + 1 (0 = none)
+ * OT_WAIT_COUPLE: Bits 16-31: temporary couple group ID + 1 (0 = none)
  */
 /*
  * xdata2 users:
@@ -618,13 +621,19 @@ public:
 
 	/* Decouple / couple order parameters (OT_DECOUPLE / OT_GOTO_COUPLE / OT_WAIT_COUPLE).
 	 * These order types are new, so we are free to define their flag bit fields.
-	 * flags bit 0-7 only (flags is saved as 8 bits on disk, see order_sl.cpp).
+	 * The whole 16 bit flags field is saved (see sl/order_sl.cpp,
+	 * XSLFI_ORDER_FLAGS_EXTRA); OT_DECOUPLE uses the low 9 bits only, the high
+	 * half is unused by it.
 	 * OT_DECOUPLE flag layout:
 	 *  bit 0    : decouple enabled (OrderDecoupleFlags).
-	 *  bits 1-6 : boundary value. 0 = auto (no explicit boundary).
+	 *  bits 1-6 : boundary value (0..63).
 	 *  bit 7    : the boundary is counted from the head (split after segment N)
-	 *             instead of from the rear (release the last N segments); only
-	 *             meaningful when bits 1-6 are non-zero. */
+	 *             instead of from the rear (release the last N segments).
+	 *  bit 8    : an explicit boundary mode was chosen (R3R, 2026-09-27). While
+	 *             this bit is clear the order is in the automatic mode and bits
+	 *             1-7 are ignored. Old orders therefore keep their meaning
+	 *             (value 0 = auto), while a newly chosen mode may select a value
+	 *             of 0 without silently collapsing back to the automatic mode. */
 
 	/**
 	 * Get whether the decouple action of this order is enabled.
@@ -633,32 +642,58 @@ public:
 	inline OrderDecoupleFlags GetDecouple() const { return (OrderDecoupleFlags)GB(this->flags, 0, 1); }
 	/**
 	 * R3R: Get the segment boundary value of a decouple order.
-	 * 0 means "auto" and releases the last coupled-on segment. A segment is a
-	 * powered chain that was coupled onto this train (its front vehicle carries
-	 * the SegmentFront marker). When the train has no coupled-on segments, the
-	 * decouple falls back to the native minimal-decouplable-unit heuristic.
+	 * With #GetDecoupleBoundaryMode() == Auto the value is always 0 and the order
+	 * releases the last coupled-on segment. A segment is a powered chain that was
+	 * coupled onto this train (its front vehicle carries the SegmentFront marker).
+	 * When the train has no coupled-on segments, the decouple falls back to the
+	 * native minimal-decouplable-unit heuristic.
 	 * With #GetDecoupleFromHeadBoundary() clear the value is the number of
 	 * trailing segments to release; with it set, the value is the head segment
-	 * index n and the train is split between segment n and n + 1.
+	 * index n and the train is split between segment n and n + 1. A value of 0 is
+	 * legal for an explicitly chosen mode (it is clamped to 1 by the boundary
+	 * geometry helpers, i.e. it selects the nearest possible boundary).
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline uint8_t GetNumDecouple() const { return GB(this->flags, 1, 6); }
 	/**
 	 * R3R: Whether the decouple boundary of this order is measured from the head
 	 * (split after segment n) instead of from the rear (release the last n
-	 * segments). Only meaningful when #GetNumDecouple() is non-zero.
+	 * segments). Only meaningful when #HasExplicitDecoupleBoundary() is set.
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline bool GetDecoupleFromHeadBoundary() const { return HasBit(this->flags, 7); }
 	/**
+	 * R3R: Whether this decouple order carries an explicitly chosen boundary mode.
+	 * @return True when the player selected a boundary mode; false when the order
+	 *         is in the automatic "release the last coupled-on segment" mode.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline bool HasExplicitDecoupleBoundary() const { return HasBit(this->flags, 8); }
+	/**
 	 * R3R: Resolve the boundary mode of this decouple order.
+	 * Orders written before the explicit boundary bit existed used a value of 0
+	 * as the "auto" sentinel, so a zero value without that bit still means Auto.
 	 * @return The mode; the boundary value is available via #GetNumDecouple().
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline DecoupleBoundaryMode GetDecoupleBoundaryMode() const
 	{
-		if (this->GetNumDecouple() == 0) return DecoupleBoundaryMode::Auto;
+		if (!this->HasExplicitDecoupleBoundary() && this->GetNumDecouple() == 0) return DecoupleBoundaryMode::Auto;
 		return this->GetDecoupleFromHeadBoundary() ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
+	}
+	/**
+	 * R3R: The boundary value to show to the player (and to prefill the query
+	 * with). It is #GetNumDecouple() for explicit modes, but clamped to at least
+	 * 1 because the boundary geometry always treated an explicit 0 as 1 - the
+	 * stored 0 of orders saved before the clamp (or written by older builds)
+	 * must never be presented as "0 segments". Auto mode returns 0.
+	 * @pre IsType(OT_DECOUPLE).
+	 */
+	inline uint8_t GetDecoupleBoundaryValue() const
+	{
+		const uint8_t value = this->GetNumDecouple();
+		if (value == 0 && this->GetDecoupleBoundaryMode() != DecoupleBoundaryMode::Auto) return 1;
+		return value;
 	}
 	/**
 	 * Get the number of vehicles to couple onto. 0 means "no restriction".
@@ -675,6 +710,11 @@ public:
 	 * @pre IsType(OT_GOTO_COUPLE).
 	 */
 	inline bool GetCoupleIsDepot() const { return HasBit(this->flags, 2); }
+	/**
+	 * R3R: Get the chain side this train is attached on when coupling.
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline OrderCoupleSide GetCoupleSide() const { return static_cast<OrderCoupleSide>(GB(this->flags, 8, 2)); }
 	/**
 	 * Does this GOTO_COUPLE order specify a cargo type?
 	 * @pre IsType(OT_GOTO_COUPLE).
@@ -708,8 +748,10 @@ public:
 	inline void SetDecouple(OrderDecoupleFlags decouple) { SB(this->flags, 0, 1, decouple); }
 	/**
 	 * R3R: Set the raw segment boundary value of a decouple order.
-	 * 0 means "auto"; otherwise the value is a trailing segment count or a head
-	 * boundary index as selected by #SetDecoupleBoundary.
+	 * With #HasExplicitDecoupleBoundary() clear the value has to be 0 (= auto);
+	 * otherwise the value is a trailing segment count or a head boundary index as
+	 * selected by #SetDecoupleBoundary. Use #SetDecoupleBoundary() rather than
+	 * this setter so the mode stays consistent with the value.
 	 * @param num_decouple The boundary value (0..63).
 	 * @pre IsType(OT_DECOUPLE).
 	 */
@@ -727,23 +769,30 @@ public:
 	 * @param mode  The boundary mode; `value` is ignored for Auto.
 	 * @param value The boundary value: trailing segment count (TailSegments) or
 	 *        head segment index n, split between segment n and n + 1
-	 *        (HeadBoundary). Valid range 1..63.
+	 *        (HeadBoundary). Valid range 0..63; a value of 0 is clamped to 1 so
+	 *        that an explicitly chosen mode always reads back as (and behaves
+	 *        as) the nearest possible boundary instead of "0 segments". An
+	 *        explicit mode is never silently rewritten into the automatic mode.
 	 * @pre IsType(OT_DECOUPLE).
 	 */
 	inline void SetDecoupleBoundary(DecoupleBoundaryMode mode, uint8_t value)
 	{
+		const uint8_t clamped = (value == 0) ? 1 : value;
 		switch (mode) {
 			case DecoupleBoundaryMode::Auto:
+				ClrBit(this->flags, 8);
 				this->SetDecoupleFromHeadBoundary(false);
 				this->SetNumDecouple(0);
 				break;
 			case DecoupleBoundaryMode::TailSegments:
+				SetBit(this->flags, 8);
 				this->SetDecoupleFromHeadBoundary(false);
-				this->SetNumDecouple(value);
+				this->SetNumDecouple(clamped);
 				break;
 			case DecoupleBoundaryMode::HeadBoundary:
+				SetBit(this->flags, 8);
 				this->SetDecoupleFromHeadBoundary(true);
-				this->SetNumDecouple(value);
+				this->SetNumDecouple(clamped);
 				break;
 			case DecoupleBoundaryMode::End:
 				break;
@@ -768,6 +817,12 @@ public:
 	 */
 	inline void SetCoupleIsDepot(bool depot_target) { SB(this->flags, 2, 1, depot_target); }
 	/**
+	 * R3R: Set the chain side this train is attached on when coupling.
+	 * @param side The side (front = [this][target], rear = [target][this]).
+	 * @pre IsType(OT_GOTO_COUPLE).
+	 */
+	inline void SetCoupleSide(OrderCoupleSide side) { SB(this->flags, 8, 2, static_cast<uint8_t>(side)); }
+	/**
 	 * Set the trace restrict slot the consist must be in to be coupled.
 	 * @param slot The slot to require, or #TraceRestrictSlotID::Invalid() to clear.
 	 * @pre IsType(OT_GOTO_COUPLE).
@@ -782,6 +837,50 @@ public:
 	 * @pre IsType(OT_GOTO_COUPLE).
 	 */
 	inline void SetCoupleCargoType(CargoType cargo) { this->refit_cargo = cargo; }
+	/**
+	 * R3R: Does this GOTO_COUPLE / WAIT_COUPLE order temporarily join a couple group?
+	 * @pre IsType(OT_GOTO_COUPLE) || IsType(OT_WAIT_COUPLE).
+	 */
+	inline bool HasCoupleTempGroup() const { return this->GetCoupleTempGroup() != INVALID_COUPLE_GROUP; }
+	/**
+	 * R3R: Get the couple group this GOTO_COUPLE / WAIT_COUPLE order temporarily joins.
+	 *
+	 * The train executing this order is, for as long as this order is the one it
+	 * runs, treated as if the segment carrying the order also belonged to this
+	 * group -- on top of the groups that segment really has (see
+	 * R3RCoupleAllowed()) -- so it may couple onto a consist of that group.
+	 * Nothing is written to the segment itself: the membership is derived from
+	 * the order, and it is gone as soon as the order stops being current (i.e.
+	 * after a successful coupling, see Couple() in train_cmd.cpp).
+	 *
+	 * A WAIT_COUPLE order (KI-225) carries the group for the *opposite*
+	 * direction of the same handshake: the waiting consist declares which
+	 * temporary group it may be picked up under, which is the only way for it to
+	 * be reachable by a locomotive of another company (the cross-company gate
+	 * compares the groups of both sides, see
+	 * R3RCoupleGroupMasksAllowCrossCompany()).
+	 *
+	 * The group ID is stored in the high 16 bits of xdata as ID + 1, so 0 -- the
+	 * value of every order in a savegame written before this feature -- means
+	 * "join none", while group ID 0 stays usable.
+	 *
+	 * @pre IsType(OT_GOTO_COUPLE) || IsType(OT_WAIT_COUPLE).
+	 * @return The group, or #INVALID_COUPLE_GROUP when no group is joined.
+	 */
+	inline CoupleGroupID GetCoupleTempGroup() const
+	{
+		const uint16_t raw = this->GetXDataHigh();
+		return raw != 0 ? CoupleGroupID(static_cast<uint16_t>(raw - 1)) : INVALID_COUPLE_GROUP;
+	}
+	/**
+	 * R3R: Set the couple group this GOTO_COUPLE / WAIT_COUPLE order temporarily joins.
+	 * @param group The group to join, or #INVALID_COUPLE_GROUP to join none.
+	 * @pre IsType(OT_GOTO_COUPLE) || IsType(OT_WAIT_COUPLE).
+	 */
+	inline void SetCoupleTempGroup(CoupleGroupID group)
+	{
+		this->SetXDataHigh(group == INVALID_COUPLE_GROUP ? 0 : static_cast<uint16_t>(group.base() + 1));
+	}
 
 	/**
 	 * Get the order strategy for the first part of the train after decoupling.

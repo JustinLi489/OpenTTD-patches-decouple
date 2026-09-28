@@ -52,6 +52,7 @@ enum class VehicleRailFlag : uint8_t {
 	ArticGroupHead            = 24, ///< R3R: head (parent) role of a de-articulated group; real artic groups derive this from subtype and never carry this bit.
 	ArticGroupMember          = 25, ///< R3R: member (part) role of a de-articulated group; real artic parts derive this from subtype and never carry this bit.
 	SegmentFlipped            = 26, ///< R3R: the segment this vehicle belongs to was logically reversed (R3RFlipChainBySegments); in-segment / in-group position variables are mirrored so NewGRF keeps the pre-flip values.
+	ForceReserveOnce          = 27, ///< R3R (KI-179): one-shot "reserve independently of the signals" ability, granted to the merged train when a coupling completes. Consumed by the first successful path reservation (whether or not it needed the red-signal bypass), kept while every reservation attempt fails (the train then takes the ordinary "waiting for free track" punishment). Saved with the rest of the rail flags (Train::flags).
 };
 using VehicleRailFlags = EnumBitSet<VehicleRailFlag, uint32_t>;
 
@@ -228,6 +229,16 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void ClearSegmentFlipped() { this->flags.Reset(VehicleRailFlag::SegmentFlipped); }
 	/** Toggle the segment-reversed marker (self-inverse: flipping back clears it). */
 	void FlipSegmentFlipped() { this->flags.Flip(VehicleRailFlag::SegmentFlipped); }
+
+	/**
+	 * R3R (KI-179): whether the one-shot "independent reservation" ability is pending.
+	 * Granted when a coupling completes, see VehicleRailFlag::ForceReserveOnce.
+	 */
+	bool HasForceReserveOnce() const { return this->flags.Test(VehicleRailFlag::ForceReserveOnce); }
+	/** R3R: grant the one-shot "independent reservation" ability (a coupling just completed). */
+	void SetForceReserveOnce() { this->flags.Set(VehicleRailFlag::ForceReserveOnce); }
+	/** R3R: consume/clear the one-shot "independent reservation" ability. */
+	void ClearForceReserveOnce() { this->flags.Reset(VehicleRailFlag::ForceReserveOnce); }
 
 	/* R3R de-articulated-group baked overrides. UINT16_MAX means "no override" (fall
 	 * back to the vehicle record / normal rules). Set by DearticulateChainWithSnapshot
@@ -725,8 +736,9 @@ bool R3RIsCarOnlyFormation(const Train *v);
  * path found and the coupling that is finally executed agree on targets. */
 bool R3RIsCoupleTarget(const Train *t);
 
-/* R3R couple priority (route A): the priority/borrow state of a consist is
- * runtime-only, so it is rebuilt from the order-list pointers after a load. */
+/* R3R couple priority (route A): segment ranks and borrow flags are rebuilt
+ * after a load from the physical chain and the order-list pointers; a parked
+ * schedule which survived the load is kept as is. */
 void R3RRebuildCouplePriorities(Train *chain);
 
 #endif /* TRAIN_H */

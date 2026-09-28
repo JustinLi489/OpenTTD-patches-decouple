@@ -3143,8 +3143,14 @@ static constexpr NWidgetPart _nested_station_yard_widgets[] = {
 		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SY_YARD_SEL), SetMinimalSize(90, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_YARD_NAME_NONE, STR_R3R_YARD_SEL_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_ASSIGN), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_ASSIGN, STR_R3R_YARD_ASSIGN_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_NEW_YARD), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_NEW, STR_R3R_YARD_NEW_TOOLTIP),
+	EndContainer(),
+
+	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SY_SHARED_SEL), SetMinimalSize(80, 12), SetStringTip(STR_R3R_YARD_SHARED, STR_R3R_YARD_SHARED_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_WORKSHOP), SetMinimalSize(80, 12), SetStringTip(STR_R3R_YARD_WORKSHOP_NONE, STR_R3R_YARD_WORKSHOP_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_LOCATE), SetMinimalSize(50, 12), SetStringTip(STR_R3R_YARD_LOCATE, STR_R3R_YARD_LOCATE_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_RENAME), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_RENAME, STR_R3R_YARD_RENAME_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_DELETE), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_DELETE, STR_R3R_YARD_DELETE_TOOLTIP),
 		NWidget(WWT_RESIZEBOX, Colours::Grey),
 	EndContainer(),
 };
@@ -3170,6 +3176,8 @@ private:
 	std::vector<uint16_t> platform_yards; ///< Yard of each entry of #platforms.
 	int selected = -1;                ///< Selected index into #platforms, or -1.
 	uint16_t sel_yard = Station::R3R_YARD_NONE; ///< Yard the toolbar buttons apply to (0 = no yard / whole station).
+	uint16_t query_yard = Station::R3R_YARD_NONE; ///< Yard the pending rename query applies to (the selection may change while the query window is open).
+	uint16_t pending_delete_yard = Station::R3R_YARD_NONE; ///< Yard the pending delete confirmation applies to.
 
 	/** Rebuild the platform list from the station, keeping the selection if possible. */
 	void RebuildPlatforms()
@@ -3210,12 +3218,38 @@ private:
 		return st != nullptr && Company::IsValidID(st->owner) && st->owner == _local_company;
 	}
 
-	/** The (translated) label of \a yard at the managed station. */
+	/** The (translated) label of \a yard at the managed station: the player's own
+	 *  name for it when it has one, otherwise the default "yard n", each with the
+	 *  shared/workshop markers appended. */
 	std::string YardLabel(uint16_t yard) const
 	{
 		const Station *st = Station::GetIfValid(this->station_id);
 		if (yard == Station::R3R_YARD_NONE || st == nullptr || yard > st->R3RNumYards()) return GetString(STR_R3R_YARD_NAME_NONE);
-		return st->R3RIsYardShared(yard) ? GetString(STR_R3R_YARD_NAME_N_SHARED, yard) : GetString(STR_R3R_YARD_NAME_N, yard);
+		const bool shared = st->R3RIsYardShared(yard);
+		const bool workshop = st->R3RIsYardWorkshop(yard);
+		const std::string &name = st->R3RGetYardName(yard);
+		if (!name.empty()) {
+			if (shared && workshop) return GetString(STR_R3R_YARD_NAME_CUSTOM_SHARED_WORKSHOP, name);
+			if (workshop) return GetString(STR_R3R_YARD_NAME_CUSTOM_WORKSHOP, name);
+			if (shared) return GetString(STR_R3R_YARD_NAME_CUSTOM_SHARED, name);
+			return GetString(STR_R3R_YARD_NAME_CUSTOM, name);
+		}
+		if (workshop) {
+			return shared ? GetString(STR_R3R_YARD_NAME_N_SHARED_WORKSHOP, yard) : GetString(STR_R3R_YARD_NAME_N_WORKSHOP, yard);
+		}
+		return shared ? GetString(STR_R3R_YARD_NAME_N_SHARED, yard) : GetString(STR_R3R_YARD_NAME_N, yard);
+	}
+
+	/** The bare name of \a yard: its custom name if it has one, else the default
+	 *  "[Yard n]" label. Used where the shared/workshop markers would be noise
+	 *  (the fallback dropdown and the delete confirmation). */
+	std::string YardPlainLabel(uint16_t yard) const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (yard == Station::R3R_YARD_NONE || st == nullptr || yard > st->R3RNumYards()) return GetString(STR_R3R_YARD_NAME_NONE);
+		const std::string &name = st->R3RGetYardName(yard);
+		if (!name.empty()) return GetString(STR_R3R_YARD_NAME_CUSTOM, name);
+		return GetString(STR_R3R_YARD_NAME_N, yard);
 	}
 
 	/** Assign the selected platform to \a yard (or clear it for #Station::R3R_YARD_NONE). */
@@ -3256,6 +3290,57 @@ private:
 		this->SetDirty();
 	}
 
+	/** R3R: whether the currently selected yard is a workshop (检修所). */
+	bool SelectedYardIsWorkshop() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return false;
+		return st->R3RIsYardWorkshop(this->sel_yard);
+	}
+
+	/** R3R: toggle the workshop status of the currently selected yard
+	 *  (升级收费 = 平台数 × 车库造价，降级免费)。 */
+	void ToggleWorkshopOfSelected()
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || !this->CanEdit() || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return;
+		const bool now = st->R3RIsYardWorkshop(this->sel_yard);
+		Command<Commands::SetR3RStationYardWorkshop>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->sel_yard, !now);
+		this->SetDirty();
+	}
+
+	/** R3R: the yard the toolbar buttons apply to, or #Station::R3R_YARD_NONE when
+	 *  the current selection is "whole station"/stale. */
+	uint16_t GetSelectedYard() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return Station::R3R_YARD_NONE;
+		return this->sel_yard;
+	}
+
+	/** Confirmation callback for deleting the selected yard. */
+	static void DeleteYardCallback(Window *w, bool confirmed);
+
+	/** R3R: give the selected yard a name of its own (空名字 = 恢复默认「n 场」标签). */
+	void RenameSelectedYard()
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		const uint16_t yard = this->GetSelectedYard();
+		if (st == nullptr || yard == Station::R3R_YARD_NONE || !this->CanEdit()) return;
+		/* 场号在查询窗口打开期间可能因删场而改变，所以记住这次改名针对哪个场。 */
+		this->query_yard = yard;
+		ShowQueryString(st->R3RGetYardName(yard), STR_R3R_YARD_QUERY_RENAME, MAX_LENGTH_STATION_NAME_CHARS, this, CS_ALPHANUMERAL, QueryStringFlag::LengthIsInChars);
+	}
+
+	/** R3R: ask for confirmation, then delete the selected yard. */
+	void DeleteSelectedYard()
+	{
+		const uint16_t yard = this->GetSelectedYard();
+		if (yard == Station::R3R_YARD_NONE || !this->CanEdit()) return;
+		this->pending_delete_yard = yard;
+		ShowQuery(GetEncodedString(STR_R3R_YARD_QUERY_DELETE_CAPTION), GetEncodedString(STR_R3R_YARD_QUERY_DELETE, this->YardPlainLabel(yard)), this, DeleteYardCallback);
+	}
+
 public:
 	StationYardWindow(WindowDesc &desc, StationID station) : Window(desc), station_id(station)
 	{
@@ -3289,9 +3374,21 @@ public:
 			return;
 		}
 
+		/* R3R (2026-09-23): the row step must come from the LIST widget itself.
+		 * Window::resize.step_height is the root container's resize_y, and
+		 * NWidgetHorizontal computes that as lcm() over its children -- a child
+		 * with a resize step of 0 (here the scrollbar, and in the bottom row the
+		 * dropdown) zeroes the whole container. It was therefore 0, every platform
+		 * row was drawn on the same line and the list looked like it had a single
+		 * platform (玩家报告「只能看到一条站台」). Scrollbar::SetCapacityFromWidget()
+		 * already uses the widget's own resize_y, so this keeps drawing and
+		 * capacity consistent. */
+		const NWidgetBase *list_widget = this->GetWidget<NWidgetBase>(WID_SY_LIST);
+		const int step = (list_widget != nullptr && list_widget->resize_y > 0) ? static_cast<int>(list_widget->resize_y) : (GetCharacterHeight(FontSize::Normal) + 2);
+
 		int y = ir.top;
-		for (int i = this->scroll->GetPosition(); i < static_cast<int>(this->platforms.size()) && this->scroll->IsVisible(i); i++, y += this->resize.step_height) {
-			if (i == this->selected) GfxFillRect(r.left + 1, y, r.right, y + this->resize.step_height - 1, PC_DARK_GREY);
+		for (int i = this->scroll->GetPosition(); i < static_cast<int>(this->platforms.size()) && this->scroll->IsVisible(i); i++, y += step) {
+			if (i == this->selected) GfxFillRect(r.left + 1, y, r.right, y + step - 1, PC_DARK_GREY);
 			const TileIndex t = this->platforms[i];
 			std::string text = GetString(STR_R3R_YARD_LIST_ITEM, i + 1, TileX(t), TileY(t));
 			text += ' ';
@@ -3310,7 +3407,7 @@ public:
 	{
 		const uint16_t fb = this->SelectedSharedYard();
 		if (fb == Station::R3R_YARD_NONE) return GetString(STR_R3R_YARD_SHARED_NONE);
-		return GetString(STR_R3R_YARD_NAME_N, fb);
+		return this->YardPlainLabel(fb);
 	}
 
 	/** R3R: show the label of the currently selected yard on the dropdown button. */
@@ -3318,6 +3415,9 @@ public:
 	{
 		if (widget == WID_SY_YARD_SEL) return this->YardLabel(this->sel_yard);
 		if (widget == WID_SY_SHARED_SEL) return GetString(STR_R3R_YARD_SHARED_SEL, this->SharedYardLabel());
+		if (widget == WID_SY_WORKSHOP) {
+			return GetString(this->SelectedYardIsWorkshop() ? STR_R3R_YARD_WORKSHOP_SET : STR_R3R_YARD_WORKSHOP_NONE);
+		}
 		return this->Window::GetWidgetString(widget, stringid);
 	}
 
@@ -3332,8 +3432,12 @@ public:
 		this->SetWidgetDisabledState(WID_SY_YARD_SEL, !can_edit);
 		this->SetWidgetDisabledState(WID_SY_ASSIGN, !can_edit || !has_sel);
 		this->SetWidgetDisabledState(WID_SY_NEW_YARD, !can_edit || num_yards >= Station::R3R_MAX_YARDS);
-		this->SetWidgetDisabledState(WID_SY_SHARED_SEL, !can_edit || !sel_yard_valid);
+		/* 检修所不参与「停满回落」共享，因此选中检修所时共享下拉不可用。 */
+		this->SetWidgetDisabledState(WID_SY_SHARED_SEL, !can_edit || !sel_yard_valid || this->SelectedYardIsWorkshop());
+		this->SetWidgetDisabledState(WID_SY_WORKSHOP, !can_edit || !sel_yard_valid);
 		this->SetWidgetDisabledState(WID_SY_LOCATE, !has_sel);
+		this->SetWidgetDisabledState(WID_SY_RENAME, !can_edit || !sel_yard_valid);
+		this->SetWidgetDisabledState(WID_SY_DELETE, !can_edit || !sel_yard_valid);
 		this->DrawWidgets();
 	}
 
@@ -3341,6 +3445,11 @@ public:
 	{
 		if (!gui_scope) return;
 		this->RebuildPlatforms();
+		/* R3R: 删场会让其后各场的 ID 前移一位，选中的场号可能已经越界，
+		 * 这时退回「整站」而不是继续指向一个不存在的场。 */
+		const Station *st = Station::GetIfValid(this->station_id);
+		const uint16_t num_yards = (st != nullptr) ? st->R3RNumYards() : 0;
+		if (this->sel_yard > num_yards) this->sel_yard = Station::R3R_YARD_NONE;
 		this->SetDirty();
 	}
 
@@ -3386,7 +3495,7 @@ public:
 					/* 回流目标不能是自己，因此列表里跳过当前选中的场。 */
 					for (uint16_t y = 1; y <= st->R3RNumYards(); y++) {
 						if (y == this->sel_yard) continue;
-						list.push_back(MakeDropDownListStringItem(GetString(STR_R3R_YARD_NAME_N, y), y, false));
+						list.push_back(MakeDropDownListStringItem(this->YardPlainLabel(y), y, false));
 					}
 				}
 				ShowDropDownList(this, std::move(list), this->SelectedSharedYard(), WID_SY_SHARED_SEL, 0, {});
@@ -3398,6 +3507,18 @@ public:
 				if (t != INVALID_TILE) ScrollMainWindowToTile(t);
 				break;
 			}
+
+			case WID_SY_WORKSHOP:
+				this->ToggleWorkshopOfSelected();
+				break;
+
+			case WID_SY_RENAME:
+				this->RenameSelectedYard();
+				break;
+
+			case WID_SY_DELETE:
+				this->DeleteSelectedYard();
+				break;
 
 			default:
 				break;
@@ -3413,7 +3534,26 @@ public:
 			this->SetSharedYardOfSelected(static_cast<uint16_t>(index));
 		}
 	}
+
+	void OnQueryTextFinished(std::optional<std::string> str) override
+	{
+		if (!str.has_value()) return;
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || !this->CanEdit() || this->query_yard == Station::R3R_YARD_NONE || this->query_yard > st->R3RNumYards()) return;
+		/* 空名字是被允许的：它表示恢复默认的「n 场」标签。 */
+		Command<Commands::SetR3RStationYardName>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->query_yard, *str);
+		this->SetDirty();
+	}
 };
+
+void StationYardWindow::DeleteYardCallback(Window *w, bool confirmed)
+{
+	if (!confirmed) return;
+	StationYardWindow *sy = static_cast<StationYardWindow *>(w);
+	const uint16_t yard = sy->pending_delete_yard;
+	if (yard == Station::R3R_YARD_NONE) return;
+	Command<Commands::RemoveR3RStationYard>::Post(STR_ERROR_CAN_T_DO_THIS, sy->station_id, yard);
+}
 
 /** R3R: open (or bring to the front) the yard management window of \a station. */
 void ShowStationYardWindow(StationID station)

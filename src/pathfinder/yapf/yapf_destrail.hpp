@@ -324,38 +324,23 @@ public:
 		return dest_order.GetNumCouple() == CountVehiclesInChain(t);
 	}
 
-	/** Check the trace-restrict-slot requirement from the GOTO_COUPLE order.
-	 * The couple-slot selector is a purely optional user restriction. Nothing
-	 * in the game sets it on GOTO_COUPLE orders (there is no SetCoupleSlot
-	 * caller and no order-window UI for it yet), so an unset order reads back
-	 * slot id 0 (the default xdata value), NOT the Invalid() sentinel 0xFFFF.
-	 * Slot 0 typically does not exist in the pool, so GetIfValid() returns
-	 * null and every candidate would be rejected. Treat an unset/0 slot and any
-	 * slot id that no longer resolves as "no restriction". A slot that exists
-	 * but holds no occupants cannot discriminate either — the decouple flow
-	 * never registers the waiting WAIT_COUPLE consist into the coupler's slot
-	 * automatically (occupancy only appears if the map's trace-restrict setup
-	 * adds it), so an empty slot must accept the sole waiting consist instead
-	 * of making every station pick-up impossible. The slot only rejects a
-	 * candidate when it genuinely holds some other consist. */
-	bool CheckOrderSlot(const Train *t) const
-	{
-		TraceRestrictSlotID slot = dest_order.GetCoupleSlot();
-		if (slot == TraceRestrictSlotID::Invalid() || slot == TraceRestrictSlotID(0)) return true;
-		const TraceRestrictSlot *s = TraceRestrictSlot::GetIfValid(slot);
-		if (s == nullptr) return true;
-		if (s->IsOccupant(t->index)) return true;
-		if (s->occupants.empty()) return true;
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "COUPLE-SLOT-REJ u=%d slotRaw=%u nOcc=%zu\n",
-					(int)t->index.base(), (unsigned)slot.base(), s->occupants.size());
-				fclose(dbg);
-			}
-		}
-		return false;
-	}
+	/* R3R (第 109 轮, 2026-09-24): CheckOrderSlot() 已废除。
+	 *
+	 * 玩家口径：「废除常规分组和路签对挂接的影响」——候选车底是否落在机车那条
+	 * GOTO_COUPLE 命令所选的路签（trace restrict slot）里，不再参与目的地判定。
+	 *
+	 * 废除理由（原实现的两条硬伤）：①order 上的路签槽选择器在上游就只能读不能写
+	 * （没有任何 SetCoupleSlot 调用点、订单窗口也没有对应控件），所以它永远读到
+	 * xdata 默认值 0，判定退化成靠 GetIfValid() 的兜底空转；②真正会拒绝的那种情形
+	 * ——槽里恰好停着别的车底——在本 mod 的挂接流程下根本不成立：解挂流程从不把等待
+	 * 中的 WAIT_COUPLE 车底自动登记进机车的槽（占用只可能来自地图的 tracerestrict
+	 * 布设），于是「有占用但不是我」几乎总是误判，直接把唯一的等待车底从目的地集合里
+	 * 剔掉，表现就是机车到了站台却找不到挂接目标、不铺预留、沿站台乱跑。
+	 *
+	 * 挂接候选的判据现在只剩三道：R3RCoupleAllowed()（目的地 + 公司边界）、
+	 * TrainFitStation()（站台长度）、R3RIsCoupleTarget()（★段头 + WAIT_COUPLE），
+	 * 再加装货/货种/车数三条命令属性。机车自身路径的预留仍照常执行 tracerestrict
+	 * 程序（含 slot acquire/release），那属于寻路与信号系统，与挂接判定无关。 */
 
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
@@ -371,15 +356,6 @@ public:
 
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
-		if (IsRailStationTile(tile)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "PFD tile=%d,%d td=%d trackbits=0x%x hasRes=%d\n",
-					(int)TileX(tile), (int)TileY(tile), (int)td,
-					(unsigned)TrackdirBitsToTrackBits(tdb), (int)has_res);
-				fclose(dbg);
-			}
-		}
 		if (!has_res && !IsRailStationTile(tile)) return false;
 
 		Train *t = nullptr;
@@ -423,33 +399,65 @@ public:
 		}
 		if (t == nullptr) return false;
 		t = t->First();
-		{
+
+		/* R3R (KI-194, 2026-09-24): the destination probe must not report a candidate
+		 * BEFORE the gates have accepted it.
+		 *
+		 * The old accept-dump sat exactly here -- in front of the couple-group
+		 * whitelist, TrainFitStation() and R3RIsCoupleTarget() below -- and printed
+		 * every vehicle that merely had a reservation, so a purely REJECTED vehicle
+		 * (a real train holding GOTO_STATION, wc=0, fit=1) read like a valid couple
+		 * destination in the log and made a correct `found=0` look like a bug
+		 * (KI-191: veh=27 in the 2026-09-23 log, veh=33/27 in the 2026-09-24 log).
+		 *
+		 * yapf_destrail.hpp cannot reuse R3RDbgEdge() (both the gate and its tag enum
+		 * are private to train_cmd.cpp), so rejections are throttled by a tiny
+		 * per-reason counter and accepts are printed one for one (they are rare and
+		 * are the interesting case). */
+		static uint32_t r3r_dest_rej_seen[4] = { 0, 0, 0, 0 };
+		auto r3r_dest_reject = [](int why, TileIndex tile, const Train *t) {
+			static const char * const names[4] = { "PFD-REJ-GROUP", "PFD-REJ-FIT", "PFD-REJ-TARGET", "PFD-REJ-ORDER" };
+			if (why < 0 || why >= 4) return;
+			if (++r3r_dest_rej_seen[why] % 64 != 0) return;
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
-				bool co = R3RIsCarOnlyFormation(t);
-				bool wc = t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE);
-				fprintf(dbg, "PFD tile=%d,%d t=%d co=%d wc=%d ordType=%d fit=%d load=%d cargo=%d wag=%d slot=%d\n",
-					(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
-					(int)co, (int)wc, (int)t->current_order.GetType(),
-					(int)TrainFitStation(t),
-					(int)CheckOrderLoad(t), (int)CheckOrderCargoType(t),
-					(int)CheckNumberOfWagons(t), (int)CheckOrderSlot(t));
+				fprintf(dbg, "%s tile=%d,%d t=%d ordType=%d wc=%d rej=%u\n", names[why],
+						(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
+						(int)t->current_order.GetType(),
+						(int)(t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)),
+						(unsigned)r3r_dest_rej_seen[why]);
 				fclose(dbg);
 			}
-		}
+		};
+		auto r3r_dest_accept = [](const char *kind, TileIndex tile, const Train *t) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "PFD-ACCEPT kind=%s tile=%d,%d t=%d ordType=%d wc=%d\n", kind,
+						(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
+						(int)t->current_order.GetType(),
+						(int)(t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)));
+				fclose(dbg);
+			}
+		};
 
 		/* R3R: couple group whitelist (step 5). A waiting consist whose segment
 		 * belongs to a different couple group is not a candidate at all: it must
 		 * vanish from the destination set (PfDetectDestination returns false) so the
 		 * pathfinder keeps looking for a consist in the same group and otherwise
-		 * ends up in the ordinary "no couple target" outcome. No probe here on
-		 * purpose -- this runs for every station/depot tile of every path search, a
-		 * rejection is a normal outcome, and the downstream COUPLE-FAIL probe is
-		 * edge-gated and already reports the resulting "nothing to couple to". */
-		if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), t)) return false;
+		 * ends up in the ordinary "no couple target" outcome. The rejection itself is
+		 * reported by the throttled PFD-REJ-GROUP probe (see above): this runs for
+		 * every station/depot tile of every path search, so it may not be logged one
+		 * for one. */
+		if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), t)) {
+			r3r_dest_reject(0, tile, t);
+			return false;
+		}
 
 		/* R3R (pxp-decouple): the waiting formation must fit into its station. */
-		if (!TrainFitStation(t)) return false;
+		if (!TrainFitStation(t)) {
+			r3r_dest_reject(1, tile, t);
+			return false;
+		}
 
 		/* R3R (KI-62): only a real segment that is waiting to be coupled onto is a
 		 * couple destination. The segment-front marker is what tells a segment
@@ -457,19 +465,38 @@ public:
 		 * loose chain must never be aimed at. This replaces the old car-only
 		 * short-circuit, which let any zero-power formation through regardless of
 		 * which order it held. */
-		if (!R3RIsCoupleTarget(t)) return false;
+		if (!R3RIsCoupleTarget(t)) {
+			r3r_dest_reject(2, tile, t);
+			return false;
+		}
 
 		/* Target 1: a car-only formation (zero-power train front) waiting to be
 		 * coupled. */
-		if (R3RIsCarOnlyFormation(t)) return true;
+		if (R3RIsCarOnlyFormation(t)) {
+			r3r_dest_accept("car-only", tile, t);
+			return true;
+		}
 
-		/* Target 2 (pxp-decouple reference): any primary vehicle whose current
-		 * order declares WAIT_COUPLE is a candidate, provided it satisfies all
-		 * requirements of the locomotive's GOTO_COUPLE order (load / cargo type /
-		 * wagon count / trace restrict slot). */
-		if (t->IsPrimaryVehicle()) {
-			return CheckOrderLoad(t) && CheckOrderCargoType(t) &&
-					CheckNumberOfWagons(t) && CheckOrderSlot(t);
+		/* Target 2 (pxp-decouple reference): a segment which is an independent chain
+		 * head declaring WAIT_COUPLE. That is exactly what R3RIsCoupleTarget() (the
+		 * gate above) has already established -- this comment used to claim the
+		 * WAIT_COUPLE test lived in this branch, which read as if any plain running
+		 * train with a matching load were a valid destination (KI-194 evaluation,
+		 * 2026-09-24: the implementation was correct and the comment was misplaced;
+		 * the accept-dump in front of the gates is what made it look otherwise).
+		 * The explicit IsType() check below is a redundant belt-and-braces guard, not
+		 * a behaviour change. On top of it the candidate must satisfy the load / cargo
+		 * type / wagon count requirements of the locomotive's GOTO_COUPLE order.
+		 * (The trace-restrict-slot requirement used to be a fourth condition here;
+		 * it was abolished in 第 109 轮 -- see the note where CheckOrderSlot() was.) */
+		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) {
+			if (CheckOrderLoad(t) && CheckOrderCargoType(t) &&
+					CheckNumberOfWagons(t)) {
+				r3r_dest_accept("waiting", tile, t);
+				return true;
+			}
+			r3r_dest_reject(3, tile, t);
+			return false;
 		}
 
 		return false;

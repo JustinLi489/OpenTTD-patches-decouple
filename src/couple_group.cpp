@@ -14,6 +14,8 @@
 #include "vehicle_base.h"
 #include "depot_map.h"
 #include "station_map.h"
+#include "group.h"
+#include "r3r_perf.h"
 #include "core/pool_func.hpp"
 
 #include "safeguards.h"
@@ -180,9 +182,29 @@ uint R3RSetCoupleGroupAllowOthers(CoupleGroupID group, bool allow_others)
 		/* Only the head of a segment carries the mask. */
 		if (!R3RIsCoupleGroupCarrier(t)) continue;
 		if (t->owner == cg->owner) continue;
+		/* R3R (第 146 轮 / 需求叁改): the *stored* mask decides who has to leave --
+		 * a segment which only reaches this group through its parent has nothing to
+		 * clear here, it is handled by the detach below. */
 		if ((R3RGetCoupleGroupsOfSegment(t) & bit) == COUPLE_GROUP_MASK_NONE) continue;
 		R3RRemoveCoupleGroupFromSegment(t, group);
 		evicted++;
+	}
+
+	/* R3R (第 146 轮 / 需求叁改): the hierarchy is a membership relation now, so a
+	 * group which is closed again must also let go of the *foreign* sub groups hanging
+	 * below it: they would keep inheriting this group through a parent they can no
+	 * longer even see (so their owner could not remove that parent any more either).
+	 * Only the direct children are detached, the tree below them is their owner's
+	 * own business. */
+	uint detached = 0;
+	for (CoupleGroup *other : CoupleGroup::Iterate()) {
+		if (other->owner == cg->owner || other->parent != group) continue;
+		other->parent = INVALID_COUPLE_GROUP;
+		detached++;
+	}
+	if (evicted != 0 || detached != 0) {
+		R3RDbgWrite("CGRP-CLOSE group=%u evicted=%u detached=%u\n",
+				(unsigned)group.base(), evicted, detached);
 	}
 	return evicted;
 }
@@ -197,6 +219,34 @@ CoupleGroupMask R3RGetCoupleGroupsOfSegment(const Train *v)
 	for (const Train *t = head; t != nullptr; t = R3RNextSegmentVehicle(t)) groups |= t->couple_groups;
 	/* Dangling references (e.g. a hand edited savegame) behave like "no group". */
 	return R3RSanitiseCoupleGroupMask(groups);
+}
+
+/**
+ * R3R (第 146 轮 / 需求叁改): add the ancestors of every group in \a groups.
+ *
+ * The stored mask holds the groups a segment was explicitly put into; a segment
+ * of the sub group 石头 whose parent is 滚木 is also a train of 滚木, so every
+ * *read* which asks "is this segment in that group" adds the whole parent chain.
+ */
+static CoupleGroupMask R3RAddCoupleGroupAncestors(CoupleGroupMask groups)
+{
+	CoupleGroupMask result = groups;
+	for (uint i = 0; i < R3R_COUPLE_GROUP_MASK_BITS; i++) {
+		if ((groups & (CoupleGroupMask(1) << i)) == 0) continue;
+		/* Walked defensively: a hand edited savegame may contain a cycle, which is
+		 * also why R3RGetCoupleGroupDepth() caps its walk. */
+		CoupleGroupID cur = R3RGetCoupleGroupParent(CoupleGroupID(static_cast<uint16_t>(i)));
+		for (uint steps = 0; cur != INVALID_COUPLE_GROUP && steps < R3R_COUPLE_GROUP_MASK_BITS; steps++) {
+			result |= R3RCoupleGroupBit(cur);
+			cur = R3RGetCoupleGroupParent(cur);
+		}
+	}
+	return result;
+}
+
+CoupleGroupMask R3RGetEffectiveCoupleGroupsOfSegment(const Train *v)
+{
+	return R3RAddCoupleGroupAncestors(R3RGetCoupleGroupsOfSegment(v));
 }
 
 void R3RAddCoupleGroupToSegment(Train *v, CoupleGroupID group)
@@ -224,7 +274,7 @@ void R3RClearCoupleGroupsOfSegment(Train *v)
 	if (head != nullptr) head->couple_groups = COUPLE_GROUP_MASK_NONE;
 }
 
-bool R3RCoupleAllowed(const Train *coupler, const Train *target)
+bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 {
 	if (coupler == nullptr || target == nullptr) return false;
 
@@ -266,9 +316,68 @@ bool R3RCoupleAllowed(const Train *coupler, const Train *target)
 		}
 	}
 
-	const CoupleGroupMask coupler_groups = R3RGetCoupleGroupsOfSegment(coupler);
-	const CoupleGroupMask target_groups = R3RGetCoupleGroupsOfSegment(target);
-	if (!R3RCoupleGroupMasksCompatible(coupler_groups, target_groups)) return false;
+	/* R3R (KI-170): 「临时挂接分组」。
+	 *
+	 * 玩家口径：机车 A 属于真分组"石头"，车底 B 属于真分组"滚木"；A 执行的那条
+	 * 「前往挂接」命令带着属性"滚木"，于是 A 在命令执行期间"暂时同时属于滚木和
+	 * 石头" —— 就是参与挂接的那个段的有效分组 = 它自己的真分组 ∪ 命令指定的那个
+	 * 真分组。因此它挂得上滚木组的车底，而分组无交集的照样被白名单拒绝：这不是
+	 * "万能放行"，只是临时多了一个真实身份。
+	 * （第 109 轮：本题所述「不满足交集就被拒」的白名单闸门本身已废除，见下方
+	 * KI-195 注释；命令级临时分组现在只剩跨公司授权这一条作用。）
+	 *
+	 * 这层身份完全由命令派生，不写进段的数据（段上仍然只有"石头"），命令一被推进掉
+	 * （挂接成功，见 train_cmd.cpp 的 Couple() / CGRP-FAKE-DESTROY）就随之消失。
+	 * 命令里的分组被删掉时按"不指定"处理（R3RIsValidCoupleGroup()），与没写属性等价。
+	 *
+	 * 跨公司那道独立闸门(D6-①)照常用合并后的分组集判定：临时并入一个开放的真分组
+	 * 时效果与真的属于该组一致，并入一个不对外的组则依旧跨不过公司边界。 */
+	/* R3R (第 146 轮 / 需求叁改): 用"有效集合"（含所有祖先组）判定：子组的车也属于父组。 */
+	CoupleGroupMask coupler_groups = R3RGetEffectiveCoupleGroupsOfSegment(coupler);
+	CoupleGroupMask target_groups = R3RGetEffectiveCoupleGroupsOfSegment(target);
+	if (order.IsType(OT_GOTO_COUPLE)) {
+		const CoupleGroupID temp_group = order.GetCoupleTempGroup();
+		if (R3RIsValidCoupleGroup(temp_group)) coupler_groups |= R3RCoupleGroupBit(temp_group);
+	}
+	/* R3R (第 143 轮, KI-225): 等待挂接的车底也能在它的 WAIT_COUPLE 命令上声明一个
+	 * 临时分组，语义与机车侧的 GOTO_COUPLE 对称——"我在等人按这个分组来接我"。
+	 * 于是跨公司那道闸门（下面）能同时看见双方声明的分组：机车声明组 A、等待车底声明
+	 * 组 B，只要 A 与 B 有交集（且该组对其它公司开放）就能跨公司挂上，不需要任何一方
+	 * 真的把自己的段落进对方的真挂接分组里。
+	 * 这里按整条等待链取（链头的命令），不受"只有承载命令的段"限制：等待的是整列车。
+	 * 命令里的分组被删掉时按"不指定"处理（R3RIsValidCoupleGroup()）。 */
+	if (target != nullptr) {
+		const Train *wait_head = Train::From(target->First());
+		if (wait_head != nullptr && wait_head->current_order.IsType(OT_WAIT_COUPLE)) {
+			const CoupleGroupID wait_group = wait_head->current_order.GetCoupleTempGroup();
+			if (R3RIsValidCoupleGroup(wait_group)) target_groups |= R3RCoupleGroupBit(wait_group);
+		}
+	}
+
+	/* R3R (第 109 轮, 2026-09-24): 常规分组（真挂接分组）的白名单闸门已废除。
+	 *
+	 * 玩家口径：「废除常规分组和路签对挂接的影响」。原先这里要求
+	 * R3RCoupleGroupMasksCompatible(机车段掩码, 车底段掩码) 为真，即两段的真分组
+	 * 必须有交集，否则候选直接被判成"这里没有等待的车底"。这条闸门现在只按「公司在
+	 * 不同公司时必须共用一个对外的分组」的公司边界（下面那段）保留，不再按同公司内
+	 * 的分组归属否决候选。
+	 *
+	 * 废除理由：分组本是玩家用来组织车队的账目，把它当成挂接许可，会让"忘记把车底
+	 * 加进同一分组"直接表现成机车到了站台却找不到挂接目标（候选择被剔出目的地集合
+	 * -> 无预留 -> 沿站台乱跑）；而真正该管住"只能挂上目标那一列"的机制是 KI-182 的
+	 * 一对一配对锁（R3RCoupleAllowed() 里的 r3r_couple_target/requester），它比分组
+	 * 白名单精确得多。
+	 *
+	 * 连带影响：命令级的「临时挂接分组」(GetCoupleTempGroup) 对同公司挂接不再有任何
+	 * 作用（本来就是为了通过这道白名单）；它仍然有效的地方是公司边界——临时并入一个
+	 * 对外的真分组，就能跨公司挂上对方那一列。coupler_groups 的合并（上面几行）因此
+	 * 必须保留。真挂接分组本身、分组管理 UI、白名单比较函数
+	 * R3RCoupleGroupMasksCompatible() 都保留不动，只是不再否决挂接。
+	 *
+	 * 注意：本函数是三个解析层级共用的唯一判据（yapf_destrail.hpp 的目的地测试、
+	 * yapf_rail.cpp 的 CheckSafePositionOnNode 回溯安全测试、train_cmd.cpp 的到点闸门），
+	 * 所以这一处改动对三者同时生效；train_cmd.cpp 里 R3RCanCoupleNow 的 reject 标签
+	 * (R3REDGE_COUPLEGATE) 也随之一并只反映目的地与公司边界。 */
 
 	/* R3R (D6-①): the company boundary is a second, independent gate. Two
 	 * segments of the same company couple exactly as before; two segments of
@@ -280,6 +389,130 @@ bool R3RCoupleAllowed(const Train *coupler, const Train *target)
 		return R3RCoupleGroupMasksAllowCrossCompany(coupler_groups, target_groups);
 	}
 	return true;
+}
+
+/**
+ * R3R (KI-182): the chain head stored in one half of a pair flag, if it is
+ * still a live chain head. A lock whose counterpart has been rearranged away
+ * (the stored index is no longer a head, or not a train at all) counts as gone.
+ */
+static Train *R3RResolveCouplePairHalf(VehicleID id)
+{
+	if (id == VehicleID::Invalid()) return nullptr;
+	Train *other = Train::GetIfValid(id);
+	if (other == nullptr) return nullptr;
+	Train *other_head = Train::From(other->First());
+	if (other_head == nullptr || other_head->index != id) return nullptr;
+	return other_head;
+}
+
+bool R3RCouplePairMatches(const Train *coupler, const Train *target)
+{
+	if (coupler == nullptr || target == nullptr) return false;
+	const Train *c = Train::From(coupler->First());
+	const Train *t = Train::From(target->First());
+	if (c == nullptr || t == nullptr) return false;
+	return c->r3r_couple_target == t->index && t->r3r_couple_requester == c->index;
+}
+
+Train *R3RGetCouplePairPartner(const Train *v)
+{
+	if (v == nullptr) return nullptr;
+	const Train *head = Train::From(v->First());
+	if (head == nullptr) return nullptr;
+
+	/* Active half: this chain stores the consist it has locked onto. */
+	Train *partner = R3RResolveCouplePairHalf(head->r3r_couple_target);
+	if (partner != nullptr && partner->r3r_couple_requester != head->index) partner = nullptr;
+
+	/* Passive half: this chain stores the locomotive which locked onto it. */
+	if (partner == nullptr) {
+		partner = R3RResolveCouplePairHalf(head->r3r_couple_requester);
+		if (partner != nullptr && partner->r3r_couple_target != head->index) partner = nullptr;
+	}
+	return partner;
+}
+
+bool R3RHasCouplePair(const Train *v)
+{
+	if (v == nullptr) return false;
+	const Train *head = Train::From(v->First());
+	if (head == nullptr) return false;
+	return head->r3r_couple_target != VehicleID::Invalid() || head->r3r_couple_requester != VehicleID::Invalid();
+}
+
+bool R3RPairCoupleTargets(Train *coupler, Train *target)
+{
+	if (coupler == nullptr || target == nullptr) return false;
+	Train *c = Train::From(coupler->First());
+	Train *t = Train::From(target->First());
+	if (c == nullptr || t == nullptr || c == t) return false;
+
+	/* Drop whatever either side was locked to before, so no chain is left
+	 * pointing at a consist which has just been handed to somebody else. */
+	R3RUnpairCoupleTargets(c);
+	R3RUnpairCoupleTargets(t);
+
+	c->r3r_couple_target = t->index;
+	t->r3r_couple_requester = c->index;
+	return true;
+}
+
+void R3RUnpairCoupleTargets(Train *v)
+{
+	if (v == nullptr) return;
+	Train *head = Train::From(v->First());
+	if (head == nullptr) return;
+
+	/* Clear the counter half first: once our own fields are gone the partner
+	 * can no longer be found through them. */
+	Train *partner = R3RGetCouplePairPartner(head);
+	if (partner != nullptr) {
+		if (partner->r3r_couple_target == head->index) partner->r3r_couple_target = VehicleID::Invalid();
+		if (partner->r3r_couple_requester == head->index) partner->r3r_couple_requester = VehicleID::Invalid();
+	}
+	head->r3r_couple_target = VehicleID::Invalid();
+	head->r3r_couple_requester = VehicleID::Invalid();
+}
+
+bool R3RCoupleAllowed(const Train *coupler, const Train *target)
+{
+	/* R3R (KI-182): the pair flag -- "已有耦合目标" -- is the outer gate.
+	 *
+	 * A locomotive which has locked onto a consist only ever drives to and
+	 * couples onto that consist, and a consist which is somebody's target is
+	 * nobody else's candidate. Every level of the resolution asks this one
+	 * function (pathfinder destination, back-walk safety, arrival gate), so the
+	 * lock cannot be bypassed by any of them. */
+	if (!R3RCouplePairMatches(coupler, target)) return false;
+	return R3RCoupleAllowedIgnoringPair(coupler, target);
+}
+
+CoupleGroupID R3RGetTempCoupleGroup(const Train *v)
+{
+	if (v == nullptr) return INVALID_COUPLE_GROUP;
+
+	/* The order which carries the group is the head's: ProcessOrders() ticks
+	 * only the chain head and R3RCoupleAllowed() reads that vehicle's
+	 * current_order (see the comment there). R3R (KI-225): a waiting consist
+	 * carries the group on its WAIT_COUPLE order, which is the symmetric half
+	 * of the same handshake. */
+	const Train *head = Train::From(v->First());
+	if (head == nullptr) return INVALID_COUPLE_GROUP;
+	if (!head->current_order.IsType(OT_GOTO_COUPLE) && !head->current_order.IsType(OT_WAIT_COUPLE)) return INVALID_COUPLE_GROUP;
+
+	/* Only the segment which carries the order gets the group; the segments
+	 * coupled on further back keep the groups they really have. */
+	if (R3RGetCoupleGroupCarrier(v) != head) return INVALID_COUPLE_GROUP;
+
+	/* A group the order names but which no longer exists counts as "none". */
+	const CoupleGroupID group = head->current_order.GetCoupleTempGroup();
+	return R3RIsValidCoupleGroup(group) ? group : INVALID_COUPLE_GROUP;
+}
+
+bool R3RHasTempCoupleGroup(const Train *v)
+{
+	return R3RGetTempCoupleGroup(v) != INVALID_COUPLE_GROUP;
 }
 
 bool R3RGetChainScheduleOwner(const Train *v, const Train **owner, uint *index, uint *total)
@@ -371,7 +604,9 @@ uint R3RCountSegmentsInCoupleGroup(CoupleGroupID group)
 	uint count = 0;
 	for (const Train *t : Train::Iterate()) {
 		if (!R3RIsCoupleGroupCarrier(t)) continue;
-		const CoupleGroupMask groups = R3RGetCoupleGroupsOfSegment(t);
+		/* R3R (第 146 轮 / 需求叁改): 子组的段也算在本组里 —— 列表上显示的"段数"
+		 * 就是"挂在这一支下面的所有车"，与乘客看到的成员关系一致。 */
+		const CoupleGroupMask groups = R3RGetEffectiveCoupleGroupsOfSegment(t);
 		if (group == INVALID_COUPLE_GROUP) {
 			/* The implicit group is formed by every unassigned segment. */
 			if (groups == COUPLE_GROUP_MASK_NONE) count++;
@@ -409,6 +644,39 @@ const char *R3RGetCoupleGroupName(CoupleGroupID group)
 {
 	const CoupleGroup *cg = CoupleGroup::GetIfValid(group);
 	return cg != nullptr ? cg->name.c_str() : nullptr;
+}
+
+CoupleGroupID R3RGetCoupleGroupParent(CoupleGroupID group)
+{
+	const CoupleGroup *cg = CoupleGroup::GetIfValid(group);
+	return cg != nullptr ? cg->parent : INVALID_COUPLE_GROUP;
+}
+
+uint R3RGetCoupleGroupDepth(CoupleGroupID group)
+{
+	uint depth = 0;
+	/* 旧档里可能残留历史环，所以给步数一个硬上限，绝不让界面绘制陷进去。 */
+	for (CoupleGroupID cur = R3RGetCoupleGroupParent(group);
+			cur != INVALID_COUPLE_GROUP && depth < MAX_LENGTH_COUPLE_GROUP_NAME_CHARS;
+			cur = R3RGetCoupleGroupParent(cur)) {
+		depth++;
+	}
+	return depth;
+}
+
+bool R3RCanCoupleGroupHaveParent(CoupleGroupID group, CoupleGroupID parent)
+{
+	if (!R3RIsValidCoupleGroup(group)) return false;
+	if (parent == INVALID_COUPLE_GROUP) return true; // 变回顶层组永远合法
+	if (!R3RIsValidCoupleGroup(parent) || parent == group) return false;
+
+	/* 顺着拟定的父组往上走：撞到自己就是成环。步数上限同样是为了防旧档里的历史环。 */
+	uint steps = 0;
+	for (CoupleGroupID cur = parent; cur != INVALID_COUPLE_GROUP && steps <= MAX_LENGTH_COUPLE_GROUP_NAME_CHARS; steps++) {
+		if (cur == group) return false;
+		cur = R3RGetCoupleGroupParent(cur);
+	}
+	return true;
 }
 
 void R3RUnassignCoupleGroup(CoupleGroupID group)
@@ -453,4 +721,94 @@ void AfterLoadCoupleGroups()
 		const CoupleGroupMask groups = R3RSanitiseCoupleGroupMask(t->couple_groups);
 		if (groups != t->couple_groups) t->couple_groups = groups;
 	}
+
+	/* R3R (第 144 轮 / 需求叁): 父组必须指向一个活着的组，且不能成环。旧存档没有这个
+	 * 字段（读出来是 0，0 又恰好是个合法下标），损坏的层级也要在这里断掉 —— 否则
+	 * R3RGetCoupleGroupDepth() 与界面绘制会一直踩一个已经不存在的组。 */
+	for (CoupleGroup *cg : CoupleGroup::Iterate()) {
+		if (cg->parent == INVALID_COUPLE_GROUP) continue;
+		if (!R3RCanCoupleGroupHaveParent(cg->index, cg->parent)) {
+			R3RDbgWrite("CGRP-PARENT-RESET g=%d bad=%d\n", (int)cg->index.base(), (int)cg->parent.base());
+			cg->parent = INVALID_COUPLE_GROUP;
+		}
+	}
+}
+
+/**
+ * R3R（2026-09-23）：读档收尾把每条物理链的「列车分组」与「挂接分组」收敛到实际控制段。
+ *
+ * 与 train_cmd.cpp 里 Couple() / DecoupleTrain() 提交点上调用的 R3RNormaliseChainGroups()
+ * 同一口径（实际控制段 = R3RGetChainScheduleOwner() 选出的 r3r_priority 最小者），差别只有两点：
+ *  - 面向整张地图遍历（读档时所有车辆刚建好），而不是单条链；
+ *  - 不做 num_vehicle 簿记 —— 它由紧随其后的 GroupStatistics::UpdateAfterLoad() 整表重算，
+ *    连 SetTrainGroupID 顺带维护的 num_engines 也一并被重算覆盖。
+ *
+ * 调用点（saveload/afterload.cpp）必须夹在 AfterLoadVehiclesPhase2() 之后、
+ * GroupStatistics::UpdateAfterLoad() 之前：前者保证 orders 这条 REF 指针已经修正
+ * （读档时 CGVR 的 post 钩子太早，那时表里还是裸序号，绝不能解引用），后者是统计口径。
+ * 世界刚刚从文件读出来，这里只应与一处不一致的存档对上；正常存档零命中。
+ */
+void R3RNormaliseChainGroupsAfterLoad()
+{
+	uint chains = 0;
+	uint group_fixes = 0;
+	uint mask_fixes = 0;
+
+	for (Train *t : Train::Iterate()) {
+		if (t->Previous() != nullptr || !t->IsFrontEngine()) continue;
+		chains++;
+
+		const Train *owner = nullptr;
+		R3RGetChainScheduleOwner(t, &owner, nullptr, nullptr);
+		if (owner == nullptr) continue;
+
+		/* 列车分组：整链推平为控制段的分组。判据扫全链而不是只比链头 —— 不一致的
+		 * 往往正是被并入的那一段。 */
+		bool uniform = true;
+		for (const Vehicle *w = t; w != nullptr; w = w->Next()) {
+			if (w->group_id != owner->group_id) { uniform = false; break; }
+		}
+		if (!uniform) {
+			const GroupID old_g = t->group_id;
+			/* R3R (第 144 轮 / 需求伍): 与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径 ——
+			 * 先把"分组会被改写"的段头（含链头）自己的分组停放，等该段重新成为链头时由
+			 * NormaliseTrainHead() 取回。读档路径不做 num_vehicle 簿记：紧随其后的
+			 * GroupStatistics::UpdateAfterLoad() 会整表重算。 */
+			for (Train *s = t; s != nullptr; ) {
+				if ((s->Previous() == nullptr || s->IsSegmentFront()) && s->group_id != owner->group_id &&
+						s->group_id_backup == GroupID::Invalid()) {
+					s->group_id_backup = s->group_id;
+					R3RDbgWrite("GRP-PARK-LOAD veh=%d g=%u\n", (int)s->index.base(), (uint)s->group_id.base());
+				}
+				Vehicle *next = s->Next();
+				s = (next != nullptr) ? Train::From(next) : nullptr;
+			}
+			SetTrainGroupID(t, owner->group_id);
+			group_fixes++;
+			R3RDbgWrite("GRP-NORM-LOAD head=%d old=%u new=%u\n", (int)t->index.base(),
+					(uint)old_g.base(), (uint)owner->group_id.base());
+		}
+
+		/* 挂接分组：把控制段的掩码复制到链内每一个段头。 */
+		const CoupleGroupMask target = R3RGetCoupleGroupsOfSegment(owner);
+		for (Train *s = t; s != nullptr; ) {
+			if (s->Previous() == nullptr || s->IsSegmentFront()) {
+				if (R3RGetCoupleGroupsOfSegment(s) != target) {
+					R3RClearCoupleGroupsOfSegment(s);
+					for (uint i = 0; i < R3R_COUPLE_GROUP_MASK_BITS; i++) {
+						if ((target & (CoupleGroupMask(1) << i)) != 0) {
+							R3RAddCoupleGroupToSegment(s, CoupleGroupID(static_cast<uint16_t>(i)));
+						}
+					}
+					mask_fixes++;
+					R3RDbgWrite("CGRP-NORM-LOAD seg=%d mask=%llu\n", (int)s->index.base(),
+							(unsigned long long)target);
+				}
+			}
+			Vehicle *next = s->Next();
+			s = (next != nullptr) ? Train::From(next) : nullptr;
+		}
+	}
+
+	R3RDbgWrite("GRP-NORM-LOAD-SUM chains=%u groupfix=%u maskfix=%u\n", chains, group_fixes, mask_fixes);
 }

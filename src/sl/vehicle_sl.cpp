@@ -481,6 +481,23 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 {
 	const Vehicle *si_v = nullptr;
 	SCOPE_INFO_FMT([&si_v], "AfterLoadVehiclesPhase2: {}", VehicleInfoDumper(si_v));
+
+	/* R3R (KI-169a): a schedule parked in orders_backup (route A borrow, depot drag)
+	 * is written out as a plain OrderList reference, so the list comes back with
+	 * its runtime bookkeeping still empty. Rebuild it exactly the way
+	 * AfterLoadVehicles() does for the schedules which are actually being driven,
+	 * otherwise FirstShared()/IsOrderListShared()/DeleteVehicleOrders() would read
+	 * a list without an owner and hand it over half-initialised when the borrow is
+	 * given back. Lists which are (also) somebody's live schedule were already
+	 * initialised by AfterLoadVehicles(); they have a first_shared and are left alone.
+	 * Only on a real load: a NewGRF reload keeps live state which must not be reset. */
+	if (part_of_load) {
+		for (Vehicle *v : Vehicle::Iterate()) {
+			if (v->orders_backup == nullptr || v->orders_backup->GetFirstSharedVehicle() != nullptr) continue;
+			v->orders_backup->Initialize(v);
+		}
+	}
+
 	for (Vehicle *v : Vehicle::IterateFrontOnly()) {
 		si_v = v;
 		assert(v->First() != nullptr);
@@ -493,11 +510,14 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 				if (t->IsFrontEngine() || t->IsFreeWagon()) {
 					t->gcache.last_speed = t->cur_speed; // update displayed train speed
 					t->ConsistChanged(CCF_SAVELOAD);
-					/* R3R: the couple-priority/borrow state is runtime-only, so a load
-					 * leaves it at its defaults and decouples would take the legacy
-					 * hand-over path (KI-02/KI-05). Rebuild it from the order-list
-					 * pointers. Only on a real load: a NewGRF reload runs this same
-					 * pass with live state that must not be disturbed. */
+					/* R3R: segment ranks and the "my schedule is parked" flag are
+					 * rebuilt from the physical chain and the order-list pointers.
+					 * Since KI-169a the parked schedules themselves are part of the
+					 * savegame (R3VP chunk), so a rebuilt head which still owns one
+					 * keeps it; only the ranking is normalised. Decouples would
+					 * otherwise take the legacy hand-over path (KI-02/KI-05). Only on
+					 * a real load: a NewGRF reload runs this same pass with live state
+					 * that must not be disturbed. */
 					if (part_of_load) R3RRebuildCouplePriorities(t);
 				}
 				break;
@@ -635,6 +655,14 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 			} else {
 				v->unitnumber = 0;
 			}
+		}
+
+		/* R3R (第 144 轮 / 需求壹): 冻结在 unitnumber_backup 里的编号在存档时是
+		 * "仍被占用"的（停放期间刻意不还池），而读档后公司车号池是空的 —— 必须
+		 * 把冻结号也占上，否则别的列车会领到这个本该冻结的编号，冻结语义一读档
+		 * 就失效（甚至出现两车同号）。UseID 对 0/UINT16_MAX 自身是空操作。 */
+		if (part_of_load && v->unitnumber_backup != 0) {
+			Company::Get(v->owner)->freeunits[v->type].UseID(v->unitnumber_backup);
 		}
 
 		v->UpdateDeltaXY();

@@ -718,7 +718,8 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 				/* R3R (KI-147 rev.3): 挂车时借出并暂存的车号也可能挂在本车上。头车在
 				 * 这里就要丢掉 front 身份,PreDestructor 的备份回收(仅 FrontEngine)
 				 * 之后再也轮不到它,不在这里回收就是永久泄漏。 */
-				if (seg->unitnumber_backup != 0 && seg->unitnumber_backup != seg->unitnumber) {
+				if (seg->unitnumber_backup != 0 && seg->unitnumber_backup != seg->unitnumber &&
+						!seg->R3RUnitNumberOwnedByOther()) {
 					Company::Get(seg->owner)->freeunits[VehicleType::Train].ReleaseID(seg->unitnumber_backup);
 				}
 				seg->unitnumber = 0;
@@ -750,7 +751,8 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 		/* Release the unit number back into the company pool. */
 		if (front->unitnumber != 0) Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber);
 		/* R3R (KI-147 rev.3): 同上,借出暂存的车号也要一起回收。 */
-		if (front->unitnumber_backup != 0 && front->unitnumber_backup != front->unitnumber) {
+		if (front->unitnumber_backup != 0 && front->unitnumber_backup != front->unitnumber &&
+				!front->R3RUnitNumberOwnedByOther()) {
 			Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber_backup);
 		}
 		front->unitnumber = 0;
@@ -2070,6 +2072,31 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				/* A segment rear pseudo engine deliberately carries no front bit;
 				 * mirror the source instead of unconditionally setting it. */
 				if (src->IsFrontEngine()) dst->SetFrontEngine();
+				/* R3R (KI-223, 2026-09-27): mirror the segment boundary markers as
+				 * well. ★/⊗ live in Train::flags (VehicleRailFlag::SegmentFront /
+				 * SegmentBack) and are not copied by BuildVehicle(), so without this
+				 * the copy of a segment is not a segment any more: it is neither a
+				 * legal demote target nor a legal couple target, because both gates
+				 * test IsSegmentFront() on the chain head. */
+				if (src->IsSegmentFront()) dst->SetSegmentFront();
+				if (src->IsSegmentBack()) dst->SetSegmentBack();
+				/* R3R (KI-223, 2026-09-27): a pseudo engine that becomes a chain
+				 * head has to be marked as stopped in the depot.
+				 * IsStoppedInDepot() (vehicle_base.h) demands VehState::Stopped from
+				 * a primary vehicle, but CmdBuildRailWagon() leaves the bit clear (a
+				 * freshly built wagon is not a primary vehicle) -- while a real
+				 * locomotive clone gets it from CmdBuildRailVehicle(). The flag
+				 * matters immediately: the very next loop iteration attaches the
+				 * second car with MoveRailVehicle(), whose dst_head is this very car,
+				 * and that command refuses any edit with
+				 * STR_ERROR_TRAINS_CAN_ONLY_BE_ALTERED_INSIDE_A_DEPOT when the
+				 * destination head is a primary vehicle without VehState::Stopped
+				 * (train_cmd.cpp, "dst_head->IsStoppedInDepot()"). That is why
+				 * cloning a pure pseudo-engine chain (a segment standing in a depot)
+				 * always failed while cloning an ordinary locomotive worked. The bit
+				 * also leaves the copy in the state of a freshly bought locomotive:
+				 * editable in the depot and waiting for the player to start it. */
+				if (v == v_front) dst->vehstatus.Set(VehState::Stopped);
 				if (v == v_front) {
 					dst->ConsistChanged(CCF_ARRANGE);
 				} else {

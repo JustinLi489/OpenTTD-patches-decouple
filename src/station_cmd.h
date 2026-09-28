@@ -32,5 +32,8 @@ DEF_CMD_TUPLE_NT(Commands::ExchangeStationNames,           CmdExchangeStationNam
 DEF_CMD_TUPLE_NT(Commands::SetStationCargoAllowedSupply,   CmdSetStationCargoAllowedSupply,          {}, CommandType::OtherManagement,       CmdDataT<StationID, CargoType, bool>)
 DEF_CMD_TUPLE_NT(Commands::SetR3RStationYard,              CmdR3RSetStationYard,                     {}, CommandType::OtherManagement,       CmdDataT<StationID, TileIndex, uint16_t>)
 DEF_CMD_TUPLE_NT(Commands::SetR3RStationYardShared,        CmdR3RSetStationYardShared,               {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint16_t>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RStationYardWorkshop,      CmdR3RSetStationYardWorkshop,             {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, bool>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RStationYardName,          CmdR3RSetStationYardName,                 {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, std::string>)
+DEF_CMD_TUPLE_NT(Commands::RemoveR3RStationYard,           CmdR3RRemoveStationYard,                  {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t>)
 
 #endif /* STATION_CMD_H */

@@ -45,11 +45,63 @@
  *     shared_with 都等于 A 场的 ID。读取 v2 时按旧语义迁移：所有非共享场回落
  *     到第一个共享场（只有一个共享场的存档即完全等价），共享场自身不回落。
  *
- * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v3/v2 解码；否则按 v1 迁移（任一 v1 列表
+ * v4：每组新增一个「场标志」word（bit0 = is_workshop 检修所），放在
+ *     shared_with 之后、tile 数量之前。读取 v3/v2 时该标志恒为 false。
+ *
+ * v5：每组新增「名称」块（玩家自定义的场名，见 Station::R3RStationYard::name）。
+ *     名称是 std::string，而本 chunk 的载体是 std::vector<TileIndex>（32 位 word），
+ *     所以按字节打包成 word：先写字节数（一个字），再写 ceil(字节数/4) 个字，
+ *     每字装 4 个 UTF-8 字节（低位在前，末字高位补 0）。名称块放在「场标志」之后、
+ *     tile 数量之前。读取 v4/v3/v2 时名称恒为空（界面显示默认的「N 场」）。
+ *
+ * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v5/v4/v3/v2 解码；否则按 v1 迁移（任一 v1 列表
  * 非空时构造场 1/2/3，保证旧存档里订单引用的场 ID 仍然有效）。
  */
 static constexpr uint32_t SYRD_V2_MAGIC = 0xFFFFFF01;
 static constexpr uint32_t SYRD_V3_MAGIC = 0xFFFFFF02;
+static constexpr uint32_t SYRD_V4_MAGIC = 0xFFFFFF03;
+static constexpr uint32_t SYRD_V5_MAGIC = 0xFFFFFF04;
+
+/** R3R: SYRD v5 场标志 word 的位定义。 */
+static constexpr uint32_t SYRD_YARD_FLAG_WORKSHOP = 0x00000001; ///< 本场是检修所
+
+/** R3R: 场名解码时的合法长度上限（字节）。命令层按
+ * #MAX_LENGTH_STATION_NAME_CHARS 个字符校验，最坏 4 字节/字符，所以上限取
+ * 4 倍字符数；超出（损坏/恶意编码）的部分截断，避免巨大的内存分配。 */
+static constexpr uint32_t SYRD_MAX_NAME_BYTES = MAX_LENGTH_STATION_NAME_CHARS * 4;
+
+/** R3R: 把名称按字节打包进 SYRD word 流（见文件头 v5 说明）。 */
+static void R3RPackName(std::vector<TileIndex> &out, const std::string &name)
+{
+	const size_t len = name.size();
+	out.push_back(static_cast<TileIndex>(len));
+	for (size_t i = 0; i < len; i += 4) {
+		uint32_t word = 0;
+		for (size_t k = 0; k < 4 && i + k < len; k++) {
+			word |= static_cast<uint32_t>(static_cast<uint8_t>(name[i + k])) << (8 * k);
+		}
+		out.push_back(static_cast<TileIndex>(word));
+	}
+}
+
+/** R3R: 从 SYRD word 流解出名称，并把 \a p 推进到名称块之后。 */
+static std::string R3RUnpackName(const std::vector<TileIndex> &in, size_t &p)
+{
+	if (p >= in.size()) return {};
+	const uint32_t len = std::min<uint32_t>(in[p++].base(), SYRD_MAX_NAME_BYTES);
+
+	std::string name;
+	name.reserve(len);
+	for (uint32_t i = 0; i < len; i++) {
+		const size_t wi = p + (i / 4);
+		if (wi >= in.size()) break;
+		name.push_back(static_cast<char>((in[wi].base() >> (8 * (i % 4))) & 0xFF));
+	}
+
+	p += (static_cast<size_t>(len) + 3) / 4;
+	if (p > in.size()) p = in.size();
+	return name;
+}
 
 static const NamedSaveLoad _r3r_station_yard_desc[] = {
 	NSL("yard_a",      SLE_VARVEC(Station, r3r_yard_a,      SLE_UINT32)),
@@ -70,22 +122,26 @@ static void R3REncodeYards(Station *st)
 
 	if (st->r3r_yards.empty()) return;
 
-	out.push_back(static_cast<TileIndex>(SYRD_V3_MAGIC));
+	out.push_back(static_cast<TileIndex>(SYRD_V5_MAGIC));
 	out.push_back(static_cast<TileIndex>(st->r3r_yards.size() & 0xFFFF));
 	for (const Station::R3RStationYard &y : st->r3r_yards) {
 		out.push_back(static_cast<TileIndex>(y.shared_with));
+		out.push_back(static_cast<TileIndex>(y.is_workshop ? SYRD_YARD_FLAG_WORKSHOP : 0));
+		R3RPackName(out, y.name);
 		out.push_back(static_cast<TileIndex>(y.tiles.size()));
 		out.insert(out.end(), y.tiles.begin(), y.tiles.end());
 	}
 }
 
-/** R3R: decode a v3/v2 yard buffer into \a st->r3r_yards. Returns false if \a in is neither v3 nor v2 encoded. */
+/** R3R: decode a v5/v4/v3/v2 yard buffer into \a st->r3r_yards. Returns false if \a in is none of them. */
 static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 {
 	if (in.empty()) return false;
 	const uint32_t magic = in[0].base();
-	if (magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
+	if (magic != SYRD_V5_MAGIC && magic != SYRD_V4_MAGIC && magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
 	const bool legacy_v2 = (magic == SYRD_V2_MAGIC);
+	const bool has_flags = (magic == SYRD_V5_MAGIC || magic == SYRD_V4_MAGIC);
+	const bool has_names = (magic == SYRD_V5_MAGIC);
 
 	st->r3r_yards.clear();
 
@@ -98,6 +154,14 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 	for (uint32_t k = 0; k < n; k++) {
 		if (p + 2 > in.size()) break; // 截断的编码，安全停止
 		const uint32_t w = in[p++].base();
+		uint32_t flags = 0;
+		if (has_flags) {
+			if (p >= in.size()) break;
+			flags = in[p++].base();
+		}
+		std::string name;
+		if (has_names) name = R3RUnpackName(in, p);
+		if (p >= in.size()) break; // 截断的编码，安全停止
 		const uint32_t m = in[p++].base();
 		Station::R3RStationYard &y = st->r3r_yards.emplace_back();
 		if (legacy_v2) {
@@ -106,6 +170,8 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 		} else {
 			y.shared_with = static_cast<uint16_t>(w & 0xFFFF);
 		}
+		y.is_workshop = (flags & SYRD_YARD_FLAG_WORKSHOP) != 0;
+		y.name = std::move(name);
 		for (uint32_t i = 0; i < m && p < in.size(); i++) y.tiles.push_back(in[p++]);
 	}
 

@@ -2324,6 +2324,17 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 					DrawString(tr.left, tr.right, ir.top, GetString(STR_GROUP_NAME, vc->group_id.base() | GROUP_NAME_HIERARCHY), TextColour::Black, SA_LEFT, false, FontSize::Small);
 				}
 
+				/* R3R (KI-170): a chain which runs a "go to and couple" order holds a
+				 * temporary couple group (R3RHasTempCoupleGroup()); badge it on the name
+				 * line. Kept a small step away from the row's edge, where the company
+				 * colour stripe of a foreign chain is drawn. */
+				if (v->type == VehicleType::Train && R3RHasTempCoupleGroup(Train::From(v))) {
+					const int badge_inset = GetCharacterHeight(FontSize::Small);
+					DrawString(rtl ? tr.left + badge_inset : tr.left, rtl ? tr.right : tr.right - badge_inset,
+							ir.top, GetString(STR_R3R_TEMP_COUPLE_GROUP), TextColour::Orange,
+							rtl ? SA_LEFT : SA_RIGHT, false, FontSize::Small);
+				}
+
 				if (show_orderlist) DrawSmallOrderList(v, olr.left, olr.right, ir.top + GetCharacterHeight(FontSize::Small), this->order_arrow_width, v->cur_real_order_index);
 
 				TextColour tc;
@@ -3264,7 +3275,8 @@ struct VehicleDetailsWindow : Window {
 	{
 		if (v->type != VehicleType::Train) return false;
 		const Train *t = Train::From(v);
-		if (R3RGetCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) return true;
+		/* R3R (第 146 轮 / 需求叁改): 有效集合 —— 属于子组的分段也算"有分组"。 */
+		if (R3RGetEffectiveCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) return true;
 
 		uint total = 0;
 		return R3RGetChainScheduleOwner(t, nullptr, nullptr, &total) && total > 1;
@@ -3289,7 +3301,7 @@ struct VehicleDetailsWindow : Window {
 	 */
 	static std::string GetCoupleGroupDisplayName(const Vehicle *v)
 	{
-		const std::string names = R3RGetCoupleGroupsNameList(R3RGetCoupleGroupsOfSegment(Train::From(v)));
+		const std::string names = R3RGetCoupleGroupsNameList(R3RGetEffectiveCoupleGroupsOfSegment(Train::From(v)));
 		return !names.empty() ? names : std::string(GetString(STR_DEPOT_CHAIN_NO_GROUP));
 	}
 

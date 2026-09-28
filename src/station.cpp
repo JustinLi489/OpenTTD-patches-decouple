@@ -544,6 +544,9 @@ void Station::RecomputeCatchment(bool no_clear_nearby_lists)
 
 		this->station_tiles++;
 
+		/* R3R: 检修所（场）不参与 catchment，即不吸引、不产生、不接受任何货物。 */
+		if (this->R3RIsWorkshopTile(tile)) continue;
+
 		uint r = GetTileCatchmentRadius(tile, this);
 		if (r == CA_NONE) continue;
 

@@ -22,6 +22,7 @@
 #include "../../r3r_perf.h"
 #include "../../couple_group.h"
 #include "../../pbs.h"
+#include <map> // R3R (KI-190): per-vehicle couple scan throttle state
 
 #include "../../safeguards.h"
 
@@ -436,6 +437,9 @@ public:
 	 */
 	bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool unsafe_pos = false)
 	{
+		/* R3R (KI-207): every pathfinder-made reservation passes through here, so
+		 * record which train is booking (phase stays whatever the caller named). */
+		R3RResvPhaseGuard r3r_phase(nullptr, R3RResvActorID(Yapf().GetVehicle()));
 		this->res_fail_tile = INVALID_TILE;
 		this->origin_tile = origin;
 
@@ -787,6 +791,9 @@ public:
 
 	Trackdir FindNearestCoupleTrain(const Train *v, bool dont_reserve)
 	{
+		/* R3R (KI-207): this is the GOTO_COUPLE pathfinder -- it books the route the
+		 * loco drives to the waiting consist. Name it for the reservation trace. */
+		R3RResvPhaseGuard r3r_phase("yapf-couple", R3RResvActorID(v));
 		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
 		{
 			FILE *dbg = R3RFopenDbg("a");
@@ -817,6 +824,7 @@ public:
 		 * the platform dest may sit on the far side of the consist, making the path
 		 * cut straight through it. */
 		TileIndex consist_head_tile = INVALID_TILE;
+		bool best_on_consist = false;
 		if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
 			Train *ct = GetTrainForReservation(pNode->GetLastTile(), TrackdirToTrack(pNode->GetLastTrackdir()));
 			if (ct == nullptr) {
@@ -828,11 +836,26 @@ public:
 				Train *h = ct->First();
 				Train *t = ct->Last();
 				if (h != nullptr && t != nullptr) {
-					/* R3R: couple to whichever end of the consist the loco approaches.
-					 * Targeting the head car unconditionally routes a loco coming from the
-					 * consist's tail end straight through the consist (no path found,
-					 * reservation cutting through the consist). */
-					if (DistanceManhattan(v->tile, t->tile) < DistanceManhattan(v->tile, h->tile)) {
+					for (Train *tr : VehiclesOnTile<VehicleType::Train>(pNode->GetLastTile())) {
+						if (tr->First() == h) { best_on_consist = true; break; }
+					}
+				}
+				if (h != nullptr && t != nullptr) {
+					/* R3R (KI-200): path end and reservation target must be the SAME end.
+					 * YAPF accepted the search on a real consist tile (the log line
+					 * "PFD-ACCEPT ... tile=58,19" shows the accepted tile carries the
+					 * consist's head car) -- that tile is the end the loco can actually
+					 * reach. Overriding it with the Manhattan-nearest end (58,23) made the
+					 * path end at 58,19 while the reservation target was 58,23, so the
+					 * hand-rolled reserve walk below had to trace a route back through the
+					 * consist, reserving the whole detour (log: "CPL-BEST 58,19" then
+					 * "CPL-HEAD best=58,19 head=58,23" then a 15-tile RP chain). Only when
+					 * YAPF stopped on an EMPTY platform tile (the probe scans the rest of
+					 * the platform for the consist) does the nearest end have to be
+					 * resolved here. */
+					if (best_on_consist) {
+						consist_head_tile = pNode->GetLastTile();
+					} else if (DistanceManhattan(v->tile, t->tile) < DistanceManhattan(v->tile, h->tile)) {
 						consist_head_tile = t->tile;
 					} else {
 						consist_head_tile = h->tile;
@@ -844,9 +867,10 @@ public:
 			{
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d\n",
+					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d on=%d\n",
 							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
-							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile));
+							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile),
+							(int)best_on_consist);
 					fclose(dbg);
 				}
 			}
@@ -1509,16 +1533,46 @@ bool YapfTrainCheckReverse(const Train *v)
 	 * folded chain misleads it into recommending a flip onto a heading that
 	 * cannot reach the destination (REVERSEDIR then CRT found=0, train stranded).
 	 * Detect the fold: the back wagon lies ahead of the front vehicle along the
-	 * front vehicle's facing direction -> never suggest reversing in that state. */
+	 * front vehicle's *travelling* direction -> never suggest reversing in that state.
+	 *
+	 * R3R (KI-242, 2026-09-28): the yardstick must be the direction the chain
+	 * TRAVELS (GetMovingDirection(), i.e. reverse(direction) while
+	 * DrivingBackwards), not the raw `direction`. With db=1 the chain order is
+	 * inverted relative to `direction`, so the raw value reads a perfectly
+	 * healthy backward-driving consist as folded and vetoes the very reversal
+	 * that would extricate it.
+	 *
+	 * Live report (build/R3R_debug.log, "1917行附近"): loco 27 was decoupled out
+	 * of a consist at station 60,2x and left as chain 27(60,21) -> 28(60,20) ->
+	 * 29(60,20) with db=1 (so its moving front is its tail 29 at 60,20 and it
+	 * travels NORTH), while its next order's destination was tile 60,31, i.e.
+	 * SOUTH, and the released consist 0..5 stood parked on 60,20/60,19 to the
+	 * north holding their own reservations. North was therefore blocked, and the
+	 * only way out was to reverse (flip DrivingBackwards,
+	 * train_flip_reverse_allowed = none) and leave through the south end - but
+	 * this test vetoed it: "CRT-FOLD veh=27 tile=60,20 dir=3 backTile=60,21
+	 * rel=0,1 dot=1" followed by ~100 lines of "TRP veh=27 ... spd=0 => ok=0
+	 * res=0" (no path, no reservation, train frozen) until the unrelated
+	 * "reverse at signals" stuck-timer finally turned it around.
+	 *
+	 * `direction` 3 (SE) = tile delta (0,+1); rel = tail 27 - head 29 = (0,+1),
+	 * dot = +1 -> vetoed. Measured against the travelled direction 7 (NW) =
+	 * (0,-1) the same pair is dot = -1, i.e. the tail is properly *behind* the
+	 * front, which is what it is. Genuinely folded chains are reached with db=0
+	 * (Couple() normalises the flag), so their verdict is unchanged; this only
+	 * stops the false positive. Identical reasoning to KI-173, which already
+	 * switched R3RCheckChainFoldedDirection() (train_cmd.cpp) to the moving
+	 * direction. */
 	if (moving_front->track != TRACK_BIT_DEPOT && moving_back->track != TRACK_BIT_DEPOT) {
-		const TileIndexDiffC delta = TileIndexDiffCByDir(moving_front->direction);
+		const Direction front_dir = moving_front->GetMovingDirection();
+		const TileIndexDiffC delta = TileIndexDiffCByDir(front_dir);
 		const int rel_x = TileX(tile_rev) - TileX(tile);
 		const int rel_y = TileY(tile_rev) - TileY(tile);
 		if (rel_x * delta.x + rel_y * delta.y > 0) {
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\n",
-						(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)moving_front->direction,
+						(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)front_dir,
 						(int)TileX(tile_rev), (int)TileY(tile_rev), rel_x, rel_y,
 						rel_x * delta.x + rel_y * delta.y);
 				fclose(dbg);
@@ -1623,8 +1677,73 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
  * @param dont_reserve Whether to skip making a reservation.
  * @return The track to take, or #INVALID_TRACK if no path was found.
  */
+/**
+ * R3R (KI-190): throttle the "no path" couple scan.
+ *
+ * A locomotive holding a GOTO_COUPLE order whose consist has not turned up (or
+ * whose one candidate is filtered out by the couple whitelist) used to run the
+ * full-map couple pathfinder on every single tick: YAPF walks the whole reachable
+ * network, which the probes recorded as 16271 "PFD" lines in a single session
+ * (73% of the log) and which also is the CPU part of the cost, for a locomotive
+ * that is only parked and waiting.
+ *
+ * The interesting state only changes when the locomotive itself moves, turns
+ * around or advances its order, so remember the last outcome per vehicle: as long
+ * as the last search came back empty, answer the next 7 calls with "no path"
+ * without searching at all. A consist that becomes available is therefore picked
+ * up within a handful of ticks instead of immediately, and everything else stays
+ * as it was, because a successful search clears the hold again.
+ */
+struct R3RCoupleScanState {
+	uint hold = 0; ///< Number of upcoming calls to answer without searching.
+};
+
+static std::map<int, R3RCoupleScanState> _r3r_couple_scan_state;
+static const uint R3R_COUPLE_SCAN_RETRY = 8;
+
+/**
+ * Try to skip the upcoming couple search for this vehicle.
+ * @return 0 if the search must run, otherwise the number of calls still skipped.
+ */
+static uint R3RCoupleScanHold(const Train *v)
+{
+	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
+	if (st.hold == 0) return 0;
+	return st.hold--;
+}
+
+/** Remember whether this couple search found a path, so an empty result can be retried less eagerly. */
+static void R3RCoupleScanResult(const Train *v, bool found)
+{
+	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
+	st.hold = found ? 0 : (R3R_COUPLE_SCAN_RETRY - 1);
+}
+
+/**
+ * Find the track to take when approaching a waiting consist to couple with.
+ * @param v The train to find a track for.
+ * @param dont_reserve Whether to skip making a reservation.
+ * @return The track to take, or #INVALID_TRACK if no path was found.
+ */
 Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 {
+	const uint hold = R3RCoupleScanHold(v);
+	if (hold != 0) {
+		/* R3R probe: the full search was skipped by the throttle above (see
+		 * R3RCoupleScanHold). Logged once per throttle episode so a waiting
+		 * locomotive does not flood the log it is supposed to stop flooding. */
+		if (hold == R3R_COUPLE_SCAN_RETRY - 1) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-SKIP veh=%d tile=%d,%d orderType=%d dontReserve=%d retryIn=%d\n",
+						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+						(int)v->current_order.GetType(), (int)dont_reserve, (int)R3R_COUPLE_SCAN_RETRY);
+				fclose(dbg);
+			}
+		}
+		return INVALID_TRACK;
+	}
+
 	{
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
@@ -1637,6 +1756,8 @@ Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 	Trackdir ret = _settings_game.pf.forbid_90_deg
 		? CYapfCoupleRailNo90::stFindNearestCoupleTrain(v, dont_reserve)
 		: CYapfCoupleRail::stFindNearestCoupleTrain(v, dont_reserve);
+
+	R3RCoupleScanResult(v, ret != INVALID_TRACKDIR);
 
 	return (ret != INVALID_TRACKDIR) ? TrackdirToTrack(ret) : INVALID_TRACK;
 }

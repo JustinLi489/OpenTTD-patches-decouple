@@ -16,6 +16,7 @@
 #include "station_func.h"
 #include "rail.h"
 #include "road.h"
+#include "r3r_resv_probes.h"
 
 typedef uint8_t StationGfx; ///< Index of station graphics. @see _station_display_datas
 
@@ -594,6 +595,9 @@ inline bool HasStationReservation(TileIndex t)
 inline void SetRailStationReservation(TileIndex t, bool b)
 {
 	dbg_assert_tile(HasStationRail(t), t);
+#if R3R_PROBES
+	if (HasStationReservation(t) != b) R3RResvWatchLog(b ? "SET-STN" : "CLEAR-STN", t); // R3R (KI-207)
+#endif
 	AssignBit(_me[t].m6, 2, b);
 }
 

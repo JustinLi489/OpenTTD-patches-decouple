@@ -4761,6 +4761,12 @@ void ReloadNewGRFData()
 	AfterLoadVehiclesPhase1(false);
 	AfterLoadVehiclesPhase2(false);
 	StartupEngines();
+	/* R3R: 多段链的「列车分组」/「挂接分组」在读档后收敛到实际控制段。必须放在这里 ——
+	 * 指针修正(AfterLoadVehiclesPhase1)已完成，而 GroupStatistics::UpdateAfterLoad()
+	 * 还没跑，所以本函数不做 num_vehicle 簿记、直接改 group_id 也不会让统计对不上。
+	 * 声明只写在这里，避免动 src/*.h 触发全量重编。 */
+	extern void R3RNormaliseChainGroupsAfterLoad();
+	R3RNormaliseChainGroupsAfterLoad();
 	GroupStatistics::UpdateAfterLoad();
 	/* update station graphics */
 	AfterLoadStations();

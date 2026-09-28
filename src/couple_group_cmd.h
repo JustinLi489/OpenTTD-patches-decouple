@@ -15,18 +15,20 @@
 #include "vehicle_type.h"
 #include <string>
 
-CommandCost CmdCreateCoupleGroup(DoCommandFlags flags, const std::string &name);
+CommandCost CmdCreateCoupleGroup(DoCommandFlags flags, const std::string &name, CoupleGroupID parent);
 CommandCost CmdRenameCoupleGroup(DoCommandFlags flags, CoupleGroupID group, const std::string &name);
 CommandCost CmdDeleteCoupleGroup(DoCommandFlags flags, CoupleGroupID group);
 CommandCost CmdSetCoupleGroup(DoCommandFlags flags, VehicleID vehicle, CoupleGroupID group);
 CommandCost CmdRemoveCoupleGroup(DoCommandFlags flags, VehicleID vehicle, CoupleGroupID group);
 CommandCost CmdSetCoupleGroupAllowOthers(DoCommandFlags flags, CoupleGroupID group, bool allow_others);
+CommandCost CmdSetCoupleGroupParent(DoCommandFlags flags, CoupleGroupID group, CoupleGroupID parent);
 
-DEF_CMD_TUPLE_NT (Commands::CreateCoupleGroup, CmdCreateCoupleGroup, {}, CommandType::OtherManagement,   CmdDataT<std::string>)
+DEF_CMD_TUPLE_NT (Commands::CreateCoupleGroup, CmdCreateCoupleGroup, {}, CommandType::OtherManagement,   CmdDataT<std::string, CoupleGroupID>)
 DEF_CMD_TUPLE_NT (Commands::RenameCoupleGroup, CmdRenameCoupleGroup, {}, CommandType::OtherManagement,   CmdDataT<CoupleGroupID, std::string>)
 DEF_CMD_TUPLE_NT (Commands::DeleteCoupleGroup, CmdDeleteCoupleGroup, {}, CommandType::OtherManagement,   CmdDataT<CoupleGroupID>)
 DEF_CMD_TUPLE_NT (Commands::SetCoupleGroup,    CmdSetCoupleGroup,    {}, CommandType::VehicleManagement, CmdDataT<VehicleID, CoupleGroupID>)
 DEF_CMD_TUPLE_NT (Commands::RemoveCoupleGroup, CmdRemoveCoupleGroup, {}, CommandType::VehicleManagement, CmdDataT<VehicleID, CoupleGroupID>)
 DEF_CMD_TUPLE_NT (Commands::SetCoupleGroupAllowOthers, CmdSetCoupleGroupAllowOthers, {}, CommandType::OtherManagement, CmdDataT<CoupleGroupID, bool>)
+DEF_CMD_TUPLE_NT (Commands::SetCoupleGroupParent, CmdSetCoupleGroupParent, {}, CommandType::OtherManagement, CmdDataT<CoupleGroupID, CoupleGroupID>)
 
 #endif /* COUPLE_GROUP_CMD_H */

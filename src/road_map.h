@@ -15,6 +15,7 @@
 #include "rail_type.h"
 #include "road_func.h"
 #include "tile_map.h"
+#include "r3r_resv_probes.h"
 
 
 /** The different types of road tiles. */
@@ -489,6 +490,9 @@ inline bool HasCrossingReservation(TileIndex t)
 inline void SetCrossingReservation(TileIndex t, bool b)
 {
 	assert_tile(IsLevelCrossingTile(t), t);
+#if R3R_PROBES
+	if (HasCrossingReservation(t) != b) R3RResvWatchLog(b ? "SET-XING" : "CLEAR-XING", t); // R3R (KI-207)
+#endif
 	AssignBit(_m[t].m5, 4, b);
 }
 

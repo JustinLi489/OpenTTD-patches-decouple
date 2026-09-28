@@ -44,7 +44,10 @@ enum StationYardWidgets : WidgetID {
 	WID_SY_ASSIGN,       ///< R3R: assign the selected platform to the selected yard.
 	WID_SY_NEW_YARD,     ///< R3R: create a new yard and select it.
 	WID_SY_SHARED_SEL,   ///< R3R: choose the shared fallback yard of the selected yard (0 = none).
+	WID_SY_WORKSHOP,     ///< R3R: toggle whether the selected yard is a workshop (servicing yard).
 	WID_SY_LOCATE,       ///< Scroll the main view to the selected platform.
+	WID_SY_RENAME,       ///< R3R: give the selected yard a name of its own.
+	WID_SY_DELETE,       ///< R3R: delete the selected yard.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

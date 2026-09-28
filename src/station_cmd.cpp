@@ -2106,6 +2106,38 @@ uint16_t Station::R3RAddYard()
 	return static_cast<uint16_t>(this->r3r_yards.size());
 }
 
+bool Station::R3RRemoveYard(uint16_t yard)
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return false;
+
+	/* 场的 tile 随场一起消失：它们的平台回归「整站」（不再属于任何场）。 */
+	this->r3r_yards.erase(this->r3r_yards.begin() + (yard - 1));
+
+	/* 删场使其后各场的 ID 前移一位，回落的指针得跟着搬家：
+	 * 指向被删场的回落取消（回落目标必须存在），指向其后各场的减一。 */
+	for (R3RStationYard &y : this->r3r_yards) {
+		if (y.shared_with == yard) {
+			y.shared_with = R3R_YARD_NONE;
+		} else if (y.shared_with > yard) {
+			y.shared_with--;
+		}
+	}
+	return true;
+}
+
+const std::string &Station::R3RGetYardName(uint16_t yard) const
+{
+	static const std::string empty{};
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return empty;
+	return this->r3r_yards[yard - 1].name;
+}
+
+void Station::R3RSetYardName(uint16_t yard, const std::string &name)
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	this->r3r_yards[yard - 1].name = name;
+}
+
 void Station::R3RClearYard(uint16_t yard)
 {
 	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
@@ -2133,6 +2165,32 @@ bool Station::R3RIsYardShared(uint16_t yard) const
 		if (y.shared_with == yard) return true;
 	}
 	return false;
+}
+
+bool Station::R3RIsYardWorkshop(uint16_t yard) const
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return false;
+	return this->r3r_yards[yard - 1].is_workshop;
+}
+
+void Station::R3RSetYardWorkshop(uint16_t yard, bool workshop)
+{
+	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	this->r3r_yards[yard - 1].is_workshop = workshop;
+	/* 检修所不参与「停满回落」：它自身不回落到别的场；别的场也不该回落到它
+	 * （否则「目的地是本检修所」的车会被引到普通场去而得不到检修）。 */
+	if (workshop) {
+		this->r3r_yards[yard - 1].shared_with = R3R_YARD_NONE;
+		for (R3RStationYard &y : this->r3r_yards) {
+			if (y.shared_with == yard) y.shared_with = R3R_YARD_NONE;
+		}
+	}
+}
+
+bool Station::R3RIsWorkshopTile(TileIndex tile) const
+{
+	const uint16_t yard = this->R3RGetYardOfTile(tile);
+	return yard != R3R_YARD_NONE && this->r3r_yards[yard - 1].is_workshop;
 }
 
 bool Station::R3RHasAnyYard() const
@@ -2224,8 +2282,12 @@ void R3RCollectYardDestinationTiles(const Station *st, uint16_t yard, std::vecto
 	/* 该场已满 ⇒ 并入**它自己的**「共享回落场」作为回落。多个场可以指定同一个
 	 * 共享场，于是「1/2 场共享一个 A 场」= 场1/场2 的 shared_with 都指向 A 场。 */
 	if (R3RStationYardIsFull(st, yard)) {
+		const uint16_t shared_yard = st->R3RYardSharedWith(yard);
+		/* 检修所做回落目标没有意义：被引到检修所的车不会装卸，且检修判定要求
+		 * 「订单目的地明确是本场」，所以这里直接忽略。 */
+		if (shared_yard == Station::R3R_YARD_NONE || st->R3RIsYardWorkshop(shared_yard)) return;
 		std::vector<TileIndex> shared;
-		st->R3RCollectYardTiles(st->R3RYardSharedWith(yard), shared);
+		st->R3RCollectYardTiles(shared_yard, shared);
 		out.insert(out.end(), shared.begin(), shared.end());
 		std::sort(out.begin(), out.end());
 		out.erase(std::unique(out.begin(), out.end()), out.end());
@@ -2287,8 +2349,9 @@ CommandCost CmdR3RSetStationYardShared(DoCommandFlags flags, StationID station_i
 	if (ret.Failed()) return ret;
 
 	if (yard == Station::R3R_YARD_NONE) {
-		/* Append a new (empty) yard. Yards are never removed, so existing yard IDs
-		 * stay stable and orders referencing them remain valid. */
+		/* Append a new (empty) yard. Appending never moves an existing yard ID, so
+		 * orders referencing them stay valid (removal does move IDs, and is
+		 * handled by CmdR3RRemoveStationYard() which renumbers the orders). */
 		if (st->R3RNumYards() >= Station::R3R_MAX_YARDS) return CMD_ERROR;
 		if (flags.Test(DoCommandFlag::Execute)) {
 			st->R3RAddYard();
@@ -2303,6 +2366,146 @@ CommandCost CmdR3RSetStationYardShared(DoCommandFlags flags, StationID station_i
 	if (flags.Test(DoCommandFlag::Execute)) {
 		st->R3RSetYardSharedWith(yard, shared_with);
 		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R: upgrade a yard to a workshop (检修所), or remove the workshop status.
+ * 升级费用 = 该场平台数 × 车库造价；降级免费（不退款）。
+ * @param flags operation to perform
+ * @param station_id station that owns the yard
+ * @param yard the yard to modify (#Station::R3R_YARD_NONE is not allowed)
+ * @param workshop true to turn the yard into a workshop, false to remove it
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RSetStationYardWorkshop(DoCommandFlags flags, StationID station_id, uint16_t yard, bool workshop)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard == Station::R3R_YARD_NONE || yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (st->R3RIsYardWorkshop(yard) == workshop) return CommandCost(); // 已经处于目标状态，免费空操作
+
+	/* 升级费 = 该场的平台数量 × 车库造价，与「建 n 个车库」等价。降级免费。 */
+	uint platforms = 0;
+	if (workshop) {
+		for (TileIndex t : st->R3RYardTiles(yard)) {
+			if (R3RIsPlatformNorthEnd(t)) platforms++;
+		}
+		if (platforms == 0) return CommandCost(STR_ERROR_R3R_YARD_WORKSHOP_EMPTY);
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		st->R3RSetYardWorkshop(yard, workshop);
+		/* 场从「普通场」变为「检修所」会把它整场 tile 从 catchment 摘出，
+		 * 反之则重新并入；接货体系与站台缓存都需重算。 */
+		st->RecomputeCatchment();
+		st->MarkTilesDirty(true);
+		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+		SetWindowDirty(WindowClass::StationView, st->index);
+	}
+
+	if (!workshop) return CommandCost();
+	return CommandCost(ExpensesType::Construction, _price[Price::BuildDepotTrain] * platforms);
+}
+
+/**
+ * R3R: 删场前把全图订单里指向本车站的场 ID 重编号。
+ *
+ * 场 ID = 1 + 场的下标，所以删掉第 k 场会让其后所有场的 ID 前移一位：旧 ID k 的订单
+ * 改为「整站」(R3R_YARD_NONE)，旧 ID > k 的订单减一。不重编号的话，那些订单会悄悄
+ * 指向另一个场（静默改变行为，而不是报错），这是本命令必须做的事。
+ * 遍历 OrderList::Iterate() 覆盖全部订单表（含 orders_backup 借用的表，它们同样在
+ * 订单表池里）；current_order 是订单的副本、不在任何表里，另外单独修正。
+ *
+ * @param station_id 场被删掉的那个车站
+ * @param removed 被删掉的场 ID
+ */
+static void R3RRemapOrdersAfterYardRemoval(StationID station_id, uint16_t removed)
+{
+	auto remap = [station_id, removed](Order &o) {
+		if (!o.IsType(OT_GOTO_STATION)) return;
+		if (o.GetDestination().ToStationID() != station_id) return;
+
+		const uint16_t yard = o.GetR3RYard();
+		if (yard == Station::R3R_YARD_NONE || yard < removed) return;
+
+		/* 走 SetR3RYard() 顺带清掉 SYRD v1 存档遗留的 2 bit 场字段（GetR3RYard()
+		 * 会回退读它），否则重编号之后旧字段可能又冒出来指向别的场。 */
+		o.SetR3RYard(yard == removed ? Station::R3R_YARD_NONE : static_cast<uint16_t>(yard - 1));
+	};
+
+	for (OrderList *ol : OrderList::Iterate()) {
+		for (Order *o : ol->Orders()) remap(*o);
+	}
+	for (Vehicle *v : Vehicle::Iterate()) {
+		remap(v->current_order);
+	}
+}
+
+/**
+ * R3R: give a yard a name of its own (站场重命名).
+ * @param flags operation to perform
+ * @param station_id station that owns the yard
+ * @param yard the yard to rename (#Station::R3R_YARD_NONE is not allowed)
+ * @param name the new name; an empty name clears the custom name, so the UI falls
+ *             back to the default "yard n" label
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RSetStationYardName(DoCommandFlags flags, StationID station_id, uint16_t yard, const std::string &name)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard == Station::R3R_YARD_NONE || yard > st->R3RNumYards()) return CMD_ERROR;
+
+	/* 名字只是标签，但仍然要挡住超长/带控制字符的输入（与车站改名同一条尺子）。 */
+	if (!name.empty() && Utf8StringLength(name) >= MAX_LENGTH_STATION_NAME_CHARS) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		st->R3RSetYardName(yard, name);
+		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+		/* 订单窗口里的场标签也跟着名字走。 */
+		InvalidateWindowClassesData(WindowClass::VehicleOrders);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R: delete a yard (删除站场).
+ *
+ * 删掉第 k 场：它的平台回归「整站」，其后各场的 ID 前移一位，而订单里指向本车站的
+ * 场 ID 由 R3RRemapOrdersAfterYardRemoval() 统一重编号（必须先重编号再动场列表，
+ * 否则 ID 已经被移动，无从判断哪些订单指向了被删的场）。
+ *
+ * @param flags operation to perform
+ * @param station_id station that owns the yard
+ * @param yard the yard to delete (#Station::R3R_YARD_NONE is not allowed)
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RRemoveStationYard(DoCommandFlags flags, StationID station_id, uint16_t yard)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard == Station::R3R_YARD_NONE || yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		R3RRemapOrdersAfterYardRemoval(st->index, yard);
+		st->R3RRemoveYard(yard);
+
+		/* 场号变了，站场窗口与所有订单窗口的场标签都要重画。 */
+		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
+		InvalidateWindowClassesData(WindowClass::VehicleOrders);
+		SetWindowDirty(WindowClass::StationView, st->index);
 	}
 	return CommandCost();
 }
@@ -3934,9 +4137,7 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
 		SpriteID image = t->ground.sprite;
 		PaletteID pal  = t->ground.pal;
 		RailTrackOffset overlay_offset;
-		bool used_overlay_branch = false;
 		if (rti != nullptr && rti->UsesOverlay() && SplitGroundSpriteForOverlay(ti, &image, &overlay_offset)) {
-			used_overlay_branch = true;
 			SpriteID ground = GetCustomRailSprite(rti, ti->tile, RailSpriteType::Ground);
 			DrawGroundSprite(image, PAL_NONE);
 			DrawGroundSprite(ground + overlay_offset, PAL_NONE);
@@ -3953,22 +4154,6 @@ static void DrawTile_Station(TileInfo *ti, DrawTileProcParams params)
 			/* PBS debugging, draw reserved tracks darker */
 			if (_game_mode != GameMode::Menu && _settings_client.gui.show_track_reservation && HasStationRail(ti->tile) && HasStationReservation(ti->tile)) {
 				DrawGroundSprite(GetRailStationAxis(ti->tile) == Axis::X ? rti->base_sprites.single_x : rti->base_sprites.single_y, PALETTE_CRASH);
-			}
-		}
-		/* DEBUG (R3R): confirm what the draw code actually sees for a station
-		 * platform tile. Throttled to 1/200 draws, only for tiles that are NOT
-		 * currently reserved, to catch the case where consist stRes is set in
-		 * vehicle code but not visible in the renderer. */
-		if (IsRailStationTile(ti->tile) && !HasStationReservation(ti->tile)) {
-			static uint32_t r3r_draw_n = 0;
-			if ((r3r_draw_n++ % 200) == 0) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "DRAW-STATION-NORES tile=%d,%d overlayBranch=%d showRes=%d\n",
-							(int)TileX(ti->tile), (int)TileY(ti->tile), (int)used_overlay_branch,
-							(int)_settings_client.gui.show_track_reservation);
-					fclose(dbg);
-				}
 			}
 		}
 	}

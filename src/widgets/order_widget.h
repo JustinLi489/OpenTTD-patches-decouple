@@ -55,6 +55,8 @@ enum OrderWidgets : WidgetID {
 	WID_O_TEXT_LABEL,                ///< Choose text label.
 	WID_O_DEPARTURE_VIA_TYPE,        ///< Choose departure board via subtype.
 	WID_O_R3R_YARD,                  ///< R3R: choose the destination yard of a station order (whole station, or any yard of the destination station).
+	WID_O_COUPLE_SIDE,               ///< R3R: choose which side of the coupled train to attach to (front = [this][target], rear = [target][this]).
+	WID_O_COUPLE_TEMP_GROUP,         ///< R3R: choose the couple group a GOTO_COUPLE order temporarily joins while it runs.
 	WID_O_SEL_COND_VALUE,            ///< Widget for conditional value or conditional cargo type.
 	WID_O_SEL_COND_AUX,              ///< Widget for auxiliary conditional cargo type. WID_O_SEL_COND_AUX... IDs must be sequential.
 	WID_O_SEL_COND_AUX2,             ///< Widget for auxiliary conditional via button.
@@ -66,7 +68,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_SEL_TOP_RIGHT,             ///< #NWID_SELECTION widget for right part of the top row of the 'your train' order window.
 	WID_O_SEL_TOP_ROW_GROUNDVEHICLE, ///< #NWID_SELECTION widget for the top row of the 'your train' order window.
 	WID_O_SEL_TOP_ROW,               ///< #NWID_SELECTION widget for the top row of the 'your non-trains' order window.
-	WID_O_SEL_TOP_YARD,              ///< R3R: #NWID_SELECTION widget to show/hide the destination yard dropdown of the top row.
+	WID_O_SEL_TOP_YARD,              ///< R3R: #NWID_SELECTION widget to show/hide the destination yard / couple side dropdown of the top row.
 	WID_O_SEL_BOTTOM_MIDDLE,         ///< #NWID_SELECTION widget for the middle part of the bottom row of the 'your train' order window.
 	WID_O_SEL_SHARED,                ///< #NWID_SELECTION widget for WID_O_SHARED_ORDER_LIST and WID_O_ADD_VEH_GROUP
 	WID_O_SHARED_ORDER_LIST,         ///< Open list of shared vehicles.

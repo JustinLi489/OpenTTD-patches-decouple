@@ -93,10 +93,23 @@ foreach(ENUM IN LISTS ENUM_LINES)
 
             if(ACTIVE)
                 if("${LINE}" MATCHES "^	*[A-Za-z0-9_]* *[,=]")
-                    # Transform enum values
+                    # Transform enum values. Only the code part (everything
+                    # before a "//" comment) may carry an initializer; stripping
+                    # " = ..." off the whole line would silently truncate comment
+                    # text such as "(0 = none)".
+                    string(FIND "${LINE}" "//" COMMENT_POS)
+                    if(COMMENT_POS GREATER -1)
+                        string(SUBSTRING "${LINE}" 0 ${COMMENT_POS} CODE_PART)
+                        string(SUBSTRING "${LINE}" ${COMMENT_POS} -1 CODE_COMMENT)
+                    else()
+                        set(CODE_PART "${LINE}")
+                        set(CODE_COMMENT "")
+                    endif()
+
                     # REGEX REPLACE does a REGEX MATCHALL and replaces too much
-                    string(REGEX MATCH " *=[^,]*" RESULT "${LINE}")
-                    string(REPLACE "${RESULT}" "" LINE "${LINE}")
+                    string(REGEX MATCH " *=[^,]*" RESULT "${CODE_PART}")
+                    string(REPLACE "${RESULT}" "" CODE_PART "${CODE_PART}")
+                    set(LINE "${CODE_PART}${CODE_COMMENT}")
 
                     string(REGEX REPLACE " *//" " //" LINE "${LINE}")
 

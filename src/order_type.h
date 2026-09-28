@@ -140,8 +140,8 @@ enum OrderDecoupleFlags : uint8_t {
  */
 enum class DecoupleBoundaryMode : uint8_t {
 	Auto,          ///< No explicit boundary: release the last coupled-on segment (legacy default).
-	TailSegments,  ///< Release the last N coupled-on segments (count from the rear).
-	HeadBoundary,  ///< Split between segment n and n + 1 counted from the head, releasing the segments behind it.
+	TailSegments,  ///< Release the last N coupled-on segments (count from the rear); N may be 0 (treated as 1).
+	HeadBoundary,  ///< Split between segment n and n + 1 counted from the head, releasing the segments behind it; n may be 0 (treated as 1).
 	End,
 };
 
@@ -153,6 +153,18 @@ enum OrderCoupleLoadFlags : uint8_t {
 	ODC_IS_EMPTY = 1, ///< Only couple an empty consist.
 	ODC_IS_FULL  = 2, ///< Only couple a full consist.
 	ODC_END
+};
+
+/**
+ * R3R: Which side of the consist to couple onto this is placed on, expressed in
+ * terms of the resulting chain order (see the R3R coupling side feature).
+ * @note The reference is the segments of the train that is being coupled onto,
+ *       not the physical direction the train happens to be facing.
+ */
+enum OrderCoupleSide : uint8_t {
+	OCS_FRONT = 0, ///< R3R: this train's segments end up in front, i.e. [this][target] (current behaviour).
+	OCS_REAR  = 1, ///< R3R: this train's segments end up behind, i.e. [target][this].
+	OCS_END
 };
 
 /**
@@ -352,6 +364,8 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_DEPARTURES_SUBTYPE, ///< Change the label departures subtype
 	MOF_DECOUPLE_BOUNDARY, ///< R3R: change the segment boundary of a decouple order.
 	MOF_R3R_YARD,        ///< R3R: change the destination yard of a station order.
+	MOF_COUPLE_SIDE,     ///< R3R: change which side of the coupled train this train is attached to.
+	MOF_COUPLE_TEMP_GROUP, ///< R3R: change the couple group a GOTO_COUPLE order temporarily joins while it runs.
 	MOF_END
 };
 

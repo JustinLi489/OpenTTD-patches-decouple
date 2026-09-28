@@ -375,13 +375,35 @@ public:
 	Order current_order{};                       ///< The current order (+ status, like: loading)
 
 	OrderList *orders = nullptr;                 ///< Pointer to the order list for this vehicle
-	OrderList *orders_backup = nullptr;          ///< R3R: backup of this vehicle's own orders while it executes a coupled consist's schedule (restored on decouple). NOSAVE.
-	UnitID unitnumber_backup = 0;                ///< R3R: this vehicle's own unit number while it inherits the consist's number (restored on decouple). NOSAVE.
-	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). NOSAVE.
-	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. NOSAVE.
-	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). NOSAVE.
-	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A); the owner keeps its own pointer, so this list must never be freed by this vehicle. NOSAVE.
+	OrderList *orders_backup = nullptr;          ///< R3R: backup of this vehicle's own orders while it executes a coupled consist's schedule (restored on decouple). SAVED separately by the R3VP chunk, so the vehicle table layout is untouched.
+	UnitID unitnumber_backup = 0;                ///< R3R: this vehicle's own unit number while it inherits the consist's number (restored on decouple). SAVED by the R3VP chunk.
+	TinyString name_backup{};                    ///< R3R (第 144 轮 / 需求贰): this segment head's own train name while it is not the chain head (depot drag park / fold-fix identity hand-over). Given back when the vehicle becomes a chain head again. NOSAVE: like a parked schedule after a load it is simply dropped (see R3RRestoreTrainName).
+	GroupID group_id_backup = GroupID::Invalid(); ///< R3R (第 144 轮 / 需求伍): this segment head's own "列车分组" (the player-facing train group) while the consist is unified onto the control segment's group (R3RNormaliseChainGroups). Given back when the segment becomes a chain head again (R3RRestoreTrainGroupID). SAVED by the R3VP chunk.
+	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). SAVED by the R3VP chunk.
+	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. SAVED by the R3VP chunk.
+	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). SAVED by the R3VP chunk.
+	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A), or parked in orders_backup after a depot drag; the owner keeps its own pointer, so this list must never be freed by this vehicle. SAVED by the R3VP chunk.
 	CoupleGroupMask couple_groups = COUPLE_GROUP_MASK_NONE; ///< R3R: couple groups of the segment which this vehicle heads (only meaningful on a segment head, see couple_group.h). A segment may be in several groups at once (Q5); an empty mask forms one implicit group with every other unassigned segment. SAVED separately by the CGVR chunk, so the vehicle table layout is untouched.
+	/**
+	 * R3R (KI-182): the couple target lock -- "已有耦合目标" (the pair flag).
+	 *
+	 * A chain which starts executing a GOTO_COUPLE order locks onto exactly one
+	 * waiting segment right away, and both sides remember the other's chain head
+	 * here: the active side (the locomotive) stores the target in
+	 * #r3r_couple_target, the passive side (the waiting consist) stores the
+	 * locomotive in #r3r_couple_requester. Only a *matching pair* -- the two
+	 * fields pointing at each other, both sides still in the right order state
+	 * -- may be coupled; R3RCoupleAllowed() refuses everything else, and every
+	 * level of the couple resolution (pathfinder destination, back-walk safety,
+	 * arrival gate) asks that one function. That is what makes a locomotive drive
+	 * to, and couple onto, only the consist it was paired with.
+	 *
+	 * Both fields are runtime-only (NOSAVE): a stale value is always recognised
+	 * by the two-sided check (the counterpart must point back), so a savegame
+	 * round trip simply re-locks on the next tick instead of ever dangling.
+	 */
+	VehicleID r3r_couple_target = VehicleID::Invalid();    ///< R3R (KI-182): chain head this chain locked onto as its coupling target (active side).
+	VehicleID r3r_couple_requester = VehicleID::Invalid(); ///< R3R (KI-182): chain head of the locomotive which locked onto this chain (passive side).
 
 	NO_UNIQUE_ADDRESS NewGRFCache grf_cache{};   ///< Cache of often used calculated NewGRF values
 	Direction cur_image_valid_dir = Direction::Invalid; ///< NOSAVE: direction for which cur_image does not need to be regenerated on the next tick
@@ -883,6 +905,25 @@ public:
 	void ResetRefitCaps();
 
 	void ReleaseUnitNumber();
+
+	/**
+	 * R3R (第 144 轮 / 需求壹): 判断本车停放在 unitnumber_backup 里的那个车号，
+	 * 是不是已经被**别的活车**接过去了（即 backup 只是"我的号被别人拿走了"的记号，
+	 * 池位所有权在别人手上）。
+	 *
+	 * 车号池是"按位占用"的：号被谁持有，就由谁的 unitnumber 占着池位。R3R 的停放
+	 * （Couple / 车库拖动）会把号复制进 unitnumber_backup 并把活号清 0，于是备份
+	 * 有两种互不相同的语义：
+	 *  - 号已经被新链头接管（Couple 把被动方的号交给链头）⇒ 池位归链头，本车的
+	 *    backup 只是记号，**绝不能**由本车释放（会清掉链头正在用的号）。
+	 *  - 号没有任何接管者（车库拖动把段并入别的列）⇒ 本车就是该号唯一的所有者，
+	 *    段被销毁时**必须**由本车把号还回池（否则号永久冻结，正是需求壹要避免的
+	 *    那一半）。
+	 * 两者靠"是否还有别的活车用着这个号"来区分。
+	 *
+	 * @return 该号正被另一辆车当活号使用。
+	 */
+	bool R3RUnitNumberOwnedByOther() const;
 
 	/**
 	 * Copy certain configurations and statistics of a vehicle after successful autoreplace/renew

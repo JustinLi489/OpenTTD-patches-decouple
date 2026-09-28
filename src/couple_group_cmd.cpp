@@ -53,18 +53,29 @@ static bool R3RIsCoupleGroupNameInUse(CoupleGroupID exclude, Owner company, cons
  * R3R: create a new couple group.
  * @param flags type of operation
  * @param name The name of the new couple group.
+ * @param parent The group the new one becomes a sub group of (#INVALID_COUPLE_GROUP = top level).
  * @return the cost of this operation or an error
  */
-CommandCost CmdCreateCoupleGroup(DoCommandFlags flags, const std::string &name)
+CommandCost CmdCreateCoupleGroup(DoCommandFlags flags, const std::string &name, CoupleGroupID parent)
 {
 	if (!R3RIsValidCoupleGroupName(name)) return CMD_ERROR;
 	if (R3RIsCoupleGroupNameInUse(INVALID_COUPLE_GROUP, _current_company, name)) return CommandCost(STR_ERROR_NAME_MUST_BE_UNIQUE);
 	if (!CoupleGroup::CanAllocateItem()) return CMD_ERROR;
+	/* R3R (第 146 轮 / 需求叁改): the new group can be created as a sub group right away
+	 * ("选中 滚木 之后直接建 石头"). A brand new group cannot be an ancestor of anything
+	 * yet, so unlike CmdSetCoupleGroupParent() there is no cycle to look for -- only the
+	 * parent itself has to exist and to be visible to us (the management window only
+	 * offers such groups, but a command must never rely on its caller). */
+	if (parent != INVALID_COUPLE_GROUP) {
+		const CoupleGroup *pcg = CoupleGroup::GetIfValid(parent);
+		if (pcg == nullptr || !R3RCoupleGroupIsVisibleTo(pcg, _current_company)) return CMD_ERROR;
+	}
 
 	CommandCost result;
 	if (flags.Test(DoCommandFlag::Execute)) {
 		CoupleGroup *cg = CoupleGroup::Create(_current_company);
 		cg->name = name;
+		cg->parent = parent;
 
 		result.SetResultData(cg->index);
 		InvalidateWindowClassesData(WindowClass::CoupleGroup, 0);
@@ -112,14 +123,70 @@ CommandCost CmdDeleteCoupleGroup(DoCommandFlags flags, CoupleGroupID group)
 	if (!R3RCoupleGroupIsManageable(cg, _current_company)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		R3RUnassignCoupleGroup(group);
-		delete cg;
+		/* R3R (第 147 轮 / 需求叁改续): 删除一个分组 = 连它名下**整棵子树**一起删。
+		 * 第 144 轮的做法是把子组提升回顶层，但层级从第 146 轮起已经变成成员关系：
+		 * 一个"父组没了"的子组会继续把祖先的位补进成员集合里，玩家看到的却是它挂在
+		 * 一个不存在的分组下面 —— 所以这里改成把子树逐层收出来一并删除。
+		 * 收集用 BFS 并带枚举位数上限：手工改档造出的环不会让这里死循环；同时**不删**
+		 * 别公司挂在我方组下面的子组（只把它摘回顶层），因为那不是本命令的权限范围。 */
+		std::vector<CoupleGroupID> doomed;
+		doomed.push_back(group);
+		for (size_t i = 0; i < doomed.size() && doomed.size() < R3R_COUPLE_GROUP_MASK_BITS; i++) {
+			for (CoupleGroup *child : CoupleGroup::Iterate()) {
+				if (child->parent != doomed[i]) continue;
+				if (child->owner != cg->owner) {
+					child->parent = INVALID_COUPLE_GROUP;
+					continue;
+				}
+				bool known = false;
+				for (const CoupleGroupID id : doomed) {
+					if (id == child->index) { known = true; break; }
+				}
+				if (!known) doomed.push_back(child->index);
+			}
+		}
+
+		for (const CoupleGroupID id : doomed) R3RUnassignCoupleGroup(id);
+		for (const CoupleGroupID id : doomed) delete CoupleGroup::GetIfValid(id);
+		const uint removed = (uint)doomed.size();
+		if (removed > 1) {
+			R3RDbgWrite("CGRP-DELETE-STREE root=%u groups=%u\n", (unsigned)group.base(), removed);
+		}
 
 		/* R3R (KI-56): deliberately no CloseWindowById(WindowClass::CoupleGroup, ...)
 		 * here.  The couple group window is a single window registered with
 		 * window_number 0, so using the *group* id as window number closed the window
 		 * itself as soon as group 0 (the first group created) was deleted.  The list
 		 * is refreshed through the invalidation below. */
+		InvalidateWindowClassesData(WindowClass::CoupleGroup, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 144 轮 / 需求叁): set (or clear) the parent group of a couple group.
+ *
+ * The hierarchy is purely organisational: it decides where a group is shown (the
+ * management list and the order drop down draw it indented below its parent), it
+ * never changes which segments may couple with which -- that is still the group's
+ * own mask. Passing #INVALID_COUPLE_GROUP as \a parent makes \a group a top level
+ * group again.
+ *
+ * @param flags type of operation
+ * @param group The group whose parent should change.
+ * @param parent The new parent, or #INVALID_COUPLE_GROUP for "top level".
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdSetCoupleGroupParent(DoCommandFlags flags, CoupleGroupID group, CoupleGroupID parent)
+{
+	CoupleGroup *cg = CoupleGroup::GetIfValid(group);
+	if (cg == nullptr) return CMD_ERROR;
+	if (!R3RCoupleGroupIsManageable(cg, _current_company)) return CMD_ERROR;
+	if (!R3RCanCoupleGroupHaveParent(group, parent)) return CMD_ERROR;
+	if (cg->parent == parent) return CommandCost();
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		cg->parent = parent;
 		InvalidateWindowClassesData(WindowClass::CoupleGroup, 0);
 	}
 	return CommandCost();

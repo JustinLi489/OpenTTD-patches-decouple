@@ -66,6 +66,18 @@ struct CoupleGroup : CoupleGroupPool::PoolItem<&_couplegroup_pool> {
 	std::string name; ///< Group name, player editable.
 	Owner owner;      ///< Company which owns the group.
 	uint32_t flags;   ///< Reserved flag bits, see #CoupleGroupFlag.
+	/**
+	 * R3R (第 144 轮 / 需求叁): the parent group, i.e. this group is a *sub* group of it.
+	 *
+	 * This is both the display hierarchy (the management list and the order drop
+	 * down draw it indented under its parent) and, since 第 146 轮, a *membership*
+	 * relation: a segment which is in a sub group counts as a member of every
+	 * ancestor as well -- "石头 里面的列车也自动就是 滚木 里面的列车". The stored
+	 * mask keeps holding the groups a segment was explicitly put into; the
+	 * ancestors are OR-ed in on every read, see
+	 * R3RGetEffectiveCoupleGroupsOfSegment(). #INVALID_COUPLE_GROUP means "top level".
+	 */
+	CoupleGroupID parent = INVALID_COUPLE_GROUP;
 
 	CoupleGroup(CoupleGroupID index, CompanyID owner = CompanyID::Invalid()) : PoolItemBase(index), owner(owner), flags(0) {}
 
@@ -143,6 +155,25 @@ uint R3RSetCoupleGroupAllowOthers(CoupleGroupID group, bool allow_others);
 CoupleGroupMask R3RGetCoupleGroupsOfSegment(const Train *v);
 
 /**
+ * R3R (第 146 轮 / 需求叁改): the couple groups of \a v *including its ancestors*.
+ *
+ * The parent tree is a membership relation: a segment in the sub group "石头"
+ * whose parent is "滚木" is a member of 滚木 as well, so every read which decides
+ * "is this segment a member of that group" (management list, counts, the name
+ * shown on the vehicle, the cross-company gate) must use this instead of
+ * R3RGetCoupleGroupsOfSegment(). The stored mask is never expanded, so dragging a
+ * group to another parent changes the membership of all its members at once.
+ *
+ * Do NOT use this where a mask is written back (e.g. copying the control
+ * segment's groups onto the other segment heads after coupling): that would
+ * bake the ancestors into the savegame.
+ *
+ * @param v Any vehicle of the segment.
+ * @return The segment's effective group set (own groups plus every ancestor's).
+ */
+CoupleGroupMask R3RGetEffectiveCoupleGroupsOfSegment(const Train *v);
+
+/**
  * R3R: add a couple group to the segment which contains \a v.
  * The value is stored on the segment head, so callers may pass any vehicle of
  * the segment (Q3: the group follows the segment, not the individual car).
@@ -180,6 +211,119 @@ void R3RClearCoupleGroupsOfSegment(Train *v);
  * @return whether the coupling is allowed by the couple group whitelist.
  */
 bool R3RCoupleAllowed(const Train *coupler, const Train *target);
+
+/**
+ * R3R (KI-182): the couple target lock -- "已有耦合目标" (the pair flag).
+ *
+ * A locomotive which starts executing a GOTO_COUPLE order immediately locks
+ * onto exactly one waiting segment, and both sides record the other's chain
+ * head (#Vehicle::r3r_couple_target on the locomotive, #Vehicle::r3r_couple_requester
+ * on the waiting consist). From then on the locomotive only ever drives to,
+ * and may only ever couple onto, that one consist: R3RCoupleAllowed() requires
+ * a matching pair, which is the single gate every level of the couple
+ * resolution asks (pathfinder destination, back-walk safety, arrival gate).
+ *
+ * A lock is recognised as live only while *both* halves point at each other,
+ * and the side keeping the lock is still in the right order state. That makes a
+ * stale lock harmless: it simply stops matching and the next scan re-locks.
+ */
+
+/**
+ * R3R (KI-182): do \a coupler and \a target carry a matching pair flag?
+ * This is the pure flag test; the order state of either side is not inspected.
+ * @param coupler The chain which wants to couple.
+ * @param target The chain which would be coupled onto.
+ * @return whether the two chains have locked onto each other.
+ */
+bool R3RCouplePairMatches(const Train *coupler, const Train *target);
+
+/**
+ * R3R (KI-182): the chain which is locked to \a v as a couple partner, if any.
+ * Symmetric: it answers both for the locomotive (which stores the target) and
+ * for the waiting consist (which stores the locomotive), and it returns the
+ * other side only while the lock is a live, two-sided pair. Callers therefore
+ * also use it to ask "is this consist already somebody else's target?".
+ * @param v Any vehicle of the chain; may be nullptr.
+ * @return The paired chain head, or nullptr when \a v carries no live lock.
+ */
+Train *R3RGetCouplePairPartner(const Train *v);
+
+/**
+ * R3R (KI-182): does the chain which contains \a v currently carry a couple target lock?
+ * @param v Any vehicle of the chain; may be nullptr.
+ * @return whether either half of the pair flag is set on the chain head.
+ */
+bool R3RHasCouplePair(const Train *v);
+
+/**
+ * R3R (KI-182): lock \a coupler and \a target onto each other.
+ * Both sides are expected to be the chain heads; the previous lock of either
+ * side (and any counter-lock pointing at them) is dropped first.
+ * @param coupler The locomotive's chain head.
+ * @param target The waiting consist's chain head.
+ * @return whether the pair was established.
+ */
+bool R3RPairCoupleTargets(Train *coupler, Train *target);
+
+/**
+ * R3R (KI-182): drop every couple target lock which involves the chain of \a v.
+ * Clears both halves stored on the chain head and the counter-half stored on
+ * whatever chain the head was locked with.
+ * @param v Any vehicle of the chain; may be nullptr.
+ */
+void R3RUnpairCoupleTargets(Train *v);
+
+/**
+ * R3R (KI-182): R3RCoupleAllowed() without the pair flag test.
+ *
+ * Used while *selecting* a target -- at that moment no pair exists yet -- and
+ * nowhere else: every path which actually resolves or executes a coupling must
+ * ask R3RCoupleAllowed() so the pair flag is enforced.
+ *
+ * @param coupler The moving chain which wants to couple.
+ * @param target The chain which is being coupled onto.
+ * @return whether the couple group whitelist and the order destination allow it.
+ */
+bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target);
+
+/**
+ * R3R (KI-170): which couple group is the segment of \a v temporarily a member of?
+ *
+ * The player's rule: a GOTO_COUPLE order may name one real couple group (the
+ * temporary, "fake" couple group), and while the train runs that order the
+ * segment carrying it counts as a member of that group *as well* -- the
+ * locomotive of group "石头" whose order names group "滚木" temporarily belongs
+ * to both, so it may couple onto a consist of "滚木" and still onto the stock of
+ * its own group. R3RCoupleAllowed() ORs the group into the segment's real mask,
+ * so a group it does not share stays rejected: it is no master key.
+ *
+ * A group named by an order which has since been deleted behaves like "none".
+ *
+ * @param v Any vehicle of the chain; may be nullptr.
+ * @return The group joined, or #INVALID_COUPLE_GROUP when there is none.
+ */
+CoupleGroupID R3RGetTempCoupleGroup(const Train *v);
+
+/**
+ * R3R (KI-170): does the segment which contains \a v currently hold a temporary
+ * ("fake") couple group?
+ *
+ * That membership is derived state, never stored: it is in force exactly while
+ * the order is the current OT_GOTO_COUPLE order, and it is gone as soon as the
+ * order advances after a successful coupling (Couple() logs that as
+ * CGRP-FAKE-DESTROY). The order lives on the chain head, because ProcessOrders()
+ * only ticks there and R3RCoupleAllowed() reads that same vehicle's
+ * current_order, so the temporary group belongs to the head's segment and to no
+ * other segment of the chain.
+ *
+ * This is the read-only mirror of that rule for the user interface (the depot
+ * window and the vehicle list badge the chain while it is in force); it decides
+ * nothing about coupling itself.
+ *
+ * @param v Any vehicle of the chain; may be nullptr.
+ * @return whether \a v belongs to a segment which holds a temporary group.
+ */
+bool R3RHasTempCoupleGroup(const Train *v);
 
 /**
  * R3R: the number of segments currently assigned to \a group.
@@ -313,5 +457,34 @@ bool R3RCoupleGroupIsJoinableBy(const CoupleGroup *group, Owner company);
  * observed by the game, it would silently block coupling forever.
  */
 void AfterLoadCoupleGroups();
+
+/**
+ * R3R (第 144 轮 / 需求叁): the parent of \a group.
+ * @param group Group to inspect.
+ * @return The parent group, or #INVALID_COUPLE_GROUP when \a group is a top level
+ *         group (or does not exist).
+ */
+CoupleGroupID R3RGetCoupleGroupParent(CoupleGroupID group);
+
+/**
+ * R3R (第 144 轮 / 需求叁): how deep \a group sits in the parent tree (0 = top level).
+ * Defensive against a broken/cyclic chain in an old savegame: walking stops after
+ * #MAX_LENGTH_COUPLE_GROUP_NAME_CHARS steps.
+ * @param group Group to inspect.
+ * @return Nesting depth, 0 when the group does not exist.
+ */
+uint R3RGetCoupleGroupDepth(CoupleGroupID group);
+
+/**
+ * R3R (第 144 轮 / 需求叁): may \a parent become the parent of \a group?
+ *
+ * Refuses a group as its own parent, an unknown parent, and every assignment which
+ * would close a cycle (that would make the tree unwalkable and R3RGetCoupleGroupDepth()
+ * would spin forever on it).
+ * @param group Group which should get a parent.
+ * @param parent The candidate parent; #INVALID_COUPLE_GROUP means "make it top level".
+ * @return whether the assignment is allowed.
+ */
+bool R3RCanCoupleGroupHaveParent(CoupleGroupID group, CoupleGroupID parent);
 
 #endif /* COUPLE_GROUP_H */

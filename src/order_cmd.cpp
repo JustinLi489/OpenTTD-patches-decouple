@@ -39,6 +39,7 @@
 #include "vehiclelist.h"
 #include "tracerestrict.h"
 #include "train.h"
+#include "couple_group.h"
 
 #include "date_func.h"
 #include "schdispatch.h"
@@ -1548,16 +1549,24 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
 
 	if (sel_ord > v->GetNumOrders()) return CMD_ERROR;
 
-	/* R4/G1: A decouple order may only follow a station or depot order
-	 * (uncoupling must happen at a station or a depot, never at a waypoint).
-	 * GOTO_COUPLE carries its own destination, and WAIT_COUPLE declares "wait here
-	 * to be coupled" (e.g. the first order of a consist sitting in a depot/station),
-	 * so both may be placed anywhere. */
+	/* R4/G1: A decouple order may only follow an order that actually brings the
+	 * train to a standstill on a tile where uncoupling is possible (a station or a
+	 * depot), never at a waypoint or a conditional jump.
+	 * R3R (2026-09-23): the same applies to the R3R couple orders themselves --
+	 * a decouple may follow a station, a depot, a previous decouple (the train is
+	 * already standing still, so a second split is legal), a WAIT_COUPLE (the
+	 * consist waits in place to be coupled) or a GOTO_COUPLE (the train couples
+	 * onto a consist standing at its own station/depot). 玩家要求「解挂/连挂命令也
+	 * 能放在 解挂/挂接/前去挂接 后面」。GOTO_COUPLE carries its own destination and
+	 * WAIT_COUPLE declares "wait here to be coupled", so both may be placed
+	 * anywhere. */
 	if (new_order.IsType(OT_DECOUPLE)) {
 		if (sel_ord == 0) return CMD_ERROR; // Cannot be the first order.
 		const Order *prev_order = v->GetOrder(sel_ord - 1);
 		if (prev_order == nullptr) return CMD_ERROR;
-		if (!prev_order->IsType(OT_GOTO_STATION) && !prev_order->IsType(OT_GOTO_DEPOT)) {
+		if (!prev_order->IsType(OT_GOTO_STATION) && !prev_order->IsType(OT_GOTO_DEPOT) &&
+				!prev_order->IsType(OT_DECOUPLE) && !prev_order->IsType(OT_WAIT_COUPLE) &&
+				!prev_order->IsType(OT_GOTO_COUPLE)) {
 			return CommandCost(STR_ERROR_CAN_T_ADD_ORDER);
 		}
 	}
@@ -2204,6 +2213,16 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				if (mof != MOF_DECOUPLE_BOUNDARY) return CMD_ERROR;
 				break;
 
+			case OT_GOTO_COUPLE:
+				if (mof != MOF_COUPLE_SIDE && mof != MOF_COUPLE_TEMP_GROUP) return CMD_ERROR;
+				break;
+
+			case OT_WAIT_COUPLE:
+				/* R3R (KI-225): a waiting consist may declare which temporary couple
+				 * group it can be picked up under (no side to choose). */
+				if (mof != MOF_COUPLE_TEMP_GROUP) return CMD_ERROR;
+				break;
+
 			default:
 				return CMD_ERROR;
 		}
@@ -2544,6 +2563,28 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (st != nullptr && data > st->R3RNumYards()) return CMD_ERROR;
 			break;
 		}
+
+		case MOF_COUPLE_SIDE:
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (!order->IsType(OT_GOTO_COUPLE)) return CMD_ERROR;
+			if (data >= OCS_END) return CMD_ERROR;
+			break;
+
+		case MOF_COUPLE_TEMP_GROUP: {
+			if (v->type != VehicleType::Train) return CMD_ERROR;
+			/* R3R (KI-225): valid on a coupling order (the consist looks for the
+			 * group) and on a waiting order (the parked consist offers itself to
+			 * that group). */
+			if (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE)) return CMD_ERROR;
+			/* R3R: data is the couple group ID + 1, 0 = join no group. A named
+			 * group must exist and be visible to the owner of the order. */
+			if (data != 0) {
+				const CoupleGroup *cg = CoupleGroup::GetIfValid(CoupleGroupID(static_cast<uint16_t>(data - 1)));
+				if (cg == nullptr) return CMD_ERROR;
+				if (!R3RCoupleGroupIsVisibleTo(cg, v->owner)) return CMD_ERROR;
+			}
+			break;
+		}
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -2640,6 +2681,14 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 
 			case MOF_R3R_YARD:
 				order->SetR3RYard(data);
+				break;
+
+			case MOF_COUPLE_SIDE:
+				order->SetCoupleSide(static_cast<OrderCoupleSide>(data));
+				break;
+
+			case MOF_COUPLE_TEMP_GROUP:
+				order->SetCoupleTempGroup(data == 0 ? INVALID_COUPLE_GROUP : CoupleGroupID(static_cast<uint16_t>(data - 1)));
 				break;
 
 			case MOF_COND_VARIABLE: {

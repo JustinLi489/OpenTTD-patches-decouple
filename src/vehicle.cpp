@@ -1192,15 +1192,23 @@ void Vehicle::PreDestructor()
 	 * ever release it -- destroying the merged train (e.g. selling two coupled
 	 * segments at once) used to leak exactly one unit id per coupled pair, which
 	 * is why train numbers kept creeping upwards until the 65000s on a long-run
-	 * game. Only the chain head can be in that state (rev.3: use
-	 * IsPrimaryVehicle() so a car-only formation head -- a FrontWagon -- is
-	 * covered too), and only when the parked number differs from the live number
-	 * (a non-front member stores a plain copy of the number its head already
-	 * holds, which must NOT be released here). */
-	if (this->type == VehicleType::Train && this->IsPrimaryVehicle() &&
-			this->unitnumber_backup != 0 && this->unitnumber_backup != this->unitnumber) {
+	 * game.
+	 *
+	 * R3R (第 144 轮 / 需求壹): 玩家口径是"被并入方的编号冻结、别的列车不能占用，
+	 * 直到该编号所属的段被销毁才释放"。所以：
+	 *  - 停放期内号一直占池（这是需求本身）；
+	 *  - 段被销毁（本函数）时必须把号还回池 —— 但**只有当本车是该号唯一的所有者
+	 *    时**才还。Couple() 把被动方的号交给了新链头，那种 backup 只是"我的号被
+	 *    别人拿走了"的记号（R3RUnitNumberOwnedByOther() 为真），释放它会清掉链头
+	 *    正在使用的号；这类记号随车消失即可。
+	 * 旧代码用 IsPrimaryVehicle() 限制只有在链头才回收，于是"停在链中间的段"被
+	 * 卖掉时号永久冻结（池位再也回不来），与需求壹的后半句相反。 */
+	if (this->type == VehicleType::Train &&
+			this->unitnumber_backup != 0 && this->unitnumber_backup != this->unitnumber &&
+			!this->R3RUnitNumberOwnedByOther()) {
 		Company::Get(this->owner)->freeunits[this->type].ReleaseID(this->unitnumber_backup);
-		R3RDbgWrite("UNIT-RELBK bk=%u id=%u\n", this->unitnumber_backup, this->unitnumber);
+		R3RDbgWrite("UNIT-RELBK bk=%u id=%u prim=%d\n", this->unitnumber_backup, this->unitnumber,
+				this->IsPrimaryVehicle() ? 1 : 0);
 	}
 
 	if (this->type == VehicleType::Aircraft && this->IsPrimaryVehicle()) {
@@ -3810,6 +3818,19 @@ void Vehicle::ReleaseUnitNumber()
 		Company::Get(this->owner)->freeunits[this->type].ReleaseID(this->unitnumber);
 		this->unitnumber = 0;
 	}
+}
+
+/**
+ * R3R (第 144 轮 / 需求壹): 见 vehicle_base.h 的声明 —— 停放号到底归谁所有。
+ */
+bool Vehicle::R3RUnitNumberOwnedByOther() const
+{
+	if (this->unitnumber_backup == 0) return false;
+	for (const Vehicle *w : Vehicle::Iterate()) {
+		if (w == this || w->owner != this->owner) continue;
+		if (w->unitnumber == this->unitnumber_backup) return true;
+	}
+	return false;
 }
 
 static bool ShouldVehicleContinueWaiting(Vehicle *v)

@@ -257,5 +257,9 @@ rem ------------------------------------------------------------
 echo.
 if /i "%~1"=="__go" exit /b 0
 if /i "%~2"=="__go" exit /b 0
-pause
+rem  "< CON" forces the wait onto the real console. Without it a pause
+rem  inherits a closed/redirected stdin (editor task, pipe, hidden
+rem  window) and returns immediately - the window then flashes and
+rem  vanishes before the result block can be read.
+pause < CON
 exit /b 0

@@ -67,6 +67,7 @@
 #include "event_logs.h"
 #include "tile_cmd.h"
 #include "object_base.h"
+#include "pbs.h"
 #include "newgrf_newsignals.h"
 #include "roadstop_base.h"
 #include "core/backup_type.hpp"
@@ -466,6 +467,25 @@ static bool ConScrollToTile(std::span<std::string_view> argv)
  *       and y coordinates.
  * @return True when either console help was shown or a proper amount of parameters given.
  */
+/**
+ * R3R (KI-207): release track reservations that no train can be attributed to.
+ * These are the "ghost" reservations left behind by chain edits: they block other
+ * trains and paint a reservation preview along track nothing is going to drive.
+ * The periodic reservation audit releases them on its own once they have been stray
+ * for a few audits; this command is for cleaning a save that inherited ghosts from
+ * an older build, or for checking a suspicion immediately.
+ *
+ * Pause the game before running it: a stray bit is by definition one the engine
+ * cannot attribute to a train, but a running train that is in the middle of
+ * re-booking its path is the one moment when that answer can be transiently wrong.
+ */
+static bool ConR3RPurgeReservations(std::span<std::string_view> argv)
+{
+	const uint freed = R3RPurgeStrayReservations();
+	IConsolePrint(CC_WHITE, "R3R: released {} orphaned track reservation bit(s).", freed);
+	return true;
+}
+
 static bool ConHighlightTile(std::span<std::string_view> argv)
 {
 	switch (argv.size()) {
@@ -4470,6 +4490,8 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("zoomto",                  ConZoomToLevel);
 	IConsole::CmdRegister("scrollto",                ConScrollToTile);
 	IConsole::CmdRegister("highlight_tile",          ConHighlightTile);
+	/* R3R (KI-207): release orphaned track reservations on demand. */
+	IConsole::CmdRegister("r3r_resv_purge",          ConR3RPurgeReservations);
 	IConsole::AliasRegister("scrollto_highlight",    "scrollto %+; highlight_tile %+");
 	IConsole::CmdRegister("alias",                   ConAlias);
 	IConsole::CmdRegister("load",                    ConLoad);

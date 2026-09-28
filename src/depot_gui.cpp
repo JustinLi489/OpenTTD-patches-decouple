@@ -194,6 +194,24 @@ static const Train *TrainDepotGetSegmentTail(const Train *seg)
 }
 
 /**
+ * R3R (KI-212): whether dropping a block right in front of \a before would splice
+ * it into the interior of a coupled-on segment. A segment is one operational unit
+ * (it was coupled on as a whole and will be split off as a whole again) and thus
+ * behaves like an articulated block: its interior is not a valid drop position.
+ * Only in front of the segment front or behind its rear boundary is.
+ * @param before The vehicle the dragged block would be inserted in front of.
+ * @return true iff that insertion point lies inside a segment.
+ */
+static bool TrainDepotDropSplitsSegment(const Vehicle *before)
+{
+	if (before == nullptr || before->type != VehicleType::Train) return false;
+	const Train *t = Train::From(before);
+	/* The segment front is the segment's left boundary, not its interior. */
+	if (t->IsSegmentFront()) return false;
+	return TrainDepotGetSegmentFront(t) != nullptr;
+}
+
+/**
  * R3R: cut a whole coupled-on segment out of its chain. Any vehicles trailing
  * the segment (behind its last vehicle, marked by the segment's own right
  * boundary) are re-attached to the original chain first, leaving the
@@ -246,6 +264,117 @@ static void TrainDepotMoveSegment(const Train *front, const Vehicle *wagon)
 	}
 }
 
+/**
+ * R3R (KI-214): let the chain a drop landed on keep its own schedule.
+ *
+ * Dropping a block in front of another chain is a couple inside the depot: the
+ * dragged block is the arriving train, the chain it was dropped on is the
+ * consist it couples onto. Route A gives the consist's schedule to the merged
+ * train -- the arriving block parks its own in orders_backup -- and the command
+ * layer derives that from the segment priorities: the lowest rank owns the
+ * schedule and ties fall back to physical order (R3RRenumberPriorities).
+ *
+ * The drop itself is mirrored (the target chain is inserted behind the block's
+ * tail, because the command layer can only insert behind a vehicle), so the
+ * block ends up physically *first* and would win every tie. That is why the
+ * dragged segments have to be ranked above the target's *before* the move: the
+ * physical arrangement the player asked for stays as it is, but the schedule
+ * ownership becomes the one of a couple (target = passive, block = active).
+ *
+ * @param target Head of the chain the drop landed on (keeps its schedule).
+ * @param active Head of the chain that supplies the merged chain's head.
+ */
+static void TrainDepotRankDropTargetFirst(Train *target, Train *active)
+{
+	/* The dragged side must rank above *every* segment of the target chain. */
+	uint16_t target_max = 0;
+	for (const Train *t = target; t != nullptr; t = t->Next()) {
+		if ((t == target || t->IsSegmentFront()) && t->r3r_priority > target_max) target_max = t->r3r_priority;
+	}
+
+	/* Shift only: each side's internal order decides which of its segments owns
+	 * its own schedule, so it has to survive the edit.
+	 *
+	 * R3R (KI-226b): the shift has to be *strictly* above target_max. With a
+	 * plain `+= target_max` a target chain whose segments all sit at 0 (a chain
+	 * that never took part in a couple, which is the initial value) leaves both
+	 * sides at 0; R3RRenumberPriorities() then breaks the tie in physical order
+	 * and hands the schedule to the dragged block instead of the target. */
+	const uint16_t shift = (target_max < UINT16_MAX) ? (uint16_t)(target_max + 1) : target_max;
+	uint16_t active_min = UINT16_MAX;
+	for (Train *t = active; t != nullptr; t = t->Next()) {
+		if (t != active && !t->IsSegmentFront()) continue;
+		t->r3r_priority = (uint16_t)(t->r3r_priority + shift);
+		if (t->r3r_priority < active_min) active_min = t->r3r_priority;
+	}
+
+	R3RDbgWrite("DEPOT-BEFORE-HEAD-RANK head=%d tmax=%u amin=%u\n",
+			(target != nullptr) ? (int)target->index.base() : -1,
+			(unsigned)target_max, (unsigned)active_min);
+}
+
+/**
+ * R3R: drag a vehicle or a whole coupled-on segment in front of the target
+ * chain's head.
+ *
+ * The command layer can only insert *behind* a vehicle (ArrangeTrains ends in
+ * InsertInConsist(dst, src)) and a chain head has no vehicle in front of it, so
+ * "drop it before the head" has no anchor to express itself with. The operation
+ * is therefore mirrored: the *whole target chain* is moved behind the end of
+ * the dragged block. The resulting order is the one the player asked for --
+ * dragged block first, target chain right after it.
+ *
+ * The mirror move splices the target chain in behind the dragged block, so the
+ * merged chain keeps the head of the block's chain. The drop is therefore only
+ * performed while that head is an engine; otherwise the merged chain would start
+ * with a powerless wagon which the dragged-in locomotive could no longer drive.
+ * A block sitting *inside* a chain (a coupled-on car-only segment, whose fake
+ * front engine was stripped when it was attached) is fine, as it is not the head.
+ *
+ * @param sel  Index of the dragged vehicle.
+ * @param head The chain head the drag was dropped on.
+ */
+static void TrainDepotMoveBeforeHead(VehicleID sel, const Vehicle *head)
+{
+	const Train *v = Train::From(Vehicle::Get(sel));
+	if (v == nullptr || head == nullptr) return;
+
+	const Train *dst_head = Train::From(head)->First();
+	/* The operationally meaningful unit is the segment: it was coupled on as a
+	 * whole and will be split off as a whole again. */
+	const Train *folded     = TrainDepotGetSegmentFront(v);
+	const Train *block      = (folded != nullptr) ? folded : v;
+	const Train *block_tail = (folded != nullptr) ? TrainDepotGetSegmentTail(folded) : block->Last();
+
+	/* Same chain: the head that was dropped on is part of the dragged block. */
+	if (dst_head->First() == block->First()) return;
+	/* The target chain already starts right behind the block. */
+	if (dst_head == block_tail->Next()) return;
+	/* The merged chain would start with the head of the block's chain; if that is
+	 * a wagon it is not a valid (drivable) head. */
+	if (!block->First()->IsEngine()) {
+		R3RDbgWrite("DEPOT-BEFORE-HEAD-SKIP sel=%d head=%d block=%d reason=chain-head-not-engine\n",
+				(int)sel.base(), (int)dst_head->index.base(), (int)block->index.base());
+		return;
+	}
+
+	if (folded != nullptr) TrainDepotDetachSegment(folded);
+
+	/* R3R (KI-214): the drop landed on the target chain, so that chain is the one
+	 * being coupled onto: it keeps its schedule, the dragged block borrows it
+	 * (see TrainDepotRankDropTargetFirst). Must happen after the detach, whose
+	 * own depot edit renumbers the priorities of the chains it touches. */
+	TrainDepotRankDropTargetFirst(Train::From(Vehicle::Get(dst_head->index)),
+			Train::From(Vehicle::Get(block->First()->index)));
+
+	R3RDbgWrite("DEPOT-BEFORE-HEAD sel=%d head=%d block=%d tail=%d\n",
+			(int)sel.base(), (int)dst_head->index.base(), (int)block->index.base(), (int)block_tail->index.base());
+
+	/* Move the whole target chain behind the dragged block. */
+	Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, block->tile,
+			dst_head->index, block_tail->index, MoveRailVehicleFlags::MoveChain);
+}
+
 static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Vehicle *head)
 {
 	const Vehicle *v = Vehicle::Get(sel);
@@ -255,8 +384,22 @@ static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Veh
 	if (wagon == nullptr) {
 		if (head != nullptr) wagon = head->Last();
 	} else {
+		/* R3R (KI-212): a drop position inside a coupled-on segment is refused.
+		 * The segment must not be spliced open from the outside either, so the
+		 * player gets the same answer as when the drop position does not exist. */
+		if (TrainDepotDropSplitsSegment(wagon)) {
+			R3RDbgWrite("DEPOT-INSEG-SKIP sel=%d before=%d\n", (int)sel.base(), (int)wagon->index.base());
+			return;
+		}
+		/* R3R: the vehicle the drag was dropped on is the head of its chain --
+		 * dropping there means "in front of that head", which the command layer
+		 * cannot express; TrainDepotMoveBeforeHead mirrors it. */
+		const Vehicle *chain_head = wagon;
 		wagon = wagon->Previous();
-		if (wagon == nullptr) return;
+		if (wagon == nullptr) {
+			TrainDepotMoveBeforeHead(sel, chain_head);
+			return;
+		}
 	}
 
 	if (wagon == v) return;
@@ -539,7 +682,8 @@ struct DepotWindow : Window {
 		bool grouped = false;
 		if (owner != nullptr) {
 			for (const Train *t = v; t != nullptr && !grouped; t = t->Next()) {
-				if (R3RGetCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) grouped = true;
+				/* R3R (第 146 轮 / 需求叁改): 有效集合（含父组）—— 子组的分段也要显示分组行。 */
+				if (R3RGetEffectiveCoupleGroupsOfSegment(t) != COUPLE_GROUP_MASK_NONE) grouped = true;
 			}
 		}
 
@@ -565,9 +709,18 @@ struct DepotWindow : Window {
 			DrawString(tag, GetString(STR_DEPOT_CHAIN_LOOSE), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
 		}
 
+		/* R3R (KI-170): a chain which runs a "go to and couple" order holds a temporary
+		 * couple group (R3RHasTempCoupleGroup()), which is derived state and therefore
+		 * not in the stored mask the second line shows. Badge it on the state line, so
+		 * the depot tells "this one is on its way to couple" apart from an ordinary
+		 * unassigned chain. */
+		if (R3RHasTempCoupleGroup(v)) {
+			DrawString(tag, GetString(STR_R3R_TEMP_COUPLE_GROUP), TextColour::Orange, rtl ? SA_LEFT : SA_RIGHT, false, FontSize::Small);
+		}
+
 		if (!grouped && !segmented) return;
 
-		std::string name = R3RGetCoupleGroupsNameList(R3RGetCoupleGroupsOfSegment(owner));
+		std::string name = R3RGetCoupleGroupsNameList(R3RGetEffectiveCoupleGroupsOfSegment(owner));
 		if (name.empty()) name = std::string(GetString(STR_DEPOT_CHAIN_NO_GROUP));
 		name = ShortenCoupleGroupName(name, this->tag_name_budget);
 
@@ -792,10 +945,26 @@ struct DepotWindow : Window {
 		}
 
 		/* Skip the R3R chain state tag column (zero width for non-train depots). */
-		if (xm < this->tag_width) return {.action = DepotGUIAction::ShowVehicle, .vehicle = vehicle};
+		if (xm < this->tag_width) {
+			/* R3R (KI-213): the tag column lies in front of every vehicle of the
+			 * row, so a drag dropped here asks for "in front of this chain's
+			 * head". The command layer can only insert *behind* a vehicle, but
+			 * TrainDepotMoveVehicle() mirrors the request by moving the target
+			 * chain behind the dragged block. */
+			if (this->type == VehicleType::Train && this->sel != VehicleID::Invalid()) {
+				return {.action = DepotGUIAction::DragVehicle, .vehicle = vehicle, .wagon = vehicle};
+			}
+			return {.action = DepotGUIAction::ShowVehicle, .vehicle = vehicle};
+		}
 		xm -= this->tag_width;
 
 		if (xm <= this->header_width) {
+			/* R3R (KI-213): the unit number / name header is in front of every
+			 * vehicle of the row as well, so it is the same "in front of the
+			 * head" drop position while a drag is in progress. */
+			if (this->type == VehicleType::Train && this->sel != VehicleID::Invalid()) {
+				return {.action = DepotGUIAction::DragVehicle, .vehicle = vehicle, .wagon = vehicle};
+			}
 			switch (this->type) {
 				case VehicleType::Train:
 					if (is_wagon) return {.action = DepotGUIAction::Error};
@@ -1444,9 +1613,14 @@ struct DepotWindow : Window {
 				 * the end of the train.
 				 */
 				new_vehicle_over = result.vehicle->index;
-			} else if (result.wagon != nullptr && result.vehicle != result.wagon &&
+			} else if (result.wagon != nullptr &&
 					result.wagon->index != this->sel &&
-					result.wagon->Previous()->index != this->sel) { // ..over an existing wagon.
+					(result.wagon->Previous() == nullptr || result.wagon->Previous()->index != this->sel) &&
+					!TrainDepotDropSplitsSegment(result.wagon)) { // ..over an existing wagon (never inside a segment).
+				/* R3R (KI-213): a chain head is a valid drop position as well: the
+				 * tag/header column in front of the row reports it for "in front of
+				 * the head" drops, and TrainDepotMoveVehicle() mirrors that request
+				 * into "move the target chain behind the dragged block". */
 				new_vehicle_over = result.wagon->index;
 			}
 		}

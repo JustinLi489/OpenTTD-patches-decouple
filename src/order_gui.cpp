@@ -37,6 +37,7 @@
 #include "error.h"
 #include "tracerestrict.h"
 #include "tracerestrict_cmd.h"
+#include "couple_group.h"
 #include "scope.h"
 #include "zoom_func.h"
 #include "order_cmd.h"
@@ -782,8 +783,14 @@ static std::string R3RYardLabel(const Station *st, uint16_t yard)
 	if (yard == Station::R3R_YARD_NONE || st == nullptr || yard > st->R3RNumYards()) {
 		return GetString(STR_ORDER_R3R_YARD_WHOLE);
 	}
-	return st->R3RIsYardShared(yard) ? GetString(STR_ORDER_R3R_YARD_NAMED_SHARED, yard)
-	                                 : GetString(STR_ORDER_R3R_YARD_NAMED, yard);
+	const bool shared = st->R3RIsYardShared(yard);
+	/* R3R: a yard the player has renamed shows its own name instead of "yard n". */
+	const std::string &name = st->R3RGetYardName(yard);
+	if (!name.empty()) {
+		return shared ? GetString(STR_ORDER_R3R_YARD_CUSTOM_SHARED, name) : GetString(STR_ORDER_R3R_YARD_CUSTOM, name);
+	}
+	return shared ? GetString(STR_ORDER_R3R_YARD_NAMED_SHARED, yard)
+	              : GetString(STR_ORDER_R3R_YARD_NAMED, yard);
 }
 
 /**
@@ -808,6 +815,94 @@ static DropDownList R3RYardDropDownList(const Order *order, int &selected)
 	for (uint16_t yard = 1; yard <= st->R3RNumYards(); yard++) {
 		list.push_back(MakeDropDownListStringItem(R3RYardLabel(st, yard), yard, false));
 		if (yard == cur) selected = yard;
+	}
+	return list;
+}
+
+/**
+ * R3R: build the couple-side drop down for a GOTO_COUPLE order.
+ * The list items carry the #OrderCoupleSide value as their result.
+ * @param order The order being edited (may be nullptr).
+ * @param[out] selected Receives the side that should be pre-selected.
+ */
+static DropDownList CoupleSideDropDownList(const Order *order, int &selected)
+{
+	DropDownList list;
+	list.push_back(MakeDropDownListStringItem(GetString(STR_ORDER_COUPLE_SIDE_FRONT), OCS_FRONT, false));
+	list.push_back(MakeDropDownListStringItem(GetString(STR_ORDER_COUPLE_SIDE_REAR), OCS_REAR, false));
+
+	selected = OCS_FRONT;
+	if (order != nullptr && order->IsType(OT_GOTO_COUPLE)) selected = static_cast<int>(order->GetCoupleSide());
+	return list;
+}
+
+/**
+ * R3R (KI-170): label of the couple group a GOTO_COUPLE order temporarily joins.
+ * A group the order names but which has been deleted since is shown as "none",
+ * which is also how the game treats it (see R3RGetTempCoupleGroup()).
+ * @param order The order being displayed (may be nullptr).
+ */
+static std::string CoupleTempGroupLabel(const Order *order)
+{
+	if (order == nullptr || (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE))) return GetString(STR_ORDER_COUPLE_TEMP_GROUP_NONE);
+	const CoupleGroupID group = order->GetCoupleTempGroup();
+	const char *name = R3RGetCoupleGroupName(group);
+	if (name == nullptr) return GetString(STR_ORDER_COUPLE_TEMP_GROUP_NONE);
+	if (*name == '\0') return GetString(STR_ORDER_COUPLE_TEMP_GROUP_NAMED, group.base() + 1);
+	return name;
+}
+
+/**
+ * R3R (KI-170): build the couple-group drop down for a GOTO_COUPLE order.
+ * R3R (KI-225): also used for a WAIT_COUPLE order, where the waiting consist
+ * declares the group it offers itself to.
+ *
+ * The list offers "none" plus every couple group the company which owns the
+ * order may see (R3RCoupleGroupIsVisibleTo()). The item's result value is the
+ * group ID + 1, so that 0 -- the value sent to ModifyOrder for "none" -- stays
+ * unambiguous: MOF_COUPLE_TEMP_GROUP decodes it the same way.
+ *
+ * @param order The order being edited (may be nullptr).
+ * @param owner Company which owns the order; decides which groups are listed.
+ * @param[out] selected Receives the result value that should be pre-selected.
+ */
+static DropDownList CoupleTempGroupDropDownList(const Order *order, Owner owner, int &selected)
+{
+	DropDownList list;
+	list.push_back(MakeDropDownListStringItem(GetString(STR_ORDER_COUPLE_TEMP_GROUP_NONE), 0, false));
+
+	selected = 0;
+	if (order == nullptr || (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE))) return list;
+
+	const CoupleGroupID cur = order->GetCoupleTempGroup();
+
+	/* R3R (第 144 轮 / 需求叁): 挂接分组是一棵树 —— 先按深度优先展开（顶层组在最前，
+	 * 子组紧跟在它的父组之后），再用空格缩进把层级画出来。递归用自身做参数的 lambda，
+	 * 免得为这一次遍历再加个文件级函数。深度上限防止旧档里的历史环把这里锁死。 */
+	std::vector<CoupleGroupID> ordered;
+	auto collect = [&](auto &&self, CoupleGroupID parent, uint depth) -> void {
+		if (depth > MAX_LENGTH_COUPLE_GROUP_NAME_CHARS) return;
+		for (const CoupleGroup *cg : CoupleGroup::Iterate()) {
+			if (!R3RCoupleGroupIsVisibleTo(cg, owner) || cg->parent != parent) continue;
+			ordered.push_back(cg->index);
+			self(self, cg->index, depth + 1);
+		}
+	};
+	collect(collect, INVALID_COUPLE_GROUP, 0);
+	/* 兜底：只出现在父子环里的组（深度优先走不到）也要列出来，绝不静默丢组。 */
+	for (const CoupleGroup *cg : CoupleGroup::Iterate()) {
+		if (!R3RCoupleGroupIsVisibleTo(cg, owner)) continue;
+		if (std::find(ordered.begin(), ordered.end(), cg->index) == ordered.end()) ordered.push_back(cg->index);
+	}
+
+	for (CoupleGroupID gid : ordered) {
+		const CoupleGroup *cg = CoupleGroup::GetIfValid(gid);
+		if (cg == nullptr) continue;
+		const int value = static_cast<int>(gid.base()) + 1;
+		std::string label(static_cast<size_t>(R3RGetCoupleGroupDepth(gid)) * 2, ' ');
+		label.append(cg->name);
+		list.push_back(MakeDropDownListStringItem(std::move(label), value, false));
+		if (gid == cur) selected = value;
 	}
 	return list;
 }
@@ -1322,12 +1417,14 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 					break;
 
 				case DecoupleBoundaryMode::TailSegments:
-					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS, order->GetNumDecouple());
+					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS, order->GetDecoupleBoundaryValue());
 					break;
 
-				case DecoupleBoundaryMode::HeadBoundary:
-					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_HEAD, order->GetNumDecouple(), order->GetNumDecouple() + 1);
+				case DecoupleBoundaryMode::HeadBoundary: {
+					const uint8_t boundary = order->GetDecoupleBoundaryValue();
+					AppendStringInPlace(line, STR_ORDER_DECOUPLE_DETAILS_HEAD, boundary, boundary + 1);
 					break;
+				}
 
 				case DecoupleBoundaryMode::End:
 					NOT_REACHED();
@@ -1694,8 +1791,11 @@ private:
 		DP_RIGHT_REFIT     = 1, ///< Display 'refit' in the right button of the top  row of the train/rv order window.
 
 		/* WID_O_SEL_TOP_YARD (R3R) */
-		DP_YARD_EMPTY      = 0, ///< R3R: no yard button (not a train station order).
-		DP_YARD_DROPDOWN   = 1, ///< R3R: show the destination yard dropdown.
+		DP_YARD_EMPTY       = 0, ///< R3R: no yard button (not a train station order).
+		DP_YARD_DROPDOWN    = 1, ///< R3R: show the destination yard dropdown.
+		DP_YARD_COUPLE      = 2, ///< R3R: show the couple group of a coupling order that targets a station.
+		DP_YARD_COUPLE_DEPOT = 3, ///< R3R: show the couple side next to the couple group (coupling order that targets a depot, KI-172).
+		DP_YARD_WAIT_COUPLE = 4, ///< R3R: show the temporary couple group of a waiting order (KI-225).
 
 		/* WID_O_SEL_TOP_ROW */
 		DP_ROW_LOAD        = 0, ///< Display 'load' / 'unload' / 'refit' buttons in the top row of the ship/airplane order window.
@@ -2053,8 +2153,11 @@ private:
 		const bool head = (index >= 2);
 		const DecoupleBoundaryMode mode = head ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
 
+		/* Prefill with the stored value when this mode is already active, or with
+		 * the smallest meaningful one when switching modes. A stored explicit 0
+		 * is shown as 1 (it always behaved as the nearest boundary). */
 		uint cur = 1;
-		if (order->GetDecoupleBoundaryMode() == mode) cur = std::max<uint>(order->GetNumDecouple(), 1);
+		if (order->GetDecoupleBoundaryMode() == mode) cur = order->GetDecoupleBoundaryValue();
 
 		this->query_text_widget = head ? DECOUPLE_QUERY_HEAD : DECOUPLE_QUERY_TAIL;
 		ShowQueryString(GetString(STR_JUST_INT, cur),
@@ -2515,10 +2618,26 @@ public:
 		NWidgetStacked *row_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_TOP_ROW);
 		assert(row_sel != nullptr || (train_row_sel != nullptr && left_sel != nullptr && middle_sel != nullptr && right_sel != nullptr));
 
-		/* R3R: show the destination yard dropdown only for rail station orders. */
+		/* R3R: the extra top-row dropdown is the destination yard for rail station
+		 * orders, and the coupling widgets for rail GOTO_COUPLE orders (never both).
+		 * The couple side is only offered when the coupling order targets a depot:
+		 * a coupling order that names a station couples onto whatever waits at that
+		 * station, while a depot order is where the side the locomotive attaches to
+		 * is the player's choice (KI-172). */
 		if (NWidgetStacked *yard_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_TOP_YARD); yard_sel != nullptr) {
-			const bool show = this->vehicle->type == VehicleType::Train && order != nullptr && order->IsType(OT_GOTO_STATION);
-			yard_sel->SetDisplayedPlane(show ? DP_YARD_DROPDOWN : DP_YARD_EMPTY);
+			int plane = DP_YARD_EMPTY;
+			if (this->vehicle->type == VehicleType::Train && order != nullptr) {
+				if (order->IsType(OT_GOTO_STATION)) {
+					plane = DP_YARD_DROPDOWN;
+				} else if (order->IsType(OT_GOTO_COUPLE)) {
+					plane = order->GetCoupleIsDepot() ? DP_YARD_COUPLE_DEPOT : DP_YARD_COUPLE;
+				} else if (order->IsType(OT_WAIT_COUPLE)) {
+					/* R3R (KI-225): a waiting order may name the temporary group
+					 * it offers itself to; it has no side to choose. */
+					plane = DP_YARD_WAIT_COUPLE;
+				}
+			}
+			yard_sel->SetDisplayedPlane(plane);
 		}
 
 		NWidgetStacked *aux_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_COND_AUX);
@@ -3146,6 +3265,21 @@ public:
 				return R3RYardLabel(st, order->GetR3RYard());
 			}
 
+			case WID_O_COUPLE_SIDE: { // R3R: which side to attach on when coupling
+				VehicleOrderID sel = this->OrderGetSel();
+				const Order *order = this->vehicle->GetOrder(sel);
+				if (order == nullptr || !order->IsType(OT_GOTO_COUPLE)) return {};
+				return GetString(STR_ORDER_COUPLE_SIDE_SEL, GetString(order->GetCoupleSide() == OCS_REAR ? STR_ORDER_COUPLE_SIDE_REAR : STR_ORDER_COUPLE_SIDE_FRONT));
+			}
+
+			case WID_O_COUPLE_TEMP_GROUP: { // R3R (KI-170): couple group joined while the order runs
+				VehicleOrderID sel = this->OrderGetSel();
+				const Order *order = this->vehicle->GetOrder(sel);
+				/* R3R (KI-225): a WAIT_COUPLE order may offer itself to a group too. */
+				if (order == nullptr || (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE))) return {};
+				return GetString(STR_ORDER_COUPLE_TEMP_GROUP_SEL, CoupleTempGroupLabel(order));
+			}
+
 			case WID_O_OCCUPANCY_TOGGLE:
 				const_cast<Vehicle *>(this->vehicle)->RecalculateOrderOccupancyAverage();
 				if (this->vehicle->order_occupancy_average >= 16) {
@@ -3275,12 +3409,23 @@ public:
 					}
 
 					const Order *order = this->vehicle->GetOrder(sel);
+					if (order == nullptr) {
+						this->UpdateButtonState();
+						return;
+					}
 
 					if (order->IsType(OT_LABEL) && order->GetLabelSubType() == OLST_TEXT) {
 						if (this->IsWidgetActiveInLayout(WID_O_TEXT_LABEL)) this->OnClick({}, WID_O_TEXT_LABEL, click_count);
 						return;
 					}
-					if (this->vehicle->type == VehicleType::Train) {
+					/* R3R (KI-178): the stop location only exists on station orders.
+					 * Cycling it for any other row type sent a doomed
+					 * MOF_STOP_LOCATION command, which CmdModifyOrder rejects on its
+					 * order-type whitelist -- so the player got a confusing error
+					 * message and, when the row really was an OT_WAIT_COUPLE (see
+					 * the decouple wait point), the click appeared to "turn" the
+					 * order into "wait for coupling". Only station orders cycle. */
+					if (this->vehicle->type == VehicleType::Train && order->IsType(OT_GOTO_STATION)) {
 						OrderStopLocation osl = static_cast<OrderStopLocation>((to_underlying(order->GetStopLocation()) + 1) % to_underlying(OrderStopLocation::End));
 						if (osl == OrderStopLocation::Through && !_settings_client.gui.show_adv_load_mode_features) {
 							osl = OrderStopLocation::NearEnd;
@@ -3492,6 +3637,20 @@ public:
 				int selected;
 				DropDownList list = R3RYardDropDownList(this->vehicle->GetOrder(this->OrderGetSel()), selected);
 				ShowDropDownList(this, std::move(list), selected, WID_O_R3R_YARD, 0, {}, DDSF_SHARED);
+				break;
+			}
+
+			case WID_O_COUPLE_SIDE: { // R3R: choose which side to attach on
+				int selected;
+				DropDownList list = CoupleSideDropDownList(this->vehicle->GetOrder(this->OrderGetSel()), selected);
+				ShowDropDownList(this, std::move(list), selected, WID_O_COUPLE_SIDE, 0, {}, DDSF_SHARED);
+				break;
+			}
+
+			case WID_O_COUPLE_TEMP_GROUP: { // R3R (KI-170): choose the couple group joined while the order runs
+				int selected;
+				DropDownList list = CoupleTempGroupDropDownList(this->vehicle->GetOrder(this->OrderGetSel()), this->vehicle->owner, selected);
+				ShowDropDownList(this, std::move(list), selected, WID_O_COUPLE_TEMP_GROUP, 0, {}, DDSF_SHARED);
 				break;
 			}
 
@@ -3961,8 +4120,11 @@ public:
 			if (order == nullptr || !order->IsType(OT_DECOUPLE)) return;
 
 			const DecoupleBoundaryMode mode = (this->query_text_widget == DECOUPLE_QUERY_HEAD) ? DecoupleBoundaryMode::HeadBoundary : DecoupleBoundaryMode::TailSegments;
+			/* R3R (2026-09-27): 输入 0 不再被改写成「自动」（那会让玩家选的
+			 * 正序/倒序方向丢失，界面总是回显「解挂尾部段」）；它按显式边界的最小值
+			 * 1 保存，于是标签上的 N 与实际切分位置、与玩家输入的意图三者恒等。 */
 			const uint8_t value = Clamp<uint>(*try_value, 1, 63);
-			if (order->GetDecoupleBoundaryMode() == mode && order->GetNumDecouple() == value) return;
+			if (order->GetDecoupleBoundaryMode() == mode && order->GetDecoupleBoundaryValue() == value) return;
 
 			const uint16_t data = (uint16_t)(((uint16_t)static_cast<uint8_t>(mode) << 8) | value);
 			this->ModifyOrder(sel, MOF_DECOUPLE_BOUNDARY, data);
@@ -4060,6 +4222,18 @@ public:
 			case WID_O_R3R_YARD: // R3R: set the destination yard of the selected station order
 				if (index >= 0 && index <= Station::R3R_MAX_YARDS) {
 					this->ModifyOrder(this->OrderGetSel(), MOF_R3R_YARD, static_cast<uint16_t>(index));
+				}
+				break;
+
+			case WID_O_COUPLE_SIDE: // R3R: set which side the selected GOTO_COUPLE order attaches on
+				if (index >= 0 && index < OCS_END) {
+					this->ModifyOrder(this->OrderGetSel(), MOF_COUPLE_SIDE, static_cast<uint16_t>(index));
+				}
+				break;
+
+			case WID_O_COUPLE_TEMP_GROUP: // R3R (KI-170): set the couple group joined while the selected GOTO_COUPLE order runs
+				if (index >= 0) {
+					this->ModifyOrder(this->OrderGetSel(), MOF_COUPLE_TEMP_GROUP, static_cast<uint16_t>(index));
 				}
 				break;
 
@@ -4655,11 +4829,27 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_REFIT_DROPDOWN), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_REFIT_AUTO, STR_ORDER_REFIT_AUTO_TOOLTIP), SetResize(1, 0),
 				EndContainer(),
-				/* R3R: destination yard of a rail station order. Only shown for GOTO_STATION orders of trains. */
+				/* R3R: extra top-row dropdown. Plane 1 = destination yard of a rail
+				 * station order (GOTO_STATION). Plane 2 = couple group of a coupling
+				 * order that targets a station; plane 3 = the same plus the couple
+				 * side, which is only offered for coupling orders that target a depot
+				 * (KI-170 / KI-172). Plane 4 = couple group offered by a waiting order
+				 * (WAIT_COUPLE, KI-225). All planes are 60px wide in total, so
+				 * switching between them never changes the smallest window size. */
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_YARD),
 					NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(60, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
 					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_R3R_YARD), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_R3R_YARD_WHOLE, STR_ORDER_R3R_YARD_TOOLTIP), SetResize(1, 0),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_COUPLE_TEMP_GROUP), SetMinimalSize(60, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_COUPLE_TEMP_GROUP_NONE, STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP), SetResize(1, 0),
+					NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
+						NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_COUPLE_SIDE), SetMinimalSize(30, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_COUPLE_SIDE_FRONT, STR_ORDER_COUPLE_SIDE_TOOLTIP), SetResize(1, 0),
+						NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_COUPLE_TEMP_GROUP), SetMinimalSize(30, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_COUPLE_TEMP_GROUP_NONE, STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP), SetResize(1, 0),
+					EndContainer(),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_COUPLE_TEMP_GROUP), SetMinimalSize(60, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_COUPLE_TEMP_GROUP_NONE, STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP), SetResize(1, 0),
 				EndContainer(),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),

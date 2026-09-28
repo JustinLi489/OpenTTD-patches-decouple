@@ -3971,6 +3971,26 @@ STR_R3R_YARD_SHARED_NONE                                        :{BLACK}无
 STR_R3R_YARD_SHARED_SEL                                         :{BLACK}共享: {STRING}
 STR_R3R_YARD_LOCATE                                             :{BLACK}定位
 STR_R3R_YARD_LOCATE_TOOLTIP                                     :{BLACK}将主视图滚动到选中的站台
+STR_R3R_YARD_WORKSHOP                                           :{BLACK}检修所
+STR_R3R_YARD_WORKSHOP_TOOLTIP                                   :{BLACK}将当前选中的场设为检修所。检修所不吸引、不产生、不接受货物；停在该场的列车不装卸货；订单目的地明确是本场的列车到站后即进厂检修
+STR_R3R_YARD_WORKSHOP_SET                                       :{BLACK}检修所: 是
+STR_R3R_YARD_WORKSHOP_NONE                                      :{BLACK}检修所: 否
+STR_R3R_YARD_NAME_N_WORKSHOP                                    :{BLACK}[{NUM} 场·检修]
+STR_R3R_YARD_NAME_N_SHARED_WORKSHOP                             :{BLACK}[{NUM} 场·共享·检修]
+STR_ERROR_R3R_YARD_WORKSHOP_EMPTY                               :{WHITE}该场没有任何站台
+STR_R3R_YARD_RENAME                                             :{BLACK}重命名
+STR_R3R_YARD_RENAME_TOOLTIP                                     :{BLACK}给选中的场起一个自己的名字。清空名字则恢复默认的「n 场」标签
+STR_R3R_YARD_QUERY_RENAME                                       :{WHITE}重命名站场
+STR_R3R_YARD_DELETE                                             :{BLACK}删除
+STR_R3R_YARD_DELETE_TOOLTIP                                     :{BLACK}删除选中的场。它的站台回归整站，其后的场号依次前移
+STR_R3R_YARD_QUERY_DELETE_CAPTION                               :{WHITE}删除站场
+STR_R3R_YARD_QUERY_DELETE                                       :{WHITE}删除 {STRING}？{}{}它的站台会回归「整站」，其后的场号依次前移，指向这些场的订单会跟着新场号走
+STR_R3R_YARD_NAME_CUSTOM                                        :{BLACK}[{STRING}]
+STR_R3R_YARD_NAME_CUSTOM_SHARED                                 :{BLACK}[{STRING}·共享]
+STR_R3R_YARD_NAME_CUSTOM_WORKSHOP                               :{BLACK}[{STRING}·检修]
+STR_R3R_YARD_NAME_CUSTOM_SHARED_WORKSHOP                        :{BLACK}[{STRING}·共享·检修]
+STR_ORDER_R3R_YARD_CUSTOM                                       :{STRING}
+STR_ORDER_R3R_YARD_CUSTOM_SHARED                                :{STRING}（共享）
 
 # R3R:目的地场(订单窗口)
 STR_ORDER_R3R_YARD_WHOLE                                        :整站
@@ -4748,6 +4768,15 @@ STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :等待挂接
 STR_ORDER_COUPLE_ANY                                            :挂接任意
 STR_ORDER_COUPLE_EMPTY                                          :挂接空车
 STR_ORDER_COUPLE_FULL                                           :挂接满载
+STR_ORDER_COUPLE_SIDE                                           :{BLACK}挂接侧
+STR_ORDER_COUPLE_SIDE_FRONT                                     :在前
+STR_ORDER_COUPLE_SIDE_REAR                                      :在后
+STR_ORDER_COUPLE_SIDE_SEL                                       :{BLACK}挂接侧: {STRING}
+STR_ORDER_COUPLE_SIDE_TOOLTIP                                   :{BLACK}本车挂在被挂列车的哪一侧（按挂接后的链序）：在前 = [本车][被挂车]，在后 = [被挂车][本车]
+STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}临时挂接分组: {STRING}
+STR_ORDER_COUPLE_TEMP_GROUP_NONE                                :无
+STR_ORDER_COUPLE_TEMP_GROUP_NAMED                               :分组 {NUM}
+STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP                             :{BLACK}执行这条命令期间临时加入的挂接分组：除了本段本来就有的分组，再额外拥有该分组，因此可以挂上属于它的车底；挂接成功后这个临时身份立即消失
 
 # Order bottom buttons
 STR_ORDER_NON_STOP                                              :{BLACK}不停车
@@ -6100,11 +6129,12 @@ STR_BADGE_CONFIG_NAME                                           :名称
 STR_BADGE_FILTER_ANY_LABEL                                      :{STRING}：所有
 STR_ORDER_DECOUPLE_QUERY_TAIL                                  :解挂尾部 N 段…
 STR_ORDER_DECOUPLE_QUERY_HEAD                                  :在第 N 段与第 N+1 段之间解挂…
-STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :要解挂的尾部段数
-STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :从车头数起在第几段后切开
+STR_ORDER_DECOUPLE_TAIL_VALUE_CAPTION                          :要解挂的尾部段数（0 视同 1）
+STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :从车头数起在第几段后切开（0 视同 1）
 
 STR_DEPOT_CHAIN_LOOSE                                          :散链
 STR_DEPOT_CHAIN_SEGMENT_POS                                    :第 {NUM}/{NUM} 段
+STR_R3R_TEMP_COUPLE_GROUP                                      :临时挂接分组
 
 STR_COUPLE_GROUP_CAPTION                                        :{WHITE}挂接分组
 STR_COUPLE_GROUP_GROUPS_TOOLTIP                                 :挂接分组
@@ -6124,7 +6154,7 @@ STR_COUPLE_GROUP_SEGMENT_ALSO_IN                                :同属 {RAW_STR
 STR_COUPLE_GROUP_QUERY_NEW                                      :新挂接分组的名称
 STR_COUPLE_GROUP_QUERY_RENAME                                   :挂接分组的新名称
 STR_COUPLE_GROUP_QUERY_DELETE_CAPTION                           :{WHITE}删除挂接分组
-STR_COUPLE_GROUP_QUERY_DELETE                                   :确定要删除挂接分组“{RAW_STRING}”吗？其中的段将变为未分组。
+STR_COUPLE_GROUP_QUERY_DELETE                                   :确定要删除挂接分组“{RAW_STRING}”及其下面的所有子分组吗？其中的段将变为未分组。
 
 STR_DEPOT_CHAIN_GROUP_OWNER                                     :{RAW_STRING}（归属 {NUM}/{NUM}）
 STR_DEPOT_CHAIN_NO_GROUP                                        :无分组
