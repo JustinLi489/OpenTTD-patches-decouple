@@ -13,8 +13,13 @@
 #include "company_type.h"
 #include "couple_group_type.h"
 #include "core/pool_type.hpp"
+#include "group_type.h"
+#include "order_type.h"
+#include "transport_type.h"
 #include <string>
+#include <vector>
 
+struct OrderList;
 struct Train;
 struct Vehicle;
 
@@ -164,9 +169,9 @@ CoupleGroupMask R3RGetCoupleGroupsOfSegment(const Train *v);
  * R3RGetCoupleGroupsOfSegment(). The stored mask is never expanded, so dragging a
  * group to another parent changes the membership of all its members at once.
  *
- * Do NOT use this where a mask is written back (e.g. copying the control
- * segment's groups onto the other segment heads after coupling): that would
- * bake the ancestors into the savegame.
+ * Do NOT use this where a mask is written back (e.g. broadcasting the union of
+ * the chain's segment masks onto every segment head after coupling, see
+ * R3RNormaliseChainGroups()): that would bake the ancestors into the savegame.
  *
  * @param v Any vehicle of the segment.
  * @return The segment's effective group set (own groups plus every ancestor's).
@@ -486,5 +491,193 @@ uint R3RGetCoupleGroupDepth(CoupleGroupID group);
  * @return whether the assignment is allowed.
  */
 bool R3RCanCoupleGroupHaveParent(CoupleGroupID group, CoupleGroupID parent);
+
+/**
+ * R3R (第 152 轮): the identity of one segment -- every trait which belongs to
+ * the *segment* rather than to the car which happens to carry it.
+ *
+ * The problem this table solves. Before it, a segment's three traits were
+ * anchored in two different places: the schedule followed the segment with the
+ * lowest #Vehicle::r3r_priority (the "control segment"), while the unit number
+ * and the train name followed the chain head. Whenever the control segment was
+ * not the chain head, the chain had two competing answers to "whose
+ * schedule/number/name is the authoritative one", and every path which edited a
+ * chain had to guess which of the two it was looking at. The locked rule for
+ * this table is "control segment == the segment which contains the chain head"
+ * (P1-甲), and every segment gets exactly one row here, so there is one
+ * authority per segment and nothing left to guess.
+ *
+ * The row does *not* own the schedule. The OrderList itself stays an ordinary
+ * OrderList written by the ORDL chunk and (while shared) registered with the
+ * sharing chain, exactly like #Vehicle::orders; this row only keeps a pointer,
+ * so a segment which is currently not the chain head can still hold on to its
+ * own schedule. Consequence: the list behind #orders must be freed through the
+ * same paths a vehicle's orders are -- deleting a row must never delete it, and
+ * R3RSegmentFree() only drops the reference.
+ */
+struct R3RSegmentRecord {
+	OrderList *orders = nullptr;                            ///< The segment's own schedule; nullptr when it has none. Saved by the R3SG chunk as a REF_ORDERLIST, so it may point at a list which no vehicle references any more.
+	VehicleOrderID real_index = INVALID_VEH_ORDER_ID;       ///< How far this segment got in #orders while it was not the one being ticked.
+	VehicleOrderID implicit_index = INVALID_VEH_ORDER_ID;   ///< #Vehicle::cur_implicit_order_index of this segment.
+	VehicleOrderID timetable_index = INVALID_VEH_ORDER_ID;  ///< #Vehicle::cur_timetable_order_index of this segment.
+	bool orders_borrowed = false;                           ///< #orders belongs to another segment of the chain, so this segment must never free it (route A; the row-wide twin of #Vehicle::r3r_orders_borrowed).
+	UnitID unitnumber = 0;                                  ///< Unit number ("列车名") of this segment while it is not the chain head.
+	std::string name;                                       ///< Player given name of this segment; the formal home of #Vehicle::name_backup.
+	GroupID group_id = GroupID::Invalid();                  ///< "列车分组" of this segment while it is not the chain head; the formal home of #Vehicle::group_id_backup.
+	bool in_use = false;                                    ///< NOSAVE: whether this slot holds a live segment (set by R3RSegmentAlloc() and the R3SG loader, cleared by R3RSegmentFree()).
+};
+
+/**
+ * R3R (第 152 轮): take a free segment ID.
+ *
+ * IDs are reused through a free list, so the table stays as small as the number
+ * of segments which exist at once. The caller is expected to hand the ID to
+ * every car of the new segment (#Vehicle::r3r_segment_id) and to fill the row
+ * which R3RSegmentGet() then returns.
+ *
+ * @return A fresh segment ID, or #R3R_SEGMENT_NONE when the table is full.
+ */
+uint16_t R3RSegmentAlloc();
+
+/**
+ * R3R (第 152 轮): release \a id and forget its traits.
+ *
+ * Only the reference is dropped: a schedule owned by another segment (see
+ * #R3RSegmentRecord::orders_borrowed) and an order list which a car still
+ * points at are both left alone. Callers must have already cleared
+ * #Vehicle::r3r_segment_id on every car of that segment.
+ *
+ * @param id Segment ID to release; #R3R_SEGMENT_NONE and stale IDs are ignored.
+ */
+void R3RSegmentFree(uint16_t id);
+
+/**
+ * R3R (第 152 轮): the row of \a id, or nullptr when \a id names no live segment.
+ * @param id Segment ID to look up.
+ * @return Pointer into the segment table, or nullptr.
+ */
+R3RSegmentRecord *R3RSegmentGet(uint16_t id);
+
+/**
+ * R3R (第 152 轮): the row of \a id, creating an empty one when needed.
+ *
+ * Exists for the R3SG loader, which walks whatever indices a savegame holds and
+ * has to materialise them in order.
+ *
+ * @param id Segment ID to look up.
+ * @return Pointer into the segment table, or nullptr for #R3R_SEGMENT_NONE.
+ */
+R3RSegmentRecord *R3RSegmentGetOrCreate(uint16_t id);
+
+/**
+ * R3R (第 152 轮): the current size of the segment table, i.e. one past the
+ * highest ID which was ever handed out. Iterating 1 .. R3RSegmentPoolSize() and
+ * skipping the nulls yields every live segment.
+ * @return Number of table slots, including the unused slot 0 and the free ones.
+ */
+size_t R3RSegmentPoolSize();
+
+/**
+ * R3R (第 155 轮 / 落地清单 ③): the traits which belong to the segment \a v is part of.
+ *
+ * The read side of the segment identity table. #R3RSegmentRecord states that the
+ * unit number, the name and the group are traits of the *segment*, and that the
+ * control segment is the segment which holds the chain head (P1-甲). That makes
+ * the two sides read from two different places, on purpose:
+ *
+ *  - The control segment has no traits beyond the chain head's, and its row is
+ *    only a mirror written at the commit points. Reading the car directly makes
+ *    the answer impossible to be stale, which matters because the player may
+ *    rename the train, hand it a number or move it to another group at any time,
+ *    while commit points are rare.
+ *  - Every other segment reads its own row. That row is collected at each commit
+ *    point by R3RSyncSegmentTraits() (train_cmd.cpp) from the values which the
+ *    segment has parked (#Vehicle::unitnumber_backup, #Vehicle::name_backup,
+ *    #Vehicle::group_id_backup), and it is the formal home of those values.
+ *
+ * When the segment has no row yet (a single segment chain, or a car of an older
+ * savegame whose ids were never assigned) the chain head answers instead of an
+ * empty value, i.e. the display degrades to what it was before this change.
+ *
+ * @param v Any car of a chain; nullptr is accepted and answers with an empty trait.
+ */
+UnitID R3RSegmentUnitNumber(const Vehicle *v);
+std::string R3RSegmentName(const Vehicle *v);
+GroupID R3RSegmentGroupID(const Vehicle *v);
+
+/**
+ * R3R (第 170 轮 / R170-C): the section view of the three accessors above.
+ *
+ * These read the row of **the segment \a section belongs to** and fall back to
+ * that car's own live field -- never to the chain head, which wears the control
+ * segment's traits while the borrow layer is active. That distinction only
+ * matters for one caller: the vehicle list's segment sub-rows. A sub-row stands
+ * for its own segment, so it must show that segment's traits; when the segment
+ * it stands for happens to be the chain head's own segment (乙口径: the control
+ * segment is the order owner's, not necessarily the head's), asking the chain
+ * head would hand back the control segment's traits and the sub-row would be a
+ * copy of the row above it.
+ *
+ * @param section Any car of the segment being displayed; nullptr yields an empty
+ *                trait.
+ */
+UnitID R3RSegmentSectionUnitNumber(const Vehicle *section);
+std::string R3RSegmentSectionName(const Vehicle *section);
+GroupID R3RSegmentSectionGroupID(const Vehicle *section);
+
+/**
+ * R3R (第 155 轮 / 落地清单 ③): write \a v's traits into the row of \a v's own
+ * segment, i.e. the write side of the accessors above.
+ *
+ * Only the control segment (the chain head's one) is written: the other segments
+ * are collected from their cars at the commit points, so a write has to be
+ * repeated whenever one of the three traits changes while the car is the chain
+ * head -- the row would otherwise keep the value it was born with.
+ *
+ * @param v The chain head whose traits changed; nullptr and single segment chains
+ *          are no-ops (such a chain has no row and reads the car itself).
+ */
+void R3RSegmentStoreTraits(const Vehicle *v);
+
+/**
+ * R3R (第 155 轮 / 落地清单 ⑤): every segment head of \a chain except the control
+ * one, in the order the segments appear in the chain.
+ *
+ * Used by the vehicle list to grow one sub-row per hidden segment below the row
+ * of the chain (P2a). A segment starts at a car which carries
+ * #VehicleRailFlag::SegmentFront (★).
+ *
+ * 第 170 轮 / R170-C: the chain head's own segment is returned too -- as the
+ * chain head itself -- whenever it is not the control segment. Under the 乙口径
+ * the control segment is the order owner's one, which is a different segment
+ * from the head's whenever the chain was re-ordered by a depot drag (or by a
+ * couple which merged a whole segment in front): the chain's row then shows the
+ * control segment's traits, so the head's own segment has no row of its own in
+ * the list and the player cannot see it at all. A sub-row carrying the chain
+ * head reads its traits through R3RSegmentSection*(), never through the carrier
+ * view.
+ *
+ * @param chain First car of the chain; nullptr yields an empty list.
+ * @return The heads (or, for the chain head's own segment, the chain head) of the
+ *         hidden segments, in chain order. The chain head comes first.
+ */
+std::vector<const Vehicle *> R3RSegmentHiddenHeads(const Vehicle *chain);
+
+/**
+ * R3R (第 152 轮): forget every segment row, as if no segment had ever existed.
+ *
+ * Called once at the start of a load (see ResetSaveloadData()), before any chunk
+ * is read, because the table is a plain file-static: without the reset a game
+ * started or loaded into the same process would keep the rows of the previous
+ * one. That matters even when the savegame carries no R3SG chunk at all (an
+ * older savegame, or a game whose chains hold single segments): the cars of that
+ * game all read back as #R3R_SEGMENT_NONE and must not find a stale row of a
+ * previous session behind that ID.
+ *
+ * Nothing is freed: a row never owns its schedule (see #R3RSegmentRecord), and
+ * every OrderList is owned by the ORDL chunk / the order pool, which the load
+ * resets on its own.
+ */
+void R3RSegmentTableReset();
 
 #endif /* COUPLE_GROUP_H */

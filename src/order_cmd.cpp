@@ -43,6 +43,10 @@
 
 #include "date_func.h"
 #include "schdispatch.h"
+
+/* R3R (第 206 轮探针, 只读): 定义在 train_cmd.cpp。手写声明而不进头文件，
+ * 目的与 R3RWatchOrderIndexSite 的注释相同——保持本轮"只改 .cpp"。 */
+void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag);
 #include "timetable_cmd.h"
 #include "train_cmd.h"
 
@@ -53,6 +57,47 @@
 #include <vector>
 
 #include "safeguards.h"
+
+/* R3R (第 207 轮 / KI-312, 只读探针): 订单编辑命令的「成对哨兵」。
+ *
+ * 目的：把"链头当前调度命令索引（cur_real_order_index）被改写"这件事夹进一个具名
+ * 的编辑操作里，回答 KI-310 遗留的悬置项——第 207 轮已用日志证明 veh=54 的 real 在
+ * 一次「无站点覆盖」的窗口里从 0 变成 1，该窗口被夹在手动 dump（:221 curReal=0）与
+ * 手动跳命令（:289 cmd-skip-in real=1）之间，而那段时间唯一的玩家动作就是订单窗口
+ * 里的编辑（重设调度）。
+ *
+ * 站点：ordlist-insert-in/out（OrderList::InsertOrderAt）、ordlist-delete-in/out
+ * （OrderList::DeleteOrderAt）——这两个是全部插入/删除的唯一底层出口，覆盖
+ * CmdInsertOrder / CmdDeleteOrder / CmdDuplicateOrder / CmdInsertOrdersFromVehicle /
+ * CmdMassChangeOrder / CmdBulkOrder / 以及 R3R 自己在 Couple/Decouple 里插等待点等
+ * 全部路径；另有 cmd-move / cmd-reverse / cmd-modify / cmd-bulk / cmd-declone 五对
+ * 命令层哨兵，覆盖"不改条数但会改索引"的编辑（拖动排序、反转、改属性、批量、清空）。
+ *
+ * 为什么用 RAII 而不是手写 in/out：CmdModifyOrder / CmdBulkOrder 内部有多条
+ * `return CMD_ERROR;` 提前返回路径，手写 out 必漏；离开作用域析构即打 out，所有返回
+ * 路径都被覆盖，天然成对。site 必须传字符串字面量（R3RWatchOrderIndex 用其地址作为
+ * 分桶键），故每个调用点各写一个字面量。
+ *
+ * 纯只读：只读 real/impl/tt/条数/orders 指针，绝不改写任何字段。
+ */
+namespace {
+struct R3ROrderIdxWatch {
+	const Train *t;
+	const char *site_out;
+
+	R3ROrderIdxWatch(Vehicle *v, const char *site_in, const char *site_out) :
+		t((v != nullptr && v->type == VehicleType::Train) ? Train::From(v) : nullptr),
+		site_out(site_out)
+	{
+		R3RWatchOrderIndexSite(this->t, site_in, nullptr);
+	}
+
+	~R3ROrderIdxWatch()
+	{
+		R3RWatchOrderIndexSite(this->t, this->site_out, nullptr);
+	}
+};
+}
 
 /* DestinationID must be at least as large as every these below, because it can
  * be any of them
@@ -293,7 +338,7 @@ void Order::MakeLabel(OrderLabelSubType subtype)
 
 void Order::MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple)
 {
-	this->type = OT_DECOUPLE;
+	this->SetType(OT_DECOUPLE);
 	this->flags = 0;
 	this->SetDecouple(decouple);
 	this->SetNumDecouple(num_decouple);
@@ -301,7 +346,7 @@ void Order::MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple)
 
 void Order::MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load, CargoType cargo, bool depot_target)
 {
-	this->type = OT_GOTO_COUPLE;
+	this->SetType(OT_GOTO_COUPLE);
 	this->flags = 0;
 	this->dest = dest;
 	this->SetCoupleLoad(load);
@@ -311,8 +356,44 @@ void Order::MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load, CargoT
 
 void Order::MakeWaitCouple()
 {
-	this->type = OT_WAIT_COUPLE;
+	this->SetType(OT_WAIT_COUPLE);
 	this->flags = 0;
+}
+
+/**
+ * R3R (KI-302): convert the order type of this order from the old 5 bit encoding
+ * (OT_GOTO_COUPLE = 0x10, OT_WAIT_COUPLE = 0x11) to the current encoding.
+ *
+ * Before KI-302 Order::GetType() read bits 0..4, so the R3R order types were
+ * stored with bit 4 set. Under the current encoding those bytes mean OT_NOTHING
+ * and "OT_GOTO_STATION with a middle stop location" respectively.
+ *
+ * Saves written by builds which carry XSLFI_R3R_ORDER_TYPE_ENC already use the
+ * current encoding and are left untouched, as a 0x11 byte there is a legitimate
+ * station order.
+ *
+ * @param old_encoding whether this order was read from a savegame which used the
+ * old 5 bit order type encoding.
+ */
+void Order::R3RMigrateOldTypeEncoding(bool old_encoding)
+{
+	if (!old_encoding) return;
+
+	switch (this->type) {
+		case 0x10: // old OT_GOTO_COUPLE
+			this->SetType(OT_GOTO_COUPLE);
+			break;
+
+		case 0x11: // old OT_WAIT_COUPLE, or a station order with a "middle" stop location
+			/* A wait couple order carries no destination, a station order always
+			 * does. (The only station order this cannot tell apart is one going to
+			 * station #0, as the station pool is not loaded yet.) */
+			if (this->dest.base() == 0) this->SetType(OT_WAIT_COUPLE);
+			break;
+
+		default:
+			break;
+	}
 }
 
 /**
@@ -791,6 +872,7 @@ CargoMaskedStationIDVector OrderList::GetNextStoppingStation(const Vehicle *v, C
  */
 void OrderList::InsertOrderAt(Order &&ins_order, VehicleOrderID index)
 {
+	R3ROrderIdxWatch r3r_idx_watch(this->GetFirstSharedVehicle(), "ordlist-insert-in", "ordlist-insert-out");
 	if (index >= this->orders.size()) {
 		index = (VehicleOrderID)this->orders.size();
 	}
@@ -820,6 +902,7 @@ void OrderList::InsertOrderAt(Order &&ins_order, VehicleOrderID index)
  */
 void OrderList::DeleteOrderAt(VehicleOrderID index)
 {
+	R3ROrderIdxWatch r3r_idx_watch(this->GetFirstSharedVehicle(), "ordlist-delete-in", "ordlist-delete-out");
 	if (index >= this->GetNumOrders()) return;
 
 	Order *to_remove = &(this->orders[index]);
@@ -1677,6 +1760,7 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 static CommandCost DecloneOrder(Vehicle *dst, DoCommandFlags flags)
 {
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3ROrderIdxWatch r3r_idx_watch(dst, "cmd-declone-in", "cmd-declone-out");
 		/* Clear scheduled dispatch flag if any */
 		if (dst->vehicle_flags.Test(VehicleFlag::ScheduledDispatch)) {
 			dst->vehicle_flags.Reset(VehicleFlag::ScheduledDispatch);
@@ -1730,6 +1814,7 @@ CommandCost CmdDeleteOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 	if (v->GetOrder(sel_ord) == nullptr) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-delete-in", "cmd-delete-out");
 		DeleteOrder(v, sel_ord);
 	}
 	return CommandCost();
@@ -1849,6 +1934,10 @@ CommandCost CmdSkipToOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		/* R3R (第 206 轮探针, 只读): v 的索引在命令前后各取一次。谁调用了
+		 * "跳命令"命令本体，这里就会留下 real=x->sel_ord 的边沿。 */
+		R3RWatchOrderIndexSite(Train::From(v), "cmd-skip-in", nullptr);
+
 		if (v->current_order.IsAnyLoadingType()) v->LeaveStation();
 		if (v->current_order.IsType(OT_WAITING)) v->HandleWaiting(true);
 
@@ -1874,6 +1963,9 @@ CommandCost CmdSkipToOrder(DoCommandFlags flags, VehicleID veh_id, VehicleOrderI
 		InvalidateVehicleOrder(v, VIWD_MODIFY_ORDERS);
 
 		v->StopSeparation();
+
+		/* R3R (第 206 轮探针, 只读): 跳命令之后的索引。 */
+		R3RWatchOrderIndexSite(Train::From(v), "cmd-skip-out", nullptr);
 
 		/* We have an aircraft/ship, they have a mini-schedule, so update them all */
 		if (v->type == VehicleType::Aircraft || v->type == VehicleType::Ship) DirtyVehicleListWindowForVehicle(v);
@@ -1919,6 +2011,7 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-move-in", "cmd-move-out");
 		v->orders->MoveOrders(moving_order, target_order, count);
 
 		/* Update shared list */
@@ -2061,6 +2154,7 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 			VehicleOrderID order_count = v->GetNumOrders();
 			if (order_count < 2) return CMD_ERROR;
 			if (flags.Test(DoCommandFlag::Execute)) {
+				R3ROrderIdxWatch r3r_idx_watch(v, "cmd-reverse-in", "cmd-reverse-out");
 				auto map_order_id = [&](VehicleOrderID idx) -> VehicleOrderID {
 					if (idx == INVALID_VEH_ORDER_ID) return idx;
 					return (order_count - 1) - idx;
@@ -2210,6 +2304,8 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				break;
 
 			case OT_DECOUPLE:
+				/* R3R (KI-124): every new ModifyOrderFlags must be listed here
+				 * or the UI silently fails. */
 				if (mof != MOF_DECOUPLE_BOUNDARY) return CMD_ERROR;
 				break;
 
@@ -2588,6 +2684,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-modify-in", "cmd-modify-out");
 		switch (mof) {
 			case MOF_NON_STOP:
 				order->SetNonStopType((OrderNonStopFlags)data);
@@ -4856,6 +4953,7 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-bulk-in", "cmd-bulk-out");
 		InvalidateWindowData(WindowClass::VehicleOrderImportErrors, v->index);
 
 		if (v->orders == nullptr) {

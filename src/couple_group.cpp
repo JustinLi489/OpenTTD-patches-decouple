@@ -18,6 +18,8 @@
 #include "r3r_perf.h"
 #include "core/pool_func.hpp"
 
+#include <string_view>
+
 #include "safeguards.h"
 
 CoupleGroupPool _couplegroup_pool("CoupleGroup");
@@ -274,6 +276,49 @@ void R3RClearCoupleGroupsOfSegment(Train *v)
 	if (head != nullptr) head->couple_groups = COUPLE_GROUP_MASK_NONE;
 }
 
+/**
+ * R3R (KI-306, round 202): probe for the restored same-company group whitelist.
+ *
+ * The whitelist is only consulted when one of the two orders explicitly
+ * declares a temporary couple group, so this is a rare path -- but it still
+ * runs inside the couple pathfinder (three resolution levels), hence the
+ * throttle: one line per (coupler,target) id pair, and only when the verdict
+ * actually changes. Key = coupler<<16 | target; 64 pairs is plenty for the
+ * handful of locomotives that can be trying to couple at any moment, and the
+ * table is deliberately not saved (pure diagnostics).
+ *
+ * NOTE: do not name a parameter `cdecl` -- MSVC's windows headers
+ * (`#define cdecl __cdecl`) turn it into the calling convention keyword and the
+ * file stops compiling with C2059 __cdecl. `coupler_decl` / `target_decl` it is.
+ */
+static void R3RCoupleGateProbe(const Train *coupler, const Train *target, bool coupler_decl,
+		bool target_decl, CoupleGroupMask cmask, CoupleGroupMask tmask, bool compatible)
+{
+	static uint32_t keys[64] = {};
+	static bool vals[64] = {};
+	static uint32_t used = 0;
+	const uint32_t max_entries = (uint32_t)(sizeof(keys) / sizeof(keys[0]));
+
+	const uint32_t key = (coupler->index.base() << 16) | (target->index.base() & 0xFFFF);
+	for (uint32_t i = 0; i < used; i++) {
+		if (keys[i] != key) continue;
+		if (vals[i] == compatible) return; // unchanged verdict: stay quiet
+		vals[i] = compatible;
+		R3RDbgWrite("CG-GATE compatible=%d coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X\n",
+				(int)compatible, (int)coupler->index.base(), (int)target->index.base(),
+				(int)coupler_decl, (int)target_decl, (unsigned)cmask, (unsigned)tmask);
+		return;
+	}
+	if (used < max_entries) {
+		keys[used] = key;
+		vals[used] = compatible;
+		used++;
+	}
+	R3RDbgWrite("CG-GATE compatible=%d coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X\n",
+			(int)compatible, (int)coupler->index.base(), (int)target->index.base(),
+			(int)coupler_decl, (int)target_decl, (unsigned)cmask, (unsigned)tmask);
+}
+
 bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 {
 	if (coupler == nullptr || target == nullptr) return false;
@@ -305,8 +350,18 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 			 * is refused here. A candidate in a depot or on the approach track
 			 * just outside the depot mouth (which is no longer a depot tile) keeps
 			 * the old tile-agnostic behaviour -- that track is where a consist
-			 * regularly waits, and a "couple at depot" order cannot name it. */
+			 * regularly waits, and a "couple at depot" order cannot name it.
+			 *
+			 * R3R (KI-288, round 188): 「非车库格一律放行」是个洞 —— 它把**车站
+			 * 站台**也放了进来。观测 2026-10-01：机车 veh=26 执行
+			 * GOTO_COUPLE→车库 1,11（DEPOT-ARR destTx=1 destTy=11 destDepot=1），
+			 * 却停在车站格 4,11，把刚在**同一格**解下来的车底 23 挂上
+			 * （COUPLE-OK loco=26 ... tx=4 ty=11）—— 命令写在车库、挂接点在车站。
+			 * 站台永远不属于任何车库，所以这里是"目的地不匹配"的另一种形态，
+			 * 与下面车站分支对称。车库门口那段接近轨道仍是普通轨道，不受影响。
+			 * 见 train_cmd.cpp 的 R3RCoupleTargetAtOrderStation()（必须同步）。 */
 			if (IsRailDepotTile(target->tile) && GetDepotIndex(target->tile) != dest.ToDepotID()) return false;
+			if (IsRailStationTile(target->tile)) return false;
 		} else {
 			/* Station order: a candidate parked at some *other* station is not a
 			 * candidate at all. Candidates in a depot, or off any permanent way,
@@ -323,8 +378,8 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	 * 石头" —— 就是参与挂接的那个段的有效分组 = 它自己的真分组 ∪ 命令指定的那个
 	 * 真分组。因此它挂得上滚木组的车底，而分组无交集的照样被白名单拒绝：这不是
 	 * "万能放行"，只是临时多了一个真实身份。
-	 * （第 109 轮：本题所述「不满足交集就被拒」的白名单闸门本身已废除，见下方
-	 * KI-195 注释；命令级临时分组现在只剩跨公司授权这一条作用。）
+	 * （第 109 轮曾把这道白名单整体废除，于是本段所述机制变成死代码；第 202 轮
+	 * KI-306 已按"命令声明了临时分组才重新启用白名单"恢复，见下方闸门。）
 	 *
 	 * 这层身份完全由命令派生，不写进段的数据（段上仍然只有"石头"），命令一被推进掉
 	 * （挂接成功，见 train_cmd.cpp 的 Couple() / CGRP-FAKE-DESTROY）就随之消失。
@@ -335,9 +390,14 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	/* R3R (第 146 轮 / 需求叁改): 用"有效集合"（含所有祖先组）判定：子组的车也属于父组。 */
 	CoupleGroupMask coupler_groups = R3RGetEffectiveCoupleGroupsOfSegment(coupler);
 	CoupleGroupMask target_groups = R3RGetEffectiveCoupleGroupsOfSegment(target);
+	bool coupler_declared_temp = false;
+	bool target_declared_temp = false;
 	if (order.IsType(OT_GOTO_COUPLE)) {
 		const CoupleGroupID temp_group = order.GetCoupleTempGroup();
-		if (R3RIsValidCoupleGroup(temp_group)) coupler_groups |= R3RCoupleGroupBit(temp_group);
+		if (R3RIsValidCoupleGroup(temp_group)) {
+			coupler_groups |= R3RCoupleGroupBit(temp_group);
+			coupler_declared_temp = true;
+		}
 	}
 	/* R3R (第 143 轮, KI-225): 等待挂接的车底也能在它的 WAIT_COUPLE 命令上声明一个
 	 * 临时分组，语义与机车侧的 GOTO_COUPLE 对称——"我在等人按这个分组来接我"。
@@ -350,7 +410,10 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 		const Train *wait_head = Train::From(target->First());
 		if (wait_head != nullptr && wait_head->current_order.IsType(OT_WAIT_COUPLE)) {
 			const CoupleGroupID wait_group = wait_head->current_order.GetCoupleTempGroup();
-			if (R3RIsValidCoupleGroup(wait_group)) target_groups |= R3RCoupleGroupBit(wait_group);
+			if (R3RIsValidCoupleGroup(wait_group)) {
+				target_groups |= R3RCoupleGroupBit(wait_group);
+				target_declared_temp = true;
+			}
 		}
 	}
 
@@ -368,11 +431,18 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	 * 一对一配对锁（R3RCoupleAllowed() 里的 r3r_couple_target/requester），它比分组
 	 * 白名单精确得多。
 	 *
-	 * 连带影响：命令级的「临时挂接分组」(GetCoupleTempGroup) 对同公司挂接不再有任何
-	 * 作用（本来就是为了通过这道白名单）；它仍然有效的地方是公司边界——临时并入一个
-	 * 对外的真分组，就能跨公司挂上对方那一列。coupler_groups 的合并（上面几行）因此
-	 * 必须保留。真挂接分组本身、分组管理 UI、白名单比较函数
-	 * R3RCoupleGroupMasksCompatible() 都保留不动，只是不再否决挂接。
+	 * 连带影响（第 109 轮原文，已被第 202 轮 KI-306 部分撤回）：命令级的「临时挂接
+	 * 分组」(GetCoupleTempGroup) 当时对同公司挂接不再有任何作用（本来就是为了通过
+	 * 这道白名单）；它仍然有效的地方是公司边界——临时并入一个对外的真分组，就能跨
+	 * 公司挂上对方那一列。coupler_groups 的合并（上面几行）因此必须保留。真挂接
+	 * 分组本身、分组管理 UI、白名单比较函数 R3RCoupleGroupMasksCompatible() 都保留
+	 * 不动，只是不再**无条件**否决挂接。
+	 *
+	 * R3R (第 202 轮, KI-306)：上面那条"不再有任何作用"正是玩家报的问题——设了与
+	 * 没设完全一样（`build\R3R_debug.log` 里 4 个空组 + `CPL-PAIR act=48/54 tgt=0`
+	 * 无限刷屏，机车被自己车库里的车底吸住）。修法不是恢复无条件白名单（那会退回
+	 * KI-195 想治的老毛病），而是**由命令显式声明临时分组时才启用**：声明 = 玩家主动
+	 * 表达"我要按分组挂"，此时分组必须相容；不声明 = 维持本轮的"一律放行"。
 	 *
 	 * 注意：本函数是三个解析层级共用的唯一判据（yapf_destrail.hpp 的目的地测试、
 	 * yapf_rail.cpp 的 CheckSafePositionOnNode 回溯安全测试、train_cmd.cpp 的到点闸门），
@@ -387,6 +457,30 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	 * by accident and simply keeps looking for another candidate. */
 	if (coupler->owner != target->owner) {
 		return R3RCoupleGroupMasksAllowCrossCompany(coupler_groups, target_groups);
+	}
+
+	/* R3R (第 202 轮, KI-306): 同公司路径上，只有**命令显式声明了临时挂接分组**时
+	 * 才重新启用分组白名单：
+	 *   - 机车侧的 GOTO_COUPLE 声明了分组（tooltip：「再额外拥有该分组，因此可以挂上
+	 *     属于它的车底」），或
+	 *   - 等待侧的 WAIT_COUPLE 声明了分组（KI-225 的对称语义「我在等人按这个分组来接我」）。
+	 * 二者都没有时返回 true，即 KI-195 的"同公司不设门槛"照旧——"忘记把车底加进分组"
+	 * 不会再次变成"到了站台找不到挂接目标"。
+	 *
+	 * 判据用的是合并后的**有效集合**（真分组 ∪ 临时分组，且含所有祖先组，见上面几行），
+	 * 所以：声明"滚木"的机车能挂上滚木组（或滚木的子/父组）的车底；而掩码为
+	 * COUPLE_GROUP_MASK_NONE 的车底（现场那条没分组的 27 节车库车底）会被
+	 * R3RCoupleGroupMasksCompatible() 的 `a==b` 分支判 false ⇒ 直接剔出候选集。
+	 * 被拒候选按既有语义上报为"这里没有等待的车底"，机车继续找别的候选，找不到就走
+	 * KI-193 的 COUPLE-DEST-EMPTY（等待 500 tick 后跳过命令），不会卡死。
+	 *
+	 * 这一处对三个解析层级同时生效（本函数是唯一判据，见上方 KI-165 注释），
+	 * train_cmd.cpp 的到点闸门 R3RCanCoupleNow() 因此也自动受约束。 */
+	if (coupler_declared_temp || target_declared_temp) {
+		const bool compatible = R3RCoupleGroupMasksCompatible(coupler_groups, target_groups);
+		R3RCoupleGateProbe(coupler, target, coupler_declared_temp, target_declared_temp,
+				coupler_groups, target_groups, compatible);
+		return compatible;
 	}
 	return true;
 }
@@ -748,6 +842,8 @@ void AfterLoadCoupleGroups()
  * （读档时 CGVR 的 post 钩子太早，那时表里还是裸序号，绝不能解引用），后者是统计口径。
  * 世界刚刚从文件读出来，这里只应与一处不一致的存档对上；正常存档零命中。
  */
+static void R3RSegmentReconcileRows(const char *tag);
+
 void R3RNormaliseChainGroupsAfterLoad()
 {
 	uint chains = 0;
@@ -789,8 +885,16 @@ void R3RNormaliseChainGroupsAfterLoad()
 					(uint)old_g.base(), (uint)owner->group_id.base());
 		}
 
-		/* 挂接分组：把控制段的掩码复制到链内每一个段头。 */
-		const CoupleGroupMask target = R3RGetCoupleGroupsOfSegment(owner);
+		/* 挂接分组（第 159 轮 / q-2=肆）：与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径 ——
+		 * 取全链段头掩码的**并集（OR）**再广播回每一个段头，不再照抄控制段那一段（覆盖）。 */
+		CoupleGroupMask target = COUPLE_GROUP_MASK_NONE;
+		for (Train *s = t; s != nullptr; ) {
+			if (s->Previous() == nullptr || s->IsSegmentFront()) {
+				target |= R3RGetCoupleGroupsOfSegment(s);
+			}
+			Vehicle *next = s->Next();
+			s = (next != nullptr) ? Train::From(next) : nullptr;
+		}
 		for (Train *s = t; s != nullptr; ) {
 			if (s->Previous() == nullptr || s->IsSegmentFront()) {
 				if (R3RGetCoupleGroupsOfSegment(s) != target) {
@@ -811,4 +915,414 @@ void R3RNormaliseChainGroupsAfterLoad()
 	}
 
 	R3RDbgWrite("GRP-NORM-LOAD-SUM chains=%u groupfix=%u maskfix=%u\n", chains, group_fixes, mask_fixes);
+
+	/* R3R (第 156 轮 / 落地清单 ⑦): the rows of the R3SG chunk are restored verbatim, so
+	 * a savegame written between two commit points can carry rows which no car claims
+	 * (or cars whose row is empty). Reconcile them now that both the cars and their
+	 * order lists are fully in memory; see R3RSegmentReconcileRows(). */
+	R3RSegmentReconcileRows("load");
+}
+
+/*
+ * R3R (第 152 轮): the segment identity table.
+ *
+ * One row per segment (see #R3RSegmentRecord), addressed by #Vehicle::r3r_segment_id.
+ * The table is deliberately a flat std::vector indexed by the ID itself: looking
+ * up a segment is then one array index plus a bounds check, with no hashing and
+ * no traversal, which is what lets the identity be queried from the hot paths
+ * without a cost worth measuring. IDs are recycled through a free list, so the
+ * vector stays as large as the highest ID still in use rather than as large as
+ * the number of segments ever created.
+ *
+ * Lifetime rules which the rest of R3R must respect:
+ *  - A row is created by R3RSegmentAlloc() (or materialised by the R3SG loader)
+ *    and destroyed by R3RSegmentFree(). Slots are never removed from the vector.
+ *  - The returned pointer is valid only until the next R3RSegmentAlloc() /
+ *    R3RSegmentGetOrCreate(), which may grow (and therefore move) the vector.
+ *    Callers which hold a row across such a call must re-fetch it by ID.
+ *  - Freeing a row must never free the order list it points at: the list is
+ *    owned by the R3R schedule machinery (or by a car), and a borrowed row only
+ *    ever held a reference to somebody else's list.
+ */
+
+/** R3R (第 152 轮): segment rows by ID. Slot #R3R_SEGMENT_NONE is never handed out, so the table is never empty. */
+static std::vector<R3RSegmentRecord> _r3r_segments(1);
+
+/** R3R (第 152 轮): IDs which were released and may be handed out again (LIFO). */
+static std::vector<uint16_t> _r3r_free_segment_ids;
+
+size_t R3RSegmentPoolSize()
+{
+	return _r3r_segments.size();
+}
+
+R3RSegmentRecord *R3RSegmentGet(uint16_t id)
+{
+	if (id == R3R_SEGMENT_NONE || id >= _r3r_segments.size()) return nullptr;
+	R3RSegmentRecord &rec = _r3r_segments[id];
+	return rec.in_use ? &rec : nullptr;
+}
+
+R3RSegmentRecord *R3RSegmentGetOrCreate(uint16_t id)
+{
+	if (id == R3R_SEGMENT_NONE || id > R3R_SEGMENT_ID_MAX) return nullptr;
+	if (id >= _r3r_segments.size()) _r3r_segments.resize(static_cast<size_t>(id) + 1);
+
+	R3RSegmentRecord &rec = _r3r_segments[id];
+	if (!rec.in_use) {
+		rec = R3RSegmentRecord{};
+		rec.in_use = true;
+	}
+	return &rec;
+}
+
+uint16_t R3RSegmentAlloc()
+{
+	uint16_t id;
+	if (!_r3r_free_segment_ids.empty()) {
+		id = _r3r_free_segment_ids.back();
+		_r3r_free_segment_ids.pop_back();
+	} else {
+		if (_r3r_segments.size() > R3R_SEGMENT_ID_MAX) return R3R_SEGMENT_NONE;
+		id = static_cast<uint16_t>(_r3r_segments.size());
+		_r3r_segments.emplace_back();
+	}
+
+	R3RSegmentRecord &rec = _r3r_segments[id];
+	rec = R3RSegmentRecord{};
+	rec.in_use = true;
+	return id;
+}
+
+void R3RSegmentFree(uint16_t id)
+{
+	R3RSegmentRecord *rec = R3RSegmentGet(id);
+	if (rec == nullptr) return;
+
+	*rec = R3RSegmentRecord{};
+	_r3r_free_segment_ids.push_back(id);
+}
+
+void R3RSegmentTableReset()
+{
+	_r3r_segments.clear();
+	_r3r_segments.emplace_back();
+	_r3r_free_segment_ids.clear();
+}
+
+/**
+ * R3R（第 159 轮 / q-0=贰乙 玩家口径）：「控制段」= 命令所有者段。
+ *
+ * 第 159 轮把口径从**链头所在段**（P1-甲）改成**命令所有者段** —— 也就是
+ * `r3r_priority` 最小的那个段头（train_cmd.cpp 的 `R3RGetPriorityHead()`）。
+ * 现场样本 `INVAR-CTRL tag=couple head=48 nseg=2 ctrl=48 owner=21`：链头 48 与
+ * 真正的排程主人 21 本来就是两个段，乙口径下"控制段"必须是后者 —— 链头只是
+ * 承载者（carrier），它借用控制段的特质与排程，把控制段显现给玩家。
+ *
+ * 这里是 train_cmd.cpp 那条规则的等价复刻：读侧在最热的一段代码上（每个车节
+ * 每次重绘都要认控制段），不能为它跨文件去问 owner。
+ *
+ * @param chain 链头（可为 nullptr）。
+ * @return 控制段的段头；chain 为 nullptr 时返回 nullptr。
+ */
+static const Vehicle *R3RSegmentControlHead(const Vehicle *chain)
+{
+	if (chain == nullptr) return nullptr;
+
+	const Vehicle *best = nullptr;
+	for (const Vehicle *v = chain; v != nullptr && v->type == VehicleType::Train; v = v->Next()) {
+		/* 段 = 链头本身或带 ★ 的车；每段的优先级取段头的 r3r_priority。 */
+		if (v != chain && !Train::From(v)->IsSegmentFront()) continue;
+		if (best == nullptr || Train::From(v)->r3r_priority < Train::From(best)->r3r_priority) best = v;
+	}
+	return (best != nullptr) ? best : chain;
+}
+
+/**
+ * R3R (第 155 轮 / 落地清单 ③，第 159 轮改口径): the row which holds the traits
+ * of the segment \a v is part of, or nullptr when those traits are read from the
+ * chain head itself.
+ *
+ * nullptr is returned for the chain head row itself (its live fields always carry
+ * the traits of the **control segment**, see below), for the **control segment**
+ * (第 159 轮 / q-0=贰乙: the command-owner segment, i.e. the segment with the
+ * lowest #Train::r3r_priority), recognised by both cars carrying the same
+ * #Vehicle::r3r_segment_id -- and for every car whose segment has no row
+ * (single segment chains, whose id is #R3R_SEGMENT_NONE, and cars of an older
+ * savegame).
+ *
+ * 控制段的特质由**链头自身**承载（借用层）：各交接点把不再当链头的那一段自己的
+ * unitnumber / name / group_id 停进自己的 *_backup（车号同时占住号池位），链头的
+ * 活字段换成控制段的那一套；提交点再把停放的那一套收进链头段的行
+ * （R3RBorrowControlTraits()）、把活字段收进控制段的行（R3RSyncSegmentTraits()）。
+ * 于是链头一行"回退到 v->First()"读到的就是控制段的特质，字面实现"由控制段显现"。
+ */
+static const R3RSegmentRecord *R3RSegmentTraitRow(const Vehicle *v)
+{
+	const Vehicle *const head = v->First();
+
+	/* 第 159 轮 / q-0=贰乙：链头那一行**永远**读链头的活字段。乙口径下链头是
+	 * **承载者**：各交接点把链头段自己的号/名/组停进它的 *_backup、活字段换成控制段
+	 * 的那一套（R3RBorrowControlTraits() 把停放的那一套收进链头段的行，
+	 * R3RSyncSegmentTraits() 把活字段收进控制段的行），所以"回退到 v->First()"
+	 * 读出来的正好是控制段的那一套 —— 主行由此显现控制段。
+	 * 缺了这条判断时 chain->r3r_segment_id 与控制段不同，主行会读回链头段自己那一行
+	 * （停放副本），显现的就成了"承载者自己的"特质。 */
+	if (v == head) return nullptr;
+
+	/* 第 159 轮 / q-0=贰乙：控制段 = 命令所有者段（不再是链头所在段）。 */
+	const Vehicle *const ctrl = R3RSegmentControlHead(head);
+	if (ctrl != nullptr && ctrl->r3r_segment_id == v->r3r_segment_id) return nullptr;
+	return R3RSegmentGet(v->r3r_segment_id);
+}
+
+UnitID R3RSegmentUnitNumber(const Vehicle *v)
+{
+	if (v == nullptr) return 0;
+
+	const R3RSegmentRecord *const row = R3RSegmentTraitRow(v);
+	if (row != nullptr && row->unitnumber != 0) return row->unitnumber;
+	return v->First()->unitnumber;
+}
+
+std::string R3RSegmentName(const Vehicle *v)
+{
+	if (v == nullptr) return std::string();
+
+	const R3RSegmentRecord *const row = R3RSegmentTraitRow(v);
+	if (row != nullptr && !row->name.empty()) return row->name;
+
+	/* 第 159 轮 / q-0=贰乙：控制段（命令所有者段）的名称由链头承载，段内任何一节
+	 * 都读链头那一份 —— 不然控制段里的第二、第三节会回退到它们自己空名字。
+	 * 其余段仍回退**本车自己的名字**：隐藏段没有自己的名字时必须保持无名，
+	 * 否则它的子行会读成上一行的副本。#TinyString 空的时候存的是 nullptr，
+	 * 绝不能直接交给 std::string（KI-245）：走它的 string_view 转换。 */
+	const Vehicle *const head = v->First();
+	const Vehicle *const ctrl = R3RSegmentControlHead(head);
+	if (ctrl != nullptr && ctrl->r3r_segment_id == v->r3r_segment_id) {
+		return std::string(static_cast<std::string_view>(head->name));
+	}
+	return std::string(static_cast<std::string_view>(v->name));
+}
+
+GroupID R3RSegmentGroupID(const Vehicle *v)
+{
+	if (v == nullptr) return GroupID::Invalid();
+
+	const R3RSegmentRecord *const row = R3RSegmentTraitRow(v);
+	if (row != nullptr && row->group_id != GroupID::Invalid()) return row->group_id;
+	return v->First()->group_id;
+}
+
+/*
+ * R3R (第 170 轮 / R170-C)：子行读的必须是**这一段自己**那一份特质。
+ *
+ * 上面三个访问器是"承载者视角"：链头的活字段替控制段作答（链头穿着控制段的
+ * 那一套），主行靠这个显现控制段，无可替代。但子行不行 —— 当子行代表的那一段
+ * 正好是**链头段自己**（乙口径下控制段 = 命令所有者段，与链头段完全可以不是
+ * 同一段：车库"拖到列车前面"、耦合并入整段都是这种情况）时，"问链头"得到的
+ * 又是控制段的那一套，子行就变成上一行的副本；而它的号/名其实正停在自己段的
+ * 行里（R3RBorrowControlTraits() 写的）。
+ *
+ * 所以子行改用这一组：永远先读**本段**的行，读不到才退回本段自己的活字段 ——
+ * 绝不回退到链头（链头手上是控制段的特质）。R170-C 修好了
+ * R3RSegmentHiddenHeads()（把链头段自己也列出来），这三个是它的配套读侧。
+ */
+UnitID R3RSegmentSectionUnitNumber(const Vehicle *section)
+{
+	if (section == nullptr) return 0;
+
+	const R3RSegmentRecord *const row = R3RSegmentGet(section->r3r_segment_id);
+	if (row != nullptr && row->unitnumber != 0) return row->unitnumber;
+	return section->unitnumber;
+}
+
+std::string R3RSegmentSectionName(const Vehicle *section)
+{
+	if (section == nullptr) return std::string();
+
+	const R3RSegmentRecord *const row = R3RSegmentGet(section->r3r_segment_id);
+	if (row != nullptr && !row->name.empty()) return row->name;
+
+	/* #TinyString 空的时候存的是 nullptr，绝不能直接交给 std::string（KI-245）：
+	 * 走它的 string_view 转换。 */
+	return std::string(static_cast<std::string_view>(section->name));
+}
+
+GroupID R3RSegmentSectionGroupID(const Vehicle *section)
+{
+	if (section == nullptr) return GroupID::Invalid();
+
+	const R3RSegmentRecord *const row = R3RSegmentGet(section->r3r_segment_id);
+	if (row != nullptr && row->group_id != GroupID::Invalid()) return row->group_id;
+	return section->group_id;
+}
+
+void R3RSegmentStoreTraits(const Vehicle *v)
+{
+	if (v == nullptr) return;
+
+	/* Traits are written for the control segment only: it is the one the player
+	 * edits (everything the GUI offers lands on the chain head), and the one whose
+	 * row is purely a mirror of the car. The other segments are collected from
+	 * their cars at the commit points instead (R3RSyncSegmentTraits()).
+	 *
+	 * 第 159 轮 / q-0=贰乙：控制段 = **命令所有者段**，链头（玩家编辑的那辆车）
+	 * 只是承载者 —— 它的活字段在提交点被换成控制段的那一套（R3RBorrowControlTraits）。
+	 * 所以这里要写的是**控制段的行**：玩家在链头那一行改的号/名/组落到控制段头上，
+	 * 而链头段自己的特质留在它的行里（由提交点按 parked 副本补齐），两者不再互相污染。 */
+	const Vehicle *const head = v->First();
+	const Vehicle *const ctrl = R3RSegmentControlHead(head);
+	const uint16_t target_id = (ctrl != nullptr) ? ctrl->r3r_segment_id : head->r3r_segment_id;
+	if (target_id == R3R_SEGMENT_NONE) return;
+
+	R3RSegmentRecord *const row = R3RSegmentGet(target_id);
+	if (row == nullptr) return;
+
+	/* R3R (第 156 轮 / 落地清单 ③ 残留): write "the car's own value first, the parked
+	 * copy as a fallback" instead of overwriting the whole row from the live fields.
+	 * The chain head can be parked at this very moment -- a car-only consist which
+	 * lent its unit number, name or group away keeps those in the *_backup fields
+	 * while the live ones are zeroed. Overwriting from the live fields then erases
+	 * the very traits the player just looked at, and the callers of this function
+	 * (rename, set group) are exactly the ones which flush the row mid-frame. */
+	row->unitnumber = (head->unitnumber != 0) ? head->unitnumber : head->unitnumber_backup;
+
+	if (!head->name.empty()) {
+		row->name = head->name;
+	} else if (!head->name_backup.empty()) {
+		row->name = head->name_backup;
+	} else {
+		row->name.clear();
+	}
+
+	if (head->group_id != DEFAULT_GROUP) {
+		row->group_id = head->group_id;
+	} else if (head->group_id_backup != GroupID::Invalid()) {
+		row->group_id = head->group_id_backup;
+	} else {
+		row->group_id = head->group_id;
+	}
+}
+
+/**
+ * R3R (第 156 轮 / 落地清单 ⑦): reconcile the segment table with the live cars.
+ *
+ * Segment rows carry the R3R segment traits and are rewritten at every commit point
+ * (R3RSyncSegmentTraits() / R3RSyncHiddenSegmentTraits()), yet three situations can
+ * leave "a row without a car" or "a car with an empty row" behind:
+ *  - the R3SG chunk restores rows verbatim, so a savegame written between two commit
+ *    points can carry rows whose car is long gone;
+ *  - a downgrade / merge path which missed its R3RSegmentFree() leaks such a row;
+ *  - rows written by a build predating the "fall back to the live fields" rule can be
+ *    completely empty.
+ *
+ * Two deliberately conservative actions:
+ *  - a row no car claims is freed, but only when it is entirely empty (no order list
+ *    pointer, no number, no name, no group): anything else may still be a live borrow
+ *    and is left alone;
+ *  - a claimed row whose three traits are all empty is rebuilt from its segment head,
+ *    preferring the parked copies (a segment which lent its traits away keeps them in
+ *    the *_backup fields) -- the same value rule R3RSyncHiddenSegmentTraits() uses.
+ *
+ * No order list pointer, car field or chain order is touched, so this is safe to run
+ * while the map is already live.
+ *
+ * @param tag Short tag for the debug log.
+ */
+static void R3RSegmentReconcileRows(const char *tag)
+{
+	/* Which segments are still claimed, and by which car -- their head (the ★ car, or
+	 * for the first segment the chain head). Every car of a segment shares its ID, so
+	 * the head is the car which opens it in chain order. */
+	std::vector<const Train *> claimed(R3RSegmentPoolSize(), nullptr);
+
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->type != VehicleType::Train) continue;
+		const Train *const t = Train::From(v);
+		const uint16_t id = t->r3r_segment_id;
+		if (id == R3R_SEGMENT_NONE || id > R3R_SEGMENT_ID_MAX || id >= claimed.size()) continue;
+
+		const Vehicle *const prev = t->Previous();
+		const bool seg_front = t->IsSegmentFront() || prev == nullptr || prev->r3r_segment_id != id;
+		if (seg_front && (claimed[id] == nullptr || !claimed[id]->IsSegmentFront())) claimed[id] = t;
+	}
+
+	uint orphan = 0;
+	uint rebuilt = 0;
+
+	for (size_t id = 1; id < claimed.size(); id++) {
+		R3RSegmentRecord *const row = R3RSegmentGet(static_cast<uint16_t>(id));
+		if (row == nullptr) continue;
+
+		const Train *const head = claimed[id];
+		if (head == nullptr) {
+			if (row->orders != nullptr || row->unitnumber != 0 || !row->name.empty() ||
+					row->group_id != GroupID::Invalid()) {
+				continue;	// Still carries something: possibly a live borrow.
+			}
+			R3RSegmentFree(static_cast<uint16_t>(id));
+			orphan++;
+			continue;
+		}
+
+		if (row->unitnumber != 0 || !row->name.empty() || row->group_id != GroupID::Invalid()) continue;
+
+		/* R3R (第 159 轮 / q-0=贰乙): a chain head which is currently the borrower
+		 * of another segment's traits (r3r_orders_borrowed) carries the **control**
+		 * segment's unitnumber / name / group_id in its live fields, so those must
+		 * never be copied in as this segment's own values -- only the parked copies
+		 * count. (A section head which is not the chain head never borrows.) */
+		const bool borrowed = head->r3r_orders_borrowed;
+		if (head->unitnumber_backup != 0) {
+			row->unitnumber = head->unitnumber_backup;
+		} else if (!borrowed) {
+			row->unitnumber = head->unitnumber;
+		}
+		if (!head->name_backup.empty()) {
+			row->name = head->name_backup;
+		} else if (!borrowed) {
+			row->name = head->name;
+		}
+		if (head->group_id_backup != GroupID::Invalid()) {
+			row->group_id = head->group_id_backup;
+		} else if (!borrowed) {
+			row->group_id = head->group_id;
+		}
+		rebuilt++;
+	}
+
+	if (orphan == 0 && rebuilt == 0) return;
+
+	R3RDbgWrite("SEGROW-RECONCILE tag=%s rows=%u orphan=%u rebuilt=%u\n",
+			tag, (uint)claimed.size(), orphan, rebuilt);
+}
+
+std::vector<const Vehicle *> R3RSegmentHiddenHeads(const Vehicle *chain)
+{
+	std::vector<const Vehicle *> heads;
+	if (chain == nullptr) return heads;
+
+	/* A segment starts at a car which carries #VehicleRailFlag::SegmentFront (★);
+	 * the leading segment starts at the chain head and is skipped by starting the
+	 * walk at the second car. Articulated parts belong to their parent's section
+	 * and are never section heads, so they are passed over here as well.
+	 *
+	 * 第 159 轮 / q-0=贰乙：子行列出的是"非控制段"，而控制段 = 命令所有者段。
+	 * 于是控制段那一段不再列子行 —— 它的特质已经由链头那一行显现。
+	 *
+	 * 第 170 轮 / R170-C：链头段自己也要列出来（只要它不是控制段）。乙口径下控制段
+	 * 与链头段完全可以不是同一段（车库"拖到列车前面"、耦合并入整段都是），这时链头
+	 * 那一行显现的是**控制段**的特质，而链头段自己的号/名只停在自己的行里 —— 不给它
+	 * 子行，玩家在车队列表里就看不到这一段（现场 R170-C：车库拖动耦合出来的那一段
+	 * 没有子行）。承载者仍用链头本身：段 ID 放在 r3r_hidden_section，绘制子行时走
+	 * R3RSegmentSection*() 读本段的行，不会读成链头手上的控制段特质。 */
+	const Vehicle *const ctrl = R3RSegmentControlHead(chain);
+	if (ctrl != nullptr && ctrl->r3r_segment_id != chain->r3r_segment_id) heads.push_back(chain);
+	for (const Vehicle *v = chain->Next(); v != nullptr && v->type == VehicleType::Train; v = v->Next()) {
+		if (v->IsArticulatedPart()) continue;
+		if (ctrl != nullptr && v == ctrl) continue;
+		if (Train::From(v)->IsSegmentFront()) heads.push_back(v);
+	}
+	return heads;
 }

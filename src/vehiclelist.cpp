@@ -14,6 +14,7 @@
 #include "vehiclelist.h"
 #include "vehiclelist_func.h"
 #include "group.h"
+#include "couple_group.h"
 #include "tracerestrict.h"
 #include "core/serialisation.hpp"
 
@@ -175,11 +176,27 @@ bool GenerateVehicleSortList(VehicleList *list, const VehicleListIdentifier &vli
 
 		case VL_GROUP_LIST:
 			if (vli.index != ALL_GROUP) {
+				const GroupID group = vli.ToGroupID();
 				for (const Vehicle *v : Vehicle::IterateTypeFrontOnly(vli.vtype)) {
-					if (!HasBit(v->subtype, GVSF_VIRTUAL) && v->IsPrimaryVehicle() &&
-							v->owner == vli.company && GroupIsInGroup(v->group_id, vli.ToGroupID())) {
-						add_veh(v);
+					if (HasBit(v->subtype, GVSF_VIRTUAL) || !v->IsPrimaryVehicle() || v->owner != vli.company) continue;
+
+					/* R3R (第 155 轮 / 落地清单 ⑤): a chain is listed in a group when the group is
+					 * the one of its control segment (the chain head), or the one of any of the
+					 * chain's hidden segments -- those are shown as sub-rows of this row (P2a),
+					 * so a segment listed in this group has to be reachable from here. */
+					bool in_group = GroupIsInGroup(R3RSegmentGroupID(v), group);
+					if (!in_group && v->type == VehicleType::Train) {
+						for (const Vehicle *const seg : R3RSegmentHiddenHeads(v)) {
+							/* R3R (第 170 轮 / R170-C): the sub-row lists its own segment, so it is
+							 * that segment's group which decides -- the carrier accessor would answer
+							 * with the control segment's group for the chain head's own segment. */
+							if (GroupIsInGroup(R3RSegmentSectionGroupID(seg), group)) {
+								in_group = true;
+								break;
+							}
+						}
 					}
+					if (in_group) add_veh(v);
 				}
 				break;
 			}

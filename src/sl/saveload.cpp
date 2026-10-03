@@ -3886,6 +3886,13 @@ static void ResetSaveloadData()
 
 	extern void ClearVehicleOldOrderLoadState();
 	ClearVehicleOldOrderLoadState();
+
+	/* R3R (第 152 轮): the segment identity table is a file-static, so a game
+	 * loaded into the same process must start from an empty table -- otherwise
+	 * the rows of the previous game would survive into a savegame which has no
+	 * R3SG chunk at all. */
+	extern void R3RSegmentTableReset();
+	R3RSegmentTableReset();
 }
 
 /**

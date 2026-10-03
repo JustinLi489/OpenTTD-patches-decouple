@@ -267,9 +267,42 @@ public:
 
 	/**
 	 * Get the type of order of this order.
+	 *
+	 * R3R (KI-302): the upstream layout stores the order type in bits 0..3 and uses
+	 * bits 4..7 as type-specific payload (stop location bits 4..5, non-stop bits
+	 * 6..7, condition comparator bits 5..7). The R3R types #OT_DECOUPLE,
+	 * #OT_GOTO_COUPLE and #OT_WAIT_COUPLE therefore use base 15 (#OT_DECOUPLE) in
+	 * bits 0..3 plus a 2 bit sub-type in bits 4..5. This keeps bits 4..5 free for
+	 * #OrderStopLocation on regular orders; the old 5 bit encoding made "middle"
+	 * / "through" stop locations collide with #OT_WAIT_COUPLE.
 	 * @return the order type.
 	 */
-	inline OrderType GetType() const { return (OrderType)GB(this->type, 0, 5); }
+	inline OrderType GetType() const
+	{
+		const uint8_t base = GB(this->type, 0, 4);
+		if (base != static_cast<uint8_t>(OT_DECOUPLE)) return static_cast<OrderType>(base);
+		return static_cast<OrderType>(base + GB(this->type, 4, 2));
+	}
+
+	/**
+	 * Set the type of order of this order.
+	 *
+	 * R3R (KI-302): types below #OT_DECOUPLE keep the upstream 4 bit base and leave
+	 * the payload bits 4..7 untouched (they are written by the type-specific
+	 * setters such as #SetStopLocation). The R3R types are stored as base
+	 * #OT_DECOUPLE plus a sub-type in bits 4..5 and clear the remaining payload
+	 * bits, matching the byte the old full assignment used to write.
+	 * @param type the order type to set.
+	 */
+	inline void SetType(OrderType type)
+	{
+		if (type < OT_DECOUPLE) {
+			SB(this->type, 0, 4, static_cast<uint8_t>(type));
+		} else {
+			this->type = static_cast<uint8_t>(OT_DECOUPLE) |
+					((static_cast<uint8_t>(type) - static_cast<uint8_t>(OT_DECOUPLE)) << 4);
+		}
+	}
 
 	void InvalidateGuiOnRemove();
 	void Free();
@@ -292,6 +325,15 @@ public:
 	void MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple);
 	void MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load = ODC_ANY, CargoType cargo = CT_COUPLE_ANY_CARGO, bool depot_target = false);
 	void MakeWaitCouple();
+
+	/**
+	 * R3R (KI-302): convert the order type of this order from the old 5 bit
+	 * encoding (OT_GOTO_COUPLE = 0x10, OT_WAIT_COUPLE = 0x11) to the current
+	 * encoding. Does nothing when @p old_encoding is false.
+	 * @param old_encoding whether this order was read from a savegame which used
+	 * the old 5 bit order type encoding.
+	 */
+	void R3RMigrateOldTypeEncoding(bool old_encoding);
 
 	/**
 	 * Is this a 'goto' order with a real destination?
@@ -881,29 +923,6 @@ public:
 	{
 		this->SetXDataHigh(group == INVALID_COUPLE_GROUP ? 0 : static_cast<uint16_t>(group.base() + 1));
 	}
-
-	/**
-	 * Get the order strategy for the first part of the train after decoupling.
-	 * @pre IsType(OT_DECOUPLE).
-	 */
-	inline OrderDecoupleOrdersFlags GetDecoupleFirstOrdersType() const { return this->extra != nullptr ? (OrderDecoupleOrdersFlags)this->extra->decouple_first_orders : ODOF_KEEP_ORDERS; }
-	/**
-	 * Get the order strategy for the second part of the train after decoupling.
-	 * @pre IsType(OT_DECOUPLE).
-	 */
-	inline OrderDecoupleOrdersFlags GetDecoupleSecondOrdersType() const { return this->extra != nullptr ? (OrderDecoupleOrdersFlags)this->extra->decouple_second_orders : ODOF_KEEP_ORDERS; }
-	/**
-	 * Set the order strategy for the first part of the train after decoupling.
-	 * @param orders_type The order strategy.
-	 * @pre IsType(OT_DECOUPLE).
-	 */
-	inline void SetDecoupleFirstOrdersType(OrderDecoupleOrdersFlags orders_type) { this->CheckExtraInfoAlloced(); this->extra->decouple_first_orders = to_underlying(orders_type); }
-	/**
-	 * Set the order strategy for the second part of the train after decoupling.
-	 * @param orders_type The order strategy.
-	 * @pre IsType(OT_DECOUPLE).
-	 */
-	inline void SetDecoupleSecondOrdersType(OrderDecoupleOrdersFlags orders_type) { this->CheckExtraInfoAlloced(); this->extra->decouple_second_orders = to_underlying(orders_type); }
 
 	/**
 	 * Set variable we have to compare.

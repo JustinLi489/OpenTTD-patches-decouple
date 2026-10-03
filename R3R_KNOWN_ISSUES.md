@@ -6834,3 +6834,3498 @@ fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\
 - 只改了折叠判据的参照系；"解耦后两半贴着走的几何/包围盒"（KI-214 那一族）不在本轮。
 - 未给 `CRT-FOLD` 加边沿触发闸门（`R3RDbgEdge`），每次命中都会写一行；因 `ProcessOrders` 只在"刚离站"那一 tick 放行，实际不会刷屏。
 
+---
+
+## 第 152 轮（2026-09-29）：KI-243 段身份 + 特质边表 —— 设计**固化**，尚未写码
+
+- **ID**：KI-243
+- **一句话**：把「段」升格为第一类公民（持久**段 ID** + 按段 ID 索引的**特质边表**），让排程 / 车号 / 名称三类特质只有**一份权威寄存**，从结构上消灭「控制段 ≠ 链头」这条「打地鼠」的根。
+- **来源**：玩家 2026-09-29 逐条拍板（P1~P6）；完整决策见工作区 `R3R_segment_identity_decision.md`。
+- **状态**：**待实现**（设计已固化，未改任何源码）。
+- **严重度**：中（结构性缺陷，当前靠 KI-215b / KI-239 / KI-237 等逐点补丁维持；补丁已多次走到边界）。
+
+### 决策要点（P1~P6）
+
+| 项 | 裁决 | 结论 |
+|---|---|---|
+| P1 | **甲** | **强制不变式：控制段 == 链头所在段**（`r3r_priority` 最小者必为链头段）；耦合/翻转/解挂/车库编辑四个提交点末尾重排优先级；借用层保留为兜底 |
+| P2a | — | 隐性段在车队列表里是**挂在控制段那一行的子行** |
+| P2b | — | 子行**能选中**，但所有命令**映射回控制段链头**；先把 `IsPrimaryVehicle()` 守卫改成「段头也放行」 |
+| P2c | — | 「图例」= **车队列表的图例** |
+| P3 | **B** | **段 ID 存在段内每一节车上**；★ 移到段物理前端 = 重算段内链序第一辆，不迁移数据 |
+| P4 | **后者** | 冲突时把链头自己那一套**推回它的段 ID 行**，谁也不丢；「丢弃」场景必须 `ReleaseID` 还号池 |
+| P5 | 认可 | 边表只存**指针 + 订单位置**，不存 `OrderList` 本体；链头 `orders` 仍是投影 |
+| P6 | — | 旧档**读档时跑一次**向上迁移，迁完**旧字段转只读** |
+
+### 关键词条关系
+
+- KI-215b（`R3RPushProgressToOwner`）、KI-239（`ORD-RETURN-ORPHAN`）、KI-237/KI-238（车号取回）在甲口径下**退化为探针或结构性不可能**；KI-04（借用索引冻结）可随之收口。
+- KI-157（`vehicle_gui.cpp:96-113` 控制段注释）需按不变式改写。
+
+### 待实现清单（分段，每段独立可编译可复测）
+
+1. 数据层：`SegmentRecord` + 段 ID 分配器（freelist）+ 存档块（扩 `R3VP` 或新开 `R3SG`）。
+2. 不变式层（甲）：`R3RGetControlSegment(chain)` + 四个提交点末尾强制重排 + 读档跑一次。
+3. 特质读写统一走「控制段行」；`name_backup`（当前 `NOSAVE`，`vehicle_base.h:380`）正式落边表。
+4. ★ 迁移简化（B3）。
+5. 车队列表：`GenerateVehicleSortList`（`src/vehiclelist.cpp`，现只收 `IsPrimaryVehicle()`）+ 子行 + 图例 + 守卫放宽（`vehicle_gui.cpp:4054`/`:4072`、`vehiclelist.cpp:168`）。
+6. 读档迁移（P6）。
+7. 兜底与探针。
+
+### 性能结论（回应 P3 的「会不会巨量延迟」）
+
+热路径不查表（链头 `orders` 仍是直接指针投影）；段 ID 只在事件级被读；
+表用 `std::vector<SegmentRecord>` + freelist（**不要 `unordered_map`**）；
+本方案**取代**现状的整链线性扫描（`R3RGetSegmentHeads` / `R3RGetLowestPriority` / `R3RRebuildCouplePriorities`），
+O(链长) → O(1)，净开销可能为负；内存每车 +1 个 `uint16_t`（对齐后 +2~8 B），10 000 车 ≈ +20~80 KB。
+**唯一真实代价 = 同步点变多**（每节车都存 ID），对策：调试期一致性探针 + 读档后全链校验。
+
+### 风险（详见备忘 §6）
+
+甲口径的重排可能影响 `couple_owner` 现有语义（需逐场景复核 KI-201 / KI-239 / KI-215b）；
+`Vehicle` 加字段 vs 稀疏块未定；车队列表改造面跨 5 文件；与「按段刷新/按段运费」
+（`R3R_per_segment_linkgraph_memo.md`）的段边界判定（`★` → `segment_id`）需一并改。
+
+## 第 153 轮（2026-09-29）：KI-244 解挂后两半排程归属（ODOF）—— 数据 / 命令 / 界面 / 执行四层接线
+
+- **ID**：KI-244
+- **一句话描述**：上游遗留的 `OrderDecoupleOrdersFlags`（`ODOF_KEEP_ORDERS` / `ODOF_KEEP_ORDERS_NO_LOAD` / `ODOF_INHERIT_ORDERS` / `ODOF_WAIT_FOR_COUPLE`，`order_type.h`）与 `decouple_first_orders` / `decouple_second_orders` 一直**零使用点**（UI 无入口、执行层不读）；本轮把它整条打通，让 DECOUPLE 订单可逐条声明"解出来的两半各自保留什么排程"，不再由 `DecoupleTrain()` 的固定口径单方面决定。
+- **来源**：记忆 ID 18491399（部分解挂的排程归属与四种模型 §10，推荐形态 = 模型 3「由 DECOUPLE 订单显式声明」）、35644846（四风险点调研）；T8701 两次解挂场景（记忆 ID 67811241）要求两次归属**相反**，单向固定规则做不出。
+- **状态**：已实现 + 已编译（游戏内复测待做）。
+- **严重度**：中（能力/行为缺口，决定"两次解挂、归属相反"的场景能否跑通）。
+
+### 四层落点
+
+1. **数据层**：`order_type.h` 的 `OrderDecoupleOrdersFlags` + `MOF_DECOUPLE_ORDERS`（两位 nibble：低 = 前半/留下，高 = 后半/解出）；`order_base.h` 的 `SetDecoupleFirstOrdersType` / `GetDecoupleFirstOrdersType` / `SetDecoupleSecondOrdersType` / `GetDecoupleSecondOrdersType`；`sl/order_sl.cpp` 的覆盖位（随 `mof` 存档，无需新版本号）。
+2. **命令层**：`order_cmd.cpp` 的 `MOF_DECOUPLE_ORDERS` 白名单 —— 漏一条就会像 KI-124 那样"UI 点选静默失败"。
+3. **界面层**：`widgets/order_widget.h` 的 `WID_O_DECOUPLE_FIRST_ORDERS` / `WID_O_DECOUPLE_SECOND_ORDERS` 两个下拉；`order_gui.cpp` 的标签、回显、下拉列表（`DP_YARD_DECOUPLE_ORDERS`）与点击分派；`lang/english.txt` + `lang/simplified_chinese.txt` 各 2 串。
+4. **执行层（本轮新写）**：`src/train_cmd.cpp` 新增 `R3RApplyDecoupleOrdersStrategy()`（紧邻 `R3RAdvanceAfterDecouple()`，在 `DecoupleTrain()` 之前）；`DecoupleTrain()` 内**先**在 `OrderList *const driving_orders = v->orders;` 处读出两位声明（早于任何 `v->orders` 改写），随后对 `v`（`R3RCheckTtSync(v,"decouple-v")` 之后）与 `u`（无表兜底 `WAIT_COUPLE` 之后、`R3RPushProgressToOwner()` 之前）各调用一次。
+
+### 四种声明的执行语义
+
+| 声明 | 执行动作 |
+|---|---|
+| `ODOF_KEEP_ORDERS`（默认，=0） | 一律不动 —— 完全沿用旧的自动口径；**旧档/未声明的解挂行为与此前逐字等价** |
+| `ODOF_KEEP_ORDERS_NO_LOAD` | `vehicle_flags.Set(VehicleFlag::StopLoading)`（只覆盖它正要停的那一站，`BeginLoading()` 会清掉） |
+| `ODOF_WAIT_FOR_COUPLE` | 就地在**自己**的 `orders` 上插 `WAIT_COUPLE`（同步 `cur_real` / `cur_implicit` / `cur_timetable` 三个索引 + `InvalidateVehicleOrder()`），供后续机车挂走 |
+| `ODOF_INHERIT_ORDERS` | **只校验、不搬运**：持有 `driving_orders` 的那半记 `inherit-ok`，另一半记 `inherit-skip` |
+
+### 刻意未做（边界，勿当缺陷）
+
+- `INHERIT_ORDERS` 声明在"未持有该份计划"的那半时**不把 `OrderList` 交过去**：①两半不得别名同一张表（KI-180）；②`driving_orders` 就是命令所有者自己的计划，交出去等于把它的排程抽走；③"复制余下条目"需要新的深拷贝路径。故本轮只报 `inherit-skip`，把决定留给后续轮次。
+- `orders_backup` 仍是**单层**（记忆 35644846 风险点 ①）：`INHERIT` 真搬运需要"排程栈"，未动。
+- 解挂侧"不成段链拒绝 decouple"（记忆 17190446）仍未做。
+- 等待点仍是"就地在当前索引插一条"，不是"按（站, 解挂）配对"（记忆 67811241 硬伤 ③）。
+
+### 探针
+
+每次解挂多一行（写 `build\R3R_debug.log`）：
+
+`DECOUPLE-ODOF first=%d second=%d v_tag=%s u_tag=%s v_orders=%d u_orders=%d v_noload=%d u_noload=%d`
+
+`*_tag` 取值：`keep` / `nolooad` / `wait-inserted` / `wait-already` / `wait-notable` / `wait-nowhere` / `wait-allocfail` / `inherit-ok` / `inherit-skip` / `not-applied`。
+
+### 构建自证（2026-09-29 02:42）
+
+复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；guard = `incremental is safe`；`[675/675] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`src\train_cmd.cpp` 02:17:45 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 02:40:15 → `build\openttd.exe` 02:42:38（51 432 960 B）；`read_lints` 0 条；exe 内命中 `DECOUPLE-ODOF` / `inherit-skip` / `wait-inserted` / `nolooad`。
+
+注：本轮实走 675 步（接近全量），说明第 152 轮的界面层/命令层源码此前从未编译过，本轮一并编入。
+
+### 待复测判据
+
+1. 未声明策略的解挂 ⇒ `DECOUPLE-ODOF first=0 second=0 v_tag=keep u_tag=keep`，行为与旧版逐字一致。
+2. 前半选 `WAIT_FOR_COUPLE` ⇒ 解挂后前半就地出现 `WAIT_COUPLE`（`v_tag=wait-inserted`），订单窗口光标停在它上面；后半选它时同理（`u_tag=wait-inserted`）。
+3. 本来就无排程的那半选 `WAIT_FOR_COUPLE` ⇒ 走旧的兜底分支、`*_tag=wait-already`（不重复插）。
+4. 后半选 `KEEP_ORDERS_NO_LOAD` ⇒ `u_noload=1`，该半到站不装货，下一站起恢复。
+5. 未持有计划的那半选 `INHERIT_ORDERS` ⇒ `*_tag=inherit-skip`，排程不变、无崩溃（已知边界）。
+6. 存档往返：旧 DECOUPLE 订单读回后两位仍为 `KEEP_ORDERS`（`first=0 second=0`），界面下拉显示默认项。
+7. 订单窗口：两个下拉可点、可改、可回显；改完立刻生效（无需重开窗口）。
+
+## 第 154 轮（2026-09-29）：KI-245 段特质同步在「空名字」上必崩（已修）+ 段独立显示/特质借用现状澄清
+
+- **玩家报告**：①游戏发生**无断言崩溃**（`C:\Users\冯洁敏\Documents\OpenTTD\crash-20260928T185855Z.log`，崩溃时 exe Build date Sep 29 2026 02:21:33＝第 152 轮段表那一版）；②"我观察到没有所谓的段独立显示和正确的特质借用（名字方面）"。
+- **现场**：`build\R3R_debug_1.log` 最后一行 = `SEGID-SYNC tag=couple head=50 nseg=2`，之后再无任何行 ⇒ 崩在紧随其后的 `R3RSettleChainSegments` 第二步 `R3RSyncControlTraits`。
+
+### KI-245（已修，严重度 高＝崩溃）：`TinyString::c_str()` 的空串是 nullptr
+
+- **崩溃栈**：`R3RSyncControlTraits`(train_cmd.cpp:4576) → `R3RSettleChainSegments`(:4602) → `Couple`(:9276)，最内层 `std::basic_string::_Equal` → `_Narrow_char_traits::length` → `strlen`，寄存器 `RCX=0`、异常 `C0000005` 读地址 `0x0`。
+- **根因**：`BaseConsist::name`（`src/base_consist.h:60`）是 **`TinyString`**，不是 `std::string`；`TinyString` 内部只有 `char *storage = nullptr`（`src/core/tinystring_type.hpp:25`），**空名字时 `c_str()` 返回 `nullptr`**（:106）。原行
+  `if (row->name != ctrl->name.c_str()) { row->name = ctrl->name.c_str(); changed = true; }`
+  把 `nullptr` 交给了 `std::string::operator!=(const char*)` ⇒ `traits_type::length(nullptr)` ⇒ 崩；其右侧赋值分支（`row->name = nullptr`）同样是 UB。
+- **必然性**：玩家给列车命名是少数情况 ⇒ 被 settle 的段头名字为空是**常态** ⇒ 耦合/解挂/车库编辑/读档任一提交点跑到这里就崩，与车流、与是否真的"有段特征"都无关（不是偶发）。
+- **修法（仅改 `src/train_cmd.cpp` 一行）**：改走 `TinyString` 自己的设施——
+  `if (!(ctrl->name == row->name.c_str())) { row->name = ctrl->name; changed = true; }`
+  其中 `TinyString::operator==(const char*)`（tinystring_type.hpp:98-103）把 `nullptr` 判定为 `empty()`；`std::string::c_str()` 侧恒非 null；赋值经 `TinyString::operator std::string_view()`（:108）隐式转换，空串映射为空串。**不新增 include、不动任何头文件、不改存档格式。**
+- **同类隐患（第 179 轮 KI-272 已清零）**：`src/vehicle_cmd.cpp` 的 `CloneVehicleName()` 里 `std::string new_name = src->name.c_str();`（本条备案时在 `:1424`，经第 177/178 轮增行后现为 `:1488`）在 `TinyString` 下也是 UB，其唯一调用点有 `if (!v_front->name.empty())` 守卫 ⇒ 当时不可达；**第 179 轮已改为 `std::string new_name(static_cast<std::string_view>(src->name));`，并逐个复核全仓 `name` / `name_backup` 的 `.c_str()` 站点，确认再无同类点**（详见「第 179 轮」小节）。**纪律**：R3R 新代码凡碰 `BaseConsist::name`（车辆名）或 `name_backup`，一律用 `TinyString` 的比较运算符或 `std::string_view`，**禁止把 `.c_str()` 直接交给 `std::string`**。
+- **构建自证（2026-09-29 03:07）**：复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；guard = `incremental is safe`；`[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`src\train_cmd.cpp` 03:05:39 → `build\openttd.exe` 03:07:15（51 432 960 B）；`read_lints` 0 条。
+- **待复测判据**：①同一场景（耦合、head=50 nseg=2）不再崩溃，且 `SEGID-SYNC tag=couple head=50` 之后紧跟 `SEGTRAIT-SYNC tag=couple head=50 seg=…`；②未命名列车 settle 不崩（空名字路径）；③已命名列车的段名字照旧同步、不丢；④解挂 / 车库编辑 / 读档三个提交点同样不崩；⑤存档往返后 `R3SG` 各行读回、`Vehicle::r3r_segment_id` 一致。
+
+### KI-246（已修，严重度 中；第 155 轮完成）：段独立显示与特质借用的「读取侧」尚未切换
+
+- **现状（已核实，与玩家观察一致）**：落地的只有**数据层**——`R3RSegmentRecord` 表（`couple_group.h:517`）＋四个提交点 settle（`couple` :9271 / `decouple-v`,`decouple-u` :6536-6537 / `depot-edit` :5093 / `load` :4717,:4747）＋存档（`R3SG` 稀疏块，`Vehicle::r3r_segment_id` 随车存档）。而：
+  - `R3RSyncControlTraits`（:4558-4587）是**只写**（链头 → 行）；全仓 `R3RSegmentGet()` 的调用点只有 :4565 这一处写入点，**没有任何地方读 `R3RSegmentRecord::name/unitnumber/group_id`**；
+  - 该函数注释本身就写着 *"reading stays on the chain head for now (it is the same object), the row is what will survive a load (P6)"*（:4548-4549）；
+  - `src/vehiclelist.cpp` 内**零**段相关代码，`GenerateVehicleSortList()` 仍只收 `IsPrimaryVehicle()` ⇒ 车队列表没有段子行。
+- ⇒ "没有段独立显示、没有正确的特质借用（名字）"**与当前实现完全一致**：不是回归，也不是本次崩溃造成的；这两件事正是第 152 轮落地清单的第 3 项（三特质读写统一走控制段行）与第 5 项（车队列表段头枚举＋子行＋图例＋守卫放宽）。
+- **下一步（按第 152 轮已拍板口径）**：P3 读侧切换（名字/`GetUnitNumber`/`group_id` 先查控制段行）→ P2a 车队列表收段头＋子行 → P2b 子行选中映射回控制段链头（放宽 `vehicle_gui.cpp` 与 `vehiclelist.cpp` 的 `IsPrimaryVehicle()` 守卫）→ P2c 图例。另需一并处理：读侧切换后 `R3RSyncControlTraits` 要从"settle 时写一次"升级为"特质被改动时即写"，否则玩家改名/改号后到下一次提交点之前行内是旧值。
+- **第 155 轮状态：已修**（读侧切换 + 车队列表子行/图例均已落地并编译通过），详见下文「第 155 轮」小节。
+
+---
+
+## 第 155 轮（2026-09-29）：段独立显示 + 特质借用读取侧切换（落地清单 ③ + ⑤）—— 已实现 + 已编译
+
+**口径来源**：`R3R_segment_identity_decision.md` §1 的 P1-甲 / P2a / P2b / P2c / P3。**入口问题**：第 154 轮玩家报告「我观察到没有所谓的段独立显示和正确的特质借用（名字方面）」，第 154 轮 KI-246 已定性为"读取侧根本没接"，本轮把读取侧与显示层接上。
+
+### KI-247（已修，严重度 中）：段特质只有"写侧"，全仓无任何地方读 `R3RSegmentRecord`
+
+- **读侧新增**（`couple_group.cpp`）：内部判据 `R3RSegmentTraitRow(const Vehicle *v)`——段与链头同 `r3r_segment_id`（即控制段）、或没有行（单段链 / 未迁移的旧档）⇒ 返回 `nullptr` 表示"读车上的字段"；否则返回该段自己的行。三个访问器一律"先查行、再回退"：
+  - `R3RSegmentUnitNumber(v)`：行内车号非 0 用之，否则回退 `v->First()->unitnumber`（控制段/中段车与历史行为逐字节一致，隐性段拿不到自己的号时显示所属列车的号而不是 0）；
+  - `R3RSegmentName(v)`：行内名字非空用之，否则回退**本车自己的名字**（不是链头名字）——控制段时两者是同一个对象故行为不变，隐性段没有自己的名字时保持无名；特意**不**回退链头名字，否则子行会看起来像上一行的副本；
+  - `R3RSegmentGroupID(v)`：行内组有效用之，否则回退 `v->First()->group_id`（耦合时 `R3RNormaliseChainGroups` 已把全链统一到控制段的组，故等价）。
+  - 声明在 `couple_group.h:604-606`；`R3RSegmentHiddenHeads(v)`（`couple_group.cpp:975`）列出 ★ 段头（跳过链头段与 artic part），供列表层枚举隐性段。
+- **读取点全部接线**（4 个文件 5 处）：`strings.cpp:2367-2369`（`{VEHICLE}` 的名字 / 车号 / 组三段，仅 Train 且 `R3RSegmentTraitRow` 命中时走段行 ⇒ 控制段与普通列车一字不变）、`vehiclelist.cpp:187-195`（组列表归属）、`vehicle_gui.cpp:391`（列宽 `max_unitnumber`）、`:2410/:2413/:2485`（子行名字/车号/组）、`group_gui.cpp:784`（组窗口行标记）。
+- **写侧不动**：`R3RSyncControlTraits`（`train_cmd.cpp:4558` 一带）仍负责"链头 → 控制段行"，隐性段的行仍由 settle 在四个提交点从车上收集（`R3RSettleChainSegments`：couple / decouple-v,u / depot-edit / load）。
+
+### KI-248（已实现，严重度 中）：车队列表没有段子行 / 没有图例（P2a / P2b / P2c）
+
+- **子行（P2a）**：`BaseVehicleListWindow::BuildVehicleList()`（`vehicle_gui.cpp:381-392`，仅 `grouping == GB_NONE`）在每条 Train 链的行之后，为其 `R3RSegmentHiddenHeads(v)` 各追加一行 `vehgroups.emplace_back(it, it + 1, seg)`——**共用链的迭代器**（所以利润/车龄/排序键等链级数字天然是链的，且不会重复画），段身份单独放在新字段 `GUIVehicleGroup::r3r_hidden_section`（`vehicle_gui_base.h:50`，构造参数 `:53`，判据 `R3RIsSegmentSubRow()` `:57`）。
+- **P2b 不需要放宽任何 `IsPrimaryVehicle()` 守卫**：子行共用链的行迭代器 ⇒ `GetSingleVehicle()` 恒为链头 ⇒ 点击子行（`vehicle_gui.cpp:2853-2859`，`VehicleClicked` + `ShowVehicleViewWindow`）自动映射到控制段链头，命令与"展开/打开窗口"全部落在链上。备忘里原先写的"放宽 `vehicle_gui.cpp:4054/:4072` 与 `vehiclelist.cpp:168`"因此**判定为不必要**（那两处分别是 StartStop 回调与 `VL_SHARED_ORDERS` 入口，段头根本到不了），未改。
+- **排序后重排**：`R3RReorderSegmentSubRows()`（`vehicle_gui.cpp:710`）先扫一遍"有没有子行"（没有就只付这次扫描的开销），把子行按所属链聚合、链内按 `R3RGetSegmentPosition` 恢复段序，再按链的顺序整体回写；由**唯一**排序入口 `SortVehicleList()`（`:755-758`，GB_NONE）调用 ⇒ 车辆列表窗口与组窗口（`group_gui.cpp:499/533`）共用。
+- **绘制**：pass1（`:2340-2343`）子行只画段首那一节（新增 `R3RSegmentSubRowImageRect()` `:2182`，宽度 `GetSingleVehicleWidth(front, EIT_IN_LIST)`，RTL 靠右），且不画链级数值行；pass2（`:2408-2490`）名字走 `R3RSegmentName(shown)`、车号走 `R3RSegmentUnitNumber(shown)`，缩进 `ScaleGUITrad(8)`，行首画灰色标记 `STR_VEHICLE_LIST_SEGMENT_SUBROW`；组的显示与其所属链相同（`R3RSegmentGroupID(shown) == R3RSegmentGroupID(vc)`）时**不再重复显示**，避免子行只是上一行的副本。
+- **图例（P2c）**：车辆列表窗口没有独立的图例控件，本轮把"图例"落成子行行首的灰色 `第 {NUM}/{NUM} 段` 标记（新串 `STR_VEHICLE_LIST_SEGMENT_SUBROW` = **0x8860**，英 `Segment {NUM}/{NUM}` / 中 `第 {NUM}/{NUM} 段`）＋ 8px 缩进 ＋"只画一节车"三件套，足以区分父子行。
+- **连带复核**：`CountOwnVehicles` 跳过子行（`:349`，否则同一链被重复计数）；子行不参与 `GroupStatistics`（纯显示附加行）；`VL_GROUP_LIST` 判据改为"链的控制段在该组**或**该链任一隐性段在该组"（`vehiclelist.cpp:177-198`）⇒ 段级组归属（第 146 轮 KI-233 的"有效组集合"）在车队列表里能查到对应行。
+
+### 构建自证（2026-09-29 04:20）
+
+- 复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；本轮改了 `src/vehicle_gui_base.h` 与两个 `lang/*.txt` ⇒ 护栏判**全量**（REMOVED 620 obj）：日志 `[692/692] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`、`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- `build\openttd.exe` @2026-09-29 04:20:01（51 503 104 B）；obj 全部晚于源码：`vehicle_gui.cpp`03:51:55 → `.obj`04:16:16、`vehiclelist.cpp`03:49:50 → 04:16:14、`group_gui.cpp`03:49:44 → 04:09:07、`couple_group.cpp`03:51:23 → 04:06:53、`strings.cpp`03:49:44 → 04:14:33。
+- `build\generated\table\strings.h:4924` = `STR_VEHICLE_LIST_SEGMENT_SUBROW = 0x8860`；`build\lang\*.lng` 于 03:52 一并重新生成；`read_lints` 0 条。
+- 本轮源码注释统一标为「第 155 轮 / 落地清单 ③/⑤」（共 19 处、10 个文件）。
+
+### 待复测判据
+
+1. 一条含 ★ 隐性段的耦合链在车队列表里 = 链一行 + 每个隐性段一行；子行缩进、带灰色 `第 k/N 段`，链级数字（利润/车龄/速度）只在链行出现一次。
+2. 用第 146 轮起的段特质入口给隐性段改名/改号后，**子行显示该段自己的名字与车号**，链行不受影响；把段名清空后子行**不再冒出链名**（回退到"无名"而不是链头名字）。
+3. 点任意子行 = 选中/打开链头（车辆视图），与点链行等价（P2b）；对子行执行命令（发车/停止/回库）等价于对链头执行。
+4. 切换排序方式（含按年龄/延误）后，子行仍紧跟所属链下方，链内子行按段序排列。
+5. 组窗口：把某个隐性段放进组 G 后，该链出现在 G 的列表里（子行一并显示）；组窗口行标记按段自己的组。
+6. 存档往返（`R3SG` 稀疏块）后 1-5 仍成立（段名/段号/段组来自行，不是车字段）。
+
+### 残留 / 未做
+
+- **改名即时性（KI-246 原记，仍未做）**：控制段的行仍在提交点才从链头刷新（`R3RSyncControlTraits` 由 settle 调用），玩家改名/改号后若**不触发任何提交点**就切窗口，行内可能还是旧值；下一提交点（耦合 / 解挂 / 车库编辑 / 读档）后一致。彻底修法 = 把写入挂到改名 / 改号的命令回调上（`CmdRenameVehicle` / `CmdChangeVehicleUnitNumber` 一类）。
+- 子行的**选中高亮以链为单位**（窗口只存 VehicleID）⇒ 点一条子行会把该链所有行一起点亮；未做"只点亮被点的那一行"。
+- 组列表里子行**不按组过滤**：一条链进入列表后，它的隐性段子行总是全部显示，未只显示"在该组里的段"。
+- 落地清单 ⑥（读档向上迁移）与 ⑦（兜底与探针）仍未做。
+
+## 第 156 轮（2026-09-29）：段头迁移 / 车库挂车分支的特质遗漏 + 落地清单 ②③⑥⑦ 收尾 —— 已实现 + 已编译
+
+**口径来源**：第 155 轮小节「残留 / 未做」四条 + 玩家本轮追问「你在进行特质借用/返还代码修改的时候有没有考虑过车库内挂车的分支」。日志现场 `build\R3R_debug.log`（3901-3907 行）：
+
+```
+CHAIN-ATTRS head=48 n=21 FE=1 SEG=2
+SEGID-SYNC tag=couple head=48 nseg=2
+SEGTRAIT-SYNC tag=couple head=48 seg=1 unit=1 group=65534 borrowed=1
+SEGTRAIT-SYNC-SEC tag=couple head=48 seg=3 unit=0 group=65534 parkedname=0
+INVAR-CTRL tag=couple head=48 nseg=2 ctrl=48 ctrl_pri=2 owner=21 owner_pri=1 borrowed=1
+```
+
+`SEGTRAIT-SYNC-SEC seg=3 unit=0`：车底链（原链头 6，日志 3848 `COUPLE-OK loco=48 rear=8 consist=6`）在折叠修正里被段内翻转，★ 从 6 迁到 21，**段特质却留在 6 上** ⇒ 新段头的段行被写成"无号、无名字、默认分组"。
+
+### KI-249（已修，严重度 中）：段头迁移时"名字/分组"的停放副本不跟着走
+
+- **根因**：`R3RMoveSegmentOwner(from, to)`（`train_cmd.cpp:7236`）在段内翻转时只交换排程与 `r3r_orders_borrowed` / `r3r_priority`，`name_backup` 与 `group_id_backup` 留在旧段头车上（旧段头随后被 `NormaliseSubtypes` 降为段内普通车，再没人读它们）。
+- **修法**：`train_cmd.cpp:7275` 起新增两个 `std::swap`（`name_backup` / `group_id_backup`），与排程同款 swap 语义 ⇒ 回滚路径（`R3RUndoLogicalFlip` 会对同一对车反向再调一次）精确还原，异常态"新旧段头都带备份"也不丢一边。**`unitnumber_backup` 刻意不在这里动**：它的搬运牵着号池登记（`ReleaseID`/`UseID`），链头段仍由 `R3RRelocateFrontIdentity()` 统一处理。
+
+### KI-250（已修，严重度 低）：段头迁移后滞留在旧段头上的段号 —— 兜底找回
+
+- **修法**：新增 `R3RRecoverSegmentTraits(Train *seg)`（`train_cmd.cpp:4636`），在 `R3RSyncHiddenSegmentTraits()` 读行**之前**（`train_cmd.cpp:4718`）调用：段头自身三特质不全时，**只看本段**（从段头沿 `Next` 到下一个 ★ 之前）找"还带着停放副本"的车，搬上段头；只搬停放副本（拿 live 值会偷走段内普通车的身份）。命中写 `SEGTRAIT-RECOVER seg= unit= group= name=`。
+
+### KI-251（已修，严重度 中）：车库内挂车分支 —— 分组停放没跟上车号/车名
+
+- **根因**（`CmdMoveRailVehicle`，`train_cmd.cpp:2990-3090`）：被拖动块不再成为链头时，代码停放 `orders_backup`、`unitnumber_backup`、`R3RParkTrainName(src)`，**唯独没有 `R3RParkTrainGroupID(src)`** —— 分组只靠提交点的 `R3RNormaliseChainGroups()`（被 `IsFrontEngine()` 守卫）收敛，而被收敛掉的那一刻没有备份 ⇒ 玩家把这段拖回来时分组已经变成控制段的组。同类缺口还有紧随其后的上游语句"成为前端列 ⇒ `SetTrainGroupID(src, DEFAULT_GROUP)`"（`:3082`）：它只认"前端列身份"，会把玩家给该段设的分组直接抹成默认组。
+- **修法**：`train_cmd.cpp:3066`（与车号/车名并排）与 `:3082`（改成默认组**之前**）各补一次 `R3RParkTrainGroupID(src)`（幂等：已有备份不覆盖）。后者使 `NormaliseTrainHead() → R3RRestoreTrainGroupID()` 立刻把分组取回 ⇒ "把一段拖出来成为一列新链头"后玩家看到的分组不变（段特质优先于上游默认行为）。
+- **同时复核并确认已覆盖、本轮不改**：`IsFrontWagon()`/`IsFrontEngine()` 守卫（`R3RRestoreTrainGroupID`）、`R3RSyncChainAfterDepotEdit`（`train_cmd.cpp:5059` 起：先 `R3RRestoreUnitNumber` 再领新号）、`R3RNormaliseChainGroups`（`:5216`，改写前先停放各段头分组）、`R3RSettleChainSegments`（`:4677`）四条路径对"车底段（`R3RIsCarOnlyFormation`）"均无缺口。
+
+### KI-252（已修，严重度 低）：`R3RSegmentStoreTraits()` 会在停放态把段行抹成空
+
+- **根因**：写行一律取 live 字段。链头此刻可能正处于停放态（借出了号/名字/分组，三者都在 `*_backup`，live 全空），而该函数的调用者（`CmdRenameVehicle` `vehicle_cmd.cpp:2344`、`SetTrainGroupID` `group_cmd.cpp:1088`）正是"改完当场刷新行"的入口 ⇒ 改名会把同一行的车号与分组一起抹掉。
+- **修法**（`couple_group.cpp:964` 起）：车号 / 分组 / 名字一律"本车自己的值优先、停放的副本兜底"。
+
+### 落地清单收尾
+
+- **② 子行高亮**（原"以链为单位"）：新增 `R3RListLineSelection()`（`vehicle_gui.cpp:2212`），选中链头时把该链的**段子行**一并点亮（`vehicle_gui.cpp:2373` / `:2442` 两处传给 `DrawVehicleImage` 的 selection 由它决定）；其余行行为不变，`selected_vehicle == VehicleID::Invalid()`（车库列表）逐字节不变。
+- **③ 组列表子行按组过滤**：`vehicle_gui.cpp:395-398`，`VL_GROUP_LIST` 且非 `ALL_GROUP` 时只追加"该段确实属于该组"（`GroupIsInGroup`）的子行（新增 include `group.h`）。修掉"A 组列表里看到 B 组的段子行"。
+- **⑥ 读档向上迁移 —— 判定为不需要**：`Vehicle::r3r_segment_id` 是车辆表上的新字段（`couple_group_sl.cpp:129`，旧档读出默认值 = `R3R_SEGMENT_NONE`），读侧 `R3RSegmentTraitRow()` 对"无行"的段直接回退旧逐车字段，且每次提交点都会重写行 ⇒ 旧档零迁移即可正确工作。
+- **⑦ 兜底与探针**：新增 `R3RSegmentReconcileRows(tag)`（`couple_group.cpp:1029`，文件内 static，前向声明 `:753`），在读档收尾 `R3RNormaliseChainGroupsAfterLoad()` 末尾调用（`:823`）：① 无人认领且**完全为空**（无排程指针/号/名字/组）的行才 `R3RSegmentFree()` —— 还挂着任何信息的一律不动（可能是活着的借用）；② 有人认领但三特质全空的行，用段头（停放副本优先）重建。不碰排程指针、车辆字段与链序。命中写 `SEGROW-RECONCILE tag=load rows= orphan= rebuilt=`。
+
+### 构建自证（2026-09-29 04:56）
+
+- 复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；`couple_group.h` 先加后撤的编辑净变化为 0，已把它的 mtime 还原到内容未变之前，护栏判 `incremental is safe (no header/lang file is newer than the newest object)`，未触发全量。
+- 日志 `[7/7] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`、无 `error C*` / `fatal error` / `FAILED:`。
+- `build\openttd.exe` @2026-09-29 04:56（51 511 808 B）晚于三处改动源码：`train_cmd.cpp` 04:46、`vehicle_gui.cpp` 04:51、`couple_group.cpp` 04:53；`read_lints` 0 条；exe 命中 `SEGTRAIT-RECOVER` / `SEGROW-RECONCILE` / `SEGTRAIT-SYNC`。
+
+### 待复测判据
+
+1. 耦合折叠修正后（现场同日志 3907 行场景）：不再出现 `SEGTRAIT-SYNC-SEC ... unit=0`；若旧档仍有残留则应出现 `SEGTRAIT-RECOVER seg= unit=<非 0>`。
+2. 车库内把一段车底**拖出**成独立链再拖回去：段的**名字**与**分组**都保持玩家设定（不被抹成默认组），探针侧出现停放/取回成对（`UNIT-PARK`+`UNIT-RESTORE`、`GRP-PARK`+取回）。
+3. 给一条耦合链改名/改组：同一行里该段的车号与分组**不被抹掉**（KI-252）。
+4. 车队列表点一条子行：该子行与其链行**一起**高亮（②）；车库列表与单选行为不变。
+5. 组窗口：A 组列表里**不再**出现属于 B 组的段子行（③）；把段移出组后子行随之消失。
+6. 读档：正常存档 `SEGROW-RECONCILE` **零命中**；人为构造的空行/孤儿行被回收或重建，且开关窗口后行内特质不变。
+
+## 第 157 轮（2026-09-29）：落地清单 ④ 第一步 —— ★ 由段 ID 派生（`R3RResyncSegmentFronts`）—— 已实现 + 已编译
+
+**背景**：玩家交来复测日志（`build\R3R_debug.log`，357 466 B / 5 107 行）并授权由本轮自行判断"要不要做落地清单第 ④ 项（★ 迁移简化 / P3=B）"。
+
+### 本轮复测日志判读（第 156 轮结果的现场回执）
+
+- 提交点探针齐全且自洽：`SEGID-SYNC` 8 次、`SEGTRAIT-SYNC`(含 `-SEC`) 13 次、`INVAR-CTRL` 8 次、`CHAIN-ATTRS` 5 次；三处报的 `nseg` 在每个提交点都一致（depot-edit 2 / couple 3、2 / decouple-u 2 / decouple-v 2）。
+- `SEGTRAIT-RECOVER seg=21 unit=1 group=65535 name=0`（head=48 的 couple，日志 2849 行）——**唯一一次**触发，且随后 `SEGTRAIT-SYNC-SEC seg=3 unit=1` 不再是 0 ⇒ 第 156 轮的"搬迁 + 找回"兜底确实在工作，字面意义上救回了一个段的号。
+- `SEGROW-RECONCILE` **零命中** ⇒ 读档迁移（第 156 轮判定为不需要）在现场成立，没有空行/孤儿行。
+- ★ 分布与段划分**没有一处不一致**：5 次 `CHAIN-ATTRS` 的 `SEG idx=` 列表与 59 次 `TTB-PROBE` 的 `segm=` 标记逐节吻合（尾部 dump：段头 48 与 21，链序 48→49→50→21→…→6，无错位）。
+- 唯一系统性裂缝：`INVAR-CTRL` **8/8 全部** `ctrl != owner`（`owner_pri=1 < ctrl_pri`）⇒ 落地清单第 ② 项（甲口径：控制段 == 优先级最小者）仍未接线，两个锚的分裂是活的（`R3RCheckControlSegment` 本就只是取数探针，注释写明"强制重排必须与第 3 项同时落地"）。
+
+### 本轮决定：只做 ④ 的第一步，不做整项
+
+- **不做整项 ④ 的理由**：① ④ 的话术是"★ 不再承载数据、位置可由段 ID 推出"，而现状**段划分的唯一权威仍是 ★**（`R3RGetSegmentHeads()` 只认 ★，`R3RSyncSegmentIds()` 又按 ★ 分组才分配 ID）⇒ 直接让 ★ 由 ID 派生会出现"谁是权威"的循环依赖，必须先决定口径，属设计级动作；② 日志没有任何"★ 错位"证据（见上），而 ④ 想根治的"搬迁丢特质"已被 RMove/Owner 交换 + `R3RRecoverSegmentTraits` 压住（本轮仅 1 次且成功）；③ ④ 的真正收益要等"人工迁移代码删除"之后才兑现，一次性删翻转/回滚/车库三处的 ★ 搬迁风险过高。
+- **因此本轮落 ④ 的第一步**：把"★ 由段 ID 派生"这条原则**先落地为幂等校验 + 自证探针**，不改任何现有迁移路径的行为；等日志证明"人工迁移结果与 ID 派生结果长期一致（`SEGFRONT-RESYNC` 零命中）"，第二步再删代码。
+
+### 代码改动（仅 `src/train_cmd.cpp`，未碰任何 `src/*.h`、未碰 lang）
+
+- 新增文件内 static `R3RResyncSegmentFronts(Train *chain, const char *tag)`（紧跟 `R3RSyncSegmentIds()` 之后，约 4552 行）：
+  - 整链无任何 `r3r_segment_id`（单段链 / 未迁移）⇒ **直接返回，一字不动**（链头字段仍是全部权威）。
+  - 否则沿链序找"连续相同 ID 的 run"，每个 run 的**第一辆非 artic 车**就是该段应带的 ★（artic part 从不带 ★，与 `R3RGetSegmentHeads()` 一致）；链头段的 run 首即链头本身，属隐式段头，不计入待写集合。
+  - 同 ID **分处两个不连续 run** ⇒ 只写 `SEGFRONT-RESYNC-ANOM` 并返回（不改）：那种状态下 ID 记账本身就已经错了，盲目重写会让两个段共用同一行。
+  - "应带 ★ 集合 == 实带 ★ 集合"（顺序也一致）⇒ 静默返回（正常路径零行为、零日志）。
+  - 不一致才动手：清掉多余的 ★、补上缺的 ★，并写 `SEGFRONT-RESYNC tag= head= nseg= added= dropped=`。
+  - 存活自证：静态计数每 64 次"多段链结算"写一行 `SEGFRONT-RESYNC-CHECK runs= fixed=`，证明这段代码真的在跑且长期零修正。
+- `R3RSettleChainSegments()` 顺序改为 `R3RSyncSegmentIds → R3RResyncSegmentFronts → R3RSyncSegmentTraits → R3RSyncHiddenSegmentTraits → R3RCheckControlSegment`。**必须排在两个特质 pass 之前**：若重算挪动了段头，停放副本会留在旧车上，正好交给隐藏段 pass 里的 `R3RRecoverSegmentTraits()` 搬回（第 156 轮的兜底因此天然覆盖这条新路径）。
+
+### 构建自证（2026-09-29 05:26）
+
+- 复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；护栏 `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志仅 `[3/3] Linking CXX executable openttd.exe`，`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 05:22:36 → `train_cmd.cpp.obj` 05:24:08 → `build\openttd.exe` 05:26:18（51 516 928 B）；`read_lints` 0 条。
+- exe 内命中三条新探针字面量：`SEGFRONT-RESYNC`、`SEGFRONT-RESYNC-CHECK`、`SEGFRONT-RESYNC-ANOM`。
+
+### 待复测判据
+
+1. 复跑同一批场景（耦合 / 解挂 / 车库拖动 / 读档），`SEGFRONT-RESYNC` 应为 **零命中**，`SEGFRONT-RESYNC-CHECK` 每次出现时 `fixed=0` —— 这证明现有 9 处人工 ★ 迁移与"ID 派生"完全等价，第二步（删人工迁移）才有资格开工。
+2. 出现 `SEGFRONT-RESYNC ... added=/dropped=` 时，记下 `tag` 与 `head`：该提交点的人工迁移就是不一致的源头，先修它再谈删代码；同时核对随后的 `SEGTRAIT-SYNC-SEC` / `SEGTRAIT-RECOVER` 是否把特质搬到了新段头（应出现 RECOVER）。
+3. 单段链（无 ★ 隐性段）行为逐字节不变：`SEGFRONT-RESYNC*` 一次都不该出现，车辆列表、段子行、耦合/解挂手感无回归。
+4. `SEGFRONT-RESYNC-ANOM` 一旦出现即视为 ID 分配 bug（同 ID 两个 run），需当场抓日志分析，不要仅看"段数对不对"。
+5. 回归第 156 轮 6 条判据（尤其是无 `unit=0`、无 `SEGROW-RECONCILE`）。
+
+### 残留 / 未做
+
+- **落地清单 ④ 第二步（未做）**：删除各处人工 ★ 迁移（`R3RFlipChainBySegments` 内的逐段 ★ 迁移 / `R3RUndoLogicalFlip` 的 ★ 快照回滚 / `R3RRespaceChainAfterEdit` / `CmdMoveRailVehicle` 的段标记 / 耦合与解挂提交点），改由本轮的重算统一负责。前置条件 = 判据 1 连续多轮零命中。
+- **落地清单 ②（甲口径强制重排，未做）**：`INVAR-CTRL` 8/8 的证据保留在本轮记录里。它一旦落地会改变"耦合后跑谁的表"（T8701 的 INHERIT、KI-215b 的进度回写、`R3RMergePriorities` 的被动优先语义都会一起受影响），必须与"排程归属迁到控制段行"一起设计，不能单独动手。
+- 段 ID 与 ★ 的"权威"口径本身仍未拍板：本轮把 ID 当作派生权威（只在已分配 ID 的多段链上校验），设计文档 §1.1 的 P3=B 完整形态（★ 完全不承载数据）仍待玩家确认。
+
+## 第 158 轮（2026-09-29）：玩家四问的答复与取证（**未改任何源码**）
+
+**来源**：玩家原话四条（图像分离 / 车号名称归属 / 车库拖动判定 / 挂接分组语义），并要求"务必修记进备忘"。**详细分析与行号索引见工作区 `R3R_round158_four_questions_memo.md`**（本轮新建）。本轮只做取证与定性，四问里三问需要玩家先拍板口径，故未动代码。
+
+现场日志：`build\R3R_debug.log`（675 303 B / 9 914 行）。
+
+### KI-253（未修，严重度 中）：多段链几何塌缩 —— 段划分只剩 2 段、段内各车坐标重合、段间 82~83px 断口
+
+玩家原话「日志尾部列车的图像分离的像被狗啃了一样，怀疑是折叠」。**折叠判据无辜**：`R3RCheckChainFoldedDirection` 以 `gap > 8` 为界，而现场相邻车实测 gap ≈ 82/83px（`TTB-PROBE fold-geom veh=18 tile=60,84 x=968 y=1359 prev=23 ptile=59,79 px=952 py=1277`），探针只是报告"有巨大缝隙"。
+
+真症状两条（同一日志）：
+1. **段划分塌缩**：`CHAIN-ATTRS head=48 n=21 FE=1 SEG=2 spd=0`，而 `SEG` 的语义（`train_cmd.cpp:9378-9387`）是"链上 `IsSegmentFront()` 的车数（含链头）"⇒ 21 节车**只有 2 段**；但车号规律（48/49/50、21/22/23、18/19/20、15/16/17、12/13/14、9/10/11、6/7/8）与 `flags=0x2000000`（artic part）表明现场是 **7 个三节铰接单元** ⇒ 段与物理单元彻底脱节。
+2. **几何未展开**：尾部 dump 每三节一坨、坐标完全相同（21/22/23 同 `952,1277`；18/19/20 同 `968,1360`；15/16/17 同 `968,1382`；12/13/14 同 `968,1404`；9/10/11 同 `968,1426`；6/7/8 同 `968,1448`），坨与坨之间 82~83px 空档；只有链头那段（48/49/50：1268/1272/1275）正常展开。
+3. 该链确实跑过翻转：`FLIP-V veh=48 p=49 …` → `FLIP-DONE head=48 nseg=1 whole=0`，随后 `COUPLE-OK loco=48 … tx=60 ty=90`、`RESPACE-AFTER-EDIT couple head=48 px=10 stretch=1 visited=20 capped=0`。翻转只改 direction/链序/★ 不改位置 ⇒ 是成因之一，但解释不了"段内重合"。
+4. `CHAIN-ATTRS … len=0 pow=0 wt=0`：**该探针可能打在 `ConsistChanged()` 之前，`len=0` 暂不能当结论**，列为本轮第一项取数任务（若 `ConsistChanged()` 之后仍为 0，则"链长为 0"就是位置无法展开的直接解释）。与 KI-214（耦合后包围盒/位置错位）同族，本条是重症版。
+
+**下一步（不需拍板）**：①加只读探针：逐车 `cached_veh_length / cached_total_length / IsArticulatedPart / IsSegmentFront / IsSegmentBack / r3r_segment_id`；`RESPACE-AFTER-EDIT` 前后各 dump 每节 `(tile,x,y)` 与期望间距；`R3RFlipChainBySegments` 出口 dump 每段段头/段尾 `(tile,x,y)`；在 `ConsistChanged()` 之后补打一次 `CHAIN-ATTRS`。②判据：段数 == 物理铰接单元数（本场景 7）、段内相邻车距 ≈ 各自车长、段间 ≤2px、`len != 0`。③**请玩家补"分离瞬间"的日志**（分离发生在耦合后 / 车库拖动后 / 翻转后），现有日志只能证明分离已存在，不能唯一定位提交点。
+
+### KI-254（已修，第 159 轮改选乙口径 ⇒ 控制段 = 命令所有者段，详见 KI-260）：车号 / 名称（/分组）"依旧由链头决定" —— 这是"控制段=链头段"（P1-甲）的必然结果，非漏改
+
+玩家原话「列车编号和名称应该属于列车特质、由控制段显现，而目前我看到的是依旧由链头决定」。**成立，且是设计口径的直接后果**：
+- `R3RSegmentTraitRow(v)`（`couple_group.cpp:923-928`）：`head->r3r_segment_id == v->r3r_segment_id` ⇒ **返回 nullptr**（链头所在段 = 控制段，"没有行"）；
+- `R3RSegmentUnitNumber`（`:930-937`）与 `R3RSegmentGroupID`（`:955-962`）在行缺失/空值时**回退 `v->First()` 的字段**；`R3RSegmentName`（`:939-953`）回退**自身**名字（三处不对称，会让隐藏段子行显示链头的号与组）；
+- `R3RGetControlSegment()`（`train_cmd.cpp:4385`）从 `chain->Previous()` 向上找 ★，链头无 Previous ⇒ **恒返回链头**；`R3RSyncSegmentTraits()`（`:4696`）把链头车的活字段镜像进控制段行；`R3RSegmentStoreTraits`（`:964`）注释自陈 "the one whose row is purely a mirror of the car"。
+- 另一个锚（命令所有者）由 `R3RGetLowestPriority`（`:4353`）按 `r3r_priority` 最小挑选，现场 8/8 提交点两个锚分裂：`INVAR-CTRL tag=couple head=48 nseg=2 ctrl=48 ctrl_pri=2 owner=21 owner_pri=1 borrowed=1`（特质认链头 48，排程认段头 21）。
+- 仍直读链头字段的读出点（第 155/156 轮只覆盖主干）：`vehicle_gui.cpp:334-341`（GetUnitNumberDigits 用 `v->unitnumber`）、`:375-380`（max_unitnumber）、`:1793`（VehicleNumberSorter）、`depot_gui.cpp:810`（车库格车号）、`:1217`（车库列宽）、`couple_group_gui.cpp:584`（挂接分组编辑器的段列表用 `t->unitnumber`）、`departures_gui.cpp:215-216/224-225/1381/1385`（离站板车号与分组）、`group_cmd.cpp` 的 GroupStatistics（按链头分组）。
+
+**待拍板**：甲（第 152 轮已拍、未接线：强制控制段 == 链头段，重排 `r3r_priority`，两锚合一 —— 玩家看到的仍是"链头决定"，因为定义如此）还是 **乙**（控制段 = 命令所有者段，特质跟排程走 —— 这才是"由控制段显现"的字面实现，代价是链头不再是唯一门面、`R3RSegmentTraitRow` 的"控制段无行"约定要重写）？
+
+### KI-255（已修，第 159 轮按叁收紧挂接判定，详见 KI-259）：车库内"仅段参与"的拖动判定确实没收紧（判定只有"车在段内"）
+
+玩家原话「车库内仅有段参与的拖动应当视作耦合/解耦，我怀疑这里你的判定没收紧」。**成立**：
+- 判段只看 `TrainDepotGetSegmentFront(v)`（`depot_gui.cpp:160-179`，只回答"这辆车落在某个段内"），不回答"被拖块 == 完整段"；是段则 `TrainDepotMoveVehicle():410-412` → `TrainDepotMoveSegment():247-265`（`TrainDepotDetachSegment():222` 按 `TrainDepotGetSegmentTail():189` 摘整段 → `MoveChain` → 落空行且非机车补发 `MakeSegment`），否则普通 `MoveRailVehicle`。
+- `TrainDepotDropSplitsSegment():205-212` 只拒绝"落点在段内部"，不校验"被拖块与段边界对齐"；命令层 `CmdMoveRailVehicle` 只做位置合法性，**无耦合/解耦分支**。
+- 拖动路径**没有任何** `Commands::Couple` / `DecoupleTrain` 调用；段的耦合语义是模仿的：★/⊗ 标记搬运（`train_cmd.cpp:3096-3114`，注释自陈"复刻 Couple()"）、三特质停放（`:2967-3085`）、优先级仿"目标被动"（`depot_gui.cpp:287`）、收尾靠 `R3RSyncChainAfterDepotEdit()`（`:5266`，调用点 `:3122/:3123/:3238`）。
+- 缺口：①拖出整段到空行应视为**解耦**（现在只当并/拆链）；②拖入别链应视为**耦合**（现在只靠优先级+标记模仿，不走 Couple 的排程继承/等待点跳过）；③命令层无"块边界必须与段边界对齐"校验（可把段劈开）；④块跨两个段时不拒绝。
+
+**待拍板**：可拖动单位是否限定为 {整段, 整条链, 散车厢链}，其余一律拒绝？
+
+### KI-256（已修，第 159 轮拍板为肆 = 并集，详见 KI-258）：挂接分组的归属口径未定（修复前=等待方控制段掩码覆盖全链，不是并集）
+
+玩家问：「挂接分组应当怎么处理，是当作列车的特质？还是物理属性？就像 AB 挂 AC，耦合后的链应当属于 AB、AC 还是 ABC？」现状（已核实）：
+- 存储**按车**（`Vehicle::couple_groups`，`vehicle_base.h:387`，CGVR 稀疏只存非 0 的车），语义**按段**（只有段头是 carrier，`couple_group.cpp:55`），读取**段内并集 + 父组继承展开**（`:233-251`）。
+- 耦合时**不是并集而是覆盖**：`R3RNormaliseChainGroups()`（`train_cmd.cpp:5423`）取"控制段（=最低优先级段）"的掩码（`:5460`），清空链内**每个段头**（`R3RClearCoupleGroupsOfSegment`，`:5464` / `couple_group.cpp:272`）后逐位重填（`:5467`）；调用点 `:9475`（Couple 成功）、`:5374`（车库编辑）、`:6909/:6911`，读档 `couple_group.cpp:777-801`。owner 由 `R3RMergePriorities`（`:4938`，主动侧 `+= passive.size()`）决定 ⇒ **等待方**优先级更低 ⇒ **等待方分组覆盖挂车方**。
+- 旧"交集才可挂"已废除（`R3RCoupleGroupMasksCompatible` 仅剩定义），分组现在只用于**跨公司授权**（`couple_group.cpp:121-146`）。
+- ⇒ 对"AB 挂 AC"：结果既非并存也非并集，而是**取等待方 + 广播全链**（挂车方分组被丢弃），存储/语义/行为三层不一致（按车存、按段读、按链归一化）。
+
+**待拍板三选一**：(1) 并集 ABC（耦合时 OR，广播各段头；代价=跨公司授权变宽、段级差异消失）；(2) 段级保持 AB+AC（取消归一化，各段保自己的；语义最干净，需 UI 段子行承载，跨公司判定要说明看哪段）；(3) 维持现状覆盖（零改动，丢信息）。建议：目标若为"分组属于段"⇒ (2)；目标若为"整列车属性"⇒ (1) 并把归一化改成 OR 而非"清空重填"。
+
+### 本轮待玩家回答（一次性四条）—— **已全部答复并落地，见第 159 轮 KI-258/259/260**
+
+1. **贰**：控制段口径 = 甲（控制段≡链头段）还是 乙（控制段=命令所有者段）？
+2. **叁**：车库可拖动单位是否限定为 {整段, 整条链, 散车厢链} 且整段拖动按解耦、拖入别链按耦合走同一套语义？
+3. **肆**：挂接分组 = (1) 并集 / (2) 段级保持 / (3) 现状？
+4. **壹**：图像分离发生在耦合后 / 车库拖动后 / 翻转后？能否补"分离瞬间"的日志？
+
+
+## 第 159 轮（2026-09-29）：KI-257 混合链方向归一"目标值"修正 + KI-253 取数探针 + 第 158 轮三口径拍板落地（贰乙/叁/肆 = KI-258/259/260）—— 全部已实现 + 已编译
+
+第一批（不需要玩家拍板）：一处行为修复（**KI-257**）与一套只读取数探针（**KI-253**）。
+第二批（玩家拍板后落地）：第 158 轮挂起的三个口径问题全部拍板并已改代码——**肆 = 挂接分组并集（KI-258）**、**叁 = 车库拖动收紧"判定为挂接"（KI-259）**、**贰 = 控制段取乙「控制段=命令所有者段」（KI-260）**。落地顺序 肆 → 叁 → 贰。
+
+### KI-257（已修，严重度 中）：`R3RNormaliseMixedChainDrivingBackwards()` 一律清 0，会把"合法整链倒车"掰成正向并丢掉无驾驶室限速
+
+- 现场症状：机车反向运行时**有时**不再受"无驾驶室 32 km/h"限制，且车头方向显示与物理行进方向打架。
+- 根因（`train_cmd.cpp` 的 `R3RNormaliseMixedChainDrivingBackwards()`）：该函数（第 135 轮 KI-217 引入，用于收敛"同一根链上一半车带 `VehicleFlag::DrivingBackwards`、一半不带"的混合态）**无条件把整链归到 DB=0**。但 DB 是链级属性，其目标值应取**链头**的值：
+  - 车库合并（`R3RNormaliseDepotMergeDirection()`，`train_cmd.cpp` ~8578）会**故意**设 `DB = tail_leads`，即 legitimately 让整链倒着走；此时链头 DB=1 是正确状态；
+  - 归一器把它清 0 ⇒ `GetMovingFront()` 改选另一端 ⇒ 行进方向反转；同时 `ConsistChanged(CCF_TRACK)` 重算 `TCF_NO_DRIVING_CAB` 时按**新的** `Last()->CanLeadTrain()` 判定，原本该被限速 32 km/h 的链不再被限制。
+- 修法：先取 `const bool head_db = head->vehicle_flags.Test(VehicleFlag::DrivingBackwards);`，混合时才动手，且**向链头看齐**——`head_db` 为真则对不一致的车 `Set(DrivingBackwards)`，为假才 `Reset`；两类都照旧联动反转 `GVF_GOINGUP/DOWN` 并逐节 `UpdateStatusAfterSwap(w, false)`；末尾仍调 `head->ConsistChanged(CCF_TRACK)` 重算 `TCF_NO_DRIVING_CAB`。返回值为 `cleared + set`（本次真正改动的车数）。探针行 `DB-NORMALISE <tag> head= headDB= cleared= set= n= nocab=` 新增 `set` 与 `nocab` 两列。
+- **不变式**：一致的链（无论 DB=0 还是 DB=1）一字不动；车库合并设好 DB 后调的是 `ConsistChanged(CCF_ARRANGE)`，整链一致 ⇒ 不经过归一器，故不受影响。
+- 复测判据：①反向行驶的链应出现 `DB-NORMALISE ... headDB=1 set=N cleared=0`（而不是旧口径的 `cleared=N`）且 32 km/h 限速仍在（`nocab=1`）；②正向链出现 `headDB=0 cleared=N set=0`，行为与第 135 轮一致；③健康链不出现 `DB-NORMALISE`。
+
+### KI-253（探针部分已完成并编译通过；定因仍需玩家"分离瞬间"日志）
+
+按第 158 轮登记的"下一步（不需拍板）①"落地，全部只读、零行为改动，新增一个文件内静态助手与三处插入点：
+
+1. **新助手 `R3RDumpChainGeometry(const char *tag, const Train *head)`**（`train_cmd.cpp`，紧随 `R3RNormaliseMixedChainDrivingBackwards()`）：沿**物理链序**（`Next()`）逐车打印
+   `veh / tile / x,y / dir / db / artic / starF(★) / starB(⊗) / segid / clen`，并额外打印**到下一车的像素距离 `dist`** 与**标称间距 `nom`（`CalcNextVehicleOffset()`）**，末尾 `GEO-END tag head= n= capped=`。
+   判读口径：`dist == nom` 健康；`dist == 0` 而 `nom > 0` = "两车叠在同一像素"；`dist > nom` = "段被撑开"。铰接部件与父车同坐标属正常（`nom` 亦小）。
+2. **`R3RRespaceChainAfterEdit()` 前后各一份**：入口按 `R3RDbgOn()` 采一份 `{veh,x,y}` 快照（仅调试日志开启时才采集；该函数唯一调用点是耦合提交点，触发频率低）；在既有的 `moved/stretched/capped` 闸门内打印 `GEO-BEFORE <tag>` 若干行 + `R3RDumpChainGeometry("respace-after", head)`，再接原有的 `RESPACE-AFTER-EDIT` 行。于是"到底有没有车被移动、移了谁"可直接读出。
+3. **`R3RFlipChainBySegments()` 出口**：在 `FLIP-DONE head= nseg= whole=` 之后追加 `R3RDumpChainGeometry("flip-done", new_head)`。翻转只改 `direction`/链序/★、**不动位置**，此 dump 是后续 `RESPACE` dump 的对比基线。
+4. **`ConsistChanged()` 之后补打 `CHAIN-ATTRS`**：在 Couple 提交点末尾（`R3RSettleChainSegments(v, "couple")` 之后）新增一行
+   `CHAIN-ATTRS2 couple head= len= pow= wt= spd= nocab= db=`，用于区分"探针跑在 `ConsistChanged()` 之前"与"缓存真的是空的"——正是第 158 轮 `CHAIN-ATTRS … len=0 pow=0 wt=0` 无法定性的那一点。
+   （注意：`cached_total_length` 只写在链头上（`Train::ConsistChanged()` 把非链头车置 0），故 `CHAIN-ATTRS` 里 `SEG idx=… len=0` 是**预期**的，只有**链头那行**的 `len` 才有判读意义。）
+
+**判据（待玩家现场日志）**：段数 == 物理铰接单元数（该场景 7）、段内相邻车距 ≈ 各自车长、段间 ≤2px、链头 `len != 0`；并请补"分离瞬间"（耦合后 / 车库拖动后 / 翻转后）的日志以定位提交点。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `error C*/fatal error/FAILED:/build stopped` 计数 0、`[3/3] Linking CXX executable openttd.exe`；`src\train_cmd.cpp` 18:11:43 → `build\openttd.exe` 18:14:36；`read_lints` 0 条；exe 内含字面量 `GEO-BEFORE %s n=%d veh=%d x=%d y=%d`、`GEO-END %s head=%d n=%d capped=%d`、`CHAIN-ATTRS2 couple head=%d …`。
+
+### KI-258（已修，严重度 中）：挂接分组归属按玩家拍板 **肆 = 并集（OR）** —— 耦合不再"等待方覆盖挂车方"
+
+第 158 轮 KI-256 登记的三选一里玩家选 **(1) 并集**：耦合后整链属于双方分组之并（"AB 挂 AC ⇒ ABC"）。两处归一化从"取控制段掩码 + 清空重填"改为"按位取并"：
+
+- `R3RNormaliseChainGroups()`（`train_cmd.cpp:5515`）：先控 `front` 与 `R3RGetChainScheduleOwner()` 给出 `owner`（= 控制段 / 排程所有者，乙口径下即命令所有者段），把每个段头的掩码**按位 OR** 到累积值 `union_mask`，末尾把并集广播回**每个非空段头**；探针 `CGRP-NORM-UNION head= nseg= mask=`（`:5563`）。空掩码不参与（"没有分组"不会被并成有分组）。
+- `R3RNormaliseChainGroupsAfterLoad()`（`couple_group.cpp:755`）：读档重建同构，探针 `CGRP-NORM-LOAD seg= mask=`（`:816`）与汇总 `GRP-NORM-LOAD-SUM chains= groupfix= maskfix=`（`:825`）。
+- 代价（玩家已接受）：跨公司授权闸门（`couple_group.cpp:121-146`）读有效集合，并集后自然**变宽**；段级分组差异消失；读档再跑一次并集是**单调增**（不会回退）。
+
+### KI-259（已修，严重度 中）：车库拖动收紧"判定为挂接" —— 段与散车厢不得混挂（玩家拍板 **叁**）
+
+第 158 轮 KI-255 的缺口④（块跨段不拒绝）与"仅段参与"的判定已收口，闸门放在**工具层唯一漏斗** `TrainDepotMoveVehicle()`（`depot_gui.cpp:486`）：
+
+- 四个文件内静态助手（`depot_gui.cpp:224-310`）：`TrainDepotChainHasLoosePart(chain)`（从链头沿 `Next()` 分段：遇 `IsSegmentFront()` 开新串；**链头所在串豁免**（它就是那条隐式前导段），其后的任何一串若不以 `IsSegmentBack() ⊗` 收尾即判"散车厢 / 未成段"）、`TrainDepotChainHasSegment(chain)`（链上是否有 ★）、`TrainDepotSideIsLoose(chain)`（链头 `IsFreeWagon()` 或 `HasLoosePart`）、`TrainDepotRefuseSegLooseMix(drag, anchor, head)`。
+- 闸门判据（`depot_gui.cpp:295-309`）：先要求**至少一侧有段**（`drag_is_segment = TrainDepotGetSegmentFront(被拖车) != nullptr` 或 `dst_is_segment = TrainDepotChainHasSegment(落点链)`），否则直接放行（普通"机车 + 新车厢"的拼挂不受影响）；再算**两条链各自**是否沾散车厢（`drag_loose` / `dst_loose` = `TrainDepotSideIsLoose(整链)`），**只要有任一侧沾散车厢就拒绝**；日志 `DEPOT-SEG-MIX-SKIP sel= dst= dragSeg= dstSeg= dragLoose= dstLoose=`（`:306`）。
+- 落点为空行（`dst_chain == nullptr`）/ 同链内重排（`dst_chain == drag_chain`）直接放行，故"拖出即解耦式"与链内排序不受影响；KI-212 的"段内部落点拒绝"仍在其上游。
+- 注意 `drag_loose` / `dst_loose` 量的是**整条链**（不是被拖的那一块），所以"从一条含散车厢的长链里拖出一个健康的整段"同样会被拒——这是玩家口径"段不得与散车厢同处一条链"的直接推论，代价是必须先清干净链内的散车厢才能重组。
+- 结果：**有段参与的车库内拖动只可能是段↔段（含"段 ↔ 单机车"那条隐式前导段）**，不再能造出"段 + 散车厢"同链的混合体。
+
+### KI-260（已修，严重度 中）：控制段口径按玩家拍板 **贰 = 乙「控制段 = 命令所有者段」**，链头退化为承载者
+
+第 158 轮 KI-254 的"车号 / 名称依旧由链头决定"是**甲口径（控制段≡链头段）的必然**；玩家改选**乙**：控制段 = 命令所有者段（`r3r_priority` 最小者），链头车只是**借用**控制段订单与三特质的**承载者**。落地五处：
+
+1. **`R3RGetControlSegment()`（`train_cmd.cpp:4392`）直接返回 `R3RGetPriorityHead(chain)`** —— 两锚合一，"控制段"从此与"排程所有者"是同一个段，链头不再特殊。
+2. **提交点新增借用步**：`R3RSettleChainSegments()`（`:4967`）的顺序改为
+   `R3RSyncSegmentIds → R3RResyncSegmentFronts → R3RBorrowControlTraits → R3RSyncSegmentTraits → R3RSyncHiddenSegmentTraits → R3RCheckControlSegment`。
+   - 新增 `R3RBorrowControlTraits(chain, tag)`（`:4702`）：把**链头自己**那一套特质（车号 / 名称 / 分组）写进**链头自己的段行**——来源以 `*_backup`（交接点停放的那一套）优先，`r3r_orders_borrowed` 为真时**不许回退到活字段**（活字段此刻装的是控制段的）；幂等，行里已有值即跳过；探针 `CTRL-PARK tag= head= seg= unit=`（`:4733`）。
+   - `R3RSyncSegmentTraits()`（`:4768`）的特质来源改为 `const Train *traits = (ctrl == chain || !chain->r3r_orders_borrowed) ? ctrl : chain;` —— 借用态下控制段的行只能由**链头的活字段**填充（那正是交接点从控制段搬过来的那一套），不许读控制段自己已被清空的活字段。
+   - `R3RSyncHiddenSegmentTraits()`（`:4898`）遍历时 `seg == chain` 直接 `continue`：链头段的行**独占地**由 `R3RBorrowControlTraits` 负责，避免两处写入冲突。
+3. **读侧"无行"判据重写**（`couple_group.cpp`）：`R3RSegmentTraitRow(v)`（`:968`）改为「**链头 ⇒ 无行**（其活字段即控制段那一套）」且「**落在控制段内的车 ⇒ 无行**（读控制段的行 / 链头活字段）」，其余段头返回自己的行；新增 `R3RSegmentControlHead(chain)`（`:936`，在链头与各 ★ 中取 `r3r_priority` 最小者），`R3RSegmentHiddenHeads()`（`:1165`）的**子行枚举由"非链头段"改为"非控制段"** —— 车队列表里显性那一行永远是**控制段**，其余段（含链头所在段，若它不是控制段）都成为子行。
+4. **读档重建不许把借来的值当成段自己的**：`R3RSegmentReconcileRows()`（`couple_group.cpp:1097`）重建段行时对链头车加 `r3r_orders_borrowed` 守卫——只从 `*_backup` 取，借用态下**不回退活字段**（探针 `SEGROW-RECONCILE`，`:1161`）。
+5. **探针 `R3RCheckControlSegment()`（`train_cmd.cpp:4415`）**：旧判据（甲口径的 `owner == ctrl`）在乙口径下恒真故永不触发；已去掉恒真早退，改为报告实际形态 `INVAR-CTRL tag= head= nseg= ctrl= ctrl_pri= head_pri= borrowed=`（`:4431`）。
+
+**不变式（乙口径）**：链头的活字段 = 控制段那一套；链头段自己的那一套恒在**链头自己的段行**（持久）与其 `*_backup`（临时停放）里；`R3RSegmentTraitRow(链头) == nullptr`，所有"链头行"读取回退到链头活字段即得控制段特质；"链头段自己的那一套"需要显示时走它自己的段行。**绝不在提交点对调链头与控制段的活字段**（第 159 轮初版如此，已废弃）——落到活字段上的"借 / 还"由各交接点（Couple / 车库拖动 / 折叠修正 / `NormaliseTrainHead()`）负责，提交点只负责"填段行 + 查不变式"。
+
+**构建自证（第 159 轮第二批 = 肆 + 叁 + 贰乙）**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`build\openttd.exe` @2026-09-29 19:31:51（51 534 336 B）；`src\depot_gui.cpp` 18:37:37 → `depot_gui.cpp.obj` 19:13:01、`src\couple_group.cpp` 18:51:54 → `couple_group.cpp.obj` 19:12:06、`src\train_cmd.cpp` 19:27:40 → `train_cmd.cpp.obj` 19:31:46，三者均早于 exe；`read_lints` 0 条；exe 命中 `CTRL-PARK` / `INVAR-CTRL` / `CGRP-NORM-UNION` / `CGRP-NORM-LOAD` / `GRP-NORM-LOAD-SUM` / `DEPOT-SEG-MIX-SKIP` / `SEGROW-RECONCILE`。
+
+**未做 / 边界（等复测）**：
+
+- **贰乙尚未在游戏内验证**：车队列表主行应显示"控制段 = 排程所有者段（`ctrl_pri` 最小）"，链头所在段若不同则成为子行；车号 / 名称 / 分组应跟随排程所有者段而非链头物理车。判据：①多段链接管后 `INVAR-CTRL … ctrl= owner= ctrl_pri=1 borrowed=1`（两锚合一）；②车队列表主行 = 控制段、链头段成子行；③`CTRL-PARK` 只在链头段确有停放副本时出现，`unit=` 为链头自己那一套；④改控制段车号后主行变化、链头段子行不变。
+- **仍直读链头活字段的读出点未全部改**（第 158 轮 KI-254 所列：`vehicle_gui.cpp:334-341/:375-380/:1793`、`depot_gui.cpp:810/:1217`、`couple_group_gui.cpp:584`、`departures_gui.cpp:215-216/:224-225/:1381/:1385`、`group_cmd.cpp` 的 `GroupStatistics`）。乙口径下这些点在 `borrowed` 时读到的**仍是控制段那一套**（因为活字段就是它），逻辑自洽，故未动；只有"链头段自己的那一套"需要显示的场合才有差异（当前无此 UI）。
+- **叁只挡住车库拖动**：命令层 `CmdMoveRailVehicle` 未加"段 / 散混挂"校验（`TrainDepotMoveVehicle()` 是玩家可达的唯一漏斗），程序化调用仍可造出混合链；段↔段拖动仍不走 `Commands::Couple / DecoupleTrain` 的排程继承与等待点跳过（第 158 轮 KI-255 缺口①②，未修）。
+- **肆的代价未验证**：跨公司授权变宽、段级分组差异消失，均属预期；存档往返是否稳定（两次并集单调增）待复测。
+
+## 第 160 轮（2026-09-29）：KI-261 车名与车号同源同构地"借 / 还"（**已实现 + 已编译**）
+
+**来源**：玩家 2026-09-29 原话——「**名称还是跟链头，不知道是否和旧 R3R 版本存档有关**」。现场日志 `build\R3R_debug.log`（455 735 B，19:51:50，第 159 轮 exe）。
+
+### KI-261（已修，严重度 中）：耦合后列车名称仍取链头车名 —— 车号早已借自被挂车组，车名从未做过同一件事（名/号对称性破缺）
+
+**现场**：第 159 轮 KI-260（贰乙：控制段 = 命令所有者段）落地后玩家复测，看到车号已经跟随被挂车组，**名字仍跟随链头物理车**。日志里 `CTRL-PARK tag=couple head=48 seg=2 unit=6`、`INVAR-CTRL tag=couple head=48 nseg=2 ctrl=21 ctrl_pri=1 head_pri=2 borrowed=1` 说明控制段与借用关系已成立；`NAME-` 命中 0 只是因为该 exe 尚无名称探针。
+
+**根因（结构性的不对称）**：车号从 KI-147 / route A 起就在 `Couple()` 里**从被挂车组链头 `u` 借到链头 `v`**——`v->unitnumber = u->unitnumber`，同时 `v->unitnumber_backup` 停住自己的号、`u->unitnumber_backup` 留一份副本，解挂时在 `DecoupleTrain()` 里互换回去。**名称从未被纳入这套机制**：`v->name` 一直是链头（机车）自己的活字段，所以车辆列表主行 / 列车窗口标题 / 车队列表恒显示链头车名。这正是第 158 轮 KI-254「车号/名称依旧由链头决定」的**号侧已修、名侧未修**。
+
+**修复 1（活字段借用，`src\train_cmd.cpp`）**：`Couple()` 提交点紧接车号继承块（`:9442`）新增同构名块——`u` 有名时 `u->name_backup = u->name`（仅在空时填）、`v->name_backup = v->name`（仅在空时填）、`v->name = u->name`、`u->name.clear()`；探针 `NAME-XFER head= u= head_own= got_u=`。门禁 `!non_leading_engines_keep_name && !u->name.empty()`，与号块 `if (u->unitnumber != 0)` 同一条判据、与 `R3RParkTrainName()` 的设置门禁一致，故"车组没名字"时链头名一字不动，不会凭空丢名字。
+
+**修复 2（归还，`src\train_cmd.cpp`）**：`DecoupleTrain()` 车号归还块之后（`:7108`）新增名称归还——`if (!v->name_backup.empty()) { v->name = v->name_backup; v->name_backup.clear(); NAME-RESTORE veh= side=head }`（v 侧必须无条件覆盖身上那件借来的名字），u 侧 `if (u->name.empty()) R3RRestoreTrainName(u)`（幂等，只在活名为空时取回）。角色与号侧完全一致：**v = 留下/机车半**（拿回自己的号与名），**u = 解出的车组半**（拿回车组自己的号与名）。
+
+**修复 3（存档往返 —— 玩家猜的"旧存档"那一半，`src\sl\couple_group_sl.cpp`）**：`name_backup` 原本是 NOSAVE（`vehicle_base.h:380`），于是"耦合时穿上车组名字、自己的名字停进 `name_backup`"这**对借用/返还里的返还端在存档往返后消失**。已把 `name_backup` 加进 R3VP 稀疏块（字段名 `"name_backup"`，`SLE_CONDSTR(TinyString, length=0)`，与车辆表里 `Vehicle::name` 的写法一致；紧邻 `unitnumber_backup`），并把它加进 `R3RHasParkState()`。车号侧（`unitnumber_backup`）早在 KI-169a 就随 R3VP 入档，名字侧补齐后两侧才真正同构。**这一步同时修掉第 144 轮的遗留**："车库拖动导致耦合之后，把后半条链的控制段拖出来，列车名称会变回默认"。
+
+**对"是否和旧 R3R 版本存档有关"的明确回答**：**车名本身一直是正常存档字段**（`sl\vehicle_sl.cpp` 的 `name`，`SLE_CONDSTR(Vehicle, name, SLE_STR|SLF_ALLOW_CONTROL, 0, SLV_84, …)`），与存档新旧无关，不存在"旧档名字读坏"这回事。旧 exe 存档里"耦合中的列车"上 `v->name` 就是机车自己的名字、`u->name` 是车组的名字（**因为那时根本没有名侧借用这一步**），所以读旧档看到的"名称跟链头"**不是存档损坏，而是旧行为本身**；换成新 exe 也**不会自动追溯**——名侧借用只在 `Couple()` 那一瞬发生。想让旧档里**已经耦合**的车也显示车组名，只有**解挂后重挂一次**（或等未来的读档归一，见下方边界）。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.log` = `[4/4] Linking CXX executable openttd.exe`，`error C` / `fatal error` / `FAILED:` / `build stopped` 计数 0；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 20:31:42 → `train_cmd.cpp.obj` 20:32:56、`src\sl\couple_group_sl.cpp` 20:31:50 → `couple_group_sl.cpp.obj` 20:32:50，均早于 `build\openttd.exe` @2026-09-29 20:34:20（51 534 848 B）；`read_lints` 0 条；exe 内命中 `NAME-XFER head=%d u=%d head_own=%d got_u=%d` 与 `NAME-RESTORE veh=%d side=head`，且 R3VP 字段名表里 `unitnumber_backup` 之后紧跟 `name_backup`。
+
+**待复测判据（4 条）**：
+
+1. 机车（链头）挂上**有名字**的等待车底 ⇒ 日志 `NAME-XFER head=H u=U head_own=1 got_u=1`，且车辆列表主行 / 列车窗口标题**显示车组的名字**（"名称跟链头"消失）。
+2. 该链解挂 ⇒ `NAME-RESTORE veh=H side=head`，机车拿回自己的名字、解出的车组也显示自己的原名。
+3. 耦合状态**存档 → 读档 → 解挂** ⇒ 第 2 条仍然成立（`name_backup` 已入 R3VP，不再随读档丢失）。
+4. 等待车底**没有名字**时不出现 `NAME-XFER`、机车名字一字不动；`non_leading_engines_keep_name` 开启时整块跳过。
+
+**未做 / 边界**：
+
+- **读档不追溯**：旧档里**已经处于耦合态**的车，其名侧借用状态无法从存档重建（旧档 `v->name` 就是机车自己的名字），故读档后仍是旧显示；本轮**未做**读档归一。可选做法 = 在 `R3RSegmentReconcileRows()` / `AfterLoadVehiclesPhase2()` 里对 `r3r_orders_borrowed` 的链按"链头活字段 := 控制段那套"重演一次借用，**风险** = 可能覆盖玩家手写的链头车名，需先与玩家定口径。
+- 名侧与号侧**同源同构**，因此当 `u->name` 为空而 `u->unitnumber` 非空（车组有号无名）时，链头只借号不借名 —— 与既有"车组没名字就不动链头名"一致，属预期行为。
+- 与第 152 轮 R3SG 段行里的 `name`（段的**正式**名字宿主）**尚未完全打通**：本轮仍以 `Vehicle::name_backup` 为借用端，段行 `name` 由 `R3RSyncSegmentTraits()` / `R3RBorrowControlTraits()` 负责写。两处口径若将来不一致（例如"改名只写段行、不写活字段"），本条需要一并复核（与第 155 轮残留②"改名后行内值要等下一个提交点才刷新"同源）。
+- **连续两次耦合**（第一次未解挂）时的名字语义：`v->name_backup` 只在空时填 ⇒ 保留链头**最初**自己那一套；活字段则被**最后一次**借来的车组名覆盖，先前借入的车组名仍停在各车自己的 `name_backup` 里，不丢。
+- 本轮**未动**任何 `src\*.h`（车名借用只用既有字段），也未改 `R3RParkTrainName()` / `R3RRestoreTrainName()` 的既有语义（仓库拖动 + 折叠修正的身份迁移路径行为不变）。
+
+
+## 第 161 轮（2026-09-29）：KI-263 —— 「排程跟控制段走」在**车库拖动**与**读档**两条边上补齐号/名（**已实现 + 已编译**）
+
+**来源**：第 160 轮（KI-261）复测后玩家继续提的两件事（源码注释里分别标为「需求贰」与「事项三」）。二者是同一个结构漏洞的两条边：**第 159 轮把"控制段 = 命令所有者段"（`R3RGetControlSegment()` == `R3RGetPriorityHead()`）定死之后，"排程跟控制段走"在 `Couple()` / `DecoupleTrain()` / 车库拖动三处都已成立，但"号与名跟控制段走"只在 `Couple()` 与 `DecoupleTrain()` 两个交接点做了 —— 车库拖动那条交接路径漏了；而已经存进旧档的借用态列车，读回来仍然穿着链头自己那一套号/名。**
+
+### KI-263（已修，严重度 中）：交接点漏穿 + 旧档不追溯 —— 号/名与排程的归属不一致
+
+**需求贰 —— 车库拖动这条交接路径漏掉的"把控制段特质穿到链头活字段上"**
+
+- **漏点**：`TrainDepotMoveBeforeHead()`（"拖动到列车前面"）把落点链的那一段整体挪到拖动块之后，**合并链头 = 拖动块的链头**，而排程已由 `TrainDepotRankDropTargetFirst()` 正确地交给**落点链**（第 143 轮 KI-226 的排程修正，`src\depot_gui.cpp:287-314`）。现场即玩家看到的形态：「**排程继承了非拖动段，车号和名称却还继承拖动段**」—— 第 158 轮 KI-254 的拖动版，与第 160 轮 KI-261（耦合路径）同源但不同路径。
+- **修复**：`src\train_cmd.cpp` 新增 `static void R3RBorrowControlTraitsLive(Train *chain, const char *tag)`（定义 `:5393`，前向声明 `:5059`）：
+  - **四道门禁**：`chain != nullptr && chain->IsFrontEngine()`；`R3RGetControlSegment(chain)` 非空且 `!= chain`；`chain->r3r_orders_borrowed` 为真（**没借到排程就不换身份**，否则会穿上一套根本不属于它的号/名）；控制段确实还在本链上（否则那套特质不在本链保管范围内）。
+  - **车号**：`ctrl->unitnumber_backup != 0 && chain->unitnumber != ctrl->unitnumber_backup` 时，先把链头自己那一个停进 `chain->unitnumber_backup`（仅空时、且非 0），再把 `chain->unitnumber` 换成控制段停放的那个。控制段**没有号可借**时一字不动（不能让链头的活号与备份号填成同一个值）。
+  - **车名**：门禁与 `Couple()` / `R3RParkTrainName()` 一致（`!_settings_game.vehicle.non_leading_engines_keep_name && !ctrl->name_backup.empty()`），同样先停链头自己的名（仅空时），再穿上控制段的名字。
+  - **绝不改写任何 `*_backup` 上已存在的值** ⇒ 链头段与控制段在号池里占的位都还在，谁再当链头谁就能拿回自己那一个（下方还原块 / `R3RNormaliseChainGroups()` 的取值块）。
+  - **幂等**：已穿着同一个号/名时不写；链头一旦停放过（`unitnumber_backup != 0` / `name_backup` 非空）也不再动手 ⇒ 同一条链被连续编辑多次不会重复搬运。
+  - 命中一次打一行 `DEPOT-XFER-ID <tag> head= ctrl= unit= own_bk= hasname= own_name=`。
+- **调用点**：`R3RSyncChainAfterDepotEdit()`（`:5455`）在 `R3RRenumberPriorities()`（`:5459`）→ `R3RSyncDrivingOrders(chain, false)`（`:5460`）**之后**、下面"取回自己的号"块（`:5486`）**之前**调 `R3RBorrowControlTraitsLive(chain, "depot-edit")`（`:5465`）—— 前后两块**互斥**：一块管借用态、一块管非借用态，顺序反了会互相打架。
+- **号池护栏**：新增 `static bool R3RUnitNumberParkedByOther(const Train *chain, const Train *self, uint16_t num)`（`:5360`）—— 查 `num` 是否正停在链上**别的车**的 `unitnumber_backup` 里，与既有的、查"别人正拿它当活号用"的 `R3RUnitNumberUsedByOther()` 成对。用在释放块 `:5486-5489`，防止把**控制段仍然占着的那一位**放回号池。
+
+**事项三 —— 旧 R3R 存档字段的兼容口径与处置（读档补穿）**
+
+- **位置**：`R3RRebuildCouplePriorities()`（`:5083`）**两条返回路径**都在 `R3RSettleChainSegments()` 之前补一次 `R3RBorrowControlTraitsLive(chain, "load")`：停放分支（`chain->orders_backup != nullptr`）在 `:5094`，普通分支在 `:5136`。
+- **口径与安全边界（三条）**：
+  1. **只对确实是借用态的链动手**（`r3r_orders_borrowed`，KI-169a 起随 R3VP 入档）；R3VP 之前的更旧档读回标志恒为 `false` ⇒ **一个字都不改，绝不凭空发明身份**。
+  2. 控制段那套取自**它自己的 `*_backup`**（本来就是停放态），链头自己那一套**先停进链头自己的 `*_backup` 再穿** ⇒ 谁也没丢，解耦/解借时原样还回。
+  3. 幂等 ⇒ 本 exe 之后写下的档读进来不会反复搬运。
+- **顺序硬约束**：必须在 `R3RSettleChainSegments()` **之前**调用 —— 那个提交点会把链头活字段**镜像进控制段行**（`R3RSyncSegmentTraits()`），只有"先穿、后镜像"才能得到自洽的段行。
+- **对玩家"是不是旧存档的锅"的答复**：读出**本 exe 之前写下的、带 R3VP 借用标志的档**时**会一次性追溯**（补穿号/名）；但 **R3VP 之前的老档**既没有借用标志也没有停放字段，无从重建 ⇒ 不追溯。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）；`build\R3R_incbuild.guard.log` 末三行 = `GUARD:   newer: src\lang\simplified_chinese.txt  (2026-09-29 21:39:01)` / `GUARD:   newer: src\lang\english.txt  (2026-09-29 21:38:51)` / `GUARD: REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`（语言文件晚于最新 obj 20:32:56 ⇒ 按 KI-183 护栏走全量）；`build\R3R_incbuild.log` = `[701/702] Building CXX object CMakeFiles\openttd.dir\src\os\windows\win32_main.cpp.obj` → `[702/702] Linking CXX executable openttd.exe`，`error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`build\R3R_incbuild.done` = `EXIT_CODE=0`；源码 `src\train_cmd.cpp` 21:54:55 → `train_cmd.cpp.obj` 22:28:26，均早于 `build\openttd.exe` @**2026-09-29 22:32:15**（51 536 896 B）；`read_lints` **0** 条；exe 内命中 `DEPOT-XFER-ID`。**注**：语言文件虽在同一时间窗被保存，但相对上一提交（`8d10a666`）**没有新增任何 R3R 串**（`git diff` 的 `+STR_*` 全部属于此前轮次），本轮不引入新串。
+
+**待复测判据（4 条）**：
+
+1. 用"拖动到列车前面"把一段并到别条链前面（排程落到落点链）⇒ 出现 `DEPOT-XFER-ID depot-edit head=H ctrl=C`，且车辆列表主行 / 列车窗口标题显示**落点链（控制段）**的车号与车名，而不是拖动块的。
+2. 同场景**存档 → 读档** ⇒ 出现 `DEPOT-XFER-ID load head=H ctrl=C`，号/名仍是控制段那一套；再读一次**不再重复搬运**（幂等）。
+3. 把该段再拖出来（或在库里卖车触发释放）⇒ **不出现**"控制段的号被放回号池"（`R3RUnitNumberParkedByOther()` 生效），控制段拿回自己的号仍可用。
+4. **反例不许误伤**：`r3r_orders_borrowed == false` 的链（没借排程）、控制段就是链头、R3VP 之前的旧档 ⇒ 一条 `DEPOT-XFER-ID` 都不该出现、号/名一字不动；`non_leading_engines_keep_name` 开启时名侧整块跳过。
+
+**未做 / 边界**：
+
+- 本轮只补了"**车库拖动**"与"**读档**"两条边；`Couple()` / `DecoupleTrain()` 两条边早已具备（第 159 轮）。**其它可能改变链头身份的路径**（折叠修正 `R3RFlipChainBySegments()` 的身份迁移、`R3RRelocateFrontIdentity()`）**尚未逐一核对**是否需要同一句补穿。
+- 与第 152 轮 R3SG 段行的 `unitnumber` / `name`（段的**正式**宿主）**仍未完全打通**：本轮仍以 `Vehicle::*_backup` 为借用端，段行由 `R3RSyncSegmentTraits()` / `R3RBorrowControlTraits()` 负责写。将来若改成"段行是唯一宿主"，本条要一并复核（与第 160 轮同款边界）。
+- 读档补穿**只覆盖带 R3VP 借用标志的档**；更老档里的借用态**无法**还原 —— 这是"不发明身份"的代价，属有意取舍。
+- 本轮**未动**任何 `src\*.h`（只用既有字段）。
+
+
+## 第 162 轮（2026-09-29）：KI-262 —— 三处 UI 修复：`{STATION}` / `{STRING}` 参数形式 + 订单窗口被一个过宽 plane 撑爆（**已实现 + 已编译**）
+
+### KI-262（已修，严重度 低）：参数传错 + `EqualSize` 容器宽度被单个 plane 抬高
+
+**来源**：玩家 2026-09-29 复测反馈三件事 —— 站场窗口标题栏显示 "(invalid parameter)"、解挂/挂接下拉框的标签同样显示 "(invalid parameter)"、以及**订单窗口异常宽**。
+
+1. **站场窗口标题（`src\station_gui.cpp:3424`）**：`WID_SY_CAPTION` 原先走基类实现 ⇒ 按"无任何参数"渲染，而 `STR_R3R_YARD_CAPTION` 里带 `{STATION}` ⇒ 标题栏显示 "(invalid parameter)"。改为在该窗口的 `GetWidgetString()` 重载内、`WID_SY_WORKSHOP` 分支之后加一行 `return GetString(STR_R3R_YARD_CAPTION, this->station_id);`。
+2. **解挂排程归属标签（`src\order_gui.cpp:885`）**：`DecoupleOrdersLabel()` 把 `ODOF_*` 映射成 `StringID`（变量 `value`）之后**先渲染成文本**再塞进外层串，而外层串用的是 `{STRING}` —— `{STRING}` 要的正是 **StringID 本身**。改为 `return GetString(first ? STR_ORDER_DECOUPLE_FIRST_ORDERS_SEL : STR_ORDER_DECOUPLE_SECOND_ORDERS_SEL, value);`。
+3. **挂接方向标签（`src\order_gui.cpp:3343`）**：`WID_O_COUPLE_SIDE` 同样把 `STR_ORDER_COUPLE_SIDE_REAR/FRONT` 渲染后塞进 `{STRING}`，一并改成直接传 StringID。
+4. **订单窗口被撑宽（`src\order_gui.cpp:4941-4969`）**：`WID_O_SEL_TOP_YARD` 这个 `NWID_SELECTION` 的**整个 top row 是 `NWidContainerFlag::EqualSize` 容器**，其宽度 = **最宽子项 × 子项数**，所以**任何一个**过宽的 plane 都会把五个槽位一起撑大、进而抬高窗口最小宽度。第 152/153 轮（KI-244）加的 **plane 5**（解挂订单的"前半/后半排程"两个下拉框）当时是各 60px ⇒ top row 被抬到 **5 × 120 = 600px**，正是玩家看到的"订单窗口太宽"。现把 plane 5 的两个下拉框改成 **各 30px**（与 plane 3 的两个 30px 同口径），top row 回到 5 × 60 = 300px；代码注释里写明"该 selection 的每个 plane 都必须 ≤60px"。
+
+**构建自证**：与第 161 轮同一次全量构建（`[702/702] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`、错误计数 0、`build\openttd.exe` @2026-09-29 22:32:15 / 51 536 896 B）；`src\order_gui.cpp` 21:38:27 → `order_gui.cpp.obj` 22:25:02、`src\station_gui.cpp` 21:39:43 → `station_gui.cpp.obj` 22:27:11，均早于 exe；`read_lints` 0 条；`build\generated\table\strings.h` 内 `STR_R3R_YARD_CAPTION = 0xC55`、`STR_ORDER_DECOUPLE_FIRST_ORDERS_SEL = 0xEC2`。
+
+**待复测判据（4 条）**：
+
+1. 打开站场窗口 ⇒ 标题栏显示"<车站名> 站场"之类，**不再**出现 "(invalid parameter)"。
+2. 选中解挂订单 / 挂接订单 ⇒ 两个下拉框标签显示"前半: 保留排程 / 后半: 等待挂接""方向: 前"之类，不再 "(invalid parameter)"。
+3. 选中一条解挂订单 ⇒ 订单窗口宽度与普通订单窗口**基本一致**（top row 不再被撑到 600px），两个新下拉框仍可点开。
+4. 其它 plane（1/2/4 的 60px、plane 3 的 2×30px）外观**无回归**。
+
+**未做 / 边界**：
+
+- 30px 是这两个下拉框的**最小**宽度，长文本（例如中文"等待挂接"）是否被省略号截断需玩家目测确认；若不可读，可把两者改成 45/45，或把 top row 从 `EqualSize` 改成按 plane 各自宽度布局。
+- 本轮**未动**任何 `src\*.h`，也未新增语言串。
+
+---
+
+## 第 163 轮（2026-09-29 现场日志诊断）
+
+**本轮未改任何源码**，只对玩家交来的 `build\R3R_debug.log` 做取证与定性。完整行号索引见工作区临时备忘 `R3R_round162_retest_diag_memo.md`。
+
+- **日志身份**：`build\R3R_debug.log`，493 828 B / 7 599 行，mtime 2026-09-29 23:14:51；exe = `build\openttd.exe` @2026-09-29 22:32:15（51 536 896 B）= **第 161/162 轮构建** ⇒ 正是当轮挂起判据的现场回执。
+- **事件线**：`COUPLE-OK` ×5（269 loco=24 / 1003 loco=27 / 2667 loco=27 / 3408 loco=50 / 5205 loco=48）、`DECOUPLE-DONE` ×5（703 u=0 / 1338 u=6 / 2230 u=0 / 3032 u=6 / 3778 u=6）。场景 = 3 台机车反复挂/解一条 21 节车底链（`48,49,50` + 6 个三节铰接单元），被挂方 `consist=6` = car-only formation。
+
+### KI-263（第 161 轮，中）→ 状态：**判据 1 成立；判据 2/3/4 未覆盖（部分验证）**
+
+```
+ 165  UNIT-PARK veh=6 bk=2
+ 167  DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2 own_bk=1 hasname=1 own_name=1
+ 170  CTRL-PARK tag=depot-edit head=0 seg=1 unit=1
+ 172  INVAR-CTRL tag=depot-edit head=0 nseg=2 ctrl=6 ctrl_pri=1 head_pri=2 borrowed=1
+```
+
+判据 1（车库拖动到列车前面后补穿号/名）**成立**：链头 `head=0` 从控制段 `ctrl=6` 穿到号 `unit=2`（自号已停进备份 `own_bk=1`，名也穿了 `hasname=1 own_name=1`），不变式仍自洽。
+判据 2（读档路径）**未覆盖**：全日志 `DEPOT-XFER-ID` 仅 1 条且 `tag=depot-edit` ⇒ 本会话**没有发生读档**。判据 3（幂等/号池）与判据 4（反例不误伤）样本仅 1 条，判不了。
+
+### KI-261（第 160 轮，中）→ 状态：**判据 1/2 成立；判据 3 未覆盖（部分验证）**
+
+`NAME-XFER` 5 条（如 5204 `head=48 u=6 head_own=0 got_u=1`、3407 `head=50 u=6`）、`NAME-RESTORE` 3 条（733 / 1368 / 3062）⇒ 挂时借、解时还都成立；`XFER=5` 而 `RESTORE=3` 属正常（head=50 / head=48 挂上后日志即结束）。判据 3（`name_backup` 经 R3VP 存档往返）因无读档未覆盖。`head_own=0` 仍 `got_u=1` ⇒ 说明方向正确、无误伤迹象。
+
+### KI-262（第 162 轮，低）→ 状态：**待复测**（日志零覆盖，4 条判据全是 UI 目测）
+
+### 控制段不变式（乙口径）→ **8/8 成立**
+
+`INVAR-CTRL` 8 条（172 / 336 / 695 / 1073 / 1330 / 2729 / 3468 / 5265）全部 `ctrl != head`、`ctrl_pri=1 < head_pri=2`、`borrowed=1`。其中 5265 `tag=couple head=48 nseg=2 ctrl=21` 最直白：链头 48 只是被挂后的物理链头，控制段是 ★ 段头 **21**，与 KI-254 的乙口径一致。
+
+### KI-264（新，中）铰接单元边界系统性裂开 ~20px
+
+**来源**：第 163 轮现场日志（`GEO respace-after head=48`，日志 5176-5197）。**状态：已修（第 164 轮）**，见文末「第 164 轮」。严重度：中（观感/体验，与 KI-253 同族）。
+
+链 `head=48 n=21` = `[48,49,50]` + 6 个三节铰接单元 `(21,22,23) (18,19,20) (15,16,17) (12,13,14) (9,10,11) (6,7,8)`，每单元构成 = `[clen2 non-artic][clen8 artic][clen2 artic]`。`GEO` 的 `dist` = 本车到 `Next()` 的像素中心距，`nom` = `Train::CalcNextVehicleOffset()`：
+
+```
+ n=5 veh=23 dist=21 nom=2     ← 23→18 应为 2，实际 21
+ n=8 veh=20 dist=22 nom=2     ← 20→15
+n=11 veh=17 dist=22 nom=2     ← 17→12
+n=14 veh=14 dist=22 nom=2     ← 14→9
+n=17 veh=11 dist=22 nom=2     ← 11→6
+（对照：单元内部正确）
+ n=6 veh=18 dist=5 nom=5      ← 18→19
+ n=7 veh=19 dist=5 nom=5      ← 19→20
+```
+
+⇒ **每一个铰接单元边界都多出约 19-20px**，这就是"图像分离像被狗啃"的观感来源。旁证：`FOLDCHK COUPLE-FLIP-U worst_gap=20` 的 worst pair 正好是 `idx=20 ↔ idx=15`，`COUPLE-FLIP-V worst_gap=69`（`idx=50 ↔ idx=6`、`dist=71`）——折叠判据一直在把这类单元缝当"假折叠"来源。
+
+**口径未定（先别动位置代码）** *【第 164 轮已定：`nom` 是真值、21-22px 是真裂缝，两者证据见文末「第 164 轮」，本条已修】**：`nom` 用的是 `cached_veh_length` 口径（单元间名义 2px），而实测 pitch 21-22px。必须先确认**哪一侧是真值**（是真有 20px 裂缝，还是 `cached_veh_length` 口径本身不对）。
+
+### KI-253（第 158 轮，中）→ 状态：**仍复现**；本轮补出三条附记
+
+**附记 1（责任人指向 `R3RRespaceChainAfterEdit()`）**：含 ★ 的第一个单元（21/22/23）在 respace **之前**是 `1466 / 1461 / 1457`（dist 5/4，正确），respace **之后**三节 y 全为 `1456`（`dist=0 nom=5` / `dist=0 nom=4` ⇒ 21↔22 重叠 5px、22↔23 重叠 4px）。
+
+```
+（respace 之前）GEO-BEFORE couple  n=3 veh=21 y=1466 / n=4 veh=22 y=1461 / n=5 veh=23 y=1457
+（respace 之后）GEO respace-after  n=3 veh=21 y=1456 / n=4 veh=22 y=1456 / n=5 veh=23 y=1456
+5203  [R3R] RESPACE-AFTER-EDIT couple head=48 px=10 stretch=1 visited=20 capped=0
+```
+
+`COUPLE-OK` 逐节 dump 同证：`CPL idx=21 ... gap=-5 nom=5`、`CPL idx=22 ... gap=-4 nom=4`（gap 为负 = 两车盒子重合）。其余 5 个单元内部间距在 respace 后仍正确（5/5）⇒ **只有含 ★ 的第一个单元塌**。
+
+**附记 2（头部拼接缝是瞬时的，不算残留）**：4717 `SPLICE-GAP-REJECT COUPLE-FLIP-BOTH prev=50 y=1455 head=21 y=1466 exp=2 dist=11` → 4718 `SPLICE-GAP-LAST-RESORT` 强行接受 11px 缝；随后 `px=10` 把 50(1454)→21(1456) 收到 2px（正确）⇒ 缝被收拢，真正残留的是 KI-264 的单元缝与附记 1 的塌陷。
+
+**附记 3（口径需玩家确认，第 158 轮的"段划分塌缩"可能是记错了）**：`CHAIN-ATTRS head=48 n=21 SEG=2`；`R3RGetSegmentHeads` 只看到 1 个额外 ★（21），另一段是链头本身 ⇒ 段构成 = `[48,49,50]` + `[21..8]`。**若这条车底本来就是「1 个机车组段 + 1 个 18 节车组段」，SEG=2 就是对的**——"6 个三节铰接单元"是 **artic 单元**而不是 R3R 段。⇒ 请玩家确认该车底原本应为 **1 段** 还是 **6 段**；若为 1 段，则第 158 轮"段划分塌缩"的描述应撤回，只保留 KI-264 与附记 1 的几何问题。
+
+### 第 157 轮判据（`SEGFRONT-RESYNC`）→ **判据作废，不可观测**
+
+全日志 `SEGFRONT-RESYNC*` **0 命中**（字符串确实在 exe 内，已核对）。原因**不是**没触发，而是**采样窗口**：`src\train_cmd.cpp` 该处 `checks % 64` 才打一行 `-CHECK`，本会话 settle 提交点只有约 10 次（5 couple + 5 decouple + 1 depot-edit）⇒ 结构上打不出来。修法：(a) 改成"首次 + 字段变化时"打印；(b) 换判据。**状态：判据作废/待改。**
+
+### 探针覆盖缺口（本轮发现 3 处）
+
+1. `GEO-*` dump 全部跑在 `R3RSettleChainSegments()` **之前** ⇒ `segid` 恒为 0（`R3R_SEGMENT_NONE = 0`），**不能据此判"段 ID 缺失"**；全日志最后一条 GEO 是 5202（settle 之前），无法观测提交后的 `segid`。
+2. `CHAIN-ATTRS` 可能打在 `ConsistChanged()` 之前，不能当结论；`CHAIN-ATTRS2`（5 条，`head=48 len=80`）才是提交后的数 ⇒ 第 158 轮"链长为 0"的怀疑**排除**。
+3. `CGRP-NORM-UNION` 16 条但**掩码全 0**（本场景无挂接分组）⇒ 第 153/155 轮的分组并集判据在本场景**不可观测**，需另做带分组的场景。
+
+### 零命中 / 健康项 / 未定性
+
+- **零命中**（探针在 exe 内）：`SEGTRAIT-RECOVER` / `SEGROW-RECONCILE` / `SEGID-SYNC` / `UNIT-FREEZE` / `RESV-AUDIT-STRAY` / `A1-ROLLBACK-DONE` / `CRASH` / `ASSERT`。`UNIT-FREEZE` 未出现 ⇒ 本会话未走到"号位被别的活车占用"的兜底路径。
+- **健康**：`DB-NORMALISE` 2（KI-217 的混合 DrivingBackwards 归一化守卫生效）、`FOLDCHK-ACCEPT` 2、`SPLICE-GAP-REJECT` 3、`A3-FLIP-V` 2、`A2-ROLLBACK` 2。
+- **未定性**：末段 `COUPLE-FAIL` 152 次（`veh=24 @20,9` / `veh=27 @58,49`，`order=16`=`OT_GOTO_COUPLE`、`tx/ty` 打的是自身格、`TRP ... spd=0 fp=0`）与第 148 轮"候选车底尚未到位（`found=0`）"的正常形态一致 ⇒ **暂判正常等待、不是卡死**；但日志到此结束，需玩家确认末段是否属"一直挂不上"。另 `SVC-DEPOT-SKIP veh=0 cur=17 real=3(17) tag=couple-protocol` 是 KI-220 的自动回库守卫（`cur=17`=`OT_WAIT_COUPLE`），正常。
+
+### 下一步取数建议（3 条）
+
+1. `R3RRespaceChainAfterEdit()` 补**"入/出成对 dump"**（现只有出参 `GEO respace-after`，附记 1 的塌陷只能靠对比 `GEO-BEFORE` 间接看出，无法定位到具体哪一步写的坐标）。
+2. settle **之后**补一条带 `r3r_segment_id` / ★⊗ / `IsControlSegment` 的 dump。
+3. dump 里同时打印"真实单元长度 / 相邻单元真实间隙"，先定 KI-264 的 `nom` 口径（`cached_veh_length` vs 实际 sprite 长度）。
+
+### 需玩家补测的动作
+
+1. **KI-253 段口径**：那条 21 节车底原本应是 1 段还是 6 段？
+2. **补一次读档**（存档 → 退出 → 读档）⇒ 点亮 KI-263 判据 2（`DEPOT-XFER-ID load`）与 KI-261 判据 3（`name_backup` 经 R3VP 往返）。
+3. **KI-262 目测 4 条**。
+4. 末段 152 次 `COUPLE-FAIL` 是否属"有车底一直挂不上"。
+5. 若能给一条**带挂接分组**的场景，用来验 `CGRP-NORM-UNION` 的并集语义。
+
+
+## 第 164 轮（2026-09-30）KI-264 已修：铰接单元边界的 ~20px 裂缝
+
+**先答第 163 轮留下的"口径未定（先别动位置代码）"：`nom` 是真值，21-22px 是真裂缝。** 两条硬证据：
+
+1. **引擎自己的判据**：`src\train_cmd.cpp:204-228` 的 `CheckTrainsLengths()` 把 `max(|dx|,|dy|) != u->CalcNextVehicleOffset()` 直接判为"车辆长度损坏"（`STR_BROKEN_VEHICLE_LENGTH`），只有 depot 格例外 ⇒ 引擎要求**含 artic part 在内的每一对相邻车**都严格等于 `nom`。
+2. **同一份日志里同一条车底曾经是好的**：`head=50` 那次（`GEO respace-after`，日志 2616-2637，即 58,63 的 `COUPLE-OK loco=50`）显示 `6→7→8` 为 5/5、`8→9` 为 `dist=2 nom=2`、`11→12` 为 2……**全部 `dist==nom`**；而 `head=48` 那两次（3779-3800 / 5176-5197）单元间是 21-22 ⇒ 20px 是"某次提交点没被收拢"，不是 sprite 口径差。
+
+**根因**：`R3RRespaceChainAfterEdit()`（第 132 轮 KI-214 引入的重排器）里有一行豁免
+
+```
+if (a->IsArticulatedPart() || b->IsArticulatedPart()) continue;
+```
+
+（原注释写"artic part 与其父车天然共享中心、距离 0 不是重叠"——**这条假设是错的**：健康单元的实测就是 `dist==nom`，例 `18→19 = 5/5`、`19→20 = 5/5`）。而这条 21 节车底的**每一个坏对都恰好含一节 artic part**：单元缝 `20↔15 / 17↔12 / 14↔9 / 11↔6 / 23↔18`（`a` 是 part）与塌陷缝 `21↔22 / 22↔23`（`b` 是 part）⇒ 六个 20px 缝与含 ★ 首单元的 5px/4px 重叠**从来没有被任何提交点处理过**。第 163 轮附记 1 里"respace 之后 21/22/23 三节 y 全 1456"也随之解释通了：那次 `px=10 stretch=1` 只做了 `50↔21` 一对，所有重叠对被豁免跳过。
+
+**改动（仅 `src\train_cmd.cpp` 的 `R3RRespaceChainAfterEdit()`，未碰任何 `src\*.h`）**：上述豁免换成 **depot 豁免**
+
+```
+if (a->track == TRACK_BIT_DEPOT || b->track == TRACK_BIT_DEPOT) continue;
+```
+
+（与 `CheckTrainsLengths()` 的 depot 例外同口径；车库内引擎本就允许同格堆叠、`TrainController()` 在库内也不移动车辆，故不参与重排——顺手消除第 163 轮那条"库内 27 节全在 20,184 却 `stretch=16`"的无用功。）`nominal < 2` 的零长 part 豁免保留。含 part 的配对现在与普通配对同判据、同两条修法：缝大 ⇒ 拉后半链向前（`TrainController(b, nullptr, false)`）；重叠 ⇒ 推前半链向前（`TrainController(head, b, false)`）。两条位移都是**整段前缀/后缀一起走**，单元内部 5/5 间距不会被破坏。
+
+**预期数值**（同场景同链 `head=48 n=21`，从第 163 轮那份 `GEO-BEFORE` 起算）：`px≈108 stretch≈11 visited=20 capped=0`（`stretch` = 1+1+5+4：`48↔49`、`49↔50` 各 1px，`21↔22` 5px，`22↔23` 4px；`moved` = 9+19+20×4）。即复测时 `GEO respace-after` 应满足**除末车外每一对 `dist == nom`**。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 .cmd）；`GUARD: incremental is safe`；日志 `[3/3] Linking CXX executable openttd.exe`、`error C*/fatal error/FAILED:/build stopped` 计数 0；`build\R3R_incbuild.done = EXIT_CODE=0`；`src\train_cmd.cpp` 23:55:48 → `train_cmd.cpp.obj` 23:58:12 → `build\openttd.exe` @2026-09-30 00:08:25（51 536 896 B）；`read_lints` 0 条。
+
+**复测判据（3 条）**：
+
+1. 同场景再挂一次：`GEO respace-after` 里 `23→18 / 20→15 / 17→12 / 14→9 / 11→6` 全部 `dist=2 nom=2`，`21→22 = 5`、`22→23 = 4`（不再出现 `dist=21/22 nom=2`，也不再有 `dist=0 nom≥2`）。
+2. `RESPACE-AFTER-EDIT` 的 `stretch` 由 1 变成 ≈11、`px` 由 10 变成 ≈108（数值可浮动，关键看缝是否被收拢）。
+3. 车库内拖动/挂车行为不变（`DEPOT-*` 系列不回归；库内那次 `RESPACE-AFTER-EDIT` 的 `stretch` 不再空转到 16）。
+
+**边界/未做**：只修"重排器不处理含 part 的配对"这一件事。第 163 轮的"探针取数建议 1-3"（入/出成对 dump、settle 后段 ID dump、真实单元长度）未做；KI-263 判据 2/3/4、KI-261 判据 3、KI-262 目测 4 条、末段 152 次 `COUPLE-FAIL` 的定性仍待玩家补测；"是否需要在**每次**链编辑提交点都跑 respace（现在只有 couple / decouple / depot-edit 三处）"未复核；KI-253 附记 3 的"该车底应为 1 段还是 6 段"仍待玩家拍板（附记 1 的几何半已随本条修掉）。
+
+---
+
+## 第 165 轮（2026-09-30，纯探针）KI-253 复测探针补强 + respace 提交点复核（**已实现 + 已编译**）
+
+**本轮定性：纯只读探针补强，零行为变更**（不动位置、不动订单、不动段结构、不改存档）。做的是第 164 轮"边界/未做"里能自查的那三条（第 163 轮取数建议 ①②③，代码注释里按 §5.1/§5.2 记），目的是让下一次复测的日志能**一次读全**，不再出现"日志里没有某行 ≠ 那件事没发生"的判读困境。
+
+**改动清单（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**
+
+1. **入/出成对 dump（§5.1）**：`struct R3RGeoPoint` 由 `R3RRespaceChainAfterEdit()` 内的局部结构提到文件级（:6548），字段从 `{veh,x,y}` 扩成 `{veh,tx,ty,x,y}`；新增 `R3RDumpChainGeometrySnapshot()`（:6556），用与 `R3RDumpChainGeometry()` **完全相同的字段格式**输出。respace 里原来那行只有 `veh/x/y` 的 `GEO-BEFORE` 被换成 `GEO respace-before`（:6693）⇒ 现在 `respace-before` / `respace-after` 字段一一对应（`veh/tile/x/y/dir/db/artic/starF/starB/segid/clen/dist/nom`），可以直接逐行 diff。注意：快照只钉"respace 会改的东西"（tile/x/y），其余字段 dump 时读活车——respace 只动像素，`clen/artic/★⊗/segid/dir` 不受影响；`dist/nom` 的 before 值由快照位置算，after 值由当前位置算。
+
+2. **summary 常开**：`RESPACE-AFTER-EDIT` 由"只在动过时打"改成**每次提交点都打**（:6696-6705），否则"日志里没有 `RESPACE-AFTER-EDIT`"无法与"这个提交点根本没跑 respace"区分（KI-253 几轮复测都卡在这里）。两条重 dump（`GEO respace-before/after`）仍留在门禁内，避免日志体积失控。
+
+3. **settle 之后补段 ID dump（§5.2）**：新增 `R3RSettleWorthDumping()`（:4973），并在 `R3RSettleChainSegments()` 末尾（:5019）补一条 `GEO settle-<提交点>`——tag 映射 `couple→settle-couple`、`decouple-v/u→settle-decouple-v/u`、`depot-edit→settle-depot-edit`、其余 `settle-other`（用 `std::string_view` 比较拼字面量，不引 `snprintf`/`seprintf`）。原因：**段 ID / ★⊗ / 控制段是 settle 里才写成终值的**，此前所有 dump（`GEO respace-after`、`CHAIN-ATTRS`）都跑在 settle 之前，打出来的 `segid` 一律是 0（现场第 163 轮日志 5176 行即如此），"这一段应该是一段还是六段"从日志里判不出来。噪声门禁两条：`tag=="load"` 不打（读档会对**每一列车** settle 一次），且只打"多段链或节数 > 8"的链（单段短链没什么可说）。
+   坑：`R3RDumpChainGeometry()` 定义在文件很后面，前置声明**必须放在 `R3RSettleChainSegments()` 之前**（现加在 :4961）；第一次误放进文件后段的前置声明区（原 :5079），编译直接报 `src\train_cmd.cpp(5022): error C3861: "R3RDumpChainGeometry": 找不到标识符`，`ninja: build stopped: subcommand failed.`——已修正并复编通过。
+
+4. **`SEGFRONT-RESYNC-CHECK` 采样改口径（第 157 轮判据修法）**：由 `++checks % 64 == 0` 改成"**首次调用 + `fixed_total` 变化时**打印"（:4630-4650）。原因：settle 一次会话只跑几次（提交点级，不是 tick 级），第 64 次永远到不了 ⇒ 那一行几乎从不出现，"日志里没有"读不出任何信息。改后：`runs=1` 一行保底证明这一段重同步跑过；只要它真修过东西（`fixed` 变化）就会再出一行。
+
+**respace 提交点复核结论（第 164 轮遗留项）＝不需要补调用点**。核实：`R3RRespaceChainAfterEdit()` 全文件**只有 1 个调用点**（:9461，`tag="couple"`），而 `R3RSettleChainSegments()` 有 5 个（:5147 / :5189 读档、:5630 车库编辑、:7222 / :7223 解挂两半、:10020 耦合）。四条理由：
+
+1. respace 修的是"**拼接面**"——只有耦合会把两条链拼到一起，才可能产生缝/重叠；
+2. 解挂是**切分**：两半各自的内部间距原样保留，切点两侧本来就是正常相邻间距，切完不会新增坏对；
+3. 车库编辑按 depot 豁免（第 164 轮改的判据）本就跳过，调了也只是空转（第 163 轮那条"库内 27 节全在 `20,184` 却 `stretch=16`"就是这类空转）；
+4. 读档的时空对齐由 `ConsistChanged(CCF_LOADSAVE)` + 存档里的位置负责。
+
+⇒ 第 164 轮那句"现在只有 couple / decouple / depot-edit 三处"**本身写错了**（decouple / depot-edit 从来没调过 respace），本条更正。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志 `Linking CXX executable` 命中 1 次、`error C*/fatal error/FAILED:/build stopped` 计数 0；`build\R3R_incbuild.done = EXIT_CODE=0`（01:06:17 写盘）；`src\train_cmd.cpp` 00:45:57 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 00:48:00 → `build\openttd.exe` @2026-09-30 01:05:29（51 540 480 B）；`read_lints` 0 条；exe 逐串自证命中 `respace-before` / `respace-after` / `settle-couple` / `settle-decouple-u` / `settle-depot-edit` / `SEGFRONT-RESYNC-CHECK` / `RESPACE-AFTER-EDIT` / `GEO-END` / `fixed=%u`。
+
+**状态＝已实现 + 已编译（纯探针，零行为变更），读数待下次复测**，四条判据：
+
+1. `GEO respace-before` 与 `GEO respace-after` **成对出现**且字段一一对应（可直接 diff 出"哪几节被推/被拉、推了多少"）；
+2. 即使本次没动过任何像素，也**一定有** `RESPACE-AFTER-EDIT ... px=0`（证明提交点跑到了）；
+3. 耦合 / 解挂 / 车库编辑之后出现 `GEO settle-*`，且其中 `segid` **非 0**、★⊗ 与控制段自洽 —— 这是"该车底是 1 段还是 6 段"（KI-253 附记 3）的判读依据；
+4. `SEGFRONT-RESYNC-CHECK runs=1` 至少出现一次；若出现第二行则 `fixed>0`，说明段头重同步真修过东西。
+
+**边界**：仍**不做**"真实单元长度"（取数建议 ③）——第 164 轮已用 `CheckTrainsLengths()` 的实测口径证明 `nom`（`CalcNextVehicleOffset()`）**就是**真实值（健康单元 `dist==nom`，例 `18→19 = 5/5`），无需再取 sprite 长度；`GEO settle-*` 对 depot 内的单段短链按设计不打印；本轮未动 `R3RDumpChainGeometry()` 既有输出格式（老判据继续可用）。
+
+
+
+
+## 第 166 轮（2026-09-30）：KI-253 附记 —— respace 的"加宽预算"由**每次调用**改为**每对**（尾段铰接单元被压成一坨的直接原因）＋ `unfixed` 判定探针（**已实现 + 已编译**）
+
+**现场（`build\R3R_debug.log`，2026-09-30 01:26 的本次运行）**：第 165 轮补的成对探针全部按预期落盘，其中 `head=48` 的耦合链给出决定性读数。
+
+- `GEO respace-before head=48`（:6796-6816）：单元**之间**的 y 缝是 21~22px，而 `nom` 只要 2（`50→21 dist=11/nom=2`、`23→18 21/2`、`20→15 22/2`、`17→12 22/2`、`14→9 22/2`、`11→6 22/2`）；单元**内部**三节则**已经** `dist==nom`（`18→19 5/5`、`19→20 5/5`）。
+- `RESPACE-AFTER-EDIT couple head=48 px=109 stretch=16 visited=20 capped=0`（:6840）——`stretch` **恰好等于** `R3R_RESPACE_MAX_STRETCH`（16）。
+- `GEO settle-couple head=48`（:6903-6923，`R3RSettleChainSegments()` 之后的终值，`segid` 已非 0）：链头段 `48/49/50`（segid=1）以及 `21/22/23`、`18→19` 都精确落在 `dist==nom`，但**从 `19→20` 起向后共 9 对被压扁**：`19→20 1/5`、`15→16 0/5`、`16→17 0/5`、`12→13 0/5`、`13→14 0/5`、`9→10 0/5`、`10→11 0/5`、`6→7 0/5`、`7→8 0/5`（单元内的第 3 对仍是 `2/2` 正确）。被压掉的正是"每个铰接单元的第 1↔2 节"，与玩家报的"图像像被狗啃"逐字吻合。
+
+**根因**：`R3RRespaceChainAfterEdit()` 的"太近 ⇒ 把前半推前"分支，`stretch` 是**整趟扫描共用一个计数器**，闸门 `if (stretched >= R3R_RESPACE_MAX_STRETCH) break;` 一响，**之后每一对**都立刻 break 出循环。扫描是链头先走的，于是 16px 预算被链头那几对先用掉，尾部 `15→16`、`12→13`、`9→10`、`6→7` 这些同样需要 5px 加宽的对**永远拿不到预算**——而它们之所以变"太近"，恰恰是同一趟扫描为了消掉上面那 6 个 21~22px 单元缝、反复 `TrainController(b, nullptr, false)` 把车尾往前拖造成的。`px=109` 与 `stretch=16` 正是"先拖坏、后修不完"的组合读数。
+
+**改动（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：
+
+1. `stretch` 降级为**只用于汇总输出**；每对新增局部计数 `int pair_stretched`，闸门改判 `pair_stretched >= R3R_RESPACE_MAX_STRETCH`。安全性依据写进常量注释：给对 (i,i+1) 加宽只动 `head..i`（`TrainController(head, b, false)` 走到 `b` 为止、不碰 `b`），**不可能**破坏扫描已经修好的任何一对，因此预算可以放心按对发放；`moved`（拉近）一侧本来就只有 `guard < 64` 的每对上限，两侧口径至此一致。
+2. 新增每对收尾判定：guard 循环结束后若 `dist != nominal` 则 `unfixed++`；`RESPACE-AFTER-EDIT` 行尾追加 `unfixed=%d`，并把 `unfixed != 0` 也纳入**打印条件**。这样"这一对修不了"（控制器被挡 / 轨道到头 / 该节朝向相反）与"本来就没问题"在日志上不再同形——旧摘要里这两者都是 `px=0`，无法区分。
+3. `R3R_RESPACE_MAX_STRETCH` 的注释改写为"**每对**的预算"，并记下本轮现场读数。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志 `Linking CXX executable` 命中 1 次、`error C*/fatal error/FAILED:/build stopped` 计数 0；`build\R3R_incbuild.done = EXIT_CODE=0`（01:56:29 写盘）；`src\train_cmd.cpp` 01:49:55 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 01:54:12 → `build\openttd.exe` @2026-09-30 01:56:21（51 540 480 B）；`read_lints` 0 条；exe 逐串自证命中 `RESPACE-AFTER-EDIT` / `stretch=%d unfixed=%d`。
+
+**状态＝已实现 + 已编译，游戏内复测待做**，判据：
+
+1. 同一耦合场景复跑，`GEO settle-couple` 里 `15→16`、`12→13`、`9→10`、`6→7` 这些对**不再是 `dist=0`**（每对 `dist==nom`）；
+2. `RESPACE-AFTER-EDIT couple` 的 `unfixed=0`。**若 `unfixed` 仍非 0，说明残下的对是硬限制**（预算已够而控制器推不动），此时它后面的 `GEO settle-*` 直接指出是哪一连、哪一节 —— 这将是下一轮的起点，**不要**再回头去调 `R3R_RESPACE_MAX_STRETCH`；
+3. `stretch` 允许大于 16（这是本轮的预期变化），`px` 不应显著变大：加宽总量守恒，只是分配到了该去的对；
+4. 链头段 `48/49/50`、拼接面 `50→21` 仍精确，`capped=0`。
+
+**边界 / 未做**：
+
+1. 本轮只改**预算分配**，**没有**消除上游"单元缝 21~22px"的产生源。它是第 164 轮 KI-264 的遗留形态（`R3RFlipChainBySegments` 段内各自反转 + 位置不动 ⇒ 相邻单元朝向相反），而 `dist` 是 Chebyshev 标量、**看不出正负**，所以 21px 的缝与"内部已 5/5 正确"能同时存在；respace 只是事后把它拉回来。
+2. `R3RRespaceChainAfterEdit` 仍是"按 `dist==nom` 逐对逼近"的启发式，**不校验相邻两节的朝向是否自洽**。若判据 2 复测出 `unfixed>0`，下一轮就应给 respace / `R3RCheckChainFold` 补一个"朝向自洽"判定（用 `GetMovingDirection()` 的点积，而不是标量距离）。
+3. `segid` 在本轮两个 dump 里已非 0（1 与 3），第 165 轮判据 ③ 满足；但该 21 节链的 **6 个铰接单元全部落在同一个 `segid=3` 段里**，与"一段 = 一个铰接单元"的口径仍不符，另开条目跟踪（第 158 轮 KI-253 的"段划分塌缩"同源）。
+
+---
+
+## 第 167 轮（2026-09-30）：KI-253 附记 2 —— respace 由**单趟扫描**改为**多趟收敛扫描**（每趟重走全链，`passes=` 探针）（**已实现 + 已编译**）
+
+**本轮定性：`R3RRespaceChainAfterEdit()` 的控制流改造，行为变更面限于"同一次提交点内多走几趟"，不改判据、不改预算、不碰位置之外任何东西。**
+
+**为什么单趟不够（第 166 轮的 `unfixed` 探针就是明证）**：第 166 轮把 `stretch` 预算改成每对 16px 之后，"预算不够"这一类原因已被排除，但同一趟扫描里仍然存在两类**结构性**缺口：
+
+1. **顺序依赖**：加宽对 `(a,b)` 只动 `head..a`（`TrainController(head, b, false)` 走到 `b` 为止、不碰 `b`），拉近对 `(a,b)` 只动 `b..尾`。两者都不动"别人"，但一趟扫描是**链头先走**的：前面几对为消掉 21~22px 的单元缝而反复把车尾往前拖（`moved`），被拖动的那些车**正是后面几对的成员**，于是后面几对在扫描走到它们之前就已经"变太近"，而扫描**不会回头看**已走过的对。
+2. **部分移动**：一次 `TrainController()` 在受阻轨道、不得进入的格、或轨道到头时会提前停下，只把一部分车挪到位。那些"只走了一半"的车立刻与它后面的车挤在一起 —— 这同样是"已走过的对 + 后方被动的对"，一趟里修不回来。
+
+⇒ 单趟扫描的最优结果只能保证"被扫过时状态正确的对保持正确"，无法保证"扫描结束后全链正确"。第 166 轮的现场（`stretch=16` 恰好撞到上限、尾部 9 对 `dist=0`）就是这两个缺口叠加的读数。
+
+**改动（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：
+
+1. 新增常量 `static const int R3R_RESPACE_MAX_PASSES = 4;`（紧邻 `R3R_RESPACE_MAX_STRETCH`），注释写明上述两类缺口与**收敛性论证**：加宽只动 `head..a`、拉近只动 `b..尾`，因此"每一趟里所有被请求的移动都成功"的趟不可能破坏任何一对；其后的一趟只需修复"某次移动被挡"留下的残局，趟数自然有界。上限只为防"某一对永久拒绝归位"空转。
+2. 主扫描外面套一层趟循环 `for (passes = 1; passes <= R3R_RESPACE_MAX_PASSES; passes++)`，趟首记 `done_before = moved + stretched`、把 `visited` 与 `unfixed` **清零重算**：
+   - 一趟内 `moved + stretched == done_before` ⇒ 整条链**没有任何一处动过** ⇒ 已 settle，`break` 提前退出（正常场景 = 2 趟：第 2 趟白走一趟即收敛）；
+   - 撞 `R3R_CHAIN_WALK_LIMIT` ⇒ `walk_capped = true` 并 `break`（链本身是坏的，重复走没有意义，且不再重复计时）。
+3. 汇总行尾由 `unfixed=%d visited=%d capped=%d` 扩为 `unfixed=%d passes=%d visited=%d capped=%d`，`capped` 改由 `walk_capped` 输出（原先在打印点就地重算 `visited >= R3R_CHAIN_WALK_LIMIT`，多趟之后该表达式已不再等价）。`visited` 打的是**最后一趟**的走访节数（settle 场景下即收敛趟的读数）。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`build\R3R_incbuild.guard.log`（02:40:38 写盘）= `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志 `Linking CXX executable` 命中 1 次、`error C*/fatal error/FAILED:/build stopped` 计数 0；`build\R3R_incbuild.done = EXIT_CODE=0`；`src\train_cmd.cpp` 02:40:23 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 02:41:19 → `build\openttd.exe` @2026-09-30 02:42:43（51 540 480 B）；`read_lints` 0 条；exe 逐串自证命中 `unfixed=%d passes=%d`。
+
+**状态＝已实现 + 已编译，游戏内复测待做**，判据：
+
+1. `RESPACE-AFTER-EDIT couple` 出现 `passes=` 字段；**多数场景 `passes=2`**（第 2 趟零动作即收敛）——这是"多趟机制真的生效、且没有白跑"的标志；
+2. 同一耦合场景复跑，`GEO settle-couple` 里第 166 轮列出的 9 对（`19→20`、`15→16`、`16→17`、`12→13`、`13→14`、`9→10`、`10→11`、`6→7`、`7→8`）**全部 `dist==nom`**（不再有 `0/5`、`1/5`）；
+3. `unfixed=0`。**若 `unfixed` 仍非 0 且 `passes=4`，说明残下的对是硬限制**（控制器在受阻轨道上推不动 / 朝向相反），此时后面的 `GEO settle-*` 直接指出是哪一连、哪一节 —— **不要**再加趟数，也不要去调 `R3R_RESPACE_MAX_STRETCH`（该归因已在第 166 轮排除）；
+4. 链头段 `48/49/50`、拼接面 `50→21` 仍精确，`capped=0`；`px` 不应显著变大（加宽总量守恒，只是换了分配对象）。
+
+**边界 / 未做**：
+
+1. 多趟只解决"**同一次提交点内**的收敛"，**没有**消除上游"单元缝 21~22px"的产生源（第 164 轮 KI-264 的遗留形态：`R3RFlipChainBySegments` 段内各自反转 + 位置不动 ⇒ 相邻单元朝向相反，而 `dist` 是 Chebyshev 标量、看不出正负）。
+2. `R3RRespaceChainAfterEdit` 仍是"按 `dist==nom` 逐对逼近"的启发式，**不校验相邻两节朝向是否自洽**；若判据 3 复测出 `unfixed>0`，下一轮的起点应是给 respace / `R3RCheckChainFold` 补"朝向自洽"判定（用 `GetMovingDirection()` 的点积，而不是标量距离）。
+3. `R3R_RESPACE_MAX_PASSES = 4` 是经验上限，**不是**收敛证明；趟数的收敛性只见于"所有请求移动都成功"的路径，被挡的分支靠 `guard < 64`（每对）与趟数上限共同兜底。
+4. respace 的调用点本轮**未扩张**（结论沿用第 165 轮复核：全文件只有 `tag="couple"` 一处，解挂/车库按设计与实测都无需补）。
+
+---
+
+## 第 168 轮（2026-09-30）：第 167 轮复测**判据全过**（`build\R3R_debug1.log`）＋ KI-253 附记 4 —— respace 在**倒车链**上是**静默空转**（`visited=0`，已修）
+
+### 一、第 167 轮复测结论：**判据 1~4 全部通过**
+
+现场日志 `build\R3R_debug1.log`（本轮新跑的存档，同一列车 depot → 站台 → depot 多次往返，共 5 次耦合提交点）。
+
+| 提交点 | `head=` | 汇总行 | 行号 |
+| --- | --- | --- | --- |
+| 车库内首次耦合 | 24 | `px=0 stretch=0 unfixed=0 passes=1 visited=26 capped=0` | `:233` |
+| 站台耦合 #1 | 27 | `px=0 stretch=0 unfixed=0 passes=1 visited=0 capped=0` | `:1043` |
+| 站台耦合 #2 | 27 | `px=0 stretch=0 unfixed=0 passes=1 visited=0 capped=0` | `:2584` |
+| 站台耦合 #3 | 50 | `px=1 stretch=1 unfixed=0 passes=2 visited=20 capped=0` | `:3151` |
+| 站台耦合 #4 | 48 | `px=109 stretch=62 unfixed=0 passes=3 visited=20 capped=0` | `:6646` |
+
+- **判据 1（`passes=` 存在且机制生效）✓**：字段已落盘；有活干时 `passes=2`（`:3151`）、重活干 3 趟（`:6646`，第 3 趟零动作即收敛）；链条本来就对齐时第 1 趟零动作 → `passes=1`（`:233`），属预期而非"没跑"。第 167 轮原写"多数场景 `passes=2`"应放宽为"**有活干时 `passes>=2`，无事可做时 `passes=1`**"。
+- **判据 2（第 166 轮列出的 9 对全部 `dist==nom`）✓✓**：`GEO settle-couple head=48`（`:6709-6729`）逐对核对，`n=0..19` **每一对都 `dist==nom`**：`19→20 2/2`（`:6717`）、`15→16 5/5`（`:6719`）、`16→17 2/2`（`:6720`）、`12→13 5/5`（`:6722`）、`13→14 2/2`（`:6723`）、`9→10 5/5`（`:6725`）、`10→11 2/2`（`:6726`）、`6→7 5/5`（`:6728`）、`7→8` 为链尾（`-1/-1`，按设计跳过，`:6729`）。第 166 轮的 `0/5`、`1/5` 全部消失。
+- **判据 3（`unfixed=0`）✓**：5 个提交点全部 `unfixed=0`。
+- **判据 4（链头段与拼接面精确、`capped=0`）✓**：`48→49 dist=4/nom=4`、`49→50 dist=3/nom=3`（`:6709-6711`，segid=1）、拼接面 `50→21 dist=2/nom=2`（`:6711-6712`）；全部 5 行 `capped=0`。`px=109` 与第 166 轮同量级（该链在 `GEO respace-before` 时确实整体错位 100+px，见下条），未变大。
+- 附：第 165 轮判据 ③（`segid` 非 0）亦满足 —— `48/49/50` 为 `segid=1`，`21..8` 为 `segid=3`；第 166 轮边界 3 提到的"6 个铰接单元全落在同一个 `segid=3` 段里"在本日志中**依旧**存在，仍按原条目跟踪。
+
+### 二、KI-253 附记 4（**已修**，严重度：中）—— respace 在 `DrivingBackwards` 链上从不运行
+
+**现场证据（决定性对照）**：同一份日志里 `visited` 只有两种取值，且与 `DB-NORMALISE` 严格一一对应 ——
+
+- `:1042` `[R3R] DB-NORMALISE couple head=27 headDB=1 cleared=0 set=24 n=27 nocab=1` → `:1043` `RESPACE-AFTER-EDIT couple head=27 … passes=1 **visited=0**`
+- `:2583` `[R3R] DB-NORMALISE couple head=27 headDB=1 cleared=0 set=18 n=21 nocab=1` → `:2584` `RESPACE-AFTER-EDIT couple head=27 … passes=1 **visited=0**`
+- 反例：`head=24` / `head=50` / `head=48` 三次耦合**没有** `DB-NORMALISE` 行（链本来就不是倒车态）→ `visited=26 / 20 / 20`，逐对判据全部生效。
+
+**根因**：`R3RRespaceChainAfterEdit()` 的扫描沿 `GetMovingNext()` 前进，而调用点是 `R3RRespaceChainAfterEdit(v->First(), "couple")`，起点是**物理链头**。`vehicle_base.h` 的 `GetMovingNext()` = `IsDrivingBackwards() ? Previous() : Next()`，于是当整条链是倒车态（`DrivingBackwards` 置位，`GetMovingFront()` 返回 `Last()`）时：
+
+```
+for (Train *a = head /* = First() */; …; a = a->GetMovingNext())   // First()->Previous() == nullptr
+    Train *b = a->GetMovingNext(); if (b == nullptr) break;         // 立刻 break
+```
+
+⇒ 循环体一次都没执行，`visited=0`、`px=0`、`unfixed=0`，**函数完全空转**。而"合并链链头是倒车态"并不是异常：本轮 `head=27` 的两次都是 `R3RNormaliseMixedChainDrivingBackwards()` 刚刚把整链**统一**成 `headDB=1`（`cleared=0` 即只补不撤），也就是说**归一化本身会把链送进这条静默失效的路径**。后果＝只要拼接后是倒车链，两个车底在拼接面留下的像素缝就**永远不会被收拢**（列车是刚性的，开走也不会自动贴紧）。
+
+**改动（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：
+
+1. 归一化之后新增 `Train *const front = head->GetMovingFront();`，注释写明上述因果与 `visited=0` 的现场读数。
+2. 主扫描（及趟循环）起点由 `head` 改为 `front`：`for (Train *a = front; a != nullptr && visited < R3R_CHAIN_WALK_LIMIT; a = a->GetMovingNext(), visited++)`。
+3. "太近 ⇒ 把前半推前"分支的 `TrainController(head, b, false)` 改为 `TrainController(front, b, false)`（该调用要走到 `b` 为止，起点必须是**行进方向的前端**才不至于反向推；`db=0` 时 `front == head`，行为逐字节不变）。
+4. `GEO respace-before` / `GEO respace-after` 两个 dump 仍以物理链头 `head` 为参数（它们走 `Next()`），输出格式与老判据**均不变**。
+
+**构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志 `Linking CXX executable` 命中 1 次（`[3/3] Linking CXX executable openttd.exe`）、`error C*/fatal error/FAILED:/build stopped` 计数 0；`build\R3R_incbuild.done = EXIT_CODE=0`（03:43 写盘）；`src\train_cmd.cpp` 03:24 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 03:26 → `build\openttd.exe` @2026-09-30 03:40（51 540 992 B）；`read_lints` 0 条。
+
+**状态＝已实现 + 已编译，游戏内复测待做**，判据：
+
+1. 复现"倒车链耦合"（日志出现 `DB-NORMALISE … headDB=1`）后，紧随的 `RESPACE-AFTER-EDIT couple` **`visited` 不再为 0**（应与链长减 1 相当，如 `visited=20/26`），且 `db=1` 链的 `GEO settle-couple` 里拼接面 `dist==nom`；
+2. 若该次拼接确有缝，`px`/`stretch` 应从 0 变为非 0（这是本轮预期的行为变化）；反之若本来无缝，`passes=1`、`px=0` 仍成立；
+3. `db=0` 链回归：`head=24/50/48` 三次耦合的 `visited`（26/20/20）与 `passes`（1/2/3）**逐字段不变**，`GEO settle-couple` 每对仍 `dist==nom`；
+4. 全日志 `capped=0`、`unfixed=0` 保持。
+
+**边界 / 未做**：
+
+1. 本轮只修"扫描起点"，**未**触碰上游"单元缝 21~22px"的产生源（第 164 轮 KI-264 遗留形态：`R3RFlipChainBySegments` 段内各自反转 + 位置不动 ⇒ 相邻单元朝向相反，而 `dist` 是 Chebyshev 标量、看不出正负）。
+2. 仍**不校验相邻两节朝向是否自洽**；若复测出现 `unfixed>0`，下一轮起点照旧是给 respace / `R3RCheckChainFold` 补 `GetMovingDirection()` 点积判定。
+3. `visited` 的语义本轮未改（仍为"最后一趟的走访节数"）；`db=1` 链修好之后 `visited` 才第一次有非零值，第 167 轮把 `visited=0` 当成"无事可做"的读法在本轮之前对倒车链是**误读**，后续判据应以"`visited == 链节数 - 1`"为准。
+
+---
+
+## 第 169 轮（2026-09-30）：第 168 轮复测 —— **判据 1~4 全过**（`build\R3R_debug.log`）；**未改源码**
+
+### 一、现场身份
+
+| 项 | 值 |
+|---|---|
+| 日志 | `build\R3R_debug.log`，418 186 B / **5 907 行**，mtime 09-30 04:04:06（04:12 另写 `build\R3R_perf.log`；收工时无 `openttd` 残留进程） |
+| exe | 51 540 992 B @ 09-30 03:40:03 = 第 168 轮构建（日志里 `visited` 已非 0，亦反证之） |
+| 会话形态 | `COUPLE-OK=5`（head = 24 / 27 / 27 / 50 / 48）、`DECOUPLE-DONE=5`、`DEPOT-XFER-ID=1`（`:14`，`tag=depot-edit`） |
+| 同场景依据 | 5 个 head 的顺序与坐标与第 163/167 轮逐条对应（24 在 `tile=1,11`；27 在 `x=545 y=152`；50 在 `x=936 y=1023`；48 在 `x=968 y=1386`）⇒ 同一存档、同一条 21 节车底 |
+
+### 二、判据 1（`db=1` 链的 respace 不再空转）✓
+
+```
+ 629  [R3R] DB-NORMALISE couple head=27 headDB=1 cleared=0 set=24 n=27 nocab=1
+ 630  [R3R] RESPACE-AFTER-EDIT couple head=27 px=0 stretch=0 unfixed=0 passes=1 visited=26 capped=0
+1332  [R3R] DB-NORMALISE couple head=27 headDB=1 cleared=0 set=18 n=21 nocab=1
+1333  [R3R] RESPACE-AFTER-EDIT couple head=27 px=0 stretch=0 unfixed=0 passes=1 visited=20 capped=0
+```
+
+两个 `db=1` 提交点的 `visited` 由第 167/168 轮的 **0** 变成 **26 / 20**，恰为"链节数 − 1"（同链 `GEO-END settle-couple` 报 `n=27` `:730` / `n=21` `:1419`），与上一轮边界 3 定的新口径一致 ⇒ 函数真的走完整链，不再是 `First()->GetMovingNext() == nullptr` 的立刻 break。
+
+### 三、判据 2（有缝则 `px/stretch` 非 0；本来无缝则 `passes=1`、`px=0`）✓（走"本来无缝"分支，有三份独立佐证）
+
+两处 `db=1` 都是 `px=0 stretch=0 passes=1`（`:630` / `:1333`）。这次不是"没跑"，而是"跑了、无事可做"：
+
+1. 折叠判据：`FOLDCHK COUPLE n=27 worst_gap=3 A idx=29 … B idx=0 … exp=2 dist=2`（`:626`）、`n=21 … A idx=29 … B idx=6 … exp=2 dist=2`（`:1329`）⇒ 拼接面本来就落在 2px；
+2. `COUPLE-OK` 逐节 dump **每一节 `gap=0`**（`:633`~`:653`、`:1336`~）；
+3. 其后的 `GEO settle-couple head=27` **逐对 `dist==nom`**（`:703`~`:729`、`:1398`~`:1418`），含拼接面 `29→0 = 2/2`、`29→6 = 2/2`。
+
+**残留风险（如实记）**：`px>0`（= 真有缝并被 respace 收拢）这一侧在 `db=1` 链上**仍未被观测到**。已证"不再空转"与"无事可做时如实报 0"；未证"`db=1` 链上的缝能被收拢"（该路径与 `db=0` 共用，本轮 `db=0` 侧 `px=109`，风险低）。
+
+### 四、判据 3（`db=0` 回归逐字段不变）✓
+
+| head | 第 167/168 轮基线（`R3R_debug1.log`） | 本轮 | 行号 |
+|---|---|---|---|
+| 24 | `px=0 stretch=0 unfixed=0 passes=1 visited=26` | 逐字段相同 | `:92` |
+| 50 | `px=1 stretch=1 unfixed=0 passes=2 visited=20` | 逐字段相同 | `:2108` |
+| 48 | `px=109 stretch=62 unfixed=0 passes=3 visited=20` | 逐字段相同 | `:5810` |
+
+`head=48` 的 `GEO settle-couple`（`:5873`~`:5893`）逐对 `dist==nom`：`48→49 4/4`、`49→50 3/3`、`50→21 2/2`、`21→22 5/5`、`22→23 2/2`，其余 5 个单元内部 `5/5`、`2/2`；链尾 `8` 仍为 `-1/-1`（按设计跳过）。`head=50` 的成对探针正常：`n=0 veh=50 3/4 → 4/4`、`n=1 veh=49 4/3 → 3/3`（`:2064`~`:2085` → `:2086`~`:2107`）。
+
+### 五、判据 4（全场 `capped=0` / `unfixed=0`）✓
+
+5 条 `RESPACE-AFTER-EDIT` 全部 `unfixed=0 capped=0`；所有 `GEO-END … capped=0`；全日志 `unfixed=[1-9]` 与 `capped=1` 各 0 命中，`ASSERT|CRASH|assert` 0 命中。
+
+### 六、新增佐证：`db=1` 只是"提交瞬间的协议态"，`DB-CLEAR` 随后把它清回去
+
+第 168 轮把 `visited=0` 归因于"链在提交时是倒车态"。本轮日志给出了这条因果的**完整前后文**（第一次 `db=1` 耦合）：
+
+```
+ 626  FOLDCHK COUPLE n=27 worst_gap=3 … A idx=29 … B idx=0 … exp=2 dist=2
+ 628  NOCAB-SET this=27 db=1 last=23 lastSub=0x02 lastEng=0 lastLead=0
+ 629  DB-NORMALISE couple head=27 headDB=1 cleared=0 set=24 n=27 nocab=1
+ 630  RESPACE-AFTER-EDIT couple head=27 px=0 stretch=0 unfixed=0 passes=1 visited=26 capped=0
+ 632  COUPLE-OK loco=27 rear=23 consist=0 co=1 real=5 type=1 tx=34 ty=9 x=545 y=152
+ 633  CPL idx=27 … db=1 …
+ 697  DB-CLEAR head=27 staleNocab=1 last=23 lastLead=0
+ 703  GEO settle-couple n=0 veh=27 … db=0 …
+（第二次同形：1329 / 1331 / 1332 / 1333 / 1335 / 1393 / 1398）
+```
+
+读法：机车倒着怼上挂点 ⇒ `NOCAB-SET` + `DB-NORMALISE` 把整链统一成 `db=1`（respace 就在 `:630` 跑，正是第 168 轮修法覆盖的窗口）⇒ `COUPLE-OK` 时逐节 dump 仍是 `db=1` ⇒ **`:697` 的 `DB-CLEAR`（`src\train_cmd.cpp:10048-10068`，非库场景让机车端领车）把整链清回 0** ⇒ `:703` 的 settle dump 因此读作 `db=0`。
+
+⇒ 只看"最终态"会把这两次误判成 `db=0` 的正常链，`visited=0` 就无从解释。**口径：DB 标志在提交点的取值必须按 dump 先后顺序读，不能用 settle 之后的值回推**（`:731` / `:1420` 的 `CHAIN-ATTRS2 … db=0` 同样不能用来判断 respace 当时的朝向）。
+
+### 七、顺带复核（同一份日志，均无新问题）
+
+- **几何（KI-253 / KI-264 遗留形态）**：第 163 轮 §3A1 记的"每个铰接单元边界系统性多出 ~19-20px"与 §3A2 记的"含 ★ 的那个单元塌成一格"在本日志**均未复现** —— `GEO settle-couple head=48` 里单元间 `21→22 5/5`、`18→19 5/5`、`15→16 5/5`…、单元内 `19→20 2/2`、`20→21 5/5`… 全部 `dist==nom`。
+- **控制段不变式（乙口径）8/8 成立**：`:19 :161 :379 :702 :805 :1397 :2170 :5872`，全部 `ctrl_pri=1`（`head_pri` 取 2 或 3）、`borrowed=1`；`:5872` 仍是"链头 48 只是承载者、控制段是 ★ 段头 21"的最直白样本；`:805` 的 `ctrl=0` 与 `GEO settle-couple n=3 veh=0 starF=1`（`:706`）对得上。
+- **折叠 / 拼接与第 163 轮 §3D 同形态**：`FOLDCHK-ACCEPT=2`（`worst_gap=69` `:3119` / `=20` `:3162`）、`SPLICE-GAP-REJECT=3`（`dist=78` `:3040` / `71` `:3120` / `11` `:3163`）、`SPLICE-GAP-LAST-RESORT=1`（`:3164`）⇒ 11px 缝由 `head=48` 那次 `px=109` 收拢，`unfixed=0`；`A2-ROLLBACK=2` / `A3-FLIP-V-ONLY=2` / `A3-FLIPV-DONE=2` / `A1-ROLLBACK-DONE=0` 与上一轮一致。
+- **26 处 `gap=-`（包围盒重合）全落在库内那一次耦合**（`:95`~`:120`，27 节车同处 `tile=1,11`）⇒ 库内位置度量无意义，非回归；`GEO settle-couple head=24` 的口内 `dist=0` 同理。
+- **健康项**：`REVERSEDIR` / `REVERSEDONE` 各 12 条成对（KI-242 的掉头路径走得通）；`RESV-NOBOOK=0`、`UNIT-FREEZE=0`、`RESV-AUDIT-STRAY=0`、`SEGROW-RECONCILE=0`、`SEGID-SYNC=8`、`CGRP-NORM-UNION=16`（本场景仍无挂接分组，掩码口径照旧不可观测）。
+- **`segid`**：`head=48` 链 = `48/49/50 → 1`、`21..8 → 3`；`head=27`（n=27）链 = `27/28/29 → 3`、`0..5 → 1`、`6..23 → 2` ⇒ 第 165 轮判据 ③ 继续满足。
+
+### 八、仍未覆盖 / 新观察（**都不要当成已完成**）
+
+1. **KI-263 判据 2**（读档 `DEPOT-XFER-ID load`）与 **KI-261 判据 3**（`name_backup` 经 R3VP 往返）**仍未覆盖**：本会话 `DEPOT-XFER-ID` 只有 `:14` 一条且 `tag=depot-edit` ⇒ 仍缺"存档 → 退出 → 读档"。
+2. **KI-262 的 4 条目测**日志零覆盖，仍待目视。
+3. **`SEGFRONT-RESYNC` 仍是 0 命中**：第 157 轮那条判据继续不可观测（`checks % 64` 采样窗口），要么改"首次 + 字段变化即打"，要么换判据。
+4. **KI-253 边界 3 仍在**：6 个铰接单元全部落在同一个 `segid=3` 段里。
+5. **末段等待形态**：`COUPLE-FAIL=52`、`CPL-SKIP=69`、`SVC-DEPOT-SKIP=86`，日志以 `CPL-PATHFOUND veh=24 found=0`（`:5906`）/ `TRP veh=27 … ok=0 res=0`（`:5903`）结束 —— 与第 163 轮 §E 的"正常等待、不是卡死"同形，仍待玩家确认末段是不是"一直挂不上"。
+6. **新观察（低）**：`veh=22` 的 `cached_veh_length = 7`，其余各单元中间节都是 `8`（同链 `veh=1/4/7/10/13/16/19` 全为 8），故该对名义值分裂成 `nom0=4 / nom1=5`（其余单元 `5/5`）。它在 n=21 与 n=27 两条不同链里都一样，且全部 `dist==nom` ⇒ **不是几何 bug，更像该节本来就是另一个车型**。请玩家点开第一节铰接单元的中间那节车，报一下**型号与长度**（若 6 个单元设计上完全同型，则这条要立案）。
+7. **`build\R3R_debug1.log` 已不在磁盘**（第 167 轮基线只剩本文档表格）⇒ 以后每次复测前把旧日志**改名保留**（如 `R3R_debug_r167.log`），否则跨轮对照只能靠文档。
+
+### 九、状态
+
+**第 168 轮（KI-253 附记 4）＝ 已验证关闭**：判据 1~4 全过，`db=0` 回归逐字段无变化；`db=1` 一侧唯一未观测到的是"真缝被收拢"。KI-253 未结案的两条是第八节第 4、6 项（段划分口径、单元长度口径），都要等玩家答复才能定性；第 1~3、5 项属"判据不可观测 / 缺场景"，不是代码未改。
+
+---
+
+## 第 170 轮（2026-09-30）：R170-A / R170-B / R170-C —— 玩家三条现场报告（**已实现 + 已编译**）
+
+来源：玩家逐字报告见工作区备忘 `R3R_round170_player_reports_memo.md`；现场日志 `build\R3R_debug.log`。三条全部落在**第 155 / 159 / 161 / 166 轮那套"段身份 + 特质借用"**的边角上，不是新机制。
+
+### 一、R170-A（高，**已修**）：`respace` 把整列沿轨拖到站台另一端
+
+- **症状**：一列长 2 的列车在 1~8 号站台内（本占 2-3），**反向挂车**（机车鼻对车底尾）触发防折叠的"按段逻辑反转"后，位置变成 6-7。玩家口径：**逻辑反转必须位置不变**。
+- **诊断**：**不是** `R3RFlipChainBySegments` / `R3RReverseChainDirections` —— 逻辑反转只改 `direction` / 段边界 / ★，**从不写 `x_pos/y_pos`**，也**不会**走到 `ReverseTrainSwapVehicles`（那只在候选 3 的**物理翻 v** 上，是逐车交换坐标，方向与位移都可解释）；`R3RRelocateFrontIdentity` 也只在"真引擎 v 翻完链头易主"时搬身份，不动位置。
+  真凶是提交点的 `R3RRespaceChainAfterEdit()`（第 165 轮把 `GEO respace-before` / `RESPACE-AFTER-EDIT` 做成每次提交点都打，才让它现形）：它逐对比较"实际间距 vs `CalcNextVehicleOffset()` 名义值"，凡是**不相等**就调 `TrainController()` 去挪车，**且没有错误上界**。现场日志：`px=109 stretch=62 passes=3`，被追的对是 `50→21` 差 11px、`23→18` 差 21px（名义值 `nom=2`）—— 都是**结构性错位**（真铰接单元边界 / 段边界），不是缝；`TrainController(front, b)` 是从**移动前端**一路推进到 `b`，于是每修一对就是把**整条链沿轨推一段** ⇒ 链头 `y=1448 → 1386`（两格），肉眼即"位置被搬到站台另一端"。
+- **修法（仅 `src\train_cmd.cpp`）**：
+  1. 新增常量 `R3R_RESPACE_MAX_ERROR = 8`（`:6471`，注释见代码）：**8 = 引擎自己的"同一焊点"容差** —— 折叠判据在 `|pair_dist - pair_expected| <= 8` 时豁免（KI-201 附记 4），故"折叠逻辑根本不看的对"，respace 也不许动。
+  2. 主循环里**在动之前**先算 `|dist - nominal|`，超过上界即 `skipped++; continue;`，**原样留在原地**（`:6752-6762`）。⇒ 该 pass 在结构错位对上是**空转**，永远不可能把整列拖走；真缝（≤8px，即"拼接面残差"）照旧收拢。
+  3. 探针：`RESPACE-AFTER-EDIT` 新增 `skip=%d`（本趟跳过的错位对数）与 `front=%d`（**链头本节**相对进入函数时的位移像素，`:6843`）——"整列被拖走"只看 `front`，不必再靠肉眼比对 `GEO` dump。
+- **判据**：① `front=0`（链头不动）；② `skip>0` 出现在有结构错位对的链上；③ `px/stretch` 只在真缝上非 0，`RESPACE-AFTER-EDIT` 仍每次提交点都打（第 165 轮口径不变）；④ 第 168 轮"倒车链 `visited=0`"修复不回退。
+
+### 一附、R170-A 深层根因（同日第二轮，**已修**）：打散组经「复制」路径变回真 `artic`
+
+- **为什么第一轮的上界不够**：`R3R_RESPACE_MAX_ERROR`（上文 1.）只让 respace 在结构错位对上**空转**，**没有解释错位对为什么会存在**。玩家补现场后复核：触发那一次反转的链，**翻转前后都读成真 `artic`**（`FOLD-V` / `FOLD-U` 的逐节 dump 里 `artic=1`）—— 也就是说，折叠修正本来就**不该**去翻它。
+- **两层身份混淆（真正的机制）**：
+  - **真 artic part**：由 `AddArticulatedParts()`（`BuildVehicle()` 的构造路径）生成，`IsArticulatedPart()`（subtype 位 `GVSF_ARTICULATED_PART`）为真 —— 它由**父车的 GRF 回调拥有**：位置、名次、渲染、"position in consist" 等新变量全是父车的事，**不能独立重排**。
+  - **打散组（de-articulated group）**：R3R 的 `DearticulateChainWithSnapshot()` 把 `N` 节真 artic 拆成 `N` 辆**独立车**，逐节烘焙 `weight_override` / `power_override` / `max_speed_override`（整数余数留在组头），并抬起显式角色位 `ArticGroupHead`（`VehicleRailFlag` bit 24）/ `ArticGroupMember`（bit 25）。
+  - 关键：`HasArticulatedPart()` / `GetNextVehicle()` 讲的是**语义组层** —— 对打散组也返回"属于同一组"，故这两层被读得**一模一样**。而逻辑翻 `R3RFlipChainBySegments()` 的整段假设是"**段内铰接块 = 原子块**"，这条假设**只对打散组成立**：真 artic part 被逐节反转后，段边界与包围盒会和父车脱钩 ⇒ 排程与几何一起错位 ⇒ 正是 R170-A 的现场。
+- **打散组怎么会变回真 artic（根因）**：`CloneVehicle()`（`src\vehicle_cmd.cpp`）**逐单元重建**，对每个单元调 `CmdBuildRailVehicle()` / `CmdBuildRailWagon()`，而**这两个命令都会调 `AddArticulatedParts()`** —— 引擎记录里的 artic 部件于是被重新生成成**真 artic part**；更隐蔽的是那个 build 循环用的是 `GetNextVehicle()`（语义组层），它**跨过**源成员、也**跨过**克隆出来的真部件，**从不把源成员当"车"看** ⇒ 克隆出的"打散组"变回真 artic，烘焙的 override 与整套组角色位**全部丢失**。此后任何读组语义的消费者（NewGRF position-in-consist、段/翻转机制、移动块）看到的都和原件不同 —— R170-A 报的正是这条链。
+- **修法＝双管齐下（仅 `src\vehicle_cmd.cpp` + `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：
+  1. **复制路径：把打散组镜像过去**（`src\vehicle_cmd.cpp`）。
+     - 从 `DearticulateChainWithSnapshot()` 抽出**可复用单元** `static Train *R3RDearticulateOneGroup(Train *v)`（`:411`）：快照本组统计（重量/功率/最高速）→ 数出连续真 artic 部件 → 组头 `SetArticGroupHead()` + 烘焙"均分 + 余数"→ 每个部件 `ClearArticulatedPart()` 后按其记录恢复 engine/wagon 身份、`SetArticGroupMember()` + 烘焙份额 → 返回组后第一节（组在尾则 `nullptr`）。原函数改为循环调用它（原行为逐字节不变）。
+     - `CloneVehicle()` 在 `if (flags.Test(DoCommandFlag::Execute))` 内、构建循环之后新增**锁步遍历**（`:2159-2233`）：`src_walk` / `dst_walk` 各用 `GetNextVehicle()` 逐**单元**前进（该调用在各自一侧**跨过**组员与真部件，两侧因此始终对齐）；凡源单元带 `ArticGroupHead` 角色，就分别数**源成员数 `n_src`** 与**克隆真部件数 `n_dst`**：
+       - `n_src != n_dst` ⇒ 写 `R3R-CLONE-GROUP-MISMATCH src= dst= n_src= n_dst= -> sell clone`，用 `Command<Commands::SellVehicle>::Do(..., SellVehicleFlags::SellChain, ...)` **整链退货**并 `return CommandCost(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST)` —— **宁可买不成，也不把一辆"读起来是真 artic"的坏车交给玩家**；
+       - `n_src == n_dst` 且 `n_dst > 0` ⇒ `R3RDearticulateOneGroup(dst_walk)` 复原拆组与烘焙份额，再**逐成员镜像身份**（engine/wagon 位、`FrontEngine`、`Stopped`、`SegmentFront ★` / `SegmentBack ⊗`）—— 这些是 R3R 段层**单独授予**的身份，引擎记录里推不出来（段尾是"假引擎"货车、组成员可能携带段边界标记）。任一成员身份被改写即置 `r3r_identity_rebuilt = true`，循环结束后对链头补一次 `ConsistChanged(CCF_ARRANGE)`（`ConsistChanged()` 只能在链头调用，故必须延后，`:2235-2240`）。
+     - **源侧本来就是真 artic 组**（无 `ArticGroupHead` 角色）⇒ 锁步块**整个不介入**，克隆保持由 `BuildVehicle()` 生成的真 artic，与源一致（不误伤）。
+  2. **翻转路径：含真 artic 一律否决**（`src\train_cmd.cpp`）。
+     - 新增 `static bool R3RChainHasRealArticPart(const Train *head)`（`:1870`）：顺 `Next()` 走全链，任一节 `IsArticulatedPart()`（**直接看 subtype 位**，不看语义组层）即判真。
+     - `TryTrainCouple()` 折叠修正入口，在两份 `R3RDumpCoupleIdentity()`（`FOLD-V` / `FOLD-U`）之后（`:8869-8891`）：任一参与方含真 artic ⇒ `R3RRefreshChainCaches(v/u)` + 两侧 `ConsistChanged(CCF_ARRANGE)`，写 `FOLDCHK-REFUSE-REAL-ARTIC v= u= v_real= u_real= -> rolled back, no logical flip this tick`，`return false`。**本 tick 不挂车**（状态此刻已被上面的 `RestoreTrainBackup(original_src/dst)` 还原，放弃无需额外回滚），而不是"赌一次翻转"。
+     - `R3RFlipChainBySegments()` **函数入口**再加同一道门禁（`:8308-8312`）：命中即写 `FLIP-REFUSE-REAL-ARTIC head= whole= -> chain left untouched` 并**原样返回入参链头**（= "翻转未发生"）。这一层是给**将来新增的调用方**兜底 —— 现有调用方在门外已整块否决，故本轮它不会被命中。
+- **判据**：① 库内复制一条打散组链 ⇒ **不**出现 `R3R-CLONE-GROUP-MISMATCH`，克隆侧 `FOLD-V/U` 类 dump 显示 `artic=0`、组角色位齐全、烘焙份额与源逐节相同；② 同场景再跑一次反向挂车 ⇒ 不再有链头级别的位移，`RESPACE-AFTER-EDIT` 的 `front=0` 且 `skip>0`（与第一轮口径叠加）；③ 真 artic 组的克隆 ⇒ 不静默产出坏车、也不出现 `FLIP-REFUSE-REAL-ARTIC` / `FOLDCHK-REFUSE-REAL-ARTIC` 的**误报**（源侧真 artic 组不进锁步块，见上）；④ 真 artic 参与的反向挂车 ⇒ 日志出现 `FOLDCHK-REFUSE-REAL-ARTIC ... v_real=1`（或 `u_real=1`），本 tick 不挂、下一 tick 重试（KI-06"回滚下 tick 重试"口径不变）；⑤ 第 170 轮第一轮的 A/B/C 三条口径全部不回退。
+
+### 二、R170-B（高，**已修**）：控制段是 B，名称/车号却显示 A 的
+
+- **复现链**（玩家原文）：库拖 A 到 B 前 ⇒ **AB**；调度命令 C 挂 AB 前 ⇒ **CAB**；C 在站台被解挂、换 D 挂上 ⇒ **DAB**；此时控制段 = **B**，但**名称与车序号显示 A 的**。
+- **诊断**：乙口径（第 159 轮）下"号/名跟控制段走"是靠**链头当承载者**：链头活字段戴控制段的号/名，链头段自己那套停进 `unitnumber_backup` / `name_backup`（第 160 轮 KI-261、第 161 轮 KI-263）。而 `R3RBorrowControlTraitsLive()` 当时只挂在**车库拖动**（`R3RSyncChainAfterDepotEdit`）、**读档**（`R3RRebuildCouplePriorities`）与 `Couple()` 内联块三处，**解挂提交点漏了**：
+  `DecoupleTrain()` 的归还块（第 160 轮）把**链头自己的号/名写回活字段**，但该半仍处借用态（`r3r_orders_borrowed` 为真、控制段仍是 B）⇒ 承载者立刻显示自己的（A 的）；紧接着 D 用命令挂上时，`Couple()` 咬的正是 `u->unitnumber/name` 这个**已被写坏的活字段** ⇒ DAB 显示 A 的。与备忘待查要点 4 完全吻合。
+- **修法（仅 `src\train_cmd.cpp`）**：在**唯一提交点** `R3RSettleChainSegments()` 里、`R3RResyncSegmentFronts()` 之后、两次行写入之前补一次活字段借用（`:5124` 前置声明，`:5178-5183` 调用）：
+  ```
+  R3RBorrowControlTraitsLive(chain, tag);   /* 链头活字段 <- 控制段（幂等，自带四道门禁） */
+  R3RBorrowControlTraits(chain, tag);       /* 链头段自己那套 <- 它的段行 */
+  R3RSyncSegmentTraits(chain, tag);         /* 活字段（= 控制段的）<- 控制段行 */
+  ```
+  顺序不能反：**先穿活字段，再镜像行**，否则控制段行会被镜像成链头自己的旧值。函数自带门禁（`IsFrontEngine` / 控制段非空且 `!= chain` / `r3r_orders_borrowed` 为真 / 控制段仍在本链）+ 幂等（只填空的 `*_backup`、从不改写已有值），故耦合、读档、车库编辑三条既有路径重复调用零副作用（不是"新增一条借用"，而是"把漏掉的一条补齐"）。
+- **判据**：① 同复现链走到 DAB，列表主行与列车窗口标题显示 **B 的**号/名；② 解挂出的另一半（拿回自己排程、`borrowed=0`）显示**自己的**，不出现 `DEPOT-XFER-ID`；③ 车库拖动与读档两侧行为不回退；④ 再解挂一次，号/名原样回各自那半（`NAME-RESTORE` / 号归还块仍生效）。
+
+### 三、R170-C（中，**已修**）：库拖耦合产生的链头段在车队列表里没有子行
+
+- **根因**：`R3RSegmentHiddenHeads()` 第 155 轮的实现是"**跳过控制段**、从链的第二节起"列隐藏段。乙口径下**控制段 ≠ 链头段**是常态（库拖 A 到 B 前 ⇒ 链头 = A、控制段 = B），于是**链头段（A）自己拿不到子行**，列表里只剩主行（显示的却是控制段 B 的号/名）—— 正是第 155 轮落地清单 ⑤ 的回退。
+- **修法（四处）**：
+  1. `couple_group.cpp` 的 `R3RSegmentHiddenHeads()`：当链头段 **不是**控制段时，把**链头自己**作为**首个子行**加进去（`ctrl != nullptr && ctrl->r3r_segment_id != chain->r3r_segment_id`）。子行顺序 = 控制段在前、链头段随后，与第 155 轮既定排序（`R3RReorderSegmentSubRows`）一致。
+  2. **读侧新增"本段视角"访问器**（`couple_group.cpp` / `couple_group.h`）：`R3RSegmentSectionUnitNumber()` / `R3RSegmentSectionName()` / `R3RSegmentSectionGroupID()` —— 只读"**这一辆车自己那个段**的行"，读不到才回退**该车自己的活字段**，**绝不回退链头**。为什么必须另开一组：承载者视角的旧访问器对"链头段"会回退到 `First()`（= 链头），子行于是变成主行的副本（第 158 轮 KI-254 的老症状）。空 `#TinyString` 仍走 `string_view`（KI-245 的崩溃口径不能破）。
+  3. `vehicle_gui.cpp` 的 `GB_NONE` 分支：子行的名称/分组/单位号一律走 section 版；**带 cargo 的子行不再走 `{VEHICLE}`** —— `SCC_VEHICLE_NAME`（`strings.cpp`）按车辆索引经**承载者**读号/名，子行用它必然读成链头，改为 `shown_name + " " + GetString(STR_VEHICLE_LIST_CARGO, ...)`（两种语言的该串都是 `{STRING1} {STRING1}`）。列宽预算（`max_unitnumber`）与子行分组过滤同样改 section 版。
+  4. `vehiclelist.cpp` 的 `VL_GROUP_LIST`：隐藏段的分组过滤改用 `R3RSegmentSectionGroupID(seg)`，与列表显示口径一致；否则会出现"名单收进来了、子行却全被滤掉"（链头段的分组在承载者视角下恒等于控制段的分组，永远匹配不上自己那一组）。
+- **判据**：① 库拖 A 到 B 前 ⇒ 列表里 B（控制段）主行之后出现 **A 的子行**，号/名是 **A 自己的**；② 该子行可选中，命令映射回链头（第 155 轮 P2b 口径不变）；③ `VL_GROUP_LIST` 按 A 那组过滤时该链仍出现且子行在；④ 已正确的旧场景（链头段 == 控制段）**不**多出重复子行。
+- **边界**：`R3RSegmentSectionName()` 的回退是"该车自己的活字段"，所以对**已经穿好控制段号/名**的链头车（借用态）来说，子行读的是**它的段行**（`R3RBorrowControlTraits` 已把自己那套停进去）—— 这两组数据必须同时正确，故 R170-B 与 R170-C 是同一条链上的两个方向，缺一不可。
+
+### 四、构建自证
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）。护栏：`src\couple_group.h`（05:24:44）晚于最新 obj（03:26:07）⇒ `GUARD: REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`，故本轮走**全量**（620 → 692 步）。
+- 结果：`[692/692] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志里 `error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 时间戳（源 → obj → exe 全部单调向前）：`src\train_cmd.cpp` 05:23:04 → `train_cmd.cpp.obj` 05:53:21；`src\vehicle_gui.cpp` 05:25:35 → `vehicle_gui.cpp.obj` 05:53:54；`src\couple_group.cpp` 05:24:35 → `couple_group.cpp.obj` 05:43:51；`src\vehiclelist.cpp` 05:25:45 → `vehiclelist.cpp.obj` 05:53:52；`build\openttd.exe` @ **2026-09-30 05:59:30**（51 543 552 B）。
+- 产物自证：exe 内命中 `RESPACE-AFTER-EDIT`、`skip=%d`、`front=%d`、`DEPOT-XFER-ID`（R170-A / R170-B 的探针）；`read_lints` 五个改动文件 **0 条**。R170-C 是纯读侧/UI 改动、**未新增日志串**，其入库证据 = 上述 obj 时间戳 + 游戏内复测。
+
+**第二轮（同日，R170-A 深层根因「一附」）**：
+
+- 同样复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）。`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ **增量**合法（本轮未碰任何 `src\*.h`、未碰 `lang\*.txt`，只改两个 `.cpp`）。
+- 结果：`[4/4] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志里 `Linking CXX executable` 命中 **1** 次，`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**（脚本输出的 `error C` 统计一并核过）。
+- 时间戳（源 → obj → exe 全部单调向前）：`src\train_cmd.cpp` 06:57:55 → `train_cmd.cpp.obj` 06:59:47；`src\vehicle_cmd.cpp` 06:58:10 → `vehicle_cmd.cpp.obj` 06:59:46；`build\openttd.exe` @ **2026-09-30 07:01:29**（51 543 552 B）。
+- 产物自证：exe 内命中 `FOLDCHK-REFUSE-REAL-ARTIC`、`FLIP-REFUSE-REAL-ARTIC`、`R3R-CLONE-GROUP-MISMATCH`（三条新串全部在册）；`read_lints` 两个改动文件（`train_cmd.cpp` / `vehicle_cmd.cpp`）**0 条**。
+- 口径：第一轮的 `R3R_RESPACE_MAX_ERROR = 8` 上界**保留**（两条一起才是完整修复 —— 上界挡住"整列被拖走"，组镜像 + 真 artic 否决挡住"错位对为什么会存在"）。
+
+### 五、状态
+
+R170-A / R170-B / R170-C ＝ **已实现 + 已编译，游戏内复测待做**（判据见各条）。其中 R170-A 于同日追加**第二轮（深层根因）**：`CloneVehicle()` 的打散组镜像 + `TryTrainCouple()` / `R3RFlipChainBySegments()` 的真 artic 硬否决，同样**已实现 + 已编译、游戏内复测待做**（判据见「一附」）。未动任何语言串，未改存档格式。
+
+---
+
+## 第 171 轮（2026-09-30，纯探针）KI-215 残留：**第二次解挂静默失败**的定位与决定性探针（**已实现 + 已编译**）
+
+来源：现场日志 `build\R3R_debug.log`（1733 行 / 120 534 B，2026-09-30 17:57:17）。玩家场景＝T8701 四段链、连续两次解挂。**本轮只加探针、零行为变更**（不改任何判定、不改存档格式、未碰 `src\*.h`）。
+
+### 一、取证结论：失败点唯一，且不是"排程没改写"
+
+同一份日志里两次解挂的**后半段签名**完全不同，这正是判据：
+
+| 行 | 第一次解挂（成功） | 第二次解挂（失败） |
+|---|---|---|
+| 触发 | `901 DECOUPLE-FIRE consist=24 tx=33 ty=9 real=2 mode=2 num=1 segs=2 eff=0` | `1362 DECOUPLE-FIRE consist=27 tx=58 ty=28 real=5 mode=1 num=1 segs=2 eff=6` |
+| 物理拆分 | `902 ARRANGE-IN dh=-1 dst=-1 sh=24 src=0 mc=1` → `903-905 RFC/IC/NDH-DONE` | `1363 ARRANGE-IN dh=-1 dst=-1 sh=27 src=6 mc=1` → `1364-1366 RFC/IC/NDH-DONE` |
+| 结算 | `906 SETTLE-LOAD site=decouple-front`、`907 UNIT-RESTORE`、`908 ORD-PUSH`、`909-912 SEGID/DEPOT-XFER-ID/SEGTRAIT/INVAR-CTRL`、`913-937 GEO settle-decouple-u`、`938 DECOUPLE-JUMP`、`943 DECOUPLE-ADV`、`944 DECOUPLE-ODOF`、`945 DECOUPLE-DONE u=0 co=1 real=4` | **一条都没有**（`1367` 直接就是 `LOCO-AFTER-DECOUPLE veh=27 curType=3 real=5 tile=58,28`，`1368-1374 L-ORD 0..6` 原样 7 条） |
+
+- `ARRANGE-IN dh=-1 dst=-1 sh=27 src=6 mc=1` 与 `TryTrainDecouple()` 里 `ArrangeTrains(&first_param, nullptr, &v, u, true)`（`src\train_cmd.cpp` `:6372`）的参数形态**逐字段吻合**（`*dst_head==nullptr`、`dst==nullptr`、`*src_head==v`、`src==u`、`move_chain=true`），⇒ 这次调用**确实进到了 `TryTrainDecouple(v=27, u=6)`**，且 `CanDecouple()` / `GetDecoupleVehicle()` 都已通过（否则连 `ARRANGE-IN` 都不会打）。
+- `DecoupleTrain()` `:7141` 的 `if (!TryTrainDecouple(v, u)) return v;` 之后，**下一条语句 `:7146 R3RSettleLoadingBeforeChainEdit(v, "decouple-front")` 是无条件执行的**（`SETTLE-LOAD` 由它打印，`906` 已证）。第二次解挂**完全没有 `SETTLE-LOAD`** ⇒ 执行流在 `:7141` 就 `return v` 了。
+- ⇒ **失败点 = `TryTrainDecouple()` 返回 `false`**，即 `ValidateTrains(nullptr, u, v, v, true)`（`:6382`）返回了失败的 `CommandCost`。这条结论**由日志直接证伪/证实，不是推理**：`SETTLE-LOAD`、`DECOUPLE-JUMP`、`DECOUPLE-DONE`、`GEO settle-decouple-u` 四个**无条件或必然**的打印点集体缺席，只有 `:7141` 一处能解释。
+- 顺带确认**不是**"订单改写把位置写回去"：`L-ORD 0..6`（`1368-1374`）原样保留（含 `type=15` 的两条 `DECOUPLE`），`real=5` 与 `DECOUPLE-FIRE` 前的 `1361 DEPOT-ARR veh=27 real=5(1)` 一致 ⇒ 排程与索引一个字节都没动。
+
+### 二、仍未定位的一环 = `ValidateTrains()` 的三个闸门里**哪一个**拒绝
+
+`ValidateTrains()` 只有三处可能返回失败：`CheckTrainAttachment(src=v=27)`、`CheckTrainAttachment(dst=u=6)`、`CheckNewTrain(...)`。**现有日志无法区分**（这三个函数都不打日志），故本轮不动任何判定，先把名字打进日志 —— 项目铁律「不得以推理替代取证」。
+
+**最需要区分的原因（值得先写下来，供下一轮对照）**：`CheckTrainAttachment()`（`:2409` 起）在链头 `IsEngine()` 时会对**链头之后的每一节**调 `GetVehicleCallbackParent(CBID_TRAIN_ALLOW_WAGON_ATTACH, 0, 0, head->engine_type, t, head)` —— 即用**链头**当 parent 去问 GRF「这节车能不能挂到链头上」。而**一次解挂不产生任何新的挂接关系**：拆出来的两半内部相邻对，在拆分之前就是同一条链里的相邻对，全部早已成立。因此对 `dst=u=6` 这条半链做 `(head=veh6, part=veh7..23)` 的逐对回调询问，问的是**原链里从未被问过**的组合（原合并链的链头是 27，当时问的是 `(27, X)`），GRF 完全可能基于"链头不是我认识的本务机车"而拒绝 —— 若探针证实失败落在 `stage=attach-dst` 且 `part` 是普通车厢，则正解是**把「拆分型调用」的校验口径改掉**（拆分不新增挂接 ⇒ 不跑/不致命），而不是放宽 GRF 回调本身。
+
+### 三、本轮加的三条探针（仅 `src\train_cmd.cpp`）
+
+1. `ValidateTrains()` 三处失败返回前打印：
+   `VALIDATE-FAIL stage=attach-src|attach-dst|new-train err=0x%X`
+   （实现＝文件内 lambda `probe`，只在失败路径调用；`ValidateTrains()` 的调用方只有 `CmdMoveRailVehicle` / `CmdSellRailWagon` / `TryTrainDecouple` 三处，都不在每 tick 热路径上。）
+2. `TryTrainDecouple()` 出口用 `R3RDbgEdge`（新标签 `R3REDGE_DECOUPLETRY`，payload = `ok | (err << 1)`，同状态只打一行）打印：
+   `TDTRY ok=%d v=%d u=%d err=0x%X v_head=%d u_head=%d borrowed=%d u_eng=%d v_eng=%d u_next=%d`
+   —— 一行里同时回答「是不是 `ValidateTrains` 否掉的」「`v->r3r_orders_borrowed` 是不是假（那样就算拆分成功也照样不会有 `DECOUPLE-JUMP`）」「`u` 到底算不算引擎（决定 `CheckNewTrain` 会不会去要新号）」。
+3. 新增文件内 `static void R3RDumpAttachFail(Train *head, Train *part, int allowed_len, uint16_t callback, StringID error)`（定义在 `CheckTrainAttachment()` 之前），并在 `CheckTrainAttachment()` 的**三处失败返回**上调用（非引擎分支 `TRAIN_TOO_LONG`、引擎分支 GRF 回调 `error != STR_NULL`、引擎分支尾部 `TRAIN_TOO_LONG`）：
+   `ATTACH-FAIL head=%d head_et=%d head_eng=%d part=%d part_et=%d part_eng=%d cb=0x%X allowed=%d err=0x%X`
+   —— `head_et` / `part_et` 直接把 **engine_type** 写出来，`cb` 直接写出 GRF 回调的返回值（`0x402`/`0x40F`/`0x100+` 的含义见 `:2481-2494` 的 switch）。只在失败路径打印，正常挂接/拆分零日志量。
+
+### 四、构建自证
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）。护栏：`GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ **增量**合法（只改一个 `.cpp`，未碰 `src\*.h` / `lang\*.txt`）。
+- `src\train_cmd.cpp` 20:29:00 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 20:29:55 → `build\openttd.exe` **2026-09-30 20:31:59**（51 548 160 B）；`build\R3R_incbuild.done`（20:32:33）= `EXIT_CODE=0`；日志 `[3/3] Linking CXX executable openttd.exe`，`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 产物自证：`build\openttd.exe` 内命中 `VALIDATE-FAIL`、`TDTRY`、`u_next=`、`ATTACH-FAIL`；`read_lints`（`src\train_cmd.cpp`）**0 条**。
+
+### 五、状态与复测判据
+
+状态＝**已实现 + 已编译，游戏内复测待做**（纯探针，不改行为，故无回归面）。
+
+复测判据（复跑 T8701 四段链到第二次解挂）：
+
+1. 出现 `TDTRY ok=0 v=27 u=6 ...`（或新的 v/u 号），且同一次触发伴随 `VALIDATE-FAIL stage=...`；
+2. `VALIDATE-FAIL` 的 `stage` 直接给出闸门名；若同时出现 `ATTACH-FAIL`，则 `head=/head_et=/head_eng=/part=/part_et=/part_eng=/cb=` 给出具体拒绝方；
+3. 日志里**不得**再出现"`DECOUPLE-FIRE` 之后紧跟 `LOCO-AFTER-DECOUPLE` 而没有 `SETTLE-LOAD`"这种签名 —— 即修复后第二次解挂必须打印 `SETTLE-LOAD` + `DECOUPLE-DONE`；
+4. 第一次解挂（`consist=24 → u=0`）的既有签名（`SETTLE-LOAD` / `UNIT-RESTORE` / `ORD-PUSH` / `DECOUPLE-JUMP` / `DECOUPLE-DONE`）不得回退。
+
+### 六、未做 / 下一轮待定
+
+- 本轮**没有**修复，只把失败点收敛到唯一函数并加上决定性探针；真正的修法取决于 `stage` 的取值（见「二、」的预案）。
+- 另一个仍需回答的问题（同样等探针）：第一次解挂 `u=0` 与第二次 `u=6` **同为段头**，为何前者通过、后者被拒 —— 若 `stage=attach-dst`，则答案就是"链头身份从真机车 27 变成中段假引擎 6，GRF 回调换了 parent"，可以用 `TDTRY` 的 `u_eng=` 与 `ATTACH-FAIL` 的 `head_eng=`/`head_et=` 直接对照。
+
+---
+
+## 第 172 轮（2026-09-30，最后一次挂车直接穿模：KI-174 的 OVERRIDE 采纳了真折叠）
+
+### KI-265 挂车直接拼接时 `FOLDCHK-DIR-OVERRIDE` 把真折叠判定丢弃 ⇒ 提交后"方向一致但位置倒退"的病链 ⇒ 列车穿模
+
+- **来源**：玩家 2026-09-30 口述「我的问题不在列车的解挂，而是在日志里的最后一次挂车……列车直接穿模了（严重性最高）」
+- **状态**：**已修**（2026-09-30 第 172 轮实现：OVERRIDE 加两条前提 + 新增提交前硬闸门 `COUPLE-REFUSE-STILL-FOLDED`；已编译验证，游戏内复测待做）
+- **严重度**：**高**（几何错乱 + 带病几何运行，`TTB-PROBE fold-geom` 连续刷，属已知崩溃前兆形状）
+- **临时分析报告**：`R3R_couple_clip_round172_memo.md`（工作区根目录；第八、九节为本轮实现与残留）
+
+**现场（`build\R3R_debug.log`，5504 行 / 368 202 B / 2026-09-30 20:49:06）**
+
+最后一次挂车 = 全日志唯一一次 `COUPLE-OK`（3749 行，`loco=48 rear=23 consist=6 co=1 real=11 type=1 tx=58 ty=63 x=936 y=1010`）。它是 6 次重试中的第 6 次：
+
+| 尝试 | FOLDCHK | A=机车尾 idx50 y | B=车底头 idx6 y | worst_gap | dist | FOLDCHK-DIR dot | 结果 |
+|---|---|---|---|---|---|---|---|
+| 1 | 3495 | 1022 | 1013 | 7 | 9 | 9 | REFUSE 3523 |
+| 2 | 3532 | 1021 | 1013 | 6 | 8 | 8 | REFUSE 3560 |
+| 3 | 3565 | 1020 | 1013 | 5 | 7 | 7 | REFUSE 3593 |
+| 4 | 3599 | 1019 | 1013 | 4 | 6 | 6 | REFUSE 3627 |
+| 5 | 3665 | 1018 | 1013 | 3 | 5 | 5 | REFUSE 3693 |
+| 6 | 3698 | 1017 | 1013 | **2** | 4 | **4**（3699） | OVERRIDE 3700 → 提交 |
+
+- 车底 6 一直不动，**机车每次失败后整体北推 1px**（尾部 1022→1017）；
+- 第 1 次原文（3488-3527）：`CPL-GEO v=48 vlen=2 u=6 ulen=2 dx=0 dy=2 diff=2 need=2` → `ARRANGE-IN dh=48 dst=50 sh=6 src=6 mc=1` → `FOLDCHK worst_gap=7 dist=9 A idx=50 dir=7 B idx=6 dir=3` → `FOLDCHK-DIR dot=9` → `FOLD-V`(48/49/50 全 dir=7，engType=523) / `FOLD-U`(6..23 全 dir=3，含 `artic=1` 部件与 `wagon=1` 段头，engType=372) → `3523 FOLDCHK-REFUSE-REAL-ARTIC v=48 u=6 v_real=0 u_real=1` → `3524 CPL-GEO-DONE merged=0` → `3527 CPL-HIT ... overlap=1 dx=0 dy=-1 maxd=1`。两者方向相反 ⇒ 现场是**鼻对鼻**。
+- 第 6 次：`3698 worst_gap=2 A idx=50 y=1017 dir=7 B idx=6 y=1013 dir=3 exp=2 dist=4` → `3699 FOLDCHK-DIR dot=4`（**附记 8 的收窄豁免正确生效**）→ `3700 FOLDCHK-DIR-OVERRIDE worst_gap=2 tight direct splice, fold verdict ignored` → `3702 COUPLE-SEAM-FLIP circ=4 a=50 dirA=7 b=6 dirB=3`（只改 direction、不动位置）。
+- 提交后几何（3703-3707 `GEO respace-before`、3811-3832 `GEO settle-couple`、3853 起 `F` dump 三处一致）：`48 y=1010 → 49 y=1014 → 50 y=1017 → 6 y=1013 → 7 y=1008`，**y 在拼接点 50→6 折返** ⇒ `49(1014)` 与 `6(1013)` 差 1px、`48(1010)` 与 `7(1008)` 差 2px，机车 3 节车体与车底前两节纵向交错叠置 = 穿模。
+- `3747 RESPACE-AFTER-EDIT couple head=48 px=0 stretch=0 unfixed=1 skip=0 front=0 passes=1 visited=20 capped=0`：重排跑过但**一处未修**。对 `(50,6)`：跳过门 `|4-2|<=8` 不跳过 ⇒ `dist(4)>nom(2)` 走"拉近尾部"⇒ 按 6 自己的 `direction(7)` 前进一步会把它推离 50（`next_dist 5 >= dist 4`）⇒ `train_cmd.cpp:6868-6870` 直接 `break` ⇒ **`unfixed=1` 是"结构性不可修"的机器可读签名**。对照更早三次正常挂车（`COUPLE-OK` 在 233/1104/2740 行）均为 `unfixed=0`，本次是全日志唯一一次 `unfixed=1`。
+- 提交后仍在报病：`3806/3835 CRT-FOLD veh=48 rel=0,-4 dot=4`，3853 起 `TTB-PROBE fold-geom`（`veh=7 prev=6`、`veh=6 prev=50`）连续刷、车速 22→96 仍在爬升。
+
+**根因（三层）**
+
+1. **直接**：`FOLDCHK-DIR-OVERRIDE`（`train_cmd.cpp:8876-8879`，KI-174）用几何距离推翻方向判定，而它的前提"worst_gap<=2 ⇒ 两段车确实已经头尾对位"是错的。证明：`worst_gap<=2` ⇒ 全链每对都 `|dist-nom|<=2<=8` ⇒ 方向判据的豁免只剩 `a->direction == b->direction` 一项 ⇒ 此时还能被 flag 的对**必然是 direction 相反的一对**；"相邻 + 处在名义间距 + 方向相反"在合并链里就是真交错折叠。**即 `direct_dir_fold && worst_gap<=2` 本身等价于"真折叠"**，OVERRIDE 恰好在唯一不该生效的场景生效；它想保护的"1px 紧贴健康链"根本走不到这里（紧贴且同向的对已被 7812 豁免，判定不会 fire）。
+2. **前因**：`FOLDCHK-REFUSE-REAL-ARTIC`（附记 8 后的第 170 轮改动）使"鼻对鼻 + 含真 artic 车底"永远无解 ⇒ 每 tick 拒绝、机车每 tick 北推 1px ⇒ `worst_gap` 7→2 ⇒ **恰好为 OVERRIDE 造出触发条件**。是"永远失败的挂车重试"把几何顶成了病态。
+3. **掩盖**：`COUPLE-SEAM-FLIP` 只改 direction 不动位置，把"方向相反"这个可诊断特征消掉（此后方向判定必然为假），随后 respace 又因 6 的朝向背离 50 而拒修（6868-6870）⇒ 无任何一层能纠正几何。
+- 结论：这是 **KI-201 附记 8 定性过的同一类病链**（附记 8 注释 7794-7809 描述的场景与本次逐字同形：`A idx=50 dir=7 / B idx=6 dir=3 / exp=2`），只是入口从"8px 豁免"换成 KI-174 的 OVERRIDE —— **附记 8 收窄了豁免，没同步收窄 OVERRIDE，留了第二扇门**。
+
+**修法（下一轮实现，按优先级）**
+
+1. 给 OVERRIDE 加前提，二选一或同时：(a) 被 flag 的对**不得是本次拼接对** `(v_last, u_head)`（真折叠恒在拼接对上；需让 `R3RCheckChainFoldedDirection` 用出参回传 `wa/wb`）；(b) 被 flag 的对须 `a->direction == b->direction`（由上面证明，在 `worst_gap<=2` 下等于停用 OVERRIDE）。若担心 KI-174 老场景（倒车机车 dot=2 死循环）回退，正解是**把混合 `direction` 归一**（照 KI-217 对 `DrivingBackwards` 的做法），而不是用几何覆盖方向判定。
+2. 硬闸门：在 SEAM-FLIP **之前**采样方向判定，若为真且 flag 对为拼接对且方向相反 ⇒ 拒绝提交（打 `COUPLE-REFUSE-STILL-FOLDED`），不许用 SEAM-FLIP 掩盖 —— 把附记 8 的原则从"豁免条件"升级为"提交断言"。
+3. 治前因：`REFUSE-REAL-ARTIC` 时让机车**停止推进**（命中即停车 / 不再请求前进），使 `worst_gap` 永远降不到 2，OVERRIDE 永无触发条件，作为 1、2 的第二道保险。
+4. 探针：`COUPLE-OK` 前后加 `COUPLE-PREFLIGHT folded_dir=/splice_pair=/gap=` 与 `COUPLE-POSTFOLD check=`；把 `RESPACE-AFTER-EDIT` 的 `unfixed>0` 当"大病链"标记（本次与穿模 1:1 对应）。
+
+**未确认**
+
+- 机车侧为何未被碰撞/停车守卫拦住（`merged=0` 后仍北推 1px）：证据止于 `3524 CPL-GEO-DONE merged=0` → `3527 CPL-HIT overlap=1 dy=-1 maxd=1`，未取证。
+- `REFUSE` 回滚是否 100% 还原几何（3523 回滚后有无残留平移）：需加"REFUSE 前后 GEO 对比"探针。
+- KI-174 老场景在 KI-173 + 附记 8 之后是否还存在；若已不存在，OVERRIDE 可直接删除（需一次倒车挂车复测）。
+
+**复测判据**
+
+1. 同场景（机车正向、鼻对鼻贴上 dir 相反且含真 artic 的静止车底）**不得出现 `FOLDCHK-DIR-OVERRIDE`**；应见 `REFUSE`，或走通折叠修正。
+2. `COUPLE-OK` 后的 `GEO settle-couple` 沿链序**单调**（相邻车 y 同向变化），不得出现 `50(y=1017) → 6(y=1013)` 折返。
+3. `RESPACE-AFTER-EDIT ... unfixed=0`。
+4. 提交后不再出现 `CRT-FOLD ... dot>0` 与 `TTB-PROBE fold-geom`。
+5. 回归面：健康挂车（对照 233/1104/2740 行，`unfixed=0`）不回退；附记 8 的 COUPLE-FLIP 路径与 KI-174 紧贴链场景（若仍存在）不被误伤。
+
+**实现落地（2026-09-30 第 172 轮，仅改 `src/train_cmd.cpp`，未碰 `src/*.h`）**
+
+1. **方向判据回传折叠对**（为下面两条提供前提数据）：`R3RCheckChainFoldedDirection` 增出参 `const Train **out_a = nullptr, const Train **out_b = nullptr`，入口先清空、在 `if (worst_dot > 0)`（确判折叠）处写回 `wa/wb`；`ChainFolded` lambda 同步透传两个出参，调用点改为 `ChainFolded(v, "COUPLE", &direct_gap, &direct_dir_fold, &direct_fold_a, &direct_fold_b)`。
+2. **OVERRIDE 加两条独立前提（同时要求）**（`train_cmd.cpp:8907-8929`，对应上文修法 1 的 (a)+(b)）：新前提 `fold_pair_on_splice = (direct_fold_a == v_last)`、`fold_pair_dir_mixed = (direct_fold_a->direction != direct_fold_b->direction)`；只有 `override_candidate && !fold_pair_on_splice && !fold_pair_dir_mixed` 才置回 `direct_folded = false`（照旧打 `FOLDCHK-DIR-OVERRIDE`），否则走 `else if` 保留折叠结论、只打节流日志 `FOLDCHK-DIR-OVERRIDE-SKIP worst_gap=%d on_splice=%d dir_mixed=%d dirA=%d dirB=%d A=%d B=%d -> fold verdict kept`（新枚举标签 `R3REDGE_FOLDOVR`，插在 `R3REDGE_DECOUPLETRY` 之后 / `R3REDGE_COUNT` 之前；key=(a,b) 车号对、payload=(gap,on_splice,dir_mixed)）。语义依据即根因 (A) 的证明：`worst_gap<=2` 时豁免只剩"方向相同"，还能被 flag 的对必然方向相反 ⇒ `dir_mixed=1` ⟺ 真交错折叠；OVERRIDE 想保护的"1px 紧贴健康链"因同向已被 7817 豁免吃掉、判据根本不会 flag，故不会被本次收紧误伤。
+3. **提交前硬闸门 `COUPLE-REFUSE-STILL-FOLDED`**（`train_cmd.cpp:9193-9223`，在 `bool ok = CheckTrainAttachment(head).Succeeded();`（:9225）之前、所有候选与 `SEAM-FLIP` 之后，对应上文修法 2）：重新跑 `R3RCheckChainFoldedDirection(head, "COUPLE-PREFLIGHT", &gate_a, &gate_b)`，若为真且 `gate_a == v_last` 且两车 direction 相反 ⇒ `RestoreTrainBackup(original_src/original_dst)` + `if (v_flipped) R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles)` + `if (u_flipped) R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles)` + `R3RRefreshChainCaches(v/u)` + `v/u->ConsistChanged(CCF_ARRANGE)`（与 `REFUSE-REAL-ARTIC` / `CheckTrainAttachment` 失败分支逐行同构，不引入新的复位手段）后 `return false`，本 tick 不挂车、下 tick 重试。它是**不变式断言**而非某条候选的补丁：将来任何新增候选/前提/跳过条件都必须先过这一关，"绝不提交折叠链"不会再被侧门绕过。
+4. **构建自证（复用既有 `_tmp_inc_build.cmd`，未新建任何 `.cmd`）**：`GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志 `[3/3] Linking CXX executable openttd.exe`、`error C*`/`fatal error`/`FAILED:`/`build stopped` 计数 0；`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-09-30 21:25）；`src\train_cmd.cpp` 21:18 → `train_cmd.cpp.obj` 21:22 → `build\openttd.exe` 21:24（51 548 160 B）；`read_lints` 0 条；exe 命中 `COUPLE-PREFLIGHT` / `COUPLE-REFUSE-STILL-FOLDED head=%d a=%d dirA=%d b=%d dirB=%d -> rolled back, no merge this tick` / `FOLDCHK-DIR-OVERRIDE-SKIP worst_gap=%d on_splice=%d dir_mixed=%d ...`。
+5. **本轮未做**：修法 3「治前因」（`REFUSE-REAL-ARTIC` 时机车仍每 tick 北推 1px、`worst_gap` 仍会降到 2 —— 本轮已使"降到 2"不再产生病链，但无解的**重试循环本身仍在**，正解=命中即停车/不再请求前进）；修法 4 探针只做一半（`COUPLE-PREFLIGHT` 仅在判为折叠时落 `FOLDCHK-DIR` 行，无无条件 `folded_dir=/splice_pair=/gap=` 摘要；`COUPLE-POSTFOLD check=` 未加）—— **该两项探针已在「第 173 轮」补齐，本句仅描述第 172 轮时的状态**；「未确认」三条（机车未被拦住、REFUSE 回滚是否 100% 还原、KI-174 老场景是否仍存在）未取证。
+6. **复测判据补 3 条**（在「七」的 5 条之上）：(6) OVERRIDE 被否决时应见 `FOLDCHK-DIR-OVERRIDE-SKIP ... on_splice=1`（本次现场形状）或 `... dir_mixed=1`，且不再出现裸的 `FOLDCHK-DIR-OVERRIDE ... fold verdict ignored`；(7) 折叠修正实败时应见 `COUPLE-REFUSE-STILL-FOLDED head=48 a=50 dirA=7 b=6 dirB=3 -> rolled back, no merge this tick`，随后 `GEO settle-*` 链序单调、无 `50→6` 折返；(8) 反向回归——健康紧贴挂车（残差<=2 且全链同向）仍能直拼提交，`FOLDCHK-DIR-OVERRIDE` 照旧出现（前提 (a)(b) 均为假），不被新闸门误拒。
+
+---
+
+## 第 173 轮（2026-09-30，KI-265 复测探针补强：把"每次重试"都变成可核对的现场）
+
+### 一、本轮性质
+
+**只加探针，不改判据、不改运动、不改位置**（第 172 轮的 OVERRIDE 两条前提 + 提交前硬闸门 `COUPLE-REFUSE-STILL-FOLDED` 已就位，本轮不再动它们）。目的：让下一次复测的日志**自证**每个环节 —— 上一轮之所以要靠"读 dot 值反推"，就是因为折叠判据只在判为折叠时才落 `FOLDCHK-DIR`，而它被 `R3RDbgEdge` 的 128 帧窗口节流，"日志里没有"无法区分"没折叠"与"被节流"。
+
+### 二、四处探针（全部只读，仅改 `src\train_cmd.cpp`，未碰 `src\*.h`）
+
+1. **`COUPLE-PREFLIGHT`（提交点无条件几何摘要）**——`train_cmd.cpp:9212-9245`，紧跟在硬闸门自己的 `R3RCheckChainFoldedDirection(head, "COUPLE-PREFLIGHT", ...)` 之后，**在闸门判据之前**无条件写：
+   `COUPLE-PREFLIGHT head=%d last=%d fold=%d dirfold=%d gap=%d pair=(%d dir=%d, %d dir=%d) mixed=%d onsplice=%d splice=(%d dir=%d, %d dir=%d) spd=%d db=%d`
+   节流用新枚举标签 `R3REDGE_CPLSUM`（插在 `R3REDGE_FOLDOVR` 之后 / `R3REDGE_COUNT` 之前），key=(v,u) 车号对、payload=(gap,dirA,dirB,folded,mixed)⇒**每个不同几何一行**，于是"6 次重试"会留下 6 行可逐行对比的现场（`gap` 7→2、拼接对是谁、两车朝向、机车当时 `spd`）。
+2. **`COUPLE-POSTFOLD`（提交后事后校验，只读）**——`Couple()` 内 `COUPLE-OK` 逐节 dump 之后、`ORD-AFTER-COUPLE` 之前：在**最终整链**（`v->First()`）上再跑一次方向判据并写一行：
+   `COUPLE-POSTFOLD head=%d folded=%d a=(%d dir=%d y=%d) b=(%d dir=%d y=%d) mixed=%d`，为真时末尾追加 ` INVARIANT-BROKEN-report-this`。
+   刻意**只写日志、不撤销提交**：提交之后回滚要连排程交接、索引继承、窗口失效一起还原，风险远大于收益；真正的拦截在 try 阶段。注意它落在 `COUPLE-SEAM-FLIP` **之后**，而 SEAM-FLIP 会把接缝两车的 direction 改成一致 ⇒ 这一行**预期本来就是 `folded=0`**，它只用于抓"闸门漏掉的侧门"，不能当"链没问题"的证明（金标准是提交前的 `COUPLE-PREFLIGHT`）。
+3. **`RESPACE-BADCHAIN`（结构性坏链签名）**——`R3RRespaceChainAfterEdit()` 汇总行之后：`unfixed != 0` 时单打
+   `RESPACE-BADCHAIN %s head=%d unfixed=%d skip=%d stretch=%d px=%d visited=%d capped=%d`。`unfixed` = 扫完仍有接缝"实际间距 != 名义间距"且被工具主动 `skip`（超界，见 R170-A）⇒ 工具自己承认修不动的形状（现场 3747 行 `RESPACE-AFTER-EDIT couple ... unfixed=1` 正是穿模提交后那条）。
+4. **`FOLDCHK-REFUSE-REAL-ARTIC` 扩容（"治前因"取证）**——原行追加 `gap=%d pair=(%d,%d) spd=%d db=%d`：
+   `FOLDCHK-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d gap=%d pair=(%d,%d) spd=%d db=%d -> rolled back, no logical flip this tick`。用来回答"拒绝挂车有没有让机车停下来"：现场 6 次重试机车每失败一次北推 1px（`worst_gap` 7→2），若复测里 `spd>0` 且 `gap` 逐次变小，则确认"拒绝 ≠ 停车"，下一轮才好在拒绝分支里下刹车（**本轮刻意不动运动/位置**，理由见「四」）。
+
+### 三、构建自证
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）。护栏：`GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ **增量**合法。
+- `src\train_cmd.cpp` 21:36 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 21:37 → `build\openttd.exe` **2026-09-30 21:39**（51 548 160 B）；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `[3/3] Linking CXX executable openttd.exe`，`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`read_lints`（`src\train_cmd.cpp`）**0 条**。
+- 产物自证：exe 内命中 `COUPLE-PREFLIGHT head=%d last=%d fold=%d dirfold=%d gap=%d ...`、`COUPLE-POSTFOLD head=%d folded=%d ...`、`COUPLE-POSTFOLD INVARIANT-BROKEN-report-this`、`RESPACE-BADCHAIN %s head=%d unfixed=%d ...`、`FOLDCHK-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d gap=%d pair=(%d,%d) spd=%d db=%d ...`。
+
+### 四、本轮**故意不做**的事（有把握才做）
+
+- **不给机车下刹车**（修法 3「治前因」的落地）。唯一能真正阻止 1px/tick 逼近的杠杆是在拒绝分支里把 `cur_speed`/`subspeed` 清零（上游等信号时的标准停法）。但拒绝点既可能来自"滚动逼近路径"、也可能来自"停稳扫描路径"，两者共用同一函数；在没有现场数据（本轮新探针的第 4 条就是给它取数的）之前贸然清零，有让机车**停在挂车距离之外再也挂不上**的风险 ⇒ 先取证，再动手。
+- **不在提交后回滚**（`COUPLE-POSTFOLD` 只记日志）：见「二、2」。
+- **不动 `SEAM-FLIP`**：它是"把接缝两侧方向改成一致"的善后，本身不制造折叠；但它的存在正说明"提交前必须拦住"（闸门因此刻意放在它之前）。
+
+### 五、复测时请看什么（玩家目测 + 日志判读）
+
+**目测（不需要看日志）**
+
+1. 复跑那次挂车场景：车底在路点等待、机车（`48`）/车底（`6/7`）那一段 —— **不许再出现"机车压在车厢上"（穿模）**；就算挂不上，也应当看到机车**规规矩矩停在车底前面**（而不是压进去）。
+2. 若出现"挂不上、机车在车底前反复尝试"：请顺手记一句**它是否会一点点往前蹭**（我们预计**会**，那就是「治前因」要修的东西）。
+3. 挂上之后**不要**出现"列车图像错位/被狗啃/车厢叠在一起"，也不要出现 `TTB-PROBE fold-geom` 那种连续刷屏导致的卡顿。
+
+**日志（我来看，但你可以先 grep 这几个词）**
+
+4. `COUPLE-PREFLIGHT`：每次到提交点都应有一行；最后一次挂车前的若干行里，`pair=` 应显示方向相反的折叠对、`onsplice=1`，且**不得**紧接着出现裸的 `FOLDCHK-DIR-OVERRIDE ... fold verdict ignored` —— 应改为 `FOLDCHK-DIR-OVERRIDE-SKIP ... on_splice=1`（或 `dir_mixed=1`）。
+5. 若最终挂不上：应出现 `COUPLE-REFUSE-STILL-FOLDED ... -> rolled back, no merge this tick`（这是新闸门拦下的证据）；若最终挂上了，应出现 `COUPLE-POSTFOLD head=... folded=0`，且**不得**出现 `INVARIANT-BROKEN-report-this`。
+6. `FOLDCHK-REFUSE-REAL-ARTIC ... gap=... spd=...`：请把这段日志（哪怕只是连续 10~20 行）留下来 —— `spd` 是否 >0、`gap` 是否逐次变小，直接决定下一轮怎么修「治前因」。
+7. `RESPACE-BADCHAIN`：**不应再出现**（它是坏链签名）；若出现，说明还有一条侧门，把那一行连同上下文 30 行给我。
+
+---
+
+## 第 174 轮（2026-09-30，KI-265「治前因」落地 + 第 173 轮复测判读：拒绝挂车必须让机车真正停下）
+
+### 一、本轮性质
+
+**改行为 2 处，仅 `src\train_cmd.cpp`（未碰 `src\*.h`）**：
+
+1. **「治前因」落地**：在 `FOLDCHK-REFUSE-REAL-ARTIC` 拒绝分支里给机车下刹车（第 172 轮修法 3）。
+2. **折叠判据补一格**：`R3RCheckChainFoldedDirection` 增判"拼接对同格同位"（`dot==0` 盲区，见 2.4）。
+
+不改运动学其它环节、不动 `SEAM-FLIP`、不在提交后回滚。
+
+### 二、第 173 轮复测判读
+
+- 现场：`build\R3R_debug.log`（236 487 B，最后写入 2026-09-30 21:54:55，5504 行级别的一次完整会话），由第 173 轮 exe（21:39）产生。
+- 一句话结论：**第 172 轮的修法 1、2 全部按设计生效（旧侧门确实关上了），但穿模仍在 —— 病链这次是从"方向判据 `dot==0` 的盲区"进来的；同时第 173 轮的取证目标 100% 达成，`spd` 与 `gap` 的数据把「治前因」的必要性钉死。**
+
+#### 2.1 探针统计
+
+| 探针 | 次数 | 判读 |
+|---|---|---|
+| 裸 `FOLDCHK-DIR-OVERRIDE ... fold verdict ignored` | **0** | 第 172 轮修法 1 生效，旧侧门已关 |
+| `FOLDCHK-DIR-OVERRIDE-SKIP ... on_splice=1 dir_mixed=1` | 4 | 折叠结论被保留、继续走折叠修正分支，与设计一致 |
+| `FOLDCHK-REFUSE-REAL-ARTIC ... gap=... spd=...` | 10 | 拒绝分支反复触发（无解的重试循环仍在） |
+| `COUPLE-PREFLIGHT` / `COUPLE-POSTFOLD` | 4 / 4 | 两个新探针都在落 |
+| `COUPLE-REFUSE-STILL-FOLDED` | **0** | ⚠️ 新硬闸门**一次都没拦到**（提交那一 tick 它读到的 `fold=0`） |
+| `INVARIANT-BROKEN-report-this` | 0 | 因 POSTFOLD 读到的是"方向已被抹平"的链（见 2.4），**不能**当"链没问题"的证明 |
+| `RESPACE-BADCHAIN` | 0 | 无"结构性不可修"签名 |
+| `TTB-PROBE fold-geom` | 0 | 提交后没有刷屏（比第 172 轮"侥幸没崩"好），但下面 `CRT-FOLD` 证明几何仍是坏的 |
+| `CRT-FOLD` | **1** | ⚠️ yapf 自己的独立折叠检测，在提交后报了一次 |
+| `COUPLE-OK` / `COUPLE-SEAM-FLIP` | 4 / 1 | 前 3 次挂车健康（246 / 904 / 2212 行），第 4 次即病链 |
+
+#### 2.2 重试循环的形状（10 行 `FOLDCHK-REFUSE-REAL-ARTIC`，全部 `v=48 u=6 pair=(50,6) db=0`）
+
+| # | 行 | gap | spd |
+|---|---|---|---|
+| 1 | 3041 | 7 | 120 |
+| 2 | 3077 | 6 | 21 |
+| 3 | 3112 | 5 | 23 |
+| 4 | 3146 | 4 | 23 |
+| 5 | 3177 | 4 | **0** |
+| 6 | 3210 | 3 | 22 |
+| 7 | 3277 | 2 | 23 |
+| 8 | 3314 | 1 | 22 |
+| 9 | 3348 | 0 | 23 |
+| 10 | 3387 | 1 | 23 |
+
+- **`spd` 全程非 0（唯一一次 0 仍被下一 tick 顶回 22）**，`gap` 总体单调变小（7→0→1）；
+- 机车 48 的 y 由第一次拒绝时的 **1015**（`CPL-GEO-DONE v=48 u=6 merged=0 spd=120 x=936 y=1015`）一路北推到提交那一 tick 的 **1006**（`GEO respace-before n=0 veh=48 tile=58,62 x=936 y=1006`），即 **10 次拒绝期间整列车向北推进 9px，车底 6 一动不动**；
+- 第 1 次拒绝时同 tick 还有 `CPL-HIT site=open loco=48 v=6 ... min_diff=1 need=2 fit=2 dx=0 dy=-1 maxd=1 overlap=1 spd=21 dir=7` ⇒ **拒绝点来自"已经碰上"的判定**（这一条是 3.1 敢下刹车的依据）。
+
+⇒ 第 173 轮要回答的问题答案是明确的：**"拒绝挂车"不等于"停车"**，重试循环确实在把几何顶向病态。
+
+#### 2.3 提交那一 tick（3395-3401，逐行原文）
+
+```
+3395:FOLDCHK COUPLE n=21 worst_gap=2 A idx=50 x=936 y=1013 tile=58,63 dir=7 trk=0x2 db=0 B idx=6 x=936 y=1013 tile=58,63 dir=3 trk=0x2 exp=2 nom=2 nom0=2 nom1=2 dist=0
+3396:COUPLE-PREFLIGHT head=48 last=50 fold=0 dirfold=0 gap=2 pair=(-1 dir=15, -1 dir=15) mixed=0 onsplice=0 splice=(50 dir=7, 6 dir=3) spd=22 db=0
+3398:COUPLE-SEAM-FLIP circ=4 a=50 dirA=7 b=6 dirB=3
+3399:GEO respace-before n=0 veh=48 tile=58,62 x=936 y=1006 dir=7 ... dist=4 nom=4
+3401:GEO respace-before n=2 veh=50 tile=58,63 x=936 y=1013 dir=7 ... dist=0 nom=2
+```
+
+读法：被重试循环顶了 9px 的拼接对 `(50,6)` 这时已经**同格同位**（x=936 y=1013 完全相同，`dist=0`）⇒ 判据里的 `Δ=(0,0)` ⇒ `dot=0`；而判据的条件是 `dot > 0` ⇒ **不判折叠**（`pair=(-1 dir=15, ...)` 就是"没判出任何折叠对"的签名）。于是提交前硬闸门与 OVERRIDE 前提同时失明，`fold=0` 一路放行 ⇒ 提交。
+
+#### 2.4 提交后的链（`GEO settle-couple` 3508-3528 与 yapf 的独立检测）
+
+链序与 y 坐标：
+
+```
+48 y=1004 → 49 y=1008 → 50 y=1011 → 6 y=1013 → 7 y=1008 → 8 y=1003 → … → 23 y=944
+                       ↑ 递增        ↑ 在 50→6 处折返
+```
+
+- 折返点 = 拼接点 `50↔6`；
+- 跨车体重叠：`49(1008)` 与 `7(1008)` **完全同格同位**、`48(1004)` 与 `8(1003)` 差 1px、`50(1011)` 与 `6(1013)` 差 2px ⇒ 机车 3 节车体压在车底前段上 = 玩家看到的穿模；
+- **引擎自己的独立检测**（yapf，与折叠判据不同源）：`3503:CRT-FOLD veh=48 tile=58,62 dir=7 backTile=58,59 rel=0,-3 dot=3` —— "链尾（23，tile 58,59）落在车头（48，tile 58,62）的前方（北）3px"，正是空间折叠；
+- `COUPLE-POSTFOLD ... folded=0` 之所以为 0，是因为紧随其后的 `COUPLE-SEAM-FLIP` 已把车底 18 节的方向由 3 改成 7（位置一像素未动）⇒ 方向特征被抹掉。**这就是第 173 轮预告过的"POSTFOLD 恒为 0、不能当证明"的实例。**
+
+#### 2.5 机制链（与第 172 轮的 (A)(B)(C) 对照）
+
+- **(B) 前因照旧**：`REFUSE-REAL-ARTIC` 每 tick 拒绝、机车每 tick 前进 ⇒ `worst_gap` 7→2，且这次一路顶到"拼接对共位"。
+- **(A) 换了入口**：第 172 轮是从 KI-174 的 `OVERRIDE` 侧门进（那次 dot=+4 被如实判出、却被 OVERRIDE 丢掉）；本轮 `OVERRIDE` 已被第 172 轮的两条前提关掉（4 行 `SKIP`、0 行裸 `OVERRIDE`），病链改从 **`dot` 恰好等于 0** 的盲区进 —— 判据把"后继落在鼻子侧"（`dot>0`）当折叠，却漏掉"后继与车头完全重合"（`dot==0`）。
+- **(C) 掩盖层照旧**：`SEAM-FLIP` 只改方向不动位置，随后 `POSTFOLD`、目测都失去方向线索。
+
+⇒ 第 172 轮的两条修法**没有被证伪**（它们确实挡住了原来的入口），但它们挡不住"几何本身被顶穿"。**只要无解的重试循环还在推进，判据就永远在追着一个移动的靶子** —— 这正是第 172 轮修法 3「治前因」的定位，故本轮落地它。
+
+### 三、两处实现
+
+#### 3.1 拒绝分支下刹车（`train_cmd.cpp:9038-9062`，探针 `FOLDCHK-REFUSE-BRAKE`）
+
+位置：`FOLDCHK-REFUSE-REAL-ARTIC` 那行之后、`return false` 之前。
+
+```cpp
+Train *const v_front = v->First();
+const int v_spd_before = (int)v_front->cur_speed;
+v_front->cur_speed = 0;
+v_front->subspeed = 0;
+v_front->progress = 0;
+R3RDbgWrite("FOLDCHK-REFUSE-BRAKE v=%d front=%d spd_before=%d spd_after=%d db=%d\n", ...);
+```
+
+- 用**本文件既有的停车惯用写法**（`train_cmd.cpp:15894` 一带的 `consist->cur_speed = 0; consist->progress = 0;`，上游等信号时的标准停法），不引入新的状态复位手段；
+- `cur_speed` 只对**前部机车主控**有效，故刹车对象取 `v->First()`，不是 `v`；
+- **为什么这次敢下刹车**（第 173 轮刻意不做的理由正是缺数据）：现场 10 次拒绝**全部**伴随 `CPL-HIT ... overlap=1` ⇒ 拒绝点一定来自"已经碰上"，机车本来就已够着，刹车**不会**把它停在挂车距离之外；
+- 语义：含真 artic 的链本来就翻不了（本分支存在的理由），机车继续前进只会把几何顶穿，因此拒绝 = 本 tick 不挂车 **+ 立即停车**，不再把"车还在动"留给下一 tick。
+
+#### 3.2 折叠判据补"共位"一格（`train_cmd.cpp:7840-7857`）
+
+在算完 `dot`、与 `worst_dot` 比较之前插入：
+
+```cpp
+const bool pair_co_located = (pair_dist <= 0);
+if (pair_co_located) dot = std::max(dot, 0) + 1;
+```
+
+- 依据：相邻两节**非 artic** 车各自都带车长（`cached_veh_length >= 2`），几何上**不可能共位**；而 artic 成员已在上面按 `IsArticGroupMember` 跳过 ⇒ **共位必是坏链，无需再问方向**；
+- 为不改变既有日志字段，共位按 `dot=+1` 记账（日志里出现 `dot=1` 且 A/B 同坐标，即是此情形）；
+- 它是一条**不变式补丁**：不改变任何健康链的判定（健康链不存在共位对），只保证"绝不提交折叠链"不会再次从"恰好 `dot==0`"漏掉。
+
+### 四、构建自证
+
+- 复用既有 `R3R_inc_build_tmp.cmd`（`call vcvars64.bat` → `cmake --build build -j 2`，**未新建任何 `.cmd`**）。
+- `EXIT_CODE=0`；`build\openttd.exe` **2026-09-30 23:03:14**（51 556 864 B，比第 173 轮的 51 548 160 B 净增 8 704 B）；构建日志除 `/showIncludes` 的 `注意: 包含文件` 噪音外，无 `error C*` / `fatal error` / `FAILED:` / `warning`。
+- 源码：`src\train_cmd.cpp` 22:38（本轮改动）→ 23:03 链接。
+- 产物自证（在 `build\openttd.exe` 的 ASCII 字节流内检索，4/4 全中）：`FOLDCHK-REFUSE-BRAKE v=%d front=%d spd_before=%d spd_after=%d db=%d`（本轮新增）、`FOLDCHK-REFUSE-REAL-ARTIC v=%d u=%d`、`COUPLE-PREFLIGHT head=%d`、`COUPLE-REFUSE-STILL-FOLDED`。
+- `read_lints`（`src\train_cmd.cpp`）：**0 条**。
+
+### 五、复测时请看什么（第 174 轮判据）
+
+**目测**
+
+1. 同场景重跑：车底在路点等待、机车（`48`）/车底（`6`）那一段 —— **不许再出现"机车压在车厢上"（穿模）**；挂不上时应看到机车**停在车底前面不再蹭**。
+2. 挂上之后不得有图像错位／被狗啃／车厢相叠，也不得有 `TTB-PROBE fold-geom` 连续刷屏导致卡顿。
+
+**日志**
+
+3. `FOLDCHK-REFUSE-REAL-ARTIC` 应仍出现（说明仍拒绝），但**必须**紧跟一行 `FOLDCHK-REFUSE-BRAKE ... spd_before>0 spd_after=0`；此后机车不再前进（`CPL-GEO-DONE ... y=` 不再逐 tick 变小）——**这是「治前因」是否生效的唯一判据**。
+4. 拼接对共位时 `COUPLE-PREFLIGHT ... fold=` 必须为 **1**（不再是 0），且随后应见 `COUPLE-REFUSE-STILL-FOLDED ... -> rolled back, no merge this tick`（不再静默提交）。
+5. 提交后**不得**再出现 `CRT-FOLD ... dot>0`。
+6. 回归面：健康挂车（对照 246 / 904 / 2212 行）不回退；"链内部 + 同向 + 残差极小"的场景仍能直拼提交（`FOLDCHK-DIR-OVERRIDE` 照旧出现），不被 3.2 误伤。
+
+### 六、仍未做
+
+- **无实机复测**：本轮只到"编译通过 + 产物自证"，第五节 6 条判据全部待游戏内复跑。
+- 「六、未确认项」三条（**机车侧为何没被碰撞/停车守卫拦住**这一上游原因、`REFUSE` 回滚是否 100% 还原、KI-174 老场景是否还存在）仍未取证。
+- 若复测显示刹车导致"停在挂车距离外再也挂不上"（第 173 轮担心的风险），需把刹车细化成"仅当 `CPL-HIT` 已判 `overlap` 时才刹"；本轮现场数据显示 10/10 次拒绝都带 `overlap=1`，故暂按**无条件刹车**落地。
+
+---
+
+## 第 175 轮（2026-09-30，KI-265 复测判读：穿模消失，但第四次挂车永久挂不上）
+
+### 一、本轮性质
+
+**纯取证轮，未改任何源码。** 玩家报"耦合还是失败了"后对第 174 轮 exe 的实机日志做判读。
+
+- 现场：`build\R3R_debug.log`（2 823 行，最后写入 23:13:05）
+- 被测 exe：`build\openttd.exe` 2026-09-30 23:03:14（第 174 轮产物）；版本自证 = 日志含第 174 轮新增探针 `FOLDCHK-REFUSE-BRAKE` 8 次
+- 临时分析报告：`R3R_couple_deadlock_round175_memo.md`
+
+### 二、结论
+
+**第 174 轮两处改动都按设计生效，但结果是把"穿模地挂上"换成了"永远挂不上"。**
+
+| 项 | 第 173 轮 | 第 175 轮 | 判读 |
+|---|---|---|---|
+| `CRT-FOLD` | 1 | **0** | ✅ 穿模消失（引擎独立检测不再报折叠） |
+| `COUPLE-SEAM-FLIP` | 1 | **0** | ✅ 没有折叠链被提交 |
+| `COUPLE-REFUSE-STILL-FOLDED` | 0 | 0 | 硬闸门仍未拦到（病链没走到提交） |
+| `COUPLE-OK` | 4（第 4 次穿模） | **3** | ⚠️ 第四次挂车（loco=48）**没有发生** |
+| `FOLDCHK-REFUSE-BRAKE` | — | 8 | 刹车在落，但**无效** |
+| `FOLDCHK-REFUSE-REAL-ARTIC` | 10 | 8 | 同一条病链（`v=48 u=6 v_real=0 u_real=1`） |
+| 裸 `FOLDCHK-DIR-OVERRIDE` | 0 | 0 | 第 172 轮修法 1 继续生效 |
+
+三次正常挂车全部成功（`241 loco=24` / `1063 loco=27` / `1825 loco=27`）⇒ 正常路径未坏。
+
+### 三、机制（分水岭 = 第 174 轮的修法 2）
+
+折叠修正块入口 `train_cmd.cpp:8958` 是 `if (direct_folded || direct_splice)`：
+
+1. `direct_folded` = 方向判据，**判折叠的条件是 `dot > 0`**，而豁免要求 `|dist-exp|<=8` **且两车 direction 相同**（`:7825-7827`）；
+2. `direct_splice` = `SpliceFolded(v_last)`，**只抓"太远"**（`|dist-exp| > 8` 才 true，`:8851`），抓不到"共位"。
+
+| 时刻 | (50,6) | dist/exp | 豁免 | dot | direct_folded | 结果 |
+|---|---|---|---|---|---|---|
+| gap=7…1（两轮皆有） | 相距 8~2px | 6~0 / 2 | dir 7≠3 ⇒ 否 | **+8…+2** | true | 进块 ⇒ `u_real=1` ⇒ **拒绝** |
+| **共位**（gap=0） | 同格同位 | **0** / 2 | dir 7≠3 ⇒ 否 | **0** | 第 173 轮 **false** / 第 174 轮 **true** | 第 173 轮**块没进 ⇒ 提交**（穿模）；第 174 轮**进块 ⇒ 拒绝**（挂不上） |
+
+⇒ **"挂不上"的直接原因就是第 174 轮修法 2**（`dot = max(dot,0)+1`）：它把第 173 轮唯一那条"静默提交折叠链"的出口堵死了。
+
+### 四、刹车为什么无效（实测）
+
+两轮的 `spd` / `gap` 序列**逐项相同**（120,21,23,23,0,22,23,22 / 7,6,5,4,4,3,2,1），机车推进距离同步数（1015→1009）。
+
+```
+FOLDCHK-REFUSE-BRAKE v=48 front=48 spd_before=22 spd_after=0 db=0   ← 写了 0
+（下一次拒绝）… spd=22 …                                              ← 又回到 22
+```
+
+代码级原因：`TryTrainCouple` 在订单处理阶段，`cur_speed = 0` 之后**同一 tick 的速度更新/推进照旧发生**，下一 tick 因 `GOTO_COUPLE` 订单有效又重新加速。本文件既有"停车惯用写法"是给"路径未订、停在库/路点"的场景用的 —— **本场景路径已订、目标在前方，清速度并不能阻止它继续开**。
+
+### 五、病根（KI-265）：含真 artic 的铰接车底永远无法被折叠修正
+
+- 第 170 轮为防 R170-A（翻转 + 真 artic part 导致包围盒/父车脱钩）加了一刀切门禁：**任一方含真 artic part ⇒ 整块放弃折叠修正**（`train_cmd.cpp:9019`）。
+- 本例车底 6..23（18 节 = 6 个三节铰接单元）**天生全是真 artic part**（`FOLD-U` dump：`veh=19/20/22/23 subtype=0x02(...artic=1)`）⇒ 门禁恒真 ⇒ **只要需要一次折叠修正，这个挂车永远不可能成功** ⇒ 无限拒绝环（每 tick 顶 1px，直到共位也判折叠、继续拒绝）。
+- 即：第 174 轮治掉了"症状"（穿模），第一次把"真病"完整暴露出来，且没有兜底出口。
+
+### 六、玩家两个假设的答复
+
+- **四候选没被改**：第 174 轮只改了 `:9019` 之后的拒绝分支（刹车 + 探针）与 `:7840` 附近的方向判据（共位 `dot=+1`），均不在四候选里；且 `FOLDCHK-REFUSE-REAL-ARTIC` 门禁位于候选遍历**之前**，本轮病链**根本没走到四候选**。
+- **控制段没绕过修复**：控制段（`DEPOT-XFER-ID`/`R3RBorrowControlTraitsLive`）只搬运车号/名称归属，不碰几何与判据；日志里门禁与刹车成对在落、三次正常挂车成功 ⇒ 既有修复全部在位。
+
+### 七、修复方向（待玩家拍板）
+
+1. **立即（小、低风险）——把刹车做成真的停住**：不能只清一个会被同 tick 覆盖的 `cur_speed`。可选：把清零挪到速度更新之后；或用"本 tick 保持停住"标志让 `TrainLocoHandler` 在速度更新前直接跳过加速（等价于被信号拦住）；或拒绝即放弃本 tick 的路径预留走"无路可走"分支自然停下。
+2. **治本（中风险，建议）——解除"含真 artic ⇒ 不许折叠修正"的一刀切**：真 artic 组在 `R3RFlipChainBySegments` 里本就按原子块整体倒序处理；第 170 轮禁掉的真因是**翻转后包围盒/父车位置脱钩（KI-214）**，不是翻转不合法。正解 = 让真 artic 组也能整链倒置 + 翻转后重算 artic 成员对应面位置/包围盒，门禁收窄为"仅当真 artic 组跨拼接点时才拒绝"。
+3. **兜底（零风险，纯 UX）——给无解场景出口**：按 KI-193 的 `COUPLE-DEST-EMPTY` 范式判定本次挂车不可能，把机车从 `GOTO_COUPLE` 上摘下来并推进订单/原地等待提示，不再无限重试。
+
+### 八、复测判据
+
+1. `FOLDCHK-REFUSE-BRAKE spd_after=0` 之后，**下一次**拒绝的 `spd_before` 必须为 0；`gap` 不再逐 tick 变小；机车 48 的 `y` 停在 1015 不再变化。
+2. `CRT-FOLD` 保持 0（本轮已达标，作回归看住）。
+3. 若采用方向 2：同场景应出现 `COUPLE-OK loco=48`，且 `GEO settle-couple` 链序单调、无 `50→6` 折返。
+4. 若采用方向 3：应见明确的"本次挂车放弃"日志与订单推进，且不再有连续 `FOLDCHK-REFUSE-REAL-ARTIC`。
+5. 回归面：三次正常挂车（24/27/27）与健康紧贴同向挂车（`FOLDCHK-DIR-OVERRIDE-SKIP`）不受影响。
+
+### 九、未确认项
+
+1. **刹车为何被覆盖**：`TrainCoupleHandler` 相对"速度更新/推进"的调用次序未实测，只由"spd 序列逐项相同"反推 ⇒ 修方向 1 前应先加一条速度更新处的 `cur_speed` 探针定位钩子。
+2. **车底为何朝向与机车相反**：未取证（上一轮挂/解挂/车库编辑的朝向残留？玩家刻意？），这决定方向 2 与方向 3 哪个更合适。
+3. **47 次 `COUPLE-FAIL` 里有无"永久 `found=0`"**：`loco=48 @58,67`、`loco=24 @20,9` 各多次，未逐条判定是正常等待还是又一个无解环（建议下一轮加节流统计）。
+
+---
+
+## 第 176 轮（KI-266 订单一层硬闸门 + KI-267 "谁把列车焊死"）
+
+**状态**：已实现 + 已编译（游戏内复测待做）
+
+**严重度**：高（含真铰接的列车被焊成段后，段语义全面失真 / 挂车永久重试）
+
+**玩家要求（两条，2026-09-30）**
+
+1. **订单一层硬闸门**：列车下一条命令是 `GOTO_COUPLE` / `WAIT_COUPLE` / `DECOUPLE`（称 R3R 命令）时，先检查自身是否存在**真铰接式**；若存在，跳到该条命令**后面的第一条非 R3R 命令**，从寻路/耦合阶段就让它无法参与耦合。
+2. **追查并修复"谁把列车焊死"**：找出把含真铰接的列车焊成整节并打上段标记（★）的路径，在源头加闸门。
+
+玩家同时确认：第 175 轮那次"鼻对鼻挂不上"是纯几何问题；原先"参与挂接的列车都无真铰接"的假设**是错的**——现场车底就是一条含真铰接的车底。
+
+---
+
+### 一、现场证据：★ 与真 artic part 共存于同一条链
+
+`build\R3R_debug.log`（190 099 B / 2 823 行，第 174 轮 exe 的复测）
+
+| 行 | 内容 | 说明 |
+|---|---|---|
+| 2525 | `FOLD-U … veh=6 p=-1 n=7 subtype=0x09(front=1 eng=1 wagon=0 freeW=0 artic=0) AH=0 AM=0 SF=1 dir=3` | 车底链头 6 带 **SF=1（★）**，是 R3R 造的**假引擎**（subtype 0x09），但 `artic=0` |
+| 2526 | `FOLD-U … veh=7 p=6 subtype=0x02(…) artic=1 AH=0 AM=0 SF=0` | **veh=7 是真 artic part**（subtype 0x02） |
+| 2527 | `FOLD-U … veh=8 … artic=1 …` | 同 |
+| 1820 | `CPL-WAITCLEAR veh=6 head=27 tile=58,26 segFront=1 primary=1` | **合并之前**车底 6 就已经 `segFront=1` |
+| 1879 | `CHAIN-ATTRS head=27 n=21 FE=2 SEG=2` | 合并后链上有 2 个段 |
+| 1912 | `CPL-GEO-DONE v=27 u=6 merged=1` | 机车 27 与含真 artic 的车底 6 **耦合成功**（几何不折叠 ⇒ 没走 `FOLDCHK-REFUSE-REAL-ARTIC`） |
+
+**结论**：一条链上同时存在「真 artic part（veh=7/8/19/20/22/23 …）」与「★ + 假引擎头（veh=6）」——
+这正是玩家说的"整节列车被焊死"。而且 1820 行证明 ★ 在这次耦合**之前**就已存在，
+本次耦合只是又把它当段挂上了一回。
+
+### 二、"谁把列车焊死"的答案（KI-267）
+
+全代码库给链授予 ★ 的地方只有 5 处：
+
+| # | 位置 | 是否有打散前置 | 处置 |
+|---|---|---|---|
+| 1 | `CmdMakeSegment`（`vehicle_cmd.cpp:646`） | **有**（`DearticulateChainWithSnapshot(t)`） | 无需改（这条路径本就把真 artic 打散成假铰接） |
+| 2 | 车库拖动 merged-on 标记（`train_cmd.cpp:3206` 附近） | **无** | **已修**（见下） |
+| 3 | 解挂时给解出部分发 ★（`train_cmd.cpp:7633` 附近） | **无** | **已修** |
+| 4 | `Couple()` 提交点（`merged_first->SetSegmentFront()`） | **无** | **已修**（在 `TryTrainCouple` 入口硬否决） |
+| 5 | 翻转 `R3RFlipChainBySegments` / 翻转回滚恢复 ★ | 只在已耦合链上操作 | 由 #4 保护（含真铰接的链进不了耦合，也就翻不了） |
+
+⇒ 焊死根因确认：**R3R 的耦合与车库编辑两条路径都会把一条"从未走过升段命令"的真铰接列车
+打上 ★ 并提升假引擎头**，而这两条路径都没有打散前置（只有 `CmdMakeSegment` 有）。
+第 170 轮的 `FOLDCHK-REFUSE-REAL-ARTIC` 只在「需要折叠修正」时才走到，
+**几何不折叠时旧代码一路提交成功并打 ★** —— 现场 1912 行就是这种情形。
+
+### 三、本轮改动（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）
+
+**KI-266 订单一层硬闸门**
+
+- 新增 `static bool R3RIsCoupleCommand(const Order *o)`（`:15796`）—— 判定 `OT_GOTO_COUPLE` / `OT_WAIT_COUPLE` / `OT_DECOUPLE`。
+- 新增 `static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)`（`:15837`）——
+  `R3RChainHasRealArticPart(consist)` 为假时立刻返回（正常车底零影响）；
+  为真且 `cur_real_order_index` 所指订单（或已加载的 `current_order`）是 R3R 命令时，
+  **向后走过整段连续的 R3R 命令，落在第一条普通命令上**；索引直接赋值
+  （不走 `IncrementRealOrderIndex`，那条路对已加载的 `GOTO_COUPLE` 是刻意的 no-op），
+  同时 `current_order.Free()` + `SetDestTile(INVALID_TILE)`，让本 tick 的 `ProcessOrders()`
+  用新索引重新装填（否则残留的 `GOTO_COUPLE` 会继续驱动耦合寻路）。
+  整张表全是 R3R 命令时只丢弃当前命令并原地停车。探针 `ARTIC-SKIP-R3R`（`:15867` / `:15881`）。
+- 调用点：`TrainLocoHandler` 中、**建立耦合目标锁 `R3REnsureCouplePair()` 之前**（`:16065`）。
+
+**KI-267 源头闸门（三处）**
+
+- `TryTrainCouple()` 入口硬否决（`:8830`）：`v` 或 `u` 含真 artic part ⇒ 打
+  `CPL-REFUSE-REAL-ARTIC`（含 `v_real/u_real`）并 `return false`。此处尚未 `ArrangeTrains`，
+  状态未被改动，无需回滚。
+- `R3RIsCoupleTarget()`（`:1937`）：加 `if (R3RChainHasRealArticPart(t)) return false;`
+  —— 寻路侧（`yapf_rail.cpp` / `yapf_destrail.hpp` 均走本函数）从此瞄不到含真铰接的等待车底。
+- 车库拖动 merged-on 标记（`:2989` 采样 + `:3207` 判断）：拖动块含真 artic part ⇒
+  **不发 ★/⊗**，打 `DEPOT-SEG-SKIP-REAL-ARTIC`；含真铰接与否必须在 `ArrangeTrains()` **之前**
+  采样（合并后 `src->Last()` 已是合并链尾）。
+- 解挂给解出部分发 ★（`:7633`）：解出方 `u` 含真 artic part ⇒ **不发 ★**，打
+  `DECOUPLE-SEG-SKIP-REAL-ARTIC`。
+
+判据一律只认 subtype 位（`R3RChainHasRealArticPart`，`:1870`），**绝不用角色层**
+（`ArticGroupHead`/`ArticGroupMember`）——打散后的假铰接每节都挂角色位，用角色层会把好链也拒掉。
+
+### 四、构建自证
+
+复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）：
+
+- `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`
+- `build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`
+- `src\train_cmd.cpp` 23:51:50 → `train_cmd.cpp.obj` 23:53:19 → `build\openttd.exe` **2026-09-30 23:58:47（51 559 424 B）**
+- `read_lints`（train_cmd.cpp）0 条
+- exe 内 4/4 命中新探针：`ARTIC-SKIP-R3R` / `CPL-REFUSE-REAL-ARTIC` / `DEPOT-SEG-SKIP-REAL-ARTIC` / `DECOUPLE-SEG-SKIP-REAL-ARTIC`
+
+### 五、复测判据
+
+1. **机车侧**（含真铰接的机车自己排了 `GOTO_COUPLE`）：应在刚走到该命令时出现
+   `ARTIC-SKIP-R3R veh=N from=<idx> to=<idx> type_from=16 type_to=<普通命令>`，
+   且**不再**出现对该目标的 `COUPLE-FAIL` / `CPL-HIT` 重试循环。
+2. **车底侧**（含真铰接的等待车底排了 `WAIT_COUPLE`）：同样出现 `ARTIC-SKIP-R3R`
+   （`type_from=17`），并且其它机车对它的 `R3RIsCoupleTarget` 恒为假 ⇒ 不会再有
+   `COUPLE-OK loco=… rear=6` 这类把真铰接车底挂上去的记录。
+3. **保险层**：即使人为让机车凑到含真铰接的车底跟前，`TryTrainCouple` 也应打
+   `CPL-REFUSE-REAL-ARTIC v=… u=… v_real=0 u_real=1` 并拒绝，链序/★ 不变。
+4. **车库拖动**：把含真铰接的块拖进别列车 ⇒ 打 `DEPOT-SEG-SKIP-REAL-ARTIC`，
+   该块**不出现** ★/⊗（车队列表不显示为段）。
+5. **解挂**：从含真铰接的链上解下含真铰接的部分 ⇒ 打 `DECOUPLE-SEG-SKIP-REAL-ARTIC`，
+   解出部分不带 ★。
+6. **无回归**：全假铰接（打散组）的正常耦合/解挂/翻转**行为逐字不变**，
+   日志里**不应**出现任何 `ARTIC-SKIP-R3R` / `*-REFUSE-REAL-ARTIC` / `*-SEG-SKIP-REAL-ARTIC`。
+7. **第 175 轮的永久挂不上**：机车 48 那条 `GOTO_COUPLE` 应被闸门跳过（判据 1），
+   不再刷 47 行 `COUPLE-FAIL`。
+
+### 六、仍未做 / 已知边界
+
+1. **旧存档里已经焊死的链不会自动复原**：本轮只堵"产生路径"。已在档的"真 artic + ★"
+   由判据 1~3 隔离（不再参与耦合、不再是耦合目标），但其段划分仍失真（KI-253 现象）。
+   是否加"读档时对含真铰接的链自动打散/清 ★"（落点候选 `R3RResyncSegmentFronts`，
+   `:4711` 已有"真 artic part 不携带 ★"的局部处理）属需玩家拍板的下一步。
+2. **不做自动打散**：本轮对缺打散前置的路径选择"不发 ★ / 拒绝耦合"，不是
+   "自动 `DearticulateChainWithSnapshot`"。原因：跨文件打散入口不存在
+   （`R3RDearticulateOneGroup` 是 `vehicle_cmd.cpp` 的文件内 static），
+   且在车库拖动中途改车辆身份风险高。若玩家希望"含真铰接的链被自动规范化成假铰接后
+   正常参与耦合"，需另开一轮做跨文件打散入口。
+3. **无实机复测**：以上 7 条判据待玩家用新 exe 复跑。
+4. 本轮未动 `R3RFlipChainBySegments` / `R3RUndoLogicalFlip` 的 ★ 迁移路径（由 `TryTrainCouple`
+   入口否决保护），也未动 `R3RResyncSegmentFronts` 的派生逻辑。
+
+---
+
+## 第 177 轮（2026-10-01）：KI-268 —— 把"真铰接 / 假铰接"变成 `dump_vehicle` 能直接看的东西（**已实现 + 已编译**）
+
+**状态**：已实现 + 已编译（游戏内复测待做）
+
+**严重度**：低（纯诊断能力补齐；不改任何行为、判据、几何）
+
+**玩家要求**：第 170 轮「一附」做过"克隆时把复制出来的链也去真铰接"的修复，玩家怀疑没生效，
+要求给出「在 debug 模式下查看列车的 flag 判断真假铰接」的方法。
+
+---
+
+### 一、先回答玩家：旧 exe 看不到"假铰接"（这是找不到判据的直接原因）
+
+`dump_vehicle <id>` 的输出由 `Vehicle::DumpVehicleFlags()` → `DumpVehicleFlagsGeneric()`
+（`src\vehicle.cpp:4678` 起）生成，分两段：
+
+| 段 | 内容 | 真假铰接可见性 |
+|---|---|---|
+| `st:` | subtype 位（`F A W E f M V`） | `A` = `GVSF_ARTICULATED_PART` ⇒ **真铰接可见** |
+| `tf:` | Train 的 `VehicleRailFlag` | 旧列表**止于 `SpeedAdaptationExempt`(bit22)** ⇒ `H/M` 等**全不可见** |
+
+`ArticGroupHead`(bit24) / `ArticGroupMember`(bit25) / `SegmentFront`(bit2) / `SegmentBack`(bit15) /
+`SegmentFlipped`(bit26) / `ForceReserveOnce`(bit27) **都不在旧 `tf:` 列表里**，
+所以旧 exe 的 `dump_vehicle` 无法区分真假铰接，只能靠 R3R 日志（`MAKESEG` / `IDENT` 的 `AH=`/`AM=`）。
+
+### 二、改动 1：补全 `dump_vehicle` 的 R3R 位（仅 `src\vehicle.cpp`）
+
+`DumpVehicleFlagsGeneric()` 的 Train 分支在 `SpeedAdaptationExempt` 之后追加 6 个 dump：
+
+| 字符 | 位 | 名称 |
+|---|---|---|
+| `H` | bit24 | `ArticGroupHead`（去铰接组的**父车**） |
+| `M` | bit25 | `ArticGroupMember`（去铰接组的**部件**） |
+| `S` | bit2 | `SegmentFront`（段首 ★） |
+| `E` | bit15 | `SegmentBack`（段尾 ⊗） |
+| `Z` | bit26 | `SegmentFlipped` |
+| `O` | bit27 | `ForceReserveOnce` |
+
+- 字符在 `tf:` 内与既有 `R W P r h e q s L b p v z F B Y A K J X c` **无冲突**。
+- 单行模式输出字符、多行模式输出全名，沿用既有 dump 机制。
+- 新项追加在**末尾**，既有字符序列前缀逐字不变（不影响已有日志/截图比对）。
+- 未碰任何 `src\*.h`。
+
+**判读（真 vs 假）**
+
+- **真铰接**：部件 `st:` 带 `A`；`tf:` 既无 `H` 也无 `M`（角色由 subtype 推导，不落显式位）。
+- **去铰接组**：所有车 `st:` **不带** `A`；父车 `tf:` 带 `H`，部件带 `M`。
+
+### 三、改动 2：让"克隆有没有拆铰接"可从日志核对（仅 `src\vehicle_cmd.cpp`）
+
+`CloneVehicle()` 提交点（`r3r_identity_rebuilt` 分支内、`ConsistChanged(CCF_ARRANGE)` 之前）
+追加两条**只读** dump：
+
+```cpp
+R3RDumpUpgradeDbg(Train::From(v_front), "CLONE-SRC");
+R3RDumpUpgradeDbg(Train::From(w_front), "CLONE-DST");
+```
+
+`R3RDumpUpgradeDbg`（`src\vehicle_cmd.cpp:356`）逐车写
+`MAKESEG <tag> head=N` + `subtype=0x%02x(front=… eng=… wagon=… freeW=… artic=…) rail(AH=… AM=… SF=…)`。
+
+**判读**
+
+| 日志形态 | 含义 |
+|---|---|
+| `CLONE-SRC` / `CLONE-DST` 成对且逐行一致（`artic=0`、头 `AH=1`、成员 `AM=1`、`SF`/engine 对齐） | 第 170 轮修复**生效** |
+| `CLONE-DST` 出现 `artic=1` 而 `AH=0/AM=0` | 克隆**回退成真铰接** ⇒ 修复失效，把该段日志交下一轮 |
+| `R3R-CLONE-GROUP-MISMATCH src= dst= n_src= n_dst=`（`:2183`） | 计数不一致 ⇒ 整列退货；玩家侧表现为"克隆直接失败"（不是残留真铰接） |
+| 两块都不出现 | 源链**本就不含去铰接组**（没有什么可拆），不是失败 |
+
+### 四、构建自证
+
+复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）：
+
+- `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`
+- `build\R3R_incbuild.log` 尾部 = `[4/4] Linking CXX executable openttd.exe`
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`；`error C* / fatal error / FAILED: / build stopped` 计数 = **0**
+- `src\vehicle.cpp` 00:33:22 → `vehicle.cpp.obj` 00:47:55；`src\vehicle_cmd.cpp` 00:33:40 → `vehicle_cmd.cpp.obj` 00:47:53 → `build\openttd.exe` **2026-10-01 00:49:24（51 559 424 B）**
+- `read_lints`（vehicle.cpp / vehicle_cmd.cpp）= 0 条
+- exe 内 6/6 命中字面量：`ArticGroupHead` / `ArticGroupMember` / `SegmentFlipped` / `ForceReserveOnce` / `CLONE-SRC` / `CLONE-DST`
+
+### 五、复测判据
+
+1. `dump_vehicle` 对去铰接组：父车 `tf:` 含 `H`、部件含 `M`，且所有车 `st:` **无** `A`。
+2. `dump_vehicle` 对真铰接车：`st:` 含 `A`、`tf:` **无** `H/M`（真实铰接列车行为/读数不变）。
+3. 车库克隆含去铰接组的链 ⇒ `MAKESEG CLONE-SRC` 与 `MAKESEG CLONE-DST` 成对出现且逐行一致。
+4. 克隆真铰接组 ⇒ **不出现** `CLONE-SRC`/`CLONE-DST`（不得凭空产生日志）。
+5. 反例捕捉：若 `CLONE-DST` 里出现 `artic=1` 且无 `AM` ⇒ 第 170 轮修复失效，该段日志即为下一轮现场证据。
+
+### 六、仍未做 / 已知边界
+
+1. 本轮**只补诊断**：未改克隆去铰接逻辑（第 170 轮那套照旧）、未改任何判据/几何/段标记。
+2. `dump_vehicle` 仍只显示**原始位**，不显示 `InArticGroup()` / `HasDearticulatedGroupRole()` 这类派生语义；
+   需要时用 `st:` 的 `A` 与 `tf:` 的 `H/M` 组合推断。
+3. `R3RDumpUpgradeDbg` 的 `rail(...)` 只到 `AH/AM/SF`，不含 `SegmentBack` / `SegmentFlipped` / `ForceReserveOnce`
+   （保持既有探针格式，不动 `train_cmd.cpp` 的姊妹探针 `R3RDumpCoupleIdentity`）。
+4. **无实机复测**：以上 5 条判据待玩家用新 exe 复跑；
+   临时分析报告 = 工作区 `R3R_artic_flag_debug_round177_memo.md`。
+
+---
+
+## 第 178 轮（2026-10-01）：KI-269 克隆「成段机车」当场断言崩溃 + KI-270 克隆丢 ★
+
+**状态**：已实现 + 已编译（游戏内复测待做）
+**严重度**：KI-269 = **高**（`0x80000003` 断言崩溃，进程直接退出）；KI-270 = **中**（行为不符：克隆出来的段不再是段）
+
+**玩家原话**：「日志来了，我复制了一次成段车底，复制了一次成段机车，然后在复制成段机车的时候，游戏还报了一次无法找出断言的崩溃」
+
+**现场文件**：`build\R3R_debug.log`（254 行，本次复现）；`%USERPROFILE%\Documents\OpenTTD\crash-20260930T165541Z.log`（崩溃报告）
+
+### 一、KI-269：崩溃 = `CloneVehicleName()` 对可能为负的 `char` 调 `std::isdigit()`（已修）
+
+崩溃栈（`crash-20260930T165541Z.log`，exe = `r3r-stable-2026-09-29-m (2)` / Build 09-30 05:29:02，2026-09-30 16:55:41Z）：
+
+```
+CloneVehicleName + 142   (src\vehicle_cmd.cpp:1449)   ← 命中 Debug CRT 的 _chvalidator
+CmdCloneVehicle  + 5302  (src\vehicle_cmd.cpp:2324)
+...  DepotWindow::OnVehicleSelect
+异常码 80000003（EXCEPTION_BREAKPOINT）
+```
+
+**根因**：MSVC 的 `char` 默认**有符号**。玩家给机车起过中文名，UTF-8 末尾是续字节 `0x80..0xBF`，
+读进 `char` 即**负数**（如 `名` = `E5 90 8D`，`.back()` = `0x8D` = **-115**）。
+C 标准规定 `std::isdigit(int)` 的实参必须是 `EOF` 或 `[0..UCHAR_MAX]`，传负数是 **UB**；
+Debug CRT 用 `_chvalidator` 对这个 UB 做断言 ⇒ `__debugbreak()`。
+Release CRT 不查 ⇒ **只在内部测试版（Debug，探针 ON）炸**，正是日常使用的那个 exe。
+与"成段/铰接/去铰接"全都无关，只取决于**被克隆车的名字**，故可 100 % 复现。
+
+**修法**（`src\vehicle_cmd.cpp` 的 `CloneVehicleName()`）：两处实参先 `static_cast<unsigned char>()`；
+`*new_name.rbegin()` 改成有边界保护的 `new_name.back()` + `new_name.empty()` 前置判断：
+
+```cpp
+if (new_name.empty() || !std::isdigit(static_cast<unsigned char>(new_name.back()))) new_name += " 1";
+...
+if (pos != std::string::npos && std::isdigit(static_cast<unsigned char>(new_name[pos]))) ...
+```
+
+对纯 ASCII 数字（`0x30..0x39`）**逐位恒等**，既有"末尾非数字则补序号"行为不变；
+中文名的语义结果 = 正常判为"非数字" ⇒ 补 ` 1`（即设计意图）。
+
+### 二、KI-270：克隆「成段机车」丢 ★ —— KI-223 镜像条件过窄 + 锁步块漏镜像组头（已修）
+
+现场（`build\R3R_debug.log` 行 244-253，逐字）：
+
+```
+244: MAKESEG CLONE-SRC head=24
+245:   CLONE-SRC veh=24 p=-1 n=25 subtype=0x09 bits(front=1 wagon=0 engine=1 freeW=0 artic=0) rail(AH=1 AM=0 SF=1) eng=506
+246:   CLONE-SRC veh=25 p=24 n=26 subtype=0x08 bits(front=0 wagon=0 engine=1 freeW=0 artic=0) rail(AH=0 AM=1 SF=0) eng=506
+247:   CLONE-SRC veh=26 p=25 n=-1 subtype=0x08 bits(front=0 wagon=0 engine=1 freeW=0 artic=0) rail(AH=0 AM=1 SF=0) eng=506
+249: MAKESEG CLONE-DST head=69
+250:   CLONE-DST veh=69 p=-1 n=70 subtype=0x09 bits(front=1 wagon=0 engine=1 freeW=0 artic=0) rail(AH=1 AM=0 SF=0) eng=506   ← ★ 丢了
+251:   CLONE-DST veh=70 p=69 n=71 subtype=0x08 ...
+252:   CLONE-DST veh=71 p=70 n=-1 subtype=0x08 ...
+```
+
+源链 24/25/26 = **三节铰接机车被去铰接**后的段：`artic=0`（无真 `GVSF_ARTICULATED_PART`）而
+`AH/AM` 有值（假铰接），链头 24 是**真机车**（`front=1 engine=1`）并带 ★（`SF=1`）。
+克隆 69/70/71 的去铰接组**重建成功**（`AH=1` + 两个 `AM=1` 逐位相同），**只有链头 69 的 ★ 是 0**。
+（日志里只有**一对** `MAKESEG`：第一次克隆"成段车底"没有去铰接组，`r3r_identity_rebuilt` 不置位，
+那对 dump 根本不打印 ⇒ 第一次克隆在日志里完全静默，与玩家描述吻合。）
+
+**根因（两处缺口）**：
+
+1. KI-223 加的 ★/⊗ 镜像被写在构建循环的 `R3RIsCarOnlyFormation(Train::From(v))` 分支里
+   （改动前 `src\vehicle_cmd.cpp:2154` 附近）。`R3RIsCarOnlyFormation()` 等价于
+   `IsEngine() && RailVehInfo(engine)->railveh_type == Wagon`，**只对"车厢假冒引擎"成立**；
+   本现场链头 24 是货真价实的机车 ⇒ 分支不进 ⇒ ★ 不镜像。
+   （第一次克隆"成段车底"没暴露，正因为那种链头是假引擎 ⇒ 分支生效。）
+2. 去铰接组的锁步块在 `R3RDearticulateOneGroup(dst_walk)` 之后**只镜像成员**
+   （`sm->IsSegmentFront()` → `dm->SetSegmentFront()`），**不镜像组头自己**；
+   本现场组头就是段首 ⇒ 69 的 ★ 两头落空。成员那条线还是"只置不清"的半吊子写法。
+
+**修法**（**仅 `src\vehicle_cmd.cpp`，未碰任何 `src\*.h`**）：
+
+1. 抽出共用静态函数 `R3RMirrorSegmentMarkers(const Train *src, Train *dst)`，
+   对 ★（`VehicleRailFlag::SegmentFront`）与 ⊗（`SegmentBack`）**双向镜像**（有则置、无则清，
+   保证克隆逐位复刻；新建车两位本来都是 0，故"清"的一半通常空转）。
+2. KI-223 的原两行 `if` 改为调用它。
+3. 锁步块在 `R3RDearticulateOneGroup(dst_walk)` 之后**新增** `R3RMirrorSegmentMarkers(src_walk, dst_walk)`
+   （补组头，本轮崩溃场景的正面修法）；成员循环里的原两行 `if` 同样收敛为一次调用。
+4. 构建循环之后、KI-129 的 `ConsistChanged(CCF_ARRANGE)` 之前**新增兜底**：
+   `R3RMirrorSegmentMarkers(Train::From(v_front), Train::From(w_front))`。它覆盖前三条都盖不到的形态
+   ——「段就是一个普通真机车（★，且完全没有去铰接组）」：既不是假引擎链（第 2 条不进），
+   也没有 `ArticGroupHead`（第 3 条不进），改动前克隆它会退回成一列**不成段**的普通列车。幂等，不冲突。
+5. 探针：`R3RDumpUpgradeDbg()` 的 `rail(AH=… AM=… SF=…)` 追加 `SB=%d`
+   （新格式 `rail(AH=%d AM=%d SF=%d SB=%d)`，其余字段逐字不动），使 ⊗ 的镜像可从日志核对；
+   **此举使第 177 轮条目 §六.3「`rail(...)` 只到 AH/AM/SF，不含 `SegmentBack`」的边界作废**。
+
+**自洽性核对（★ 会不会被下一次 `R3RResyncSegmentFronts()` 抹掉）**：不会。该函数逐车读
+`w->r3r_segment_id` 组成 `should` 列表，并在 `if (should.empty()) return;`（`train_cmd.cpp:4717`）
+**提前返回、一个字节都不改**。克隆**不复制** `r3r_segment_id`（该字段只在
+`R3RAssignSegmentIds()` 于"链里真有 ≥2 段"时分配，单段链一律写 `R3R_SEGMENT_NONE = 0`），
+故克隆链上全是 `NONE` ⇒ `should` 为空 ⇒ 我置上的 ★ 存活。日后该链被耦合进多段链时，
+`R3RAssignSegmentIds()` 按 `R3RGetSegmentHeads()`（**读的就是 ★**）切 run 并分配 ID，两者一致。
+
+### 三、构建自证
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）
+- `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`
+- `build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`；`error C* / fatal error / FAILED: / build stopped` 计数 = **0**
+- `src\vehicle_cmd.cpp` 01:06:09 → `vehicle_cmd.cpp.obj` 01:07:13 → `build\openttd.exe` **2026-10-01 01:08:36（51 559 424 B）**
+- `read_lints`（vehicle_cmd.cpp）= 0 条
+- exe 字面量自证：**命中**新格式串 `SF=%d SB=%d`，**且旧格式串 `SF=%d) eng=%d` 已消失**
+  （对照组 `MAKESEG` 仍在）⇒ 确认是本次产物而非陈旧 exe
+
+### 四、复测判据
+
+1. **崩溃**：用名字以中文（或任何非 ASCII 字节）结尾的机车克隆 ⇒ **不再崩溃**；用纯 ASCII 名字克隆一次，确认序号 +1 行为不变。
+2. **KI-270 正面**：克隆"成段机车" ⇒ `MAKESEG CLONE-DST` 链头行出现 `SF=1`，与 `CLONE-SRC` 逐位一致；克隆出来的链**仍是段**（可被降级、可被挂接）。
+3. **不回退**：克隆"成段车底"（假引擎链）⇒ `CLONE-SRC/CLONE-DST` 逐行一致（KI-223 行为不退）。
+4. **⊗**：源链上有车带 ⊗ ⇒ 克隆对应车 `SB=1`（新探针字段）。
+5. **不造假段**：克隆普通（不成段）列车 ⇒ 全链 `SF=0 SB=0`。
+6. **回归**：克隆后正常开出/加挂/改名无新异常。
+
+### 五、仍未做 / 已知边界
+
+1. **`SegmentFlipped`(bit26) 与 `ForceReserveOnce`(bit27) 有意不镜像**：前者会让"克隆一条被逻辑翻转过的段"的贴图与源不一致（不影响段身份与任何判据）；后者是"刚耦合完成才授予的一次性预留许可"，克隆继承它反而是错的。
+2. ~~**假引擎链的中间车厢**若带 ★/⊗ 也不镜像~~ ⇒ **第 179 轮已修（KI-271）**：镜像已收口到"全链每一节"，本条边界作废，详见下文「第 179 轮」小节。
+3. **名/号借用与克隆的交互未核**：第 160 轮的车名借用只在 `Couple()` 里发生，与 `CloneVehicleName()` 不冲突；但"克隆一条**正处于借用状态**的链头"会得到"车组名 1"，是否合乎预期未经玩家拍板。（第 179 轮结论：符合预期、**不改码**，理由见「第 179 轮」小节。）
+4. ~~**另一条历史崩溃未动**：`crash-20260928T185855Z.log`（`R3RSyncControlTraits (train_cmd.cpp:4576)` → `R3RSettleChainSegments` → `Couple`）是**另一条路径**，本轮只登记不改。~~ ⇒ **第 179 轮结清：它就是第 154 轮已修的 KI-245**（同一份崩溃文件、同一条栈），修复行现位于 `train_cmd.cpp:4905`，**不是未修项**。详见「第 179 轮」小节。
+5. **无实机复测**：以上 6 条判据待玩家用新 exe 复跑；
+   临时分析报告 = 工作区 `R3R_clone_isdigit_round178_memo.md`。
+
+---
+
+## 第 179 轮（2026-10-01）：克隆段标记镜像收口到全链 + KI-245 同类点清零（第 178 轮 §五.2 已修 / §五.4 结清）
+
+**口径来源**：玩家指示「`R3R_clone_isdigit_round178_memo.md`，`R3R_KNOWN_ISSUES.md`，请你根据这两个继续未完成的任务」——本轮就是把第 178 轮自己列出的遗留项逐条结清。
+
+### KI-271（已修，严重度 中）：克隆会把「中间段是真机车」的段的 ★/⊗ 丢掉（第 178 轮 §五.2 的边界本身是个真缺陷）
+
+- **缺陷形态**：第 178 轮的镜像分散在**三处**，各自都有前提——
+  ① 构建循环里的 KI-223 分支：只对 `R3RIsCarOnlyFormation()`（＝`IsEngine() && railveh_type == Wagon`，即"车厢改出来的假引擎"）成立；
+  ② 去铰接组头：只对 `ArticGroupHead` 成立；
+  ③ 链头兜底：只对 `v_front`（链头）成立。
+  一个**既不是假引擎链、也没有去铰接组、又不是链头**的车——最典型的就是**多段链里段头是"真机车"的中间段**（双机重联，或任何"段头是普通机车而不是假引擎"的段）——三处全都不进 ⇒ 克隆出来那一段丢了 ★，**不再成段**。第 178 轮把它记成"既有边界、正常形态下中间车不带这两位"，但"段头是真机车的中间段"恰恰是正常形态（第 178 轮 KI-270 本人修的就是"段＝真机车"这一形态，只是当时只修了链头那一个）。
+- **修法（仅 `src\vehicle_cmd.cpp`，未碰任何 `.h`）**：把镜像**收敛到唯一一处**——`CloneVehicle()` 构建循环之后的 lock-step 步进循环，在 `while` 体**顶部**对每一节调
+  `R3RMirrorSegmentMarkers(src_walk, dst_walk);`
+  该 walk 本身已用 `GetNextVehicle()` 走过**每一节真实车**（跨过去铰接组成员与真 artic 部件，两侧同步），组内成员由紧随其后的成员循环另行镜像 ⇒ 合起来覆盖"全链每一节"。随之**删除**两处重复：去铰接分支内的组头镜像调用（第 178 轮那次修复），以及构建循环之后的链头兜底块（守卫与 walk 完全相同 ⇒ 纯冗余）。**根因正是"同一条规则写成三份"**，故本轮不做加法而做收口。
+- **新增只读探针（同文件）**：`R3RDbgCloneMarkers(const Train *src, const Train *dst)`——按 `Next()` 逐节统计 SF/SB 数量与 `diff`（上限 512 节，防坏链变挂死），
+  只在"源链不是单段平凡形态（★ 只有一个且无 ⊗）"或"两侧计数不一致"时打一行：
+  `CLONE-MARKERS src=%d dst=%d cars=%u srcSF=%u dstSF=%u srcSB=%u dstSB=%u diff=%u[ REPORT-THIS-MISMATCH]`，
+  调用点在步进结束之后。**为什么必须新开探针**：既有的 `R3RDumpUpgradeDbg()`（`CLONE-SRC`/`CLONE-DST`）只在 `r3r_identity_rebuilt` 为真时打，也就是**只覆盖走了去铰接的源链**，恰好盖不到本轮修的"多段真机车"形态 ⇒ 没有它，本次修复在游戏内无法自证。
+- **自洽性**（沿用第 178 轮结论，未变）：克隆**不复制** `r3r_segment_id`（单段链一律 `R3R_SEGMENT_NONE`）⇒ `R3RResyncSegmentFronts()` 的 `should` 为空、提前返回、一个字节不改 ⇒ 置上的 ★ 存活；日后该链被耦合进多段链时 `R3RAssignSegmentIds()` 读的就是 ★。
+
+### KI-272（已修，严重度 低＝潜在崩溃）：清零第 154 轮 KI-245 备案的最后一个同类点
+
+- **落点**：`src\vehicle_cmd.cpp` 的 `CloneVehicleName()`（第 154 轮备案时在 `:1424`，本文件经第 177/178 轮增行后现在 `:1488`）——
+  `std::string new_name = src->name.c_str();`
+  `src->name` 是 `TinyString`，**空名字时 `c_str()` 返回 `nullptr`**；把它交给 `std::string` 会进 `strlen(nullptr)` ⇒ `C0000005` 读地址 0、无断言（与 KI-245 同一形态）。
+- **可达性**：唯一调用点在 `CloneVehicle()` 里，前面有 `if (!v_front->name.empty())` 守卫 ⇒ 当前**不可达**。但"靠调用点的守卫活着"不是一个可维护的不变式，故本轮修掉。
+- **修法**：`std::string new_name(static_cast<std::string_view>(src->name));`（`TinyString::operator std::string_view()` 对空串返回空 view，**永不接触空指针**；与 `R3RSyncSegmentTraits` / `R3RSyncHiddenSegmentTraits` 用法一致），并就地写注释说明来源与口径。
+- **全仓复核（本轮结论：除这一处之外再无同类点）**：把所有 `name` / `name_backup` 的 `.c_str()` 站点逐个过了一遍——
+  `train_cmd.cpp` `R3RBorrowControlTraits:4839`（两侧都是 `std::string`）、`R3RSyncSegmentTraits:4905`（`row->name.c_str()` 是 `std::string` 侧）、`R3RSyncHiddenSegmentTraits:5044`（同）、`R3RBorrowControlTraitsLive:5588`（`chain->name` 是 `TinyString`，但走的是 `TinyString::operator==(const char*)`，该运算符把 `nullptr` 判为 `empty()`，且另一侧 `ctrl->name_backup` 也是 TinyString）⇒ 全部安全；
+  `couple_group.cpp` 里出现 `.c_str()` 的 `CoupleGroup::name`、`R3RSegmentRecord::name` 都是 `std::string` ⇒ 安全。
+  **唯一把 `TinyString::c_str()` 直接喂给 `std::string` 的就是 `:1488`，现已消除。**
+- **纪律（沿用 KI-245，重申）**：R3R 新代码凡碰 `BaseConsist::name`（车辆名）或 `name_backup`，一律用 `TinyString` 自己的比较运算符或 `std::string_view` 转换，**禁止把 `.c_str()` 交给 `std::string`**。
+
+### 第 178 轮 §五.4 结清：不是"另一条未修路径"，它就是第 154 轮已修的 KI-245
+
+- 第 178 轮 §五.4 写的是：`crash-20260928T185855Z.log`（`R3RSyncControlTraits (train_cmd.cpp:4576)` → `R3RSettleChainSegments` → `Couple`）"属另一条路径，本轮只登记不改"。
+- 核对结论：**这个崩溃文件、这条栈，就是第 154 轮 KI-245 那一份**（同名 `crash-20260928T185855Z.log`，同栈 `:4576` → `:4602` → `:9276`，同为 `strlen` 读 0）。它在**第 154 轮已经修掉**；此后函数被改名为 `R3RSyncSegmentTraits`，修复行现在位于 `train_cmd.cpp:4905`（`if (!(traits->name == row->name.c_str()))`），**该行注释里直接写着这次崩溃的文件名**。
+- ⇒ 第 178 轮那句"另一条路径"的本意是"与克隆崩溃无关的另一条"，但把它列进"仍未做"是口径失误：**它不是未修项**。§五.4 作废，此处留档以免再被当成待办捡起来。
+
+### 第 178 轮 §五.3（名/号借用与克隆的交互）结论：符合预期，**不改码**
+
+- 克隆一条**正处于借用状态**的链头时，`v_front->name` 是借来的控制段名 ⇒ 克隆得到"车组名 1"。
+- 判为符合预期：玩家在界面上看到的名字就是控制段名（第 160 轮 `NAME-XFER` 之后活字段即"显示名"），克隆按"所见即所得"复制显示名是自洽的；链自己的原名仍停在 `name_backup` 里跟着**原链**走，不会被克隆带走。若玩家日后要求"克隆后沿用本链原名（`name_backup`）"，这是一行改动，等拍板。
+
+### 构建自证（2026-10-01）
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）
+- `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`
+- `build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 = **0**
+- `src\vehicle_cmd.cpp` 01:18:47 → `vehicle_cmd.cpp.obj` 01:19:41 → `build\openttd.exe` **2026-10-01 01:33:57（51 561 472 B）**
+- `read_lints`（vehicle_cmd.cpp）= **0** 条
+- exe 字面量自证：**命中** `CLONE-MARKERS src=%d dst=%d cars=%u` 与 `REPORT-THIS-MISMATCH`（对照：`CLONE-SRC` / `CLONE-DST` 仍在）
+
+### 复测判据（游戏内，待玩家）
+
+1. **KI-271 正面**：克隆一条**多段链**、其中间段头是**真机车** ⇒ 日志出现 `CLONE-MARKERS` 且 `diff=0`（`srcSF==dstSF`）；克隆出来的每一段**仍是段**（每段可单独降级/可被挂接）。
+2. **不造假段**：克隆普通（不成段）列车 ⇒ **不出现** `CLONE-MARKERS`（`§五.2` 的"单段平凡不打印"口径），且全链 `SF=0 SB=0`。
+3. **第 178 轮行为不退**：克隆"成段机车"（链头真机车）与"成段车底"（假引擎链）⇒ `CLONE-SRC`/`CLONE-DST` 逐行一致，`SF=1` 仍在。
+4. **⊗**：源链上有车带 ⊗ ⇒ 克隆对应车 `SB=1`，`diff=0`。
+5. **崩溃面**：用名字以中文（或任何非 ASCII 字节）结尾的机车克隆 ⇒ 不崩；用纯 ASCII 名字克隆 ⇒ 序号 +1 行为不变。
+6. **若见 `REPORT-THIS-MISMATCH`**：说明源链自身标记就不自洽（或存在本轮仍未覆盖的形态），请连 `CLONE-MARKERS` 一行与前后 20 行一起回传。
+
+### 仍未做 / 已知边界（本轮之后）
+
+1. **`SegmentFlipped`(bit26) / `ForceReserveOnce`(bit27) 仍有意不镜像**（理由同第 178 轮 §五.1，未变）。
+2. **真 artic 部件（genuine artic part）本身不带 ★/⊗**，不镜像也不需要镜像（R3R 段机制只在真实车上工作）。
+3. **无实机复测**：以上 6 条判据待玩家用新 exe 复跑；临时分析报告 = 工作区 `R3R_clone_markers_round179_memo.md`。
+4. 第 178 轮 §五.1/§五.5 与第 177 轮各条复测判据**仍然有效**，本轮不改变其口径。
+
+---
+
+## 第 180 轮（2026-10-01）：两段式列车「等待挂接」却立刻跳到第二条命令 —— 只取证、不改码（KI-273 / KI-274）
+
+**口径来源**：玩家报告「一列两段式列车等待挂接，然后立刻跳到第二条命令了。我怀疑要不然打散铰接式没做好，要不然拒绝 R3R 命令收太紧了。」本轮**只取证**，未改任何源码；修法属第 176 轮 §六.2 明确留给玩家拍板的事项，故给出候选方案待拍板。临时分析报告 = 工作区 `R3R_artic_skip_waitcouple_round180_memo.md`。
+
+**现场**：`build\R3R_debug.log`（1 794 行 / 107 799 B，2026-10-01 01:48:16）；exe = `build\openttd.exe`（51 561 472 B，2026-10-01 01:33:57，含第 176 轮 KI-266/KI-267）⇒ 日志晚 15 分钟，**由当前 exe 产生**。
+
+### KI-273（已修·仅读档边「选项 C」，严重度 中：行为不符；来源＝第 176 轮 §六.1 遗留项实机咬人）：存档带入的「真铰接 + ★」链未被打散
+
+- **缺陷形态**：现场盘面有两条**各自带 ★、各自含真铰接部件**且均停驻的存量链（`veh0..5` 与 `veh6..23`）。
+  - 行 8 起 `R3RDUMP`：`idx=0 … ARTH=1 ARTM=0 SEGF=1`（veh0 = 去铰接组头 + ★ 段首）；
+  - 行 14 起：`veh1/veh2 … sub=02`（`GVSF_ARTICULATED_PART` = **真铰接部件**），`veh6 SEGF=1`；
+  - 行 59/66 `R3RDUMP-CHAIN head=0/6 … stopped=1 inDepot=1`；行 67 起 `head=6` 订单表 `i=0 type=17`（`OT_WAIT_COUPLE`）。
+- **★ 四个授予点已全封（第 176 轮 §三 固化的护栏）**：①`CmdMakeSegment` 升段 → 唯一有打散前置（`DearticulateChainWithSnapshot`）；②`Couple()` 提交点 → 被 `TryTrainCouple()` 入口硬否决（`:8830` `CPL-REFUSE-REAL-ARTIC`）；③车库拖动 merged-on 标记 → `:2989` 采样 + `:3207` 判断（本日志行 552 `DEPOT-SEG-SKIP-REAL-ARTIC` 证明生效）；④解挂给解出部分发 ★ → `:7633`（`DECOUPLE-SEG-SKIP-REAL-ARTIC`）。
+- ⇒ **四点全封**，故 2.1 的 ★+真铰接**不可能**由当前 exe 产生 ⇒ 只能是**存档带入的存量**。这正是第 176 轮 §六.1 原文：「旧存档里已经焊死的链不会自动复原」；也是 §六.2 明确**选做"不发 ★ / 拒绝耦合"而非"自动打散"**的必然结果。**打散能力本身没坏**（升段会先打散）。
+- **现场触发**：行 540-556 车库拖动把块 `0..5` 并到等待链 `6..23` 之前（镜像语义见第 132 轮补记 KI-213）⇒ 合并 `head=0`、`n=24`、**`nseg=2`**（行 555 `SEGID-SYNC tag=depot-edit head=0 nseg=2`）；行 552 源头闸门只扣住**新** ★/⊗，而 ★ 本来就在 ⇒ 两段链成立；行 583 合并后 dump 仍标 `artic=1`。
+- **状态＝已修（第 180 轮实现落地·选项 C）**：修法候选见本节末「修复候选」。玩家拍板「只做 C」并已实现+编译（见本节末「第 180 轮实现落地」）：读档时对「★/⊗ + 真铰接」链自动打散。第 176 轮 §六.1 的落点候选 `R3RResyncSegmentFronts`（`:4711` 已有"真 artic part 不携带 ★"的局部处理）未被采用，实际落点＝读档专用入口 `R3RRebuildCouplePriorities()`。
+
+### KI-274（未修，严重度 中：行为不符；来源＝第 176 轮 §五判据 2 的设计口径本身）：订单闸门把**被动**的 `WAIT_COUPLE` 也整段跳过 ⇒ 列车当场开走
+
+- **缺陷形态**：`R3RSkipCoupleOrdersForRealArtic()`（`src\train_cmd.cpp:15837`，第 176 轮 KI-266 新增）经 `R3RIsCoupleCommand()`（`:15796`）判定时，对三类耦合/解挂命令**一视同仁**：`OT_DECOUPLE`(15) / `OT_GOTO_COUPLE`(16) / `OT_WAIT_COUPLE`(17)。但三者语义不同：
+  - `OT_GOTO_COUPLE`(16) **主动**：机车去挂别人 → 跳过符合闸门动机（别让真铰接链跑耦合寻路）；
+  - `OT_DECOUPLE`(15) **主动**：跳过有争议但可接受；
+  - `OT_WAIT_COUPLE`(17) **被动**：**"就在这儿停着等人来挂"** —— 不订路、不驱动任何寻路，闸门"防止订路"的动机对它**完全不适用**；跳过它 = 命令列车开走，与该订单语义**恰好相反**。
+- **现场证据（一行即玩家所报现象）**：
+
+```
+583: GEO settle-depot-edit n=23 veh=23 tile=1,11 x=20 y=184 dir=5 db=0 artic=1 starF=0 starB=0 segid=2 clen=2 dist=-1 nom=-1
+584: GEO-END settle-depot-edit head=0 n=24 capped=0
+585: ARTIC-SKIP-R3R veh=0 tile=1,11 from=0 to=1 type_from=17 type_to=1 idx_r3r=1 cur_r3r=0
+587: DEPOT-ARR veh=0 spd=0 real=1(1) curType=0 stuck=0 tileDepot=1 tx=1 ty=11 …
+588: DEPOT-ARR veh=0 spd=0 real=1(1) curType=1 stuck=0 tileDepot=1 tx=1 ty=11 destTx=4 destTy=10 …
+```
+
+  - 行 585：索引被**直接赋值 1**（`:15853-15871` 不走 `IncrementRealOrderIndex`；`current_order.Free()` + `SetDestTile(INVALID_TILE)`），丢掉索引 0 的 `type=17`（`WAIT_COUPLE`），落到 `type=1`（`OT_GOTO_STATION`）；
+  - 行 587→588：`curType=0`（未装载）→ `curType=1 destTx=4 destTy=10` ⇒ **列车当场改去 (4,10) 站台**。
+- **闸门何时才咬到（天然对照组）**：调用点在 `:16065`（`TrainLocoHandler` 内），**位于 `Stopped` 早退 `:16029` 之后** ⇒ 停驻车不执行。行 593 `SKIP-STOPPED veh=30 order=0 real=17 spd=0 tile=1,11 parked=0 front=1 nord=29` 证明：`veh30..47` **同样含真铰接、排程首条同样 `WAIT_COUPLE`、同样停在同库 1,11**，却因处于 `Stopped` 早退分支而**没被跳**。⇒ 是本次车库编辑把合并链头推到了那个位置（本日志 `SKIP-STOPPED veh=0` 直到第 1087 行才首现）。
+- **下游后果（同源）**：机车 24 排程首条 = `GOTO_COUPLE`、目的地就是本库（行 591 `real=0(16) curType=16 destDepot=1 tileEqDest=1`），其扫到的两个目标都被 `R3RIsCoupleTarget`(`:1937`，含真铰接恒 false) 与 `CPL-GATE`(`:10651-10652` 判 `current_order.IsType(OT_WAIT_COUPLE)`) 拒：
+  - 行 618 `CPL-GATE reject=target-not-wait site=depot act=24 tgt=30 aOrd=16 tOrd=0 …`；行 619 `… tgt=0 aOrd=16 tOrd=1 …`；
+  - 行 620 `COUPLE-FAIL loco=24 order=16 tx=1 ty=11`；行 625 `COUPLE-DEST-EMPTY loco=24 tile=1,11 real=0 num=4 next=1 (waiting in place, order kept)` ⇒ 进入 `COUPLE-FAIL` + `COUPLE-DEST-EMPTY` 循环（行 620/625、640-643 等）。
+  - `tgt=0` `tOrd=1`（`GOTO_STATION`）**正是行 585 的直接后果**；`tgt=30` `tOrd=0`（`OT_NOTHING`）见 §未确认项 R-3。
+- **非一次性**：行 1570 同现象复现（`ARTIC-SKIP-R3R veh=0 from=0 to=1 type_from=17 type_to=1 idx_r3r=1 cur_r3r=0`）——借用层（KI-04 冻结索引）把索引回灌成 0 后闸门**再跳一次** ⇒ 只要该订单还在索引 0，就会被反复销毁。
+- **性质澄清**：这是**按设计发生**的（第 176 轮 §五判据 2 把"出现 `ARTIC-SKIP-R3R`（`type_from=17`）"写成**期望**）。所以不是"实现收太紧的 bug"，而是**设计口径本身在这一点上收得太紧**：为阻止"被挂上"，顺手把"在原地等"这条被动语义也毁掉了。**建议改口径**（详见修复候选 A）。
+
+### 一句话结论
+
+> **玩家两个怀疑都成立且互为因果**：(a) 存量真铰接链没被打散（第 176 轮选"不发 ★/拒绝耦合"而非自动打散，并把"读档自动打散/清 ★"列为待拍板）→ 这些链带 ★ 和真铰接进了本局；(b) 订单闸门为隔离它们，把**被动**的 `WAIT_COUPLE` 也整段跳过 → "我在等人来挂"被改成"去 (4,10) 站台"，列车当场开走；机车 24 的 `CPL-GATE target-not-wait` / `COUPLE-DEST-EMPTY` 循环就是它的下游。
+
+### 完整触发链
+
+1. 存档带入两条「真铰接 + ★」链（`veh0..5`、`veh6..23`），均停驻。
+2. 把块 `0..5` 拖到链 `6..23` 之前（行 540-548）⇒ 合并 `head=0`、`n=24`、**`nseg=2`**。
+3. 链头 `veh0` 借用控制段 6 的订单表（行 553 `DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2`），该表 `i=0` = `WAIT_COUPLE`（行 66-67）。
+4. 源头闸门只扣新 ★/⊗（行 552 生效），但 ★ 本来就在 ⇒ 两段链成立。
+5. 车库编辑那一 tick，合并链头**不在** `Stopped` 早退态 ⇒ 走过 `:16029`，抵达 `:16065`。
+6. `R3RChainHasRealArticPart(veh0)`（`:1870`）为真 ⇒ 闸门执行，索引 0 → 1（行 585）。
+7. 后果：命令变 `GOTO_STATION`(4,10)（行 588）；不再广告 `WAIT_COUPLE`；机车 24 挂接被拒（行 618-619）；`COUPLE-FAIL`/`COUPLE-DEST-EMPTY` 循环（行 620/625）。
+8. 借用层回灌索引为 0 ⇒ 闸门再跳（行 1570）⇒ 反复。
+
+### 未确认项
+
+- **R-1**：车库编辑那一 tick 合并链头为何不在 `Stopped` 早退态。已排除：KI-153 清理块（`:5696-5709`）**只**清 `r3r_parked`、不动 `VehState::Stopped`。未定位。（不影响结论：只要链头走过早退，被动命令就会被毁。）
+- **R-2**：行 59/66 的 `R3RDUMP-CHAIN` 是日志开头快照，可能与拖动帧不同帧；若"合并前 `veh0` 已非 `Stopped`"，也解释得通。需后续加一条链头 `vehstatus` 只读探针定论。
+- **R-3**：`tgt=30 tOrd=0`（`OT_NOTHING`）说明**停驻链的 `current_order` 未装载 `WAIT_COUPLE`**；这是否使**所有**停驻等待车底都不被认作耦合目标（＝第 176 轮判据 2 之外的另一条拒绝面），本轮未展开。
+
+### 修复候选（待玩家拍板）
+
+| 方案 | 内容 | 代价/风险 | 效果 |
+|---|---|---|---|
+| **A 订单层（最小）** | `R3RSkipCoupleOrdersForRealArtic` 只对**主动**命令生效：遇到 `OT_WAIT_COUPLE`(17) **不改索引**、原地停车返回（与"整表全 R3R"分支的停驻语义一致）。仅动 `train_cmd.cpp`，约 5 行 | 极低 | 止住"莫名开走"；但等待链**依旧永远挂不上**（`:1937` 仍拒）⇒ 从"跑掉"变成"干等" |
+| **B 源头（治本）** | 做跨文件打散入口（抽出/暴露 `vehicle_cmd.cpp` 的 `R3RDearticulateOneGroup`），在**车库拖动合并**与**读档**两条边对含真铰接链自动 `DearticulateChainWithSnapshot`，之后照常发 ★/参与耦合 | 中（改写车辆身份，需护栏+探针） | 玩家真正想要的动作成立 |
+| **C 读档迁移（折中）** | 只在读档时对"真 artic + ★"链自动打散/清 ★（第 176 轮 §六.1 的落点候选 `R3RResyncSegmentFronts`，`:4711` 已有局部处理） | 中（一次性改写存档态） | 存量一次清掉；新产路径已全堵 |
+
+**推荐**：先做 **A**（无条件、零风险，止住"等待却开走"这个最刺眼的症状），再按玩家选择做 **B** 或 **C** 让"能挂上"真正成立。只做 A 不动 B/C ⇒ 玩家依然挂不上，只是不再乱跑。
+
+### 复测判据（游戏内，待玩家）
+
+1. **被动命令必须保住**：含真铰接、排程首条为 `WAIT_COUPLE` 的链，**不得**再出现 `from=0 to=1 type_from=17` 的 `ARTIC-SKIP-R3R`；出现 `type_from=16` 的仍算正常（第 176 轮判据 1）。
+2. **车库拖动**：把块并到含真铰接的等待链前 ⇒ 仍打 `DEPOT-SEG-SKIP-REAL-ARTIC`，但链头订单索引**不得**因此改变。
+3. **第 176 轮判据 7 不退**：机车 48 那条 `GOTO_COUPLE` 照旧被跳、不再刷 47 行 `COUPLE-FAIL`。
+4. **第 176 轮判据 6 不退**：全假铰接（打散组）的正常耦合/解挂/翻转行为逐字不变，日志不出现 `ARTIC-SKIP-R3R` / `*-REFUSE-REAL-ARTIC` / `*-SEG-SKIP-REAL-ARTIC`（判据 1/2 修改后需重述这一条）。
+5. 若走 **B/C**：打散后同场景应能出现 `COUPLE-OK loco=24 rear=…`，且 `CPL-GATE target-not-wait` 不再针对该目标。
+6. 若走 **A**：被动链应停在原地（`ARTIC-SKIP-R3R` 不再改写索引），且**不得**出现新的"链头订单索引被赋值"日志；主动 `GOTO_COUPLE` 一侧仍被跳。
+7. 借用层回灌场景（行 1570 同款）：索引不得被反复销毁。
+8. 存档往返：新 exe 存档再读回，存量链行为与本轮一致（不因读档产生新 ★）。
+
+### 仍未做 / 已知边界（本轮之后）
+
+1. **无实机复测**：以上 8 条判据待玩家用新 exe 复跑；本轮**未改任何源码**，故无构建自证。
+2. **KI-273/KI-274 均未修**，等玩家对 A/B/C 拍板。
+3. 第 176 轮 §六.1/§六.2、§五判据 2 的口径在本轮被实机证伪其一（"跳过 `WAIT_COUPLE` 是期望"这一点建议改为"仅跳过主动命令"），但**未动码**，仅登记。
+
+---
+
+### 第 180 轮实现落地：选项 C 已实现 + 已编译（2026-10-01）
+
+玩家拍板「**只做 C**」⇒ **KI-273 状态更新为「已修（仅读档边，选项 C）」**；**KI-274 仍「未修」**（A/B 未实现，设计口径不改）。
+
+**做法**：读档时把「★/⊗ + 真铰接」的存量链一次性打散——**保留 ★/⊗**（段结构、耦合目标资格全靠它），只把真铰接拆为打散组（烘焙均分重量/功率 + `ArticGroupHead`/`ArticGroupMember` 角色位 + override），使其重新成为合法段。全部改动均为 .cpp（**未碰任何 `src\*.h`**）：
+1. `src\vehicle_cmd.cpp`：`DearticulateChainWithSnapshot()` 去掉 `static` 供跨文件调用（定义仍在升段命令旁，并加注释说明新调用方）。
+2. `src\train_cmd.cpp`：新增 `static void R3RDearticulateLegacyArticSegment(Train *head)`（插在 `R3RChainHasRealArticPart` 之后、`R3RIsCoupleTarget` 之前）。判据＝链上存在 ★/⊗ **且** `R3RChainHasRealArticPart()` 为真；命中则 `DearticulateChainWithSnapshot(head)` + `head->ConsistChanged(CCF_SAVELOAD)` + 探针 `LEGACY-ARTIC-DEARTIC head=%d n=%u (load migration, round 180 option C)`；紧邻处手写 `void DearticulateChainWithSnapshot(Train *head);` 前向声明（不改头文件以免触发 KI-183 全量）。
+3. `src\train_cmd.cpp`：`R3RRebuildCouplePriorities()` 开头（`if (chain == nullptr) return;` 之后、KI-169a 停放分支之前）调用该迁移函数。该函数**只被 `src\sl\vehicle_sl.cpp:521`（`if (part_of_load)`）调用** ⇒ 只在读档跑，活链不经此路径。
+
+**为什么是打散而不是清 ★**：闸门判据是 `R3RChainHasRealArticPart()`（`train_cmd.cpp:15840`），清 ★ 不会让闸门闭嘴；只有打散（真铰接 → 打散组）才能让该链重回合法段（可等待 / 可被挂 / 可翻向）。**作用域刻意收窄**：原生 GRF 铰接车没有 ★/⊗，`has_marker` 为假 ⇒ 一字不动。顺序上迁移早于 `R3RSettleChainSegments(chain,"load")`，故段 ID/段行照旧重建。
+
+**预期效果**：`veh0..5`/`veh6..23` 读档即打散；`R3RSkipCoupleOrdersForRealArtic()` 不再命中 ⇒ 行 585 的 `type_from=17 type_to=1` `ARTIC-SKIP-R3R` 消失、等待链原地不动；`CPL-REFUSE-REAL-ARTIC`（`:8831`）/`FLIP-REFUSE-REAL-ARTIC`（`:8453`）对该链解除 ⇒ 机车 24 有机会挂上。**KI-274 本身仍在**：C 只是让存量不再落入该口径，不改口径。
+
+**构建自证**（复用 `_tmp_inc_build.cmd`，未新建任何 .cmd）：护栏 `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`（.cpp-only，未触发全量）；`build\R3R_incbuild.log` 尾 = `[4/4] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 02:16:11 → `train_cmd.cpp.obj` 02:18:15、`src\vehicle_cmd.cpp` 02:15:45 → `vehicle_cmd.cpp.obj` 02:18:17、`build\openttd.exe` **2026-10-01 02:20:17（51 561 472 B）**；`read_lints` 两文件 0 条；exe 内含 `LEGACY-ARTIC-DEARTIC`。构建前已确认 `openttd.exe` 未在运行。
+
+**待复测 7 条**：①日志出现 `LEGACY-ARTIC-DEARTIC head=0 n=24`（或对应链头）恰好一次、二次读档仍恰好一次；②全程不再出现 `from=0 to=1 type_from=17` 的 `ARTIC-SKIP-R3R`，等待链停在原库 `1,11`；③`COUPLE-OK loco=24 rear=…` 出现、`CPL-GATE reject=target-not-wait` 消失、`COUPLE-FAIL`/`COUPLE-DEST-EMPTY` 循环消失；④原生铰接车（无 ★/⊗）读档后不得出现 `LEGACY-ARTIC-DEARTIC`，外观/编组/性能逐字不变；⑤迁移后该链仍是多段（`CHAIN-ATTRS … SEG=` 与迁移前一致），仍可拖动/解挂/翻向；⑥第 176 轮判据 7 不退（机车 48 的 `GOTO_COUPLE` 照旧被跳）；⑦读档后 5 分钟无崩溃/无 assert，接缝间距与图像无异常。
+
+**风险/边界**：①读档期改写车辆身份，**不可逆**（旧档请先备份 .sav 再读）；②运动中的链也会被迁移（判定不看速度/所在格），位置不动、理论上安全；③`CmdMakeSegment` 仍按第 176 轮口径先打散再升段，故不会再产出该组合，迁移是一次性的；④§未确认项 R-1/R-2/R-3 未深挖；⑤**A/B 未实现**。
+
+**临时分析报告**：`R3R_artic_skip_waitcouple_round180_memo.md` 第九节（实现落地）。
+
+
+## 第 181 轮（玩家现场三条：没有 48 号车 / 段编号与名称借用 / 末尾解挂异常）
+
+来源：玩家 2026-10-01 描述（日志未直接抓到，均为游戏内观察）。现场日志 `build\R3R_debug.log`（8170 行，单次会话：`=== R3RDUMP-BEGIN ===`:4 / `=== R3RDUMP-END ===`:156 只有一对）。本轮**只取证 + 定性，未改任何源码**。临时分析报告 = `R3R_onsite_report_round181_memo.md`。
+
+事件序号（后续按此计数）：`COUPLE-OK` 8 次 = 244(#1 loco=24)、1164(#2 loco=27)、2457(#3 loco=27)、**3248(#4 loco=50)**、4632(#5 loco=48)、5515(#6 loco=29)、6871(#7 loco=27)、**7873(#8 最后一次 loco=27)**；`DECOUPLE-FIRE` 第 2 次 = **1498**(consist=27)。
+
+### KI-275（未修，中）「这个场景根本没有 48 号车」——48 号车的可见身份被借用改写
+
+- 48/49/50 是真实存在的**真铰接组**、停在车库 60,79（`59:R3RDUMP idx=48 et=523 sub=09 tile=60,79 un=6 FE=1 ENG=1 ARTH=1 SEGF=1 head=48 tail=50`；`149:R3RDUMP-CHAIN head=48 n=3 inDepot=1 ordCount=6 realType=6 depotIdx=2`）。
+- 但 **48 的活车号 `un=6`，且第 59 行是读档后第一份 dump ⇒ 存档里就带着借来的号**，界面显示的号/名属于「6」，玩家按界面找不到「48」。
+- 同会话 `4631:NAME-XFER head=48 u=6 head_own=0 got_u=1`（48 自己无名，借 6 的名）、`4691:CTRL-PARK tag=couple head=48 seg=1 unit=6`，解耦时（`5185:LOCO-AFTER-DECOUPLE veh=48`）**无 `NAME-RESTORE veh=48`** ⇒ 借来的身份永久留在链头上。
+- 结论：**不是幽灵车，而是 KI-276/277 借用层归还缺失的界面可见面**。判据：存档往返后不得再有「活车号 = 别链控制段号」的车。
+
+### KI-276（未修，中）段编号借用：出现「nseg=2 但 CTRL-PARK seg=3」，且段属性只挂第一个段头
+
+- 段 ID 是**全局递增分配**而非链内 1..n，逐点对照（`SEGID-SYNC nseg` vs `CTRL-PARK seg` vs `GEO settle segid`）：
+  - depot-edit :172/174 2/1 自洽；#1 :309/310 3/3；#2 :1231/1232 3/3；#3 :2517/2518 2/1；#5 :4690/4691 2/1；#7 :6894/6895 2/1；#8 :7940/7941 3/1 均自洽。
+  - **第 2 次解耦** :1507/1508 → nseg=2、ctrl=0，但 :1511+ 的 settle 是 segid=1(0..5) + **segid=3**(27..29)。
+  - **#4** :3306/3307 → `SEGID-SYNC tag=couple head=50 nseg=2` 紧接着 `CTRL-PARK tag=couple head=50 seg=3 unit=6`，:3310-3312 `GEO settle-couple veh=50/49/48 … segid=3`、:3313+ `veh=6 … segid=1`。
+  - **#6** :5573/5574 同形态（nseg=2 / seg=3 / :5577-5579 segid=3(29,28,27)、:5580+ segid=1）。
+- 段属性：`7933:CHAIN-ATTRS head=27 n=27 FE=2 SEG=3 pow=11831 wt=808 len=105 spd=120` / `7934: SEG idx=27 …`（有值）/ `7935: SEG idx=0 pow=0 wt=0 len=0` / `7936: SEG idx=6 pow=0 wt=0 len=0` ⇒ **段头枚举正确但只有第一个段头带属性，其余全 0**；:3302-3304(head=50)、:5569-5571(head=29) 同族（带属性的是第二个段头，链头段恒 0）。
+- 待确认：段 ID 分配器是否只增不减 / 跨链重复发放 / UI 段号取的是 ID 还是链内序号（报告 §五 R-1）。
+
+### KI-277（未修，中）名称借用只借不还：48 与 29 的解耦路径没走归还，#8 耦合无 NAME-XFER
+
+- `NAME-RESTORE` 全日志仅 4 条：847(veh=24)、1577(veh=27)、2896(veh=27)、3727(veh=50) —— 前 4 次 `NAME-XFER` 均成对。
+- **缺口**：`4631:NAME-XFER head=48 u=6 head_own=0 got_u=1` 之后解耦（:5185）**无 NAME-RESTORE veh=48**；#6 耦合（:5515）**连 `NAME-XFER head=29` 都没有**；#8 最后一次耦合（:7873）**末尾也无 NAME-XFER head=27**。
+- `head_own=0`（链头自己无名）时借走 u=6 的名 ⇒ 该列车界面显示 6 的名。与 KI-275 的 `un=6` 互为印证。
+- 对照第 160 轮 KI-261 的实现口径（`Couple()` 借 / `DecoupleTrain()` 还 + R3VP 存 name_backup）：本条说明**归还分支有旁路未覆盖**（待定位 R-2）。
+
+### KI-278（未修，高）末尾解挂命令异常：耦合后索引停在未执行的 DECOUPLE 上
+
+- 锚点（最后一次耦合 #8）：
+  - `7871:RESPACE-AFTER-EDIT couple head=27 px=1 stretch=1 unfixed=0 front=1 visited=26`
+  - `7872:ORD-XFER keep veh=27 owner=6 cur_real=5 parked_real=9`
+  - `7873:COUPLE-OK loco=27 rear=23 consist=23 co=1 real=20 type=15 tx=58 ty=26` ← 已是 DECOUPLE(OT_DECOUPLE=15)
+  - `7902:ORD-AFTER-COUPLE head=27 n=29 real=20 impl=20 tt=20 owner=6 u_has_orders=0`
+  - `7923:  ORD idx=20 type=15 dest=0`（索引 20 正好是 DECOUPLE）
+  - `7937:NOCAB-SET this=27 db=1 last=23 lastSub=0x04 lastEng=0 lastLead=0`、`7938:CGRP-NORM-UNION head=27 nseg=3 mask=0`
+  - 末尾：`CRT veh=27 order=15 dir=3 origin=59,18 td=10 found=0` / `RESV-WATCH SET-STN tile=60,16 phase=choose-track actor=27` / `DEPOT-ARR veh=27 spd=0 real=20(15) curType=15 tx=60 ty=31` / `PFD-REJ-GROUP tile=58,19 t=27 ordType=15 wc=0 rej=768`
+- 判读：**一挂上就要解挂**（real=20 落在 DECOUPLE），随后链头被判 `NOCAB`、解挂寻路被分组闸门拒（`PFD-REJ-GROUP … ordType=15 rej=768`）、`CRT found=0` 原地不动。玩家所说「可按最后一次耦合定位」与此吻合；玩家自陈调度命令也有问题，但需防「玩家未知行为」触发同类卡死。
+- 待确认：`ORD-XFER keep … cur_real=5` → `ORD-AFTER-COUPLE real=20` 的跳变来源（继承 owner 索引 vs 跳过已执行 WAIT_COUPLE，R-3）；`PFD-REJ-GROUP rej=768` 与借用后分组掩码/nseg 的关系（R-4）；48 号车抢配对 `7732:CPL-PAIR-STEAL act=48 tgt=23 from=27 myEnter=9813 hisEnter=11891`（早期 `2167: act=48 tgt=6 from=27`、`6790: act=48 tgt=0 from=29`）⇒ 配对表在借用/解耦后是否清理（R-5）。
+- 独立噪点（不计缺陷）：末尾 `CPL-S0-CHK veh=48 tile=58,67` + `COUPLE-FAIL loco=48 order=16` 反复刷屏（48 带 3 节找目标 `found=0`，与第 148 轮续记的「候选车底未到位」同形态），另有 `veh=24 tile=20,9` 同类。
+
+### 第 181 轮未做
+
+- 未改任何源码；三条均为**未修**。
+- 第 180 轮遗留 **KI-274 的 A（订单闸门只对主动命令生效）与 B（车库拖动边自动打散）仍未实现**（C=读档迁移已实现）。
+- 复测判据（修完后）见报告 §六：①解耦后必须出现成对 NAME-RESTORE 且界面无借来的号/名；②存档往返后无重号；③`CTRL-PARK seg ≤ SEGID-SYNC nseg` 且 settle segid 恰为 1..N；④每个段头都带自己的 pow/wt/len；⑤`ORD-AFTER-COUPLE real=` 不得停在未执行的 DECOUPLE 上；⑥不再出现无主 `CPL-PAIR-STEAL`。
+
+## 第 181 轮续（2026-10-01）—— R-1..R-5 定性 + 三处修复
+
+本轮把第 181 轮报告 §五 留下的 R-1..R-5 全部定性完，并把其中两处**可证、可逆**的缺陷直接修掉（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）。
+
+### R-1 定性（KI-276 降级为「探针口径」，非缺陷）
+`SEGID-SYNC ... nseg=` 与 `CTRL-PARK tag=... seg=` 打的是 `chain->r3r_segment_id` / `ctrl->r3r_segment_id`，即**全局段 ID**（只增不减、解挂/降级不回收）；界面上玩家看到的「第 k 段」是**链内序号**，由 `R3RGetSegmentPosition()` / `R3RSegmentHiddenHeads()` 每次现算（车队列表子行标签走 `STR_VEHICLE_LIST_SEGMENT_SUBROW`，参数是序号不是 ID）。因此「nseg=2 却 CTRL-PARK seg=3」不是矛盾：ID 3 是链内第 2 段。段属性按段写行（控制段行 / 隐藏段行）的既有行为不变，无需改行为。
+
+### R-2 定性（KI-277 已修）：名/号两侧的借用都不对称
+- **名侧**：`Couple()` 借名时无条件 `u->name.clear()`。当链头本来就没有名字时 `v->name_backup` 留空，「这次名字是借的」在解挂时**没有任何凭据**，`DecoupleTrain()` 的归还块 `if (!v->name_backup.empty())` 整支被跳过 ⇒ 链头永久顶替等待方的名字。现场 `NAME-XFER head=48 u=6 head_own=0 got_u=1`，此后 `LOCO-AFTER-DECOUPLE veh=48` 全程没有 `NAME-RESTORE`。42/48/29 的「这个场景根本没有 48 号车」即此。
+- **号侧**：车号块在「不解挂再挂一次」（`ORD-XFER keep`，v 已在借用中）时，先 `ReleaseID(v->unitnumber_backup)`（把**链头自己的号**还给号池）再 `v->unitnumber_backup = v->unitnumber`（把**借来的**号当成本车身份停起来）⇒ 链头自己的号被销毁、借来的号成了它的身份，且 `CTRL-PARK` / `DEPOT-XFER-ID` 会把借来的号写进段行，界面里 48 于是显示成 6。
+- **修法**（两处，均可逆、不丢数据）：名侧 `Couple()` 不再清空 `u->name`（原件留在 lender 手里；lender 此时不是链头，活名字不对外显示），归还端新增一支按 `v->name == u->name` 认出「链头本来没名字」的借用并清回；号侧在 `v->r3r_orders_borrowed = true` **之前**采样 `was_borrowing`，借用中不再释放/覆盖停放副本（停放的一定是链头自己的号），且只在 `unitnumber_backup == 0` 时停放。
+- **边界**：旧档不追溯 —— 48 现在身上的 6 是旧 exe 写进存档的，原始号值不在任何字段里；需玩家手动改回，或解挂后重挂一次（新 exe 起不再发生）。
+
+### R-3 定性（KI-278 已修）：耦合后的落点可能停在一条不可执行的 DECOUPLE
+现场 head=27 合并完成后 `real=20` 正好是一条 DECOUPLE：耦合路径把等待方索引继承过来后只跳了「已兑现的 WAIT_COUPLE」（KI-177 / KI-204 的 +1），落点若为 DECOUPLE 则无人兜底。DECOUPLE 不是可执行的命令 —— 它只由「停在它前面那条 GOTO 的终点」触发（`ProcessOrders` 的解挂钩子是 (index,tile) 纯函数），单独停在上面时 `ProcessOrders` 永不为它收尾 ⇒ 停死 + 链头被判 NOCAB（不能带车）+ `PFD-REJ-GROUP rej=768` 刷屏。解挂路径两半与车库编辑都调 `R3RSkipUnfireableDecoupleOrder()`，只有耦合路径漏了 → 已补，新探针 `COUPLE-SKIP-DECOUPLE head= stepped= real= type=`。
+
+### R-4 已排除：等待方索引来源（KI-204）是正确的
+`waiter_real_index` 在 `TryTrainCouple()` **之前**采样，那时等待方仍是独立链头且自持 `orders`（`u->orders` 是在耦合提交后才搬给链头/置空的），所以 `ORD-AFTER-COUPLE` 探针里出现 `u_has_orders=0` 是**交接已完成**的正常形态，不能据此判「索引陈旧」。报告 §五 R-4 的疑点排除。
+
+### R-5 归并：48 的可见身份 = R-2 的名/号两侧 + 段行镜像
+（`CTRL-PARK` / `DEPOT-XFER-ID` 把借来的号写进段行），已归入 KI-277，不单开条目。
+
+### 构建自证
+复用 `_tmp_inc_build.cmd`（未新建 .cmd）。首次失败：`src\train_cmd.cpp(7651): error C2679 ... TinyString`（TinyString 之间没有 `operator==`，改 `std::string_view(v->name) == std::string_view(u->name)`）。修后：`GUARD: incremental is safe`、`[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done = EXIT_CODE=0`、`build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` @03:50:56 > `src\train_cmd.cpp` @03:50:32、`build\openttd.exe` @2026-10-01 03:52:36（51 561 472 B）、read_lints 0 条；exe 命中 `NAME-RESTORE veh=%d side=head-cleared` 与 `COUPLE-SKIP-DECOUPLE head=%d stepped=%u real=%d type=%d`。
+
+### 待复测（4 条）
+1. 链头本来没有名字的耦合（`NAME-XFER ... head_own=0`）之后解挂 ⇒ 必须出现 `NAME-RESTORE veh=N side=head-cleared`，该车回到「没有名字」；
+2. 借用中再挂一次（`ORD-XFER keep`）后解挂 ⇒ 链头拿回自己的号（界面号不变、段行不再显示 lender 的号）；
+3. 耦合后落点若是 DECOUPLE ⇒ 出现 `COUPLE-SKIP-DECOUPLE`，链头不再 NOCAB、不再 `PFD-REJ-GROUP rej=` 刷屏，列车继续走到下一个可执行命令；
+4. 反例不误伤：链头本来有名字的耦合解挂后名字逐字不变；`was_borrowing=0` 的路径仍照 KI-147 把过期副本还给号池（号池不泄漏）。
+
+### KI 状态变更
+- KI-275（48 号可见身份被借用）：未修 → **部分修复**（名/号两侧的借用对称性已修，见 KI-277；旧档遗留值不追溯）。
+- KI-276（段编号借用 / nseg 与 seg 不一致 / 段属性只挂第一个段头）：未修 → **非缺陷（探针口径）**，见 R-1。
+- KI-277（NAME-XFER 只借不还 / 车号二次耦合被顶替）：未修 → **已修（第 181 轮续）**。
+- KI-278（耦合后停在未执行的 DECOUPLE + NOCAB + PFD 刷屏）：未修 → **已修（第 181 轮续）**。
+
+## 第 182 轮（2026-10-01）—— KI-279：号侧「链头本来就没有号」的借用归还缺一支
+
+承接第 181 轮续 KI-277 的对称性审计（第 181 轮续「未做项 4：反例回归只做了代码走查」）。走查发现 **KI-277 只补了名称侧的反例，号侧（KI-147 的 `v->unitnumber_backup != 0` 归还块）完全没有对应分支** —— 同一族缺陷的另一半，本轮补齐。仅 `src\train_cmd.cpp`（109 行附近加 13 行），未碰任何 `src\*.h`。
+
+### 根因（与名称侧逐字同构）
+- `Couple()` 借号块：`u->unitnumber != 0` 时把 u 的号搬到 v 的活字段并 `u->unitnumber = 0`，u 侧把原号停进 `u->unitnumber_backup`；v 侧只在 `v->unitnumber_backup == 0` 时停放 —— 若 **v 本来就没有号**（`GVSF_VIRTUAL` 的假引擎链头正常无号，`NormaliseTrainHead()` 明确不给虚车发号），`v->unitnumber_backup` 保持 0。
+- `DecoupleTrain()` 的归还块 `if (v->unitnumber_backup != 0) { … }` 整支被跳过 ⇒ 链头**永久顶着等待方的号**，而 u 已在 car-only 分支用 `R3RRestoreUnitNumber(u)` 把号取回活字段 ⇒ **同一个号池条目被 v 与 u 的活字段同时引用**（真重号）；任一方随后被删/被卖，`ReleaseID()` 会把仍在使用的号放回号池 ⇒ 号池重复分配，两列车显示同一个「Train N」。
+- 名称侧没有号池，所以 KI-277 那一支只要 `v->name.clear()` 即可；号侧必须把号留回对方（`v->unitnumber = 0`，**不能** ReleaseID）。
+
+### 修法
+在 KI-147 归还块的 `if` 上补一支 `else if`，判据与名称侧 `side=head-cleared` 同构（活字段仍等于等待方自己的号就是这次借用的凭据）：
+
+```cpp
+} else if (u->unitnumber != 0 && v->unitnumber == u->unitnumber) {
+    v->unitnumber = 0;
+    v->unitnumber_backup = 0;
+    R3RDbgWrite("UNIT-RESTORE veh=%d side=head-cleared id=%u\n", ...);
+}
+```
+
+只在该场景成立（其它情形 u 的号是 car-only 分支新领的号，号池唯一，不可能等于 v 的号），可逆、不动号池登记。
+
+### 边界 / 本轮未做
+- **车库拖动边（`R3RSyncChainAfterDepotEdit` / `R3RBorrowControlTraitsLive`）行为不同**：那里链头穿的是 `ctrl->unitnumber_backup`，而控制段的号**始终留在它自己的 backup 里**（不取回活字段）⇒ 只有「一份登记 + 两处引用」，不产生重号，故未加对应分支。若将来车库侧也改成取回活字段，须同步补这一支。
+- 旧档不追溯：已经落盘的重号不会自动纠正（解挂后重挂一次，或手动改号）。
+- 未实机复测（本轮无新 exe 产生的现场日志）。
+
+### 构建自证
+复用 `_tmp_inc_build.cmd`（未新建 .cmd）；`GUARD: incremental is safe (no header/lang file is newer than the newest object)`、`[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done = EXIT_CODE=0`、`error C*/fatal error/FAILED:/build stopped` 计数 0、`src\train_cmd.cpp` 12:28:35 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 12:34:17 → `build\openttd.exe` @2026-10-01 12:40:19（51 561 472 B）、read_lints 0 条、exe 命中 `UNIT-RESTORE veh=%d side=head-cleared id=%u`。
+
+### 待复测（3 条）
+1. 无号链头（虚车链头，或 `CTRL-PARK` / `UNIT-PARK` 里 `bk=0`）耦合后再解挂 ⇒ 出现 `UNIT-RESTORE veh=N side=head-cleared`，链头回到无号、等待方保住自己的号，界面**不出现两列车同号**；
+2. 反例不误伤：链头本来有号的解挂仍走原 `side=head` 路径（`UNIT-RESTORE veh=N id=X`），号池不泄漏（对照 KI-147 的释放计数）；
+3. 存档往返后不出现重号；`CTRL-PARK` 段行号与界面号一致、`SEGFRONT-RESYNC-CHECK` 无异常。
+
+### KI 状态变更
+- 新增 **KI-279（号侧「链头本来没有号」的借用归还不归还 ⇒ 重号 / 号池串号）：已修（第 182 轮）**，严重度 中。
+
+---
+
+## 第 183 轮（2026-10-01）：名字乱传播 + 29 条命令「连续四条 R3R 命令」仍异常
+
+玩家原话（第 182 轮修复版 exe 复测后）：
+
+> 我已取得日志，目前，还有以下问题：第一个是有一个列车名字乱传播，第二个是那个 29 条的调度命令那个连续四条 R3R 命令还是出现了一些问题
+
+现场：`build\R3R_debug.log`（13 416 行 / 846 984 B，mtime 2026-10-01 13:23:27），由 `build\openttd.exe`（2026-10-01 12:40:19 = 第 182 轮 KI-279 构建）产生 ⇒ 现场有效。
+临时分析报告：`R3R_round183_name_spread_and_four_r3r_memo.md`。本轮**未改任何源码**，两条均只做到「登记 + 取证」，状态为**取证中（未修）**。
+
+### KI-280（名字乱传播：链头身上是「借来的名字」时被停成自己的备份）
+- ID：KI-280
+- 来源：备忘 `R3R_round183_name_spread_and_four_r3r_memo.md` §3.1 / §四 / §七
+- 状态：**已修（第 185 轮，2026-10-01 第四轮：已改码 + 增量编译通过；游戏内复测待做）**
+- 修法（第 185 轮，仅 `src\train_cmd.cpp`，未碰 `src\*.h`）：新增 `static bool R3RNameIsBorrowed(const Vehicle *)`——`v->r3r_orders_borrowed && v->name_backup.empty() && !v->name.empty()` 即"身上这件名字是借来的"（借用中若 `name_backup` 为空，说明耦合那一刻它本来就没有自己的名字；有名字的话早被停进备份了）。三处写点全部加门禁：① `Couple()` 的停放改用 `head_had_own = !v->name.empty() && !was_borrowing`（与号侧 KI-279 完全对称），等待方 u 的停放也加 `!R3RNameIsBorrowed(u)`；② `R3RParkTrainName()` 新增第二参 `bool name_is_borrowed = false`，两个调用点各传采样值（车库身份迁移在 `src->r3r_orders_borrowed` 被清掉【之前】采样、`R3RRelocateFrontIdentity()` 在借用标志被 swap 到 `to` 身上【之前】采样）；③ `R3RBorrowControlTraitsLive()` 的停放加 `!R3RNameIsBorrowed(chain)`。另在归还块外挂只读诊断支路 `NAME-RESTORE-SKIP veh=%d u=%d borrowed=0 head_name_matches_u=1`（给"第二条通路"留痕，不改行为）。
+- 严重度：中（行为不符：名字跨车传播，界面显示错误）
+- 玩家指认（2026-10-01 第二轮，同一现场）：**veh6 是控制段**（`UNIT-PARK veh=6 bk=2` line 12 / 4945、`4551 ORD-XFER keep veh=27 owner=6`、`ORD-AFTER-COUPLE ... owner=6`）；别的段与 veh6 耦合时 veh6 的名字被显性（符合 KI-261/263 设计），但**其他段与 veh6 解挂后仍继承 veh6 的名字**。
+- 现场锚点：
+  - `3743 NAME-XFER head=27 u=0 head_own=0`（27 本来没名字，借了 veh 0 的名字）
+  - `4551 ORD-XFER keep veh=27 owner=6 cur_real=5 parked_real=9`（第一次借名仍未归还时的第二次耦合）
+  - `4552 NAME-XFER head=27 u=23 head_own=1` ⇒ 此刻 27 的活字段是**借来的**名字
+  - 旁证（"别的段 vs veh6"四条完整往返）：`1306 NAME-XFER head=27 u=6 head_own=1 → 1530 NAME-RESTORE veh=27 side=head`、`1759 head=50 u=6 head_own=0 → 2037 veh=50 side=head`、`2439 head=48 u=6 head_own=0 → 2760 veh=48 side=head`、`2939 head=29 u=23 head_own=0 → 3313 veh=29 side=head`
+  - **全文 12 次 `NAME-RESTORE` 全为 `side=head`、`side=head-cleared` 为 0**；对照号侧（第 182 轮 KI-279）已出现 2 次 `UNIT-RESTORE veh=0 id=1 side=head-cleared` ⇒ 名侧该支路在现场等价于死代码
+- 根因（已读码定稿）——**三处写点都会把"借来的名字"停成"自己的名字"**：
+  1. `train_cmd.cpp:10254-10258` `Couple()`：`head_had_own = !v->name.empty();`（探针/判据都**无法区分"自己的名字"与"借来的名字"**）+ `if (v->name_backup.empty()) v->name_backup = v->name;` ⇒ 第二次耦合时把上一次借到的名字停成自己的备份（3743 → 4552）；
+  2. `train_cmd.cpp:2762-2768` `R3RParkTrainName()`（调用点 `3203` 车库身份迁移、`8863` `R3RRelocateFrontIdentity`）：`if (v->name_backup.empty() && !v->name.empty()) v->name_backup = v->name; v->name.clear();` ⇒ 身份迁移若发生在借名之后，停进备份的是借来的名字；
+  3. `train_cmd.cpp:5648-5655` `R3RBorrowControlTraitsLive()`（车库拖动 / 读档边）：`if (chain->name_backup.empty()) chain->name_backup = chain->name; chain->name = ctrl->name_backup;` ⇒ 这正是"控制段 veh6 的名字显性到链头"的正规通道，链头此刻若顶着借名，会把借名一起停进去。
+  归还端 `train_cmd.cpp:7660-7672` 只认 `!v->name_backup.empty()` ⇒ 被污染后必走 `side=head`，把**别人的名字**当做自己的原名还给链头（用户症状）。
+  ⇒ 与第 182 轮 KI-279（号侧同类洞）同构，名侧没有对称修法。
+- 第二条通路（同一症状）：归还块整块位于 `if (v->r3r_orders_borrowed)`（`train_cmd.cpp:7346`）之内 ⇒ "没有借用排程"的解挂**完全不执行**名字/号归还，链头继续顶着借来的名字（现场第二轮 `13045` 之后到日志结束无 `NAME-RESTORE`，与此一致）。
+- 未确认：`1759 / 2439 / 2939`（`head_own=0` 却走 `side=head`）的 `name_backup` 究竟是 `3203` 还是 `8863` 填的，需在修复时补一行"backup 来源"探针（tag）区分。
+- 复测判据草案：①`NAME-XFER` 探针要能区分"自己的名字 / 借来的名字"（新增字段）②第二次耦合时不得把借名停进 `name_backup` ③解挂后任何一节的显示名不得等于本次借入的名字（除 lender 本人）④"链头本来没名字"的解挂必须出现 `side=head-cleared`。
+
+### KI-281（29 条命令的连续四条 R3R 命令：`idx20 DECOUPLE` 被静默跳过）
+- ID：KI-281
+- 来源：备忘 `R3R_round183_name_spread_and_four_r3r_memo.md` §3.2 / §四
+- 状态：**未修（取证中）**
+- 严重度：中（行为不符：命令未执行且无留痕）
+- 玩家指认（2026-10-01 第二轮）：**"连续 4 条 R3R 命令的第三条执行有问题"**。
+- 订单表逐字证实（`U-ORD` 镜像，line 437-443，另 867-873 / 1517-1520 等同构重复）：`16 type=17` / `17 type=1` / `18 type=15` / `19 type=17` / `20 type=15` / `21 type=17` / `22 type=1`（15=OT_DECOUPLE、17=OT_WAIT_COUPLE、1=OT_GOTO_STATION）⇒ 四条连续 R3R = `idx18..21`，**第三条 = `idx20`（DECOUPLE）**，与日志落点逐字一致。
+- 现场锚点（29 条表属 `owner=6`，即 **veh6 为控制段**）：
+  - `3283 DECOUPLE-DONE u=23 co=1 real=19`（解出方停在 `idx19 WAIT_COUPLE`）
+  - `4486 ARRANGE-IN dh=27 dst=5 sh=6 src=6`（27+0..5 与等待中的 6..23 合并）
+  - `4551 ORD-XFER keep veh=27 owner=6 cur_real=5 parked_real=9`、`4553 COUPLE-SKIP-DECOUPLE head=27 stepped=1 real=21 type=17`、`4554 COUPLE-OK loco=27 rear=23 consist=23 real=21 type=17`
+  - `4583 ORD-AFTER-COUPLE head=27 n=29 real=21 ... owner=6`
+  - ⇒ 合并后落点由 `idx19` 直接跳到 `idx21`，**`idx20 DECOUPLE` 被 `R3RSkipUnfireableDecoupleOrder()` 静默吃掉**（第 181 轮续 KI-278 修复的副作用面：卡死没了、命令没了）；此后到本轮结束再无任何 `DECOUPLE-FIRE` 为 `idx20` 触发。第二轮 `13044/13045/13046/13076` 同构复现。
+- 待确认：玩家已指认"第三条执行有问题"（⇒ 期望是 `idx20 DECOUPLE` **应当被执行**）；但"该由谁、在何时、解下哪一半"仍需玩家给一句口径，再决定"让它能触发"还是"承认不可触发但必须留痕/报警"。
+- 关联：`SKIP-STOPPED veh=30 order=0 real=17 spd=0 tile=1,11 front=1 nord=29 idx=0 tt=65535`（首现 line 63，反复出现至 13401 行，全程未动一步）与本节位置（`idx17..21`）、订单数（29）高度重合，是否为同一张表的另一半**未确认**。
+
+## 第 184 轮（2026-10-01 第三轮）：`idx20 DECOUPLE` 的期望口径已定稿 —— KI-282
+
+玩家原话（回答第 183 轮 KI-281 的 R-3 追问）：
+
+> 四条中的第三条应该由veh6解下一个三节假铰接式真引擎也就是veh27，这是应该触发的
+
+⇒ 口径落地：`idx20 DECOUPLE` **应当触发**（不是"承认不可触发、只留痕报警"，也不是静默跳过）；执行者/排程主人 = `veh6`；解出对象 = **三节假铰接式真引擎，即链头 `veh27` 三节单元**。KI-281 的"待确认"项就此关闭。
+
+### KI-282（`idx20 DECOUPLE` 该触发：触发面 + 解出边界双缺口）
+- ID：KI-282
+- 来源：临时报告 `R3R_round184_decouple_idx20_memo.md`；承接 KI-281 / KI-278
+- 状态：**未修（取证中）**
+- 严重度：中（行为不符：命令未执行）
+- 现场锚点（`build\R3R_debug.log`，13 416 行 / 846 984 B，mtime 2026-10-01 13:23:27；exe = 第 182 轮 KI-279 构建 12:40:19，有效）：
+  - 订单表 `owner=6`（29 条）：`idx17 GOTO_STATION(5)` / `idx18 DECOUPLE(15)` / `idx19 WAIT_COUPLE(17)` / `idx20 DECOUPLE(15)` / `idx21 WAIT_COUPLE(17)` / `idx22 GOTO_STATION(2)`（`4584-4612 ORD idx=`）
+  - 合并链三段：`4555-4581 CPL idx=` 逐节 = `[27,28,29] | [0..5] | [6..23]`；`4614 CHAIN-ATTRS head=27 n=27 FE=2 SEG=3`；`4623 INVAR-CTRL tag=couple head=27 nseg=3 ctrl=6 ctrl_pri=1 head_pri=3 borrowed=1`（链头段 = 27 段且唯一有动力 `pow=11831`；控制段 = 6 段，两者不同）
+  - 第一轮已用掉 `idx18`：`3251 DECOUPLE-FIRE consist=29 real=17 mode=2 num=1 segs=1 eff=23` → `3283 DECOUPLE-DONE u=23 co=1 real=19`
+  - 合并后落点：`4553 COUPLE-SKIP-DECOUPLE head=27 stepped=1 real=21 type=17`、`4583 ORD-AFTER-COUPLE head=27 n=29 real=21 impl=21 tt=21 co=0 dest=4294967295 borrowed=1 owner=6 u_has_orders=0` ⇒ `idx20` 被 `R3RSkipUnfireableDecoupleOrder()` 吃掉（KI-278 修复的副作用面）
+- 缺口 A（触发面）：停稳分支 `at_order_dest`（`train_cmd.cpp` ~16363-16402）只在 `cur_real` 为 `GOTO_STATION` / `GOTO_DEPOT` / 库内 `DECOUPLE` 三处有取值分支，`cur_real = WAIT_COUPLE` 时恒 `false` ⇒ ① 落点是 `idx21 WAIT_COUPLE` 时闸门认不出"列车正停在 `idx17 GOTO 5` 的终点"；② 即便索引停在 `idx20`，只要 `cur_real` 不是那三类，闸门同样恒假。满足玩家口径需把锚点扩成"**回溯最近一条已完成的旅行命令终点站**"，允许同一停靠点上连续多条 DECOUPLE 依次触发。
+- 缺口 B（解出边界）：`GetDecoupleVehicle()`（`train_cmd.cpp:6384`）只返回**尾部**切点（`GetSegmentHeadFromRear` / `GetSegmentBoundaryFromHead`），无法单独解出**链头段**；"解出 `[27,28,29]`"在现有实现里只能表达为 `HeadBoundary num=1`＝保留 27 段、释放其后两段，归属方向与玩家字面相反。旁证：第一轮 `idx18` 已解出尾段（`eff=23`），若 `idx20` 也解尾段则解出的是 6 节 / 18 节，**都不是"三节"** ⇒ 只有把 `[27,28,29]` 当解出对象，"三节"才成立。
+- 未确认：① 解出后 29 条表的归属（第 152 轮 P1-甲 / KI-201 附记 3 同族）；② `idx21 WAIT_COUPLE` 归哪半（两条 R3R 命令不能抢同一半）；③ `veh=30`（`nord=29` 却永不推进）是否同一张表的另一半。
+- 复测判据草案：① 出现 `DECOUPLE-FIRE … real=20`；② 解出链链头 = `27`，三节 `segid` 完整不裂；③ `idx19`/`idx21` 两 `WAIT_COUPLE` 各归各半；④ 健康单条 DECOUPLE / 库内解挂零回归。
+
+### 本轮 KI 状态变更
+- KI-281：未修（取证中） → **未修（玩家口径已定稿，见 KI-282）**
+- 新增 KI-282（未修，取证中）
+
+### 第 183 轮·本轮待办
+1. ~~读码核对 `head_own` / `NAME-RESTORE` 两支打印条件 + `v->name_backup` 全部写点~~ ⇒ **已完成（2026-10-01 第二轮）**：根因定稿见 KI-280 的三处写点 + 归还闸门（`train_cmd.cpp:10254-10258 / 2762-2768 / 5648-5655`，闸门 `7346`，归还支路 `7660-7672`）；
+2. 读码核对 `R3RSkipUnfireableDecoupleOrder()` 与 `Couple()` 落点判据 ⇒ 定稿 KI-281 的"该不该跳 / 跳了要不要留痕"，并结合向玩家确认 `idx20` 的期望口径（R-3）；
+3. 定性 `veh=30`（`nord=29` 却永不推进）；
+4. ~~定稿后动手改码：名侧按"区分自己的名字 / 借来的名字"修（与第 182 轮 KI-279 号侧对称），并给 `NAME-XFER` 补"借名来源"探针~~ ⇒ **已完成（2026-10-01 第四轮 = 第 185 轮）**，见下节。
+
+## 第 185 轮（2026-10-01 第四轮）：KI-280 名侧对称修复（已改码 + 已编译，游戏内复测待做）
+
+### 交付物
+- 源码：**仅 `src\train_cmd.cpp`**（未碰任何 `src\*.h`、未碰 `src\lang\*.txt` ⇒ 护栏判"incremental is safe"，未新建任何 `.cmd`，复用既有 `_tmp_inc_build.cmd`）。
+- 清单：KI-280 状态由"未修（取证完毕、根因已定稿、待改码）"改为"**已修**"（含修法小节）。
+- 临时分析报告：`R3R_name_spread_fix_round185_memo.md`。
+- 本轮未新增任何语言串、未改存档格式。
+
+### 改动明细（1 个判定 + 4 处门禁 + 1 组探针）
+1. **新增只读判定** `static bool R3RNameIsBorrowed(const Vehicle *v)`（`train_cmd.cpp:2762` 一带，紧邻 `R3RParkTrainName()`）：`v != nullptr && v->r3r_orders_borrowed && v->name_backup.empty() && !v->name.empty()`。
+   判据依据：借用中的链头若 `name_backup` 为空，说明耦合那一刻它**本来就没有自己的名字**（有名字的话 `Couple()`/`R3RParkTrainName()` 早把原件停进备份了）⇒ 活字段上那件名字只可能是 lender 的。与号侧 KI-279 的 `was_borrowing`、KI-215 的"排程只在第一次借用时寄存"同一条规则：**借用中不寄存**。
+2. **写点 ① `Couple()`**（`train_cmd.cpp:10254` 一带）：`head_had_own` 由 `!v->name.empty()` 改为 `!v->name.empty() && !was_borrowing`；停放行改为 `if (head_had_own && v->name_backup.empty()) v->name_backup = v->name;`；等待方 u 的停放行加 `!R3RNameIsBorrowed(u) &&` 前缀。这是现场 `3743 NAME-XFER head=27 u=0 head_own=0` → `4552 NAME-XFER head=27 u=23 head_own=1` 那条污染链的起点。
+3. **写点 ② `R3RParkTrainName()`**：签名加 `bool name_is_borrowed = false`（停放行加 `!name_is_borrowed &&`）。两个调用点各传采样值：
+   - 车库身份迁移（`CmdMoveRailVehicle()` 的 cases #2/#3 块，原 `3203` 一带）：在 `if (src->r3r_orders_borrowed)` 把标志清掉【之前】采样 `const bool src_name_borrowed = R3RNameIsBorrowed(src);`，调用点改 `R3RParkTrainName(src, src_name_borrowed);`；
+   - `R3RRelocateFrontIdentity()`（原 `8863`）：在 `kept_to_name` 快照处（借用标志被 swap 到 `to` 身上【之前】）采样 `const bool from_name_borrowed = R3RNameIsBorrowed(from);`，调用点改 `R3RParkTrainName(from, from_name_borrowed);`。
+4. **写点 ③ `R3RBorrowControlTraitsLive()`**（原 `5648-5655`，车库拖动 / 读档边、控制段名字显性化的正规通道）：停放行加 `!R3RNameIsBorrowed(chain) &&` 前缀。
+5. **探针**：
+   - `NAME-XFER` 追加两字段 → `NAME-XFER head=%d u=%d head_own=%d got_u=%d keep_u=%d borrowed=%d own=%d`（`borrowed` = 采样到的 `was_borrowing`；`own` = 停放后链头是否真有一件自己的原名）。满足 KI-280 复测判据 ①。
+   - 新增只读诊断支路 `NAME-RESTORE-SKIP veh=%d u=%d borrowed=0 head_name_matches_u=1`：作为 `else if` 挂在归还块 `if (v->r3r_orders_borrowed)` 上，仅在"没有借用排程 + 链头活名字恰好等于等待方名字"时落一行，用于给"第二条通路"留痕（本轮**不改**归还闸门结构，理由见下）。
+
+### 构建自证（2026-10-01 14:27-14:34）
+- 入口：`cmd /c "cd /d ""d:\sourcecode of JGRPP"" && _tmp_inc_build.cmd"`（复用既有文件，未新建）。
+- `build\R3R_incbuild.guard.log`：`GUARD: incremental is safe (no header/lang file is newer than the newest object)`。
+- `build\R3R_incbuild.log`：仅第 515 行 `[3/3] Linking CXX executable openttd.exe`，`error C[0-9]` / `fatal error` / `FAILED:` / `build stopped` **零命中**。
+- `build\R3R_incbuild.done`：`EXIT_CODE=0`。
+- 时间戳链：`src\train_cmd.cpp` 14:27:04 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 14:29:05（10 159 447 B）→ `build\openttd.exe` 14:33:32（**51 564 544 B**，晚于全部改动源码）。
+- `read_lints src\train_cmd.cpp`：0 条。
+- exe 内字面量自证（Latin1 读二进制）：`NAME-RESTORE-SKIP` / `NAME-RESTORE-SKIP veh=%d u=%d borrowed=0` / `borrowed=%d own=%d` / `NAME-XFER` / `NAME-RESTORE veh=%d side=head` 全部命中。
+
+### 待复测（用新的 `build\openttd.exe` 复跑同一现场）
+1. 第二次耦合（`ORD-XFER … parked_real=` 之后那次）必须出现 `NAME-XFER … borrowed=1 own=0`，**不得**再出现 `borrowed=1 own=1`（旧 exe 的污染签名）。
+2. 解挂后除 lender 本人外，任何一节的显示名不得等于本次借入的名字；"链头本来没名字"的解挂应出现 `NAME-RESTORE veh=%d side=head-cleared`（现场此前 `side=head-cleared` 恒为 0）。
+3. 车库拖动耦合链（拖到列车前面 / 拖出被并入部分）后 `NAME-XFER` / `NAME-RESTORE` 的号名不串车。
+4. 健康单条耦合（链头本来就有自己的名字）必须仍出现 `own=1`，且解挂后名字回到链头自己那一件 —— 不得因本修法丢名字。
+
+### 本轮仍未做 / 边界
+- **KI-281 / KI-282（`idx20 DECOUPLE` 被静默跳过）本轮不改码**：缺口 A（`at_order_dest` 只看"最近旅行命令"）与缺口 B（`GetDecoupleVehicle()` 只返回尾部切点、表达不了"解出链头段"）都要动解挂边界模型，属行为级改动，须先有设计与复测清单；KI-282 的未确认项 ①②③（29 条表归属、`idx21 WAIT_COUPLE` 归哪半、`veh=30` 定性）也仍待玩家口径。
+- KI-280「第二条通路」本轮只加留痕探针、**不改**归还块结构：把名字/号归还移出 `if (v->r3r_orders_borrowed)` 会让"链头与等待方恰好同名"的巧合场景误清链头自己的名字，风险大于收益；先用 `NAME-RESTORE-SKIP` 取一轮实证再定。
+- 借用期间玩家手动改名（此时 `name_backup` 为空）会被本判据视为"借名"而不再寄存 —— 属已知边界，未做特殊处理。
+- 第 183 轮待办 2 / 3（读码核对 `R3RSkipUnfireableDecoupleOrder()` 与 `Couple()` 落点判据、定性 `veh=30`）本轮未推进，顺延到第 186 轮。
+
+---
+
+## 第 186 轮（2026-10-01）——解挂触发形态：为什么是「下一条是解挂」而不是「当前是解挂」
+
+**本轮未改任何源码**，只读码定性。承接 KI-281 / KI-282。详细报告 = 工作区 `R3R_decouple_trigger_round186_memo.md`。
+
+### KI-283（未修 / 属设计口径，严重度：中）解挂的触发锚点寄生在"前一条行车命令的到达事件"上
+
+- **来源**：玩家 2026-10-01 提问「为什么解挂命令要"下一条是解挂命令"的时候就触发，而不是"当前是解挂命令"的时候再触发，解决了这个，我们会轻松许多」。
+- **决定性证据**：`src\order_cmd.cpp:4580-4583`（`ProcessOrders(Vehicle*)` 分派表，定义在 `:4559`）——
+  ```cpp
+  case OT_DECOUPLE:
+  case OT_WAIT_COUPLE:
+      /* Decouple orders are consumed by the station arrival logic; wait orders keep the vehicle waiting. */
+      return false;
+  ```
+  注释逐字说明解挂「**由到站逻辑消费**」，它不是"能开过去、到了就收工"的命令，而是依附在到站事件上的附加动作。
+- **机制**：站台停靠期间，索引（`cur_real_order_index`）的推进由**离站**事件触发，不是由"停稳"触发 ⇒ 解挂必须发生的那一刻（停稳），索引必然还压在那条到站命令上。现场吻合：`3251 DECOUPLE-FIRE consist=29 real=17 mode=2`（`real=17` = `GOTO_STATION(5)`，不是 `idx18` 的 `DECOUPLE`）。⇒「当前是解挂」在站台路径上**永远晚于**解挂该发生的时刻。
+- **代价（KI-281 的根因）**：执行解挂时索引还在到站命令上，执行完必须**跨过"到站 + 解挂"这一对**，且不能只跨一格（只跨一格会停在解挂上 → `ProcessOrders` 返回 false → 僵死）。这就是 `R3RSkipUnfireableDecoupleOrder()` 两步规则的由来，也是 `COUPLE-SKIP-DECOUPLE` 顺手吃掉 `idx20` 的根源。**⇒ KI-281 不是可局部打补丁的 bug，而是"下一条"触发形态的必然副作用。**
+- **关键补充（可行性先例）**：`train_cmd.cpp:6421` 一带注释记录「after entering a depot, ProcessOrders advances cur_real **ONTO the DECOUPLE order itself**」——**车库路径上"当前是解挂"已经成立并在运行**（列车停在库里、`real` 在解挂上、`ProcessOrders` 每 tick 返回 false、等 R3R 钩子拆链后推进索引，未卡死），也正是 KI-282 缺口 A 里"库内 `DECOUPLE`"那第三条 `at_order_dest` 分支的来源。⇒ 玩家要的改造 = **把车库这条语义搬到站台**，属迁移而非新发明。
+- **改造收益（玩家"轻松许多"成立）**：①跳过机制整块可删（执行完索引天然前进一格）；②连续多条解挂天然依次触发（`idx18`/`idx20` 各自成立）；③判据收敛成一条「当前是解挂 ∧ 列车在合法位置（站台/车库）停稳」，替代"三合一 + 库内特例"；④**KI-282 缺口 A 直接消失**（不再需要回溯"最近一条旅行命令终点"——不是回溯不好，而是改形态后不需要回溯）；⑤站台/车库两路径统一。
+- **必须一起定的四件事**：①中间态能否跨 tick（库里允许，站台待验证是否被 idle/回库逻辑碰；稳妥=停稳→推进一格→同 tick 结账并执行→再推进一格）；②到站结算时序重排（现为"结账再拆链"，改后为"停稳→推进到解挂→结账→解挂"）；③`Couple()` 落点判据重写（"撞上就跨过"改为"停在解挂上等列车到位再触发"，需新增位置合法性判据拒绝"还在路点上就解挂"——**KI-281 的正解在这里**）；④连续多条解挂的"执行者/排程主人"逐条切换（承接 KI-282 未确认项 ①②）。
+- **未确认项**：U-1 站台路径"索引停在解挂上跨 tick"是否被引擎 idle/回库逻辑碰；U-2 到站结算与解挂同 tick 的先后；U-3 两条解挂的排程主人逐条计算（→ KI-282）；U-4 `veh=30` 定性（承接第 183 轮待办 3）。
+- **状态**：**已修（第 186 轮续，2026-10-01）**。玩家 2026-10-01 拍板：①站台推进时机 = **同 tick 闭环**（不新增推进点、不提前推进；解挂改为在引擎这次推进**之后**求值）；②到站结账与解挂的先后 = 结账 → 推进 → 解挂（无异议）；③耦合落点压在解挂上 = **A 不跨**，停在解挂等触发（并要求覆盖"车长 > 站台"，见 KI-286）；④连续多条解挂 = **A 每条独立求值**。落地：闸门由"内联在 `ProcessOrders` 之前"改为 lambda，求值点移到 `HandleLoading(mode)` 之后；判据收敛为「当前 real 就是 `OT_DECOUPLE` ∧ 停稳在合法位置」；`R3RSkipUnfireableDecoupleOrder()` 第 1 步（跨"到站 + 解挂"一对）删除。复测判据草案见报告 §九。
+- **顺带发现（本轮续已修）**：改形态把"解挂索引自己就是 D"变成前提，而 `DecoupleTrain()` 里 `decouple_idx` 的计算还留着旧口径的 `+1` ⇒ **KI-284**；平台标志清理只覆盖拆后仍连着链头的一半 ⇒ **KI-285**。两条均由玩家 2026-10-01 复测当场暴露。
+
+---
+
+## 第 186 轮（续）（2026-10-01）：闸门改形态落地后的两条现场回归 —— KI-284（`WAIT_COUPLE` 被跨过）+ KI-285（平台标志只清了一半）
+
+**玩家复测回报（原话）**：「第一个，等待挂接命令被莫名跳过了，第二个，我的车底它会自己蠕动」。
+**现场**：`build\R3R_debug.log`（1021 行 / 64 KB，第 186 轮 A~E 项落地后的 exe 产出）。详细取证 = 工作区 `R3R_decouple_trigger_round186_memo.md` 的 §十二。
+
+### KI-284（已修，严重度：高）解挂把 `decouple_idx` 记成 `D+1`：解出方**跨过紧随解挂的 `WAIT_COUPLE`** 直接开走
+
+- **ID**：KI-284
+- **来源**：玩家复测回报（第 186 轮改形态之后）；根因=旧闸门口径的残留 `+1`。
+- **现场证据（`build\R3R_debug.log`）**：
+  - `707`/`716` 行：解挂闸门命中，`DEPOT-ARR veh=24 spd=0 real=3(15)` ⇒ **当前 real = 3，就是 `OT_DECOUPLE`**（新闸门口径成立）。
+  - `717` 行：`DECOUPLE-FIRE consist=24 tx=33 ty=9 real=3 mode=2 num=1 segs=2 eff=0 plat=27/0`。
+  - 被挂车底（`head=6` 那张 29 条的表）`i=3 type=15 DECOUPLE`、**`i=4 type=17 WAIT_COUPLE`（等待挂接）**、`i=5 type=1 GOTO_STATION(5)`。
+  - `754` 行：`DECOUPLE-JUMP fire_real=3 dec_idx=4 wait_idx=65535 step=-1 v=24 u=0 n_u=29` + `JUMP-ORD 4 type=17` / `JUMP-ORD 5 type=1` ⇒ **解挂索引被记成 4（=D+1）**。
+  - `759` 行：`DECOUPLE-ADV dec_idx=4 v_real=1 u_real=5`；`761` 行：`DECOUPLE-DONE u=0 co=1 real=5` ⇒ 解出方落点是 **5**。
+  - `829` 行：`DEPOT-ARR veh=0 spd=0 real=5(1) … destTx=58 destTy=19` ⇒ 车底拿到的是 `GOTO_STATION(5)`，**开始自己驶离**。
+  - `760` 行：`DECOUPLE-ODOF first=0 second=0` ⇒ 策略也是从错的那一格（4=等待点）读出来的。
+- **根因**：`DecoupleTrain()`（`src\train_cmd.cpp`）里
+  ```cpp
+  const VehicleOrderID fire_real = v->cur_real_order_index;
+  VehicleOrderID decouple_idx = fire_real;
+  if (n_fire > 0) decouple_idx = (decouple_idx + 1) % n_fire;   // ← 旧口径残留
+  ```
+  这个 `+1` 属于**旧闸门口径**：那时 `fire_real` 是"刚跑完的到站命令"，解挂是它的**后继**，`+1` 恰好落在解挂自身（注释里 KI-215c 也是这么写的）。本轮闸门改成「当前 real 就压在 `OT_DECOUPLE` 上」之后，`fire_real` **本身就是解挂的索引**，再 `+1` 就把 D 记成 D+1 —— 下游三处全部差一格：①`R3RAdvanceAfterDecouple()` 从 `decouple_idx + 1` 重启 ⇒ 解出方落在 **D+2**，正好**跨过 WAIT_COUPLE**；②`DECOUPLE-ODOF` 从 `D+1` 读订单策略 ⇒ 读到等待点、玩家的声明被静默忽略；③`DECOUPLE-JUMP` 的 `JUMP-ORD` dump 起点跟着偏。
+- **修法（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：不再假定口径，改为**按订单类型自证** —— `decouple_idx = fire_real`，只有当 `GetOrder(fire_real)` 不是 `OT_DECOUPLE`（即索引还停在"到站命令"上的旧口径）时才 `+1`。这样两种闸门口径都不会差一。
+- **玩家两条报告的同一性**：**"等待挂接被跳过"就是"车底自己蠕动"** —— 跳过等待点 ⇒ 车底落在 `GOTO_STATION` 上 ⇒ 上一站结账完立刻起步；若同时残留在 `AdvanceInPlatform` 上还会被限速，看起来就是"蠕动"（KI-128 签名，见 KI-285）。
+- **复测判据**：①同场景 `DECOUPLE-JUMP` 应打 `dec_idx=3` 且 `JUMP-ORD 3 type=15(解挂)`、`JUMP-ORD 4 type=17(等待)`；②`DECOUPLE-ADV u_real=4`、`DECOUPLE-DONE u=0 … real=4`；③随后车底停在 `33,9` 不再出现 `DEPOT-ARR veh=0 real=5(1)` 的驶离；④`DECOUPLE-ODOF` 读数改为从解挂那格（`first/second` 若玩家声明过应显真实值，未声明则仍为 `keep`）。
+
+### KI-285（已修，严重度：中）解挂后平台对齐标志只清了**一半**（`AdvanceInPlatform` 残留 ⇒ 蠕行）
+
+- **ID**：KI-285
+- **来源**：承接 §十 的 **R-2**（玩家 2026-10-01 点名"车长 > 站台"），本轮实现时只覆盖了一半。
+- **根因**：R-2 的清理写成
+  ```cpp
+  DecoupleTrain(consist, true);
+  for (Train *w = consist; w != nullptr; w = w->Next()) w->flags.Reset(VehicleRailFlag::AdvanceInPlatform);
+  ```
+  但 `DecoupleTrain()` 返回后 **`consist` 只是两半中的一半**（含原链头的那半），被摘出去的另一半已经是一条独立链，`consist->Next()` **永远走不到**。平台标志是逐车字段，两半都可能带 ⇒ "解出的车底继续跑"的场景（订单表里解挂后面没有 `WAIT_COUPLE`）会残留 `AdvanceInPlatform`，下一次停站立刻进 `OT_LOADING_ADVANCE` 并被限速 = **KI-128 的"限速蠕行"**，与玩家说的"自己蠕动"吻合。
+- **修法（仅 `src\train_cmd.cpp`）**：把快照**移到拆链之前**拍（按拆前整链收集 `std::vector<Train *>`），拆完对快照里每一辆车清 `AdvanceInPlatform` —— 两半都覆盖。
+- **复测判据**：①解挂后任一半离站都不得出现"低速通过"；②`RESV-NOBOOK` / `TRP` 之外不再有异常低速；③车库解挂与耦合路径逐字不变。
+
+### KI-286（部分已修 / 待玩家复测与拍板，严重度：中）车长 > 站台：解挂的位置合法性必须按「列车与该站的对应关系」判，不能只看链头那一格
+
+- **ID**：KI-286
+- **来源**：玩家 2026-10-01 点名（第 186 轮报告 `R3R_decouple_trigger_round186_memo.md` 的 §十「追加要求：车长 > 站台」）；KI-283 的状态条引用本条（拍板 3 A「停在解挂等触发」要求覆盖该形态）。
+- **引擎自己的三条事实**（读码原文）：
+  1. 超长列车停稳时越出站台末端的那部分车被打上 `VehicleRailFlag::BeyondPlatformEnd`（`src\train_cmd.cpp:616-639` 的定位计算），**这些车不在站台 tile 上**。
+  2. 引擎承认"前端可能已不在站台 tile 上"：离站判据写作 `!IsTileType(moving_front->tile, Station) || moving_front->flags.Test(BeyondPlatformEnd)`（`src\train_cmd.cpp:4023-4025`、`:4300-4303`）。
+  3. 引擎为此提供 `Train::GetStationLoadingVehicle()`：**从移动前端跳过 `BeyondPlatformEnd` 的车，返回第一辆真正在站台上的车**（`src\train.h:414-419`）。
+- **三条硬要求 × 本轮落地情况**：
+
+  | 编号 | 要求 | 状态 | 落点 / 证据 |
+  |---|---|---|---|
+  | R-1 | 位置判据不得只看链头那一格；改为「列车与该站的对应关系」：链头越界但链中仍有车在站台上 ⇒ 视为停在站台上 | **已落地（有一处残留，见下）** | `src\train_cmd.cpp:16462-16467`：`in_depot = IsRailDepotTile(consist->tile)`；`plat = consist->GetStationLoadingVehicle()`（`:16464`）；`on_platform = plat != nullptr && IsTileType(plat->tile, TileType::Station)`；`at_order_dest = in_depot \|\| on_platform` |
+  | R-2 | 解挂后必须重算平台对齐标志（拆链改变列车长度，`AdvanceInPlatform` / `BeyondPlatformEnd` / `NotYetInPlatform` 描述的是【旧】列车） | **已落地（本轮续补齐）** | `src\train_cmd.cpp:16558-16581`：拆链**前**把整链收进 `std::vector<Train *> r3r_pre_split_chain`，拆后对快照逐车 `flags.Reset(VehicleRailFlag::AdvanceInPlatform)`；对偶于耦合路径 `src\train_cmd.cpp:10168-10181`。**KI-285 就是本条只做了一半**（`consist->Next()` 走不到被摘出的那一半），本轮续已修 |
+  | R-3 | 位置合法性是「关系」不是「格」：解出的某一半整段落在站台外时，不因"它不在站台 tile 上"而拒绝解挂 / 判非法 | **结构性满足** | 闸门只对**整链**求值（`r3r_try_decouple_arrival`，`src\train_cmd.cpp:16366`），代码内没有任何针对**解出侧**的 tile 检查 ⇒ 解出的一半落在站台外不影响触发 |
+
+- **R-1 的残留（未做，需玩家拍板）**：旧判据含「**站 ID 与目的地比对**」（第 186 轮报告 §十 R-1 原文引的 `IsTileType(consist->tile, Station) && 站 ID 匹配`，`src\train_cmd.cpp:16435-16436`），而新闸门只判 `IsTileType(..., TileType::Station)`，**不再比对站 ID**。风险面：列车离站那一 tick 若因 `cur_speed != 0` 未求值，索引会带着 `OT_DECOUPLE` 离开，此后在**任意**站台（含非预期站）停稳时闸门仍会命中。补回"站 ID = 该条旅行命令的目的站"是否必要、以及超长列车该用链中哪辆车取站 ID，须与玩家口径一致后再定。
+- **现场取证探针（本轮已加）**：`DECOUPLE-FIRE … plat=<站台内车数>/<越界车数>`（`src\train_cmd.cpp:16537-16554`）。`plat_in=0 && plat_beyond>0` ⇒ 命中的正是超长列车那一支；`plat_in≥1 && plat_beyond>0` ⇒ R-1 确实走的"链中取车"支。
+- **复测判据**（承第 186 轮报告 §十一 判据 5）：①超长列车在站台解挂时 `DECOUPLE-FIRE` 的 `plat=` 显示"站台内 ≥ 1 辆"且越界 > 0；②解挂成功、两半各自继续（不出现"僵在站台、解挂永不触发"）；③解挂后任一半离站不出现低速蠕行（KI-128 / KI-285 签名）。
+
+### 本轮修法自证（2026-10-01）
+
+- 复用既有 `d:\sourcecode of JGRPP\_tmp_inc_build.cmd`（**未新建任何 `.cmd`**），改动仅 `src\train_cmd.cpp`（无 `src\*.h`、无 `lang\*.txt`）⇒ 护栏判 `GUARD: incremental is safe (no header/lang file is newer than the newest object)`。
+- 构建：`build\R3R_incbuild.done` 的 `EXIT_CODE=0`（2026-10-01 17:53）、`build\R3R_incbuild.log` 尾部 `[3/3] Linking CXX executable openttd.exe`、`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 时间戳：`src\train_cmd.cpp` 17:48:32 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 17:51:52 → `build\openttd.exe` **17:53:26（51 565 056 B）**；`read_lints` 0 条。
+- 产物自证：本轮**未新增任何日志字符串**（改动是索引计算与清理范围），故 exe 自证按既有串即可 —— `DECOUPLE-JUMP` / `DECOUPLE-ODOF` / `DECOUPLE-ADV` 仍在（本轮的差异只能靠复测日志的 `dec_idx=` 数值证明，见 KI-284 复测判据 ①）。
+
+### 仍未做 / 未确认
+
+- U-1（承接 KI-283）：站台路径"索引停在解挂上跨 tick"是否被引擎 idle / 回库逻辑碰 —— 本轮落地的是**同 tick 闭环**（拍板 1），中间态只活在同一 tick 内，跨 tick 窗口已消掉，但**未实测**。
+- U-4（承接 KI-283）：`veh=30`（`real=17` = `WAIT_COUPLE` 停驻）定性仍未做。
+- KI-282（`idx20 DECOUPLE` 触发面 / 解出边界）与 KI-281 本轮未动：本轮的形态改造是它们的前置（改完后 `idx20` 才可能"当前就是解挂"），须以本轮 exe 复测后再定。
+- KI-286 的 R-1 残留（**站 ID 比对**）：新闸门只判 `IsTileType(tile, Station)`，不再按"该条旅行命令的目的站 ID"比对（见 KI-286 的"残留"条），是否补回待玩家拍板；R-2 / R-3 已落地。
+
+---
+
+## 第 187 轮（2026-10-01）：折叠判据的方向→像素偏移表用错了坐标系 —— KI-287
+
+### KI-287（已修，严重度：高）`R3RCheckChainFoldedDirection` 用「屏幕轴」罗盘表去算**世界轴**的 `x_pos/y_pos` 差分 ⇒ 沿 x 轴排列的链上真折叠被读成健康、穿模提交
+
+- **ID**：KI-287
+- **来源**：诊断（本轮离线代入 `build\R3R_debug.log` 现场数值）；临时分析报告 = `R3R_fold_dir_table_round187_memo.md`。
+- **现场证据（`build\R3R_debug.log` 9186–9207 行，`tile 24,9` 挂车）**：
+  - `9193 FOLDCHK COUPLE n=27 worst_gap=6 A idx=26 x=386 y=152 tile=24,9 dir=5 db=0 B idx=23 x=394 y=152 tile=24,9 dir=1 exp=2 nom=2 dist=8`
+  - `9194 COUPLE-PREFLIGHT head=24 last=26 fold=0 dirfold=0 gap=6 pair=(-1 dir=15, -1 dir=15) onsplice=0 splice=(26 dir=5, 23 dir=1)`
+  - `9196 COUPLE-SEAM-FLIP circ=4 a=26 dirA=5 b=23 dirB=1` ⇒ 闸门放行、直接提交
+  - `9197–9202 GEO respace-before` 链序与位置：`24(392) → 25(389) → 26(386) → 23(394) → 22(399) → 21(403)`，
+    即 `24→25→26` 沿 **−x** 单调、`26→23` 突然 **+x** 折回、之后继续 **+x** ⇒ **在 26↔23 处掉头的折链**；
+    `9199 veh=26 … dist=8 nom=2` 就是 KI-265 说的「结构性不可修」签名（穿模已落盘）。
+- **根因**：判据用
+  ```cpp
+  static const int dir_dx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 };
+  static const int dir_dy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
+  int dot = (b->x_pos - a->x_pos) * dir_dx[a_dir] + (b->y_pos - a->y_pos) * dir_dy[a_dir];
+  ```
+  但 `x_pos`/`y_pos` 是**世界（等轴测）坐标轴**上的像素（`src\intro_gui.cpp:82` 用 `RemapCoords(v->x_pos, v->y_pos, v->z_pos)`，
+  `RemapCoords` 的入参就是世界坐标），而这两张手写表是**屏幕坐标 + y 向下**的罗盘表。两套轴差一个 45° 等轴测映射：
+  `世界 +x = 屏幕 SW`、`世界 +y = 屏幕 SE`、`世界 −x = 屏幕 NE`、`世界 −y = 屏幕 NW`。
+  引擎权威表 `src\map.cpp:263`（`_tileoffs_by_dir`，经 `TileIndexDiffCByDir()` 取用）正是按这个映射命名的
+  （`DIR_NE=(−1,0)`、`DIR_SW=(1,0)`、`DIR_E=(−1,1)`、`DIR_W=(1,−1)` …），与手写表在
+  **`DIR_NE/SW` 的 dx、`DIR_E/W` 的 dy** 上符号相反或归零。
+  代入现场对 `(a=26 dir=5, b=23)`，`Δ=(+8, 0)`：手写表 `dot = 8×(−1) = −8` ⇒ 读成「健康」；引擎表 `dot = 8×(+1) = +8` ⇒ 「折叠」。
+  唯一的 8px 豁免（KI-201 附记 4/8）没帮上忙：`|8 − (2+2)/2| = 6 ≤ 8` 满足，但豁免还要求 `a->direction == b->direction`，而 `26 dir=5 ≠ 23 dir=1` ⇒ **不豁免**，点积必须算。
+- **为什么一直没暴露**：本工程历次现场链条都是**沿 y 排列**（`58,63`、`60,90`、`58,23`），相邻对 `Δx = 0`，
+  `dot` 只由 dy 列决定，而 dy 列在 `DIR_SE(+1)` / `DIR_NW(−1)` 上两表**恰好相同**（`3681 COUPLE head=50 tile=58,63` 全链 `dir=3`、
+  `5050 COUPLE-FLIP-BOTH head=48 tile=60,90` 全链 `dir=7` 都正常判折叠/健康）。只有当链沿 x 排列且方向落在 `DIR_NE/SW/E/W` 时才分叉 —— 本轮 `tile 24,9` 正是这个组合。
+  顺带：本轮 x 链上 `24→25`、`25→26` 两对（`Δx=−3`）用手写表也会算成 `+3`，但 `pair_dist = 3 = pair_expected` 且 `direction` 相同 ⇒
+  被 8px 豁免挡在点积之前，于是 bug 精确地从 `26→23` 这一个方向不一致的缝里漏出。
+- **修法（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h` / `lang\*.txt`）**：
+  1. 删掉 `R3RCheckChainFoldedDirection()` 开头的 `dir_dx[8]` / `dir_dy[8]`，把坐标系事实与历史错误写进函数头注释（防复发）；
+  2. 点积改取引擎权威表：
+     ```cpp
+     const TileIndexDiffC a_step = TileIndexDiffCByDir(a_dir);   // a_dir 已含 IsDrivingBackwards() 的 ReverseDir
+     int dot = (b->x_pos - a->x_pos) * a_step.x + (b->y_pos - a->y_pos) * a_step.y;
+     ```
+  `IsDrivingBackwards()` 那一支仍自洽（`ReverseDir()` 在世界轴上正好是偏移取反）。同文件 `14341` 行的 `YapfTrainCheckReverse()`
+  已是同一写法（`TileIndexDiffCByDir(moving_front->GetMovingDirection())`），本轮只是把唯一一处例外收拢。
+  **变更面有意收窄**：只影响「不享 8px 豁免」且方向落在 `NE/SW/E/W` 的 x 链（及 `E/W` 的 y 链）；享豁免的对在点积之前就 `continue`，逐字不变。
+- **构建自证（2026-10-01）**：复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）；护栏 `GUARD: incremental is safe`；
+  `build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 18:35:39 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 18:37:12 →
+  `build\openttd.exe` **18:39:15（51 566 080 B）**；`read_lints` 0 条；全树检索确认 `dir_dx`/`dir_dy` 与其字面量仅剩注释、无第二处副本。
+  本轮**未新增日志字符串**（改动是坐标系），差异只能由复测日志的 `dirfold=` / `pair=` / `onsplice=` 数值证明。
+- **复测判据**：①`9193` 那一对数值不变（`A idx=26 x=386 dir=5` / `B idx=23 x=394 dir=1 dist=8`）；
+  ②`COUPLE-PREFLIGHT` 变为 `dirfold=1`、`pair=(26 dir=5, 23 dir=1)`、`onsplice=1`；
+  ③紧随其后出现 `COUPLE-REFUSE-STILL-FOLDED`（KI-265 提交前硬闸门）并回滚，**不再**走 `COUPLE-SEAM-FLIP` 提交；
+  ④`GEO respace-before veh=26 dist=8 nom=2` 的穿模签名不再落盘；⑤`58,63` / `60,90` 两条 y 链场景判据逐字不变、不新出现 `COUPLE-REFUSE-STILL-FOLDED`；
+  ⑥车库拖动 / 解挂路径无回归（本函数只在耦合折叠修正与提交前闸门调用）。
+- **未确认项**：U-1 本轮是**离线代入日志数值**得出结论，未在实机同时打印两表 dot 做直接对照（修法正确性不依赖它，但若复测不触发，第一件事就是补这个对照探针）；
+  U-2 8px 豁免是否过宽未动（换成引擎表后本轮 x 链上那两对本来就健康，豁免在这两对上已无必要，但收紧影响 KI-06/KI-265 一串既有结论，须独立轮次）；
+  U-3 `DIR_N/S/SE/NW` 在纯 x 链上的新旧数值不同，本日志无该类现场样本、未做实测比对；
+  U-4 承 KI-284/285/286 的复测仍未做，与本条互不阻塞。
+
+
+## 第 188 轮（2026-10-01）：车库命令的车站错挂 + 原地等挂机车被卡死自愈逻辑掉头 —— KI-288 / KI-289 / KI-290
+
+> 临时分析报告 = `R3R_wrong_couple_stuck_round188_memo.md`；本轮前半段 = 纯取证定性（无构建自证），后半段已按玩家拍板落地 KI-288 / KI-289（见下方「第 188 轮构建自证」），KI-290 仍待取证。
+> 现场 = `build\R3R_debug.log`。玩家报告：①机车去指定车库挂车，却在**车站**挂上了刚解下来的车底；②机车卡死一段时间，后由玩家手动掉头解除（玩家拍板口径：**自愈两次再停止**）。
+
+### KI-288（已修，第 188 轮，**复测搁置**，严重度：高）`GOTO_COUPLE → 车库` 时闸门放行「站在任意车站」的候选车底 ⇒ 命令写在车库、实际挂接点在车站
+
+- **ID**：KI-288　**来源**：玩家报告 + 诊断（第 188 轮）
+- **现场证据**：
+  - `9537 DEPOT-ARR veh=26 spd=0 real=0(16) curType=16 stuck=1 tileDepot=0 tx=4 ty=11 destTx=1 destTy=11 destDepot=1 destResv=0 tileEqDest=0` ⇒ 命令目的地 = **车库 1,11**，机车在**车站格** 4,11。
+  - 同一窗口 `CPL-PATHFOUND veh=26 found=0` + `CPL-GATE reject=target-not-wait ... tgt=23 aOrd=16 tOrd=0` + `COUPLE-FAIL`（当时车底 23 无 `WAIT_COUPLE`，闸门正确拒）。
+  - `9626 SVC-DEPOT-SKIP veh=23 cur=17 real=27(17) tile=4,11 tag=couple-protocol`（`cur=17=OT_WAIT_COUPLE`）⇒ 8px 外的车底成为合法候选。
+  - `10178 COUPLE-PREFLIGHT head=26 last=24 fold=0 dirfold=0 gap=3 ... splice=(24 dir=1, 23 dir=1) spd=0 db=1` → `10184 COUPLE-OK loco=26 rear=0 consist=23 co=1 real=28 type=7 tx=4 ty=11` ⇒ **`COUPLE-OK` 打在车站 4,11，而命令目标是车库 1,11**。
+  - 几何起点：`9416 DECOUPLE-FIRE consist=26 tx=4 ty=11 ...` / `DECOUPLE-DONE u=23 co=1 real=27 tx=4 ty=11 x=72 y=184`，机车 `x=64` ⇒ 解挂把车底卸在**同格 8px** 之外。
+- **根因**：`src\couple_group.cpp:305-311`（`R3RCoupleAllowedIgnoringPair()`）的车库分支只拒「站在**别的车库**格上的候选」——`IsRailDepotTile(target->tile) && GetDepotIndex(...) != dest.ToDepotID()`；候选站在**车站**格时该条件为假 ⇒ **放行**。车站分支（`:317`）有对称的拒绝，车库分支缺。注释本意是放行「车库门口那段已非车库格的接近轨道」，实现放大成「非车库格即放行」。镜像副本 `src\train_cmd.cpp:10819-10825`（`R3RCoupleTargetAtOrderStation()`）对车库命令**无条件 `return true`**，同洞（该函数只用于给探针行选标签，但注释要求两者同步）。
+- **为何现在才暴露**：闸门由 KI-165（2026-09-22）引入，此前现场只有「车站命令挂错车站」；「车库命令 + 候选停在车站」还需候选恰好落在半车长内（解挂把车底卸在鼻子底下），组合很窄。
+- **修法（已实现，仅改 `src\couple_group.cpp` + `src\train_cmd.cpp` 两个 .cpp，未碰任何 `src\*.h`）**：
+  - `src\couple_group.cpp`（`R3RCoupleAllowedIgnoringPair()` 车库分支）：在原「别的车库格」拒绝之后补一行 `if (IsRailStationTile(target->tile)) return false;`（车站格绝不属于任何车库），并写注释指向本轮 veh=26 现场、注明必须与 `R3RCoupleTargetAtOrderStation()` 同步。车库门口那段「已非车库格的接近轨道」仍是 plain rail ⇒ 照旧放行，宽容没有丢。
+  - `src\train_cmd.cpp`（`R3RCoupleTargetAtOrderStation()`）：车库命令原为**无条件 `return true`**，改为镜像判断——候选在车站格 ⇒ `false`；否则 `!IsRailDepotTile(target->tile) || GetDepotIndex(target->tile) == order.GetDestination().ToDepotID()`。车站命令那一支一字未动。
+- **复测判据**：①同场景不再出现「命令 `destDepot=1 destTx/destTy` 指向车库、而 `COUPLE-OK` 的 `tx/ty` 在车站格」；②`CPL-GATE` 对该候选出现新的拒绝标签（或 `CPL-SKIP`）；③车库内/车库门口的正常挂接（含接近轨道）逐字不变、不新出现拒绝。
+
+### KI-289（已修，第 188 轮，**复测搁置**，严重度：高）KI-193「原地等待」的 `GOTO_COUPLE` 机车没有免于引擎卡死自愈掉头 ⇒ 掉头后车尾贴上刚解下的车底
+
+- **ID**：KI-289　**来源**：玩家报告 + 诊断（第 188 轮）
+- **现场证据**：
+  - `9514 TRP veh=26 ... type=16 spd=0 ... mstuck=1 fto=1 => ok=0 res=0`、`9537 ... stuck=1 destResv=0` ⇒ 等待态被标 `Stuck`。
+  - `10164 REVERSEDIR veh=26 tile=4,11 dir=1 order=16 spd=0 nv=3 rev=0 stuck=1 db=0` ⇒ **`rev=0`（非玩家）+ `stuck=1`**，即引擎自愈掉头；紧随其后 `10178 COUPLE-PREFLIGHT ... gap=3 ... splice=(24 dir=1, 23 dir=1) db=1` ⇒ 掉头把**车尾 24** 送到 8px 外的车底 23 面前，直接成为 KI-288 的扳机。
+  - `10284` 又一次 `REVERSEDIR ... rev=0 stuck=1` ⇒ 同机制复发。
+- **根因**：KI-193（第 109 轮）只实现了「目的地无等待车底时不推命令」（`R3RCoupleOrderDestinationReached()` + 500 tick 计时），**没有**保护等待中的机车不被引擎挪走。等待态在引擎眼里就是「无预留、不能前进」⇒ `stuck=1`，于是 `train_cmd.cpp:16808-16821`「Handle stuck trains」的 `turn_around = wait_counter % (pf.wait_for_pbs_path × DAY_TICKS) == 0 && pf.reverse_at_signals` 攒够后调用 `ReverseTrainDirection()`。掉头本身还会打乱 `depotDir/enterDir` 与目的地关系。
+- **修法（已实现，仅改 `src\train_cmd.cpp` 一个 .cpp，未碰任何 `src\*.h`）**。玩家拍板口径＝**自愈两次再停止**（不是一次也不许，也不是直接掐死自愈）。落地分两 halves：
+  - **生产者（标记什么算「在等一个还不存在的车底」）**：`TrainCoupleHandler()` 里，凡落到 `if (u == nullptr)` 且**已停稳**（`!r3r_rolling`）的分支 —— 即「精确位置没命中 `GetCouplePosition()`、9 格触碰扫描里也没有一个候选」—— 打 `_r3r_couple_no_target[v->index] = 1`。**刻意不要求 `R3RCoupleOrderDestinationReached()`**：本轮现场机车停在**车站** 4,11 而命令目的地是**车库** 1,11（`tileEqDest=0`），若按「已到点」判就完全覆盖不到。标记一旦立起就**持久**（该分支在非到点停驻时每 tick 都会重新打），候选一出现（`u != nullptr`）或订单不再是 `OT_GOTO_COUPLE` 时清除；订单离开时同时清 `_r3r_couple_wait_heals`，让下一次约会从两次额度重新开始。
+  - **消费者（卡死处理块）**：`train_cmd.cpp:16867` 起的 "Handle stuck trains" 里新增 `r3r_wait_no_target` / `r3r_heals` / `r3r_heal_exhausted` 三件套。`r3r_heal_exhausted`（额度用完）时把 `turn_around` 强制置假，并在 `r3r_rev_wanted`（含 `TPRRF_REVERSE_AT_SIGNAL` 那条独立通路）为真时**不再调用 `ReverseTrainDirection()`**，只打一次 `COUPLE-WAIT-NOHEAL`；未用完时照常掉头并打 `COUPLE-WAIT-HEAL`（带 `n=/limit=`）。非等待态（标记不存在）时 `r3r_heals == nullptr`，**`ReverseTrainDirection()` 与全部既有判断一字不动**，引擎原行为 100% 保留。常量 `R3R_COUPLE_WAIT_HEAL_LIMIT = 2`；`*r3r_heals` 用「超打一格当 log-once 哨兵」（`== LIMIT` 才打，然后 `++`）。
+  - 未做的事：**没有**清 `VehicleRailFlag::Stuck` 位（PBS/预留逻辑还读它，见 KI-208）；**没有**动速度/刹车（KI-265 的教训：拒绝分支清 `cur_speed` 会让机车停在挂车距离外再也挂不上）；**没有**碰 `_r3r_couple_dest_idle` 的 500 tick 计时与 KI-193 的 4 次提交失败兜底（二者仍是另外两条独立出口）。
+- **复测判据**：①同场景等待期内 `REVERSEDIR ... rev=0 stuck=1` 最多出现 **2 次**，之后出现一行 `COUPLE-WAIT-NOHEAL veh=26 ... heals=3 (self-heal exhausted, waiting in place)` 且机车**停在原地不动**；②每次自愈前应有 `COUPLE-WAIT-HEAL veh=26 ... n=1/2 limit=2`，且间隔≈`pf.wait_for_pbs_path × DAY_TICKS`；③机车在 `4,11` 停车期间不应再出现 `CPL-GATE reject=target-not-wait` 之后紧跟 `COUPLE-OK tx=4 ty=11` 这种「命令指车库、实际挂车站」（KI-288 的判据）；④车库门口/半路真卡死（订单不是 `OT_GOTO_COUPLE` 或确实有候选）**不得**出现 `COUPLE-WAIT-HEAL/NOHEAL`，掉头行为逐字不变；⑤订单离开 `GOTO_COUPLE` 后重新约会，额度必须重置（再来 2 次）。
+
+### 第 188 轮构建自证（KI-288 + KI-289）
+
+- 复用既有入口 `_tmp_inc_build.cmd`（**未新建任何 .cmd**），`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ 两个 .cpp 改动走增量。
+- `build\R3R_incbuild.log` 尾部 `[4/4] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-10-01 20:55:29）。
+- 日志内 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 时间戳：`src\couple_group.cpp` 20:50:17 → `couple_group.cpp.obj` 20:54:11；`src\train_cmd.cpp` 20:53:12 → `train_cmd.cpp.obj` 20:54:09；`build\openttd.exe` @ 2026-10-01 20:55:12（51 566 080 B）晚于全部源码与 obj。**构建前已确认 openttd.exe 未在运行。**
+- `read_lints`：`src\train_cmd.cpp` / `src\couple_group.cpp` 均 **0 条**。
+- 产物自证：`findstr /c:"COUPLE-WAIT-HEAL" /c:"COUPLE-WAIT-NOHEAL" build\openttd.exe` = **EXE-HIT**。
+- 状态＝**已实现 + 已编译**，游戏内复测待做（判据见 KI-288 / KI-289 两条目）。
+
+### KI-290（未修，**复测搁置**，严重度：中）错挂后的 27 节链 `db=1` + 领车端无驾驶室 + `tt/real` 脱钩 ⇒ ~735 行日志零遥测、只挪 4 格，玩家手动掉头才恢复
+
+- **ID**：KI-290　**来源**：玩家报告 + 诊断（第 188 轮）
+- **现场证据**：
+  - `10248 NOCAB-SET this=26 db=1 last=0 lastSub=0x04 lastEng=0 lastLead=0`（与 `10180`/`10340` 同形，共 3 次）。
+  - `10284 REVERSEDIR ... stuck=1 db=0` → `10312 REVERSEDONE db=1 mvfront=0` ⇒ **领车端 = 0 号车**，而 0 号是 `lastSub=0x04 lastEng=0 lastLead=0`（普通**货车**，无驾驶室）。
+  - `10346 DEPOT-ARR veh=26 spd=0 real=2(1) curType=1 ... tt=28 impl=2` ⇒ `cur_real_order_index=2` 对 `cur_timetable_order_index=28`（KI-94 脱钩）。
+  - `10347 TRP-AUTO veh=26 real=2 type=1 dest=1176 ok=1 res=1 stuck=0 wc=0`（有预留、非 Stuck）之后，`10348–11082` 只有每 tick 一行 `TT-CHK-BREAK pre-processorders veh=26 real=2 tt=28 impl=2 n=29 curType=1`，**无任何 CRT / TRP / CPL 行**；位置仅 `4,11 → 8,11`。
+  - `11083 REVERSEDIR veh=26 tile=8,11 ... rev=1`（**玩家手动**）→ `REVERSEDONE db=0 mvfront=26` → `11139 CRT veh=26 order=1 dir=1 origin=2,11 td=0 found=1` ⇒ 恢复。
+  - 另有健康窗口作对照：`10250 DB-CLEAR head=26 staleNocab=1` + `10283 CHAIN-ATTRS2 couple head=26 ... spd=80 nocab=0 db=0`（此窗口内车从 `4,11` 挪到 `8,11`）。
+- **重要边界（防误判）**：`TCF_NO_DRIVING_CAB` 只把速度上限压到 **32 km/h**（不置 0）；`NOCAB-LIMIT` 是**一次性 static 日志**（全日志仅在 `1816/1820` 为 `veh=27` 打过），**该车无 `NOCAB-LIMIT` 不等于没触发**，不能当证据。
+- **未确认项 U-1**：段二是「完全静止」还是「32 km/h 慢爬」——日志无全局 tick 计数，`DEPOT-ARR`/`CRT`/`TRP` 均边沿触发（慢爬不打行），现有证据只能证明「无新增预留/无路径事件」，不能区分。**下一步**：补只读探针（每 N tick 打 `cur_speed` / `db` / `GetMovingFront()` / `cur_real_order_index` / `tt` / `mvfront`），取证后再定性。**在拿到 U-1 之前不得改速度/刹车逻辑**（历史教训见 KI-265：拒绝分支清 `cur_speed` 会让机车停在挂车距离外，永远挂不上）。
+- **候选机制（均未证实）**：①`db=1` + 领车端无驾驶室 + 27 节长链导致逐 tick 重算/重试而不产生遥测；②`borrowed=1 owner=23` 的借用索引与 `tt/real` 脱钩使订单推进空转；③二者叠加。
+- **复测判据**：①KI-288 修复后错挂不再发生时，本条现象应自然消失；②若仍出现，按 U-1 探针给出 `spd/db/mvfront` 逐 tick 曲线定性；③手动掉头（`rev=1` → `mvfront` 回到真机车）仍应立刻恢复（现行行为，不得回退）。
+
+## 第 189 轮（2026-10-01）：`GOTO_COUPLE → 车库` 的机车应「先入库再干等」而不是占用站台 —— KI-291（待拍板 / 待实现）
+
+> 本轮**未改任何源码**（玩家指示：先记录备忘 + 回答问题，下一轮再修复）。无构建自证。
+> 临时分析报告 = `R3R_couple_wait_in_depot_round189_memo.md`；现场仍是第 188 轮的 `build\R3R_debug.log`。
+> 本轮另附「脱离方向机制复述」（玩家要求，只说现象），见本节末尾附录。
+
+### KI-291（待拍板 / 待实现，**搁置**，严重度：中）`GOTO_COUPLE → 车库` 的机车在**还没到车库**时就原地干等，一直占着站台
+
+- **ID**：KI-291　**来源**：玩家 2026-10-01 提议（第 189 轮）；与 KI-288 / KI-289 同族
+- **玩家口径（原话意译）**：既然这台机车是因为「指定车库内没有符合条件的列车」才原地等，那能不能让它**先进库再干等**，不要占着站台。
+- **现象（第 188 轮现场，逐字可复核）**：
+  - `DECOUPLE-FIRE consist=26 tx=4 ty=11` ⇒ 机车 26 在**车站格 4,11** 解挂。
+  - 下一条命令是 `GOTO_COUPLE → 车库 1,11`（`destDepot=1`），而 `DEPOT-ARR veh=26 ... tx=4 ty=11 ... tileEqDest=0` ⇒ **它并没有开进车库**，直接在车站格上进入了「等一个不存在的车底」。
+  - 此后 `COUPLE-FAIL` / `CPL-PATHFOUND found=0` 原地不动（KI-193 的 `COUPLE-DEST-EMPTY` 心跳），直到 KI-289 的引擎自愈把它掉头、车尾贴上 8 px 外的车底 23（→ 触发 KI-288 的错挂）。
+- **关键区分（本轮最重要的一条，避免下一轮修错地方）**：**库里干等本来就已经支持，不需要新写机制**：
+  - `R3RStopChainInDepot()` 会把执行「库内 `GOTO_COUPLE`」的链 `r3r_parked = true` + `VehState::Stopped`，停在库内等（KI-118 / KI-153）；
+  - `TrainLocoHandler` 的「库内挂车豁免」（`r3r_pending_depot_couple`）= `IsEngine() && r3r_parked && 待执行命令是 GOTO_COUPLE && 其目的地就是脚下这个车库`；
+  - 耦合成功后 `r3r_parked = false`，由正常 `ProcessOrders` 接管出库。
+  ⇒ 真正的问题不是「库里能不能等」，而是 **「为什么它没先开进库」**。188 现场 `tileEqDest=0` 说明它是在**路程中途（车站格）**就进入了等待。
+- **未确认项 U-1（下一轮必须先取证，两条互斥可能）**：
+  - U-1a **等待规则抢跑**：只要当 tick 扫不到候选车底就原地等（不论是否已到目的地）⇒「驶向车库」这件事被等待规则拦下了；
+  - U-1b **进库路径本身被拒**：车库门口/进库股道被占，或寻路去不了 ⇒ 它到不了库，只能停在现在这格。
+  - 判据：补只读探针（每 N tick 打 `cur_speed` / `current_order` 类型 / `cur_real_order_index` / 目的地车库号 / `tileEqDest` / `Stuck` / `r3r_parked` / 本 tick 是否被等待规则拦下），复跑同场景，区分「不动（被拦）」与「想动动不了（无路）」。
+- **玩家提议的可行性与副作用（待拍板，下一轮才改码）**：
+  - 可行面：库里等是现成机制；机车进库后**不再占站台**，正好消掉 188 现场的观感问题，也让 KI-288 的错挂场景（站台格上等）自然不成立。
+  - 风险 1（**已知死锁面，必须一起处理**）：KI-153 注释写明 —— `r3r_parked + Stopped` 一旦残留，`CheckTrainStayInDepot` 的 `GOTO_COUPLE` 到达守卫会一直返回真，**机车被钉死在库里出不来**。让机车「为了等待而进库」等于把这条路径从「玩家工具触发」扩大到「订单自动触发」，必须先设计好出库/放弃的出口（超时、订单变更、库位被抢、玩家手动编辑都要能解）。
+  - 风险 2：进库需要「库位可用」；目标车库停满时进不去 ⇒ 必须有回落（原地等 / 停在库门口 / 下 tick 再试）。**回落路径不能又是占站台**，否则等于没修。
+  - 风险 3：机车在库内时**不是可见的占线对象**，库位是硬资源；多台机车同时对同一车库 `GOTO_COUPLE` 会出现「排队占库」。
+  - 风险 4：与 KI-289 的交互 —— KI-289 已把「等一个不存在的车底」时的引擎自愈限到 2 次；若改为进库等待，库内有独立分支、根本不会走卡死自愈，故 `_r3r_couple_no_target` 标记**预计不必**把「库内等待」计入等待态（待实现时复核）。
+  - 风险 5：不是所有 `GOTO_COUPLE → 车库` 都该进库等 —— 只有「目的地车库内确实没有候选」时才该进库；库里有候选、只是还没开到，仍应正常驶入（现行行为）。
+- **复测判据（实现后）**：①同场景机车应驶入车库 1,11 并在库内等待，站台格 4,11 空出；②等待期间不得出现 `REVERSEDIR ... rev=0 stuck=1`（库内分支不应走卡死自愈）；③订单变更 / 玩家手动编辑 / 库位被占时能正常出库，不得复现 KI-153 的「钉死在库」；④目标车库停满时的回落行为明确且不占站台。
+
+### 附录（非缺陷，口径记录）：脱离方向机制复述 —— 只说现象
+
+（玩家 2026-10-01 要求复述。两份来源：KI-149「解挂缝 = 双向不可通行的路」与 KI-241「列车的限制脱离方向」。）
+
+1. **解挂缝**：机车解挂后，被解下的车底就停在机车正后方**同一股道**上，两车之间只留 1~2 px 的车钩缝。这条缝被当作**双向都不通行的路**：缝在车尾 ⇒ 不许原地掉头；缝在车头 ⇒ 不许向前预留进路。于是列车会改从站台的另一端出站，而不是在缝前干等。
+2. **背离才算接缝**：两半贴着时，光看距离永远分不出「接缝」和「追尾」（两者近到一样）。区分靠方向 —— 只有当本链在**背离**对面链时才算接缝、才豁免碰撞；**朝对面开过去必须照旧判碰撞**。现象上：解挂后另一半静止在后方或侧方、机车正常开走 ⇒ 不判碰撞；解挂后机车掉头朝另一半压过去 ⇒ 判碰撞。
+3. **两端同时被贴住**：前后各贴一辆等挂的车底时，两个方向都不许动 —— 物理上确实过不去，只能人工把一侧挂走或挪走。
+4. **判据只看当下世界状态**：贴合 + 位于该端外侧 + 对方在等挂；不写任何新标记。对方被挂走、拖离或改变命令后，下一 tick 自动恢复，不需要清理。
+5. **脱离的唯一手段是掉头**：列车被接缝挡住时能做的只有换端掉头（在引擎里表现为「改按倒车方向行驶」）。所以任何把「健康倒车」误读成「折叠」的方向判据，都会**否决掉头、让列车瘫痪**（KI-242 就是这个坑）。
+
+## 第 190 轮（2026-10-01）：第 188 轮修复（KI-288 / KI-289）实机复测核验 —— KI-289 无法判定，KI-288 已生效，另发现 KI-292
+
+> 本轮**未改任何源码**（玩家指示「算了，不用改了」，本轮只核验探针）。无构建自证。
+> 临时分析报告 = `R3R_round188_retest_round190_memo.md`。
+> 核验对象 = 复测现场 `build\R3R_debug.log`（12741 行 / 837 064 B，mtime 2026-10-01 21:25），由第 188 轮 exe（`build\openttd.exe` @ 2026-10-01 20:55:12，51 566 080 B，含 KI-288 / KI-289）产生。探针字符串已在 exe 内（`COUPLE-WAIT-HEAL` / `COUPLE-WAIT-NOHEAL` / `dest-mismatch`），排除「改了源码没编进 exe」。
+
+### KI-289 复测结论（**2026-10-01 同轮更正**）：判据①**被手动操作污染** ⇒ 本轮**无法判定**，不是「未通过」
+
+> ⚠ 本节初版写的是「未通过 / 抑制面未覆盖真实路径」，那是**错的**。玩家当即指出：`REVERSEDIR veh=26` 那 6 次**是他手动掉头**（他为了让机车够到车底而反复点反向）。更正记录见本节末「更正依据」。
+
+- 撤回的推理：初版把「`REVERSEDIR veh=26` 6 次 > 判据上限 2 次」当作「引擎自愈掉头仍在发生」。玩家说明这 6 次是**手动**（`CmdReverseTrainDirection` → `ReverseTrainDirection`，走的是**命令**路径），而 KI-289 的抑制点在 `train_cmd.cpp:16914` 的「Handle stuck trains」块内（**tick 自愈**路径）。
+- ⇒ 手动掉头**本来就不经过**抑制点，所以 `COUPLE-WAIT-HEAL` / `COUPLE-WAIT-NOHEAL` 各 **0 次**是**预期行为**，**不能**据此证明「抑制面没盖住真实路径」。判据①的计数（6 次）里手动与自愈混在一起，**无法分离** ⇒ 判据①本轮无从判定。
+- 保留的客观事实（与结论无关，仍可复核）：`REVERSEDIR veh=26` 6 行全同形、`stuck=1`、`db` 在 0/1 间来回。
+- **KI-289 状态：由「未修」改回「已修·待复测」，本轮判定 = 无法判定（现场未发生引擎自愈掉头）**。要判定它，需要一个「机车原地等挂、玩家全程不干预」的现场。
+- 更正依据（原始对话，2026-10-01）：玩家原话「那个反复掉头是我的手动行为」。
+
+### KI-288 复测结论（**2026-10-01 同轮更正**）：判据①**通过，但归因变了**
+
+- 判据①（不再出现「命令指车库、`COUPLE-OK` 打在车站」）**通过**：全日志最后一条 `COUPLE-OK` 是 `loco=26 rear=0 consist=23 co=1 real=25 type=1 tx=24 ty=9`（站台 24,9，属**合法站台挂接**），**没有任何 `COUPLE-OK ... tx=4 ty=11`**（第 188 轮现场有 `10184 COUPLE-OK loco=26 ... tx=4 ty=11`）。
+- ⚠ 更正：初版说「不能归功于 KI-288 的新拒绝分支，因为 `reject=dest-mismatch` 0 次 ⇒ 判据根本没被评估」。**后半句错了**：KI-288 的判据并不只在闸门（`R3RCoupleTargetAtOrderStation()`）里，它**同时**是候选筛选器 `R3RCoupleAllowedIgnoringPair()` 的一部分（`couple_group.cpp:321` 一带）。配对扫描阶段就把它拒掉的候选**根本走不到闸门**，所以 `dest-mismatch` 当然 0 次 —— 这正是「它已经生效」的表现，而不是「没被评估」。
+- ⇒ **KI-288 本轮判定 = 已生效（错挂消除），但生效方式过于粗暴：拒掉之后没有任何后续动作，直接把机车钉死在原地（见 KI-292）**。
+
+### KI-292（未修，**搁置**，严重度：高）解挂后机车执行「GOTO_COUPLE → 车库」订单，而目标车底停在站台格 ⇒ 候选在**配对扫描阶段**就被 KI-288 的目的地判据筛掉 ⇒ 配对锁**从未建立**（不是「被旧主人冻结」）⇒ 闸门只能报 `pair-mismatch`、机车原地卡死
+
+- **ID**：KI-292　**来源**：第 190 轮复测现场诊断（含 2026-10-01 同轮更正）
+- **现场时间线（逐字可复核）**：
+  1. `10768 COUPLE-OK loco=26 rear=0 consist=23 co=1 real=25 type=1 tx=24 ty=9 x=386 y=152` —— 26 在**站台 24,9** 挂上 23，属合法挂接（26 当时在执行的 GOTO_COUPLE 是**站台型**）。
+  2. `11159 DECOUPLE-FIRE consist=26 tx=4 ty=11 real=26 mode=2 num=1 segs=2 eff=23` → `11200 DECOUPLE-DONE u=23 co=1 real=27 tx=4 ty=11 x=72 y=184` —— 26 在 **4,11** 把 23 整段解下（`GEO settle-decouple-u`：head=23、24 节、沿 x 72→165 排开）。
+  3. `11280 DEPOT-ARR veh=26 ... real=0(16) curType=16 stuck=1 tileDepot=0 tx=4 ty=11 **destTx=1 destTy=11 destDepot=1**` + `11288-11291 LOCO-ORD 0 type=16 / 1 type=6 / 2 type=6 / 3 type=16` —— 解挂后订单索引回到 **0**：**GOTO_COUPLE，目的地是车库 1,11**（`destDepot=1`）。而 26 自己停在**站台格 4,11**（`plat=27/0`），23 也停在 4,11。
+  4. `11285 reject=target-not-wait ... tOrd=0`（解挂瞬间 23 还没转成 WAIT_COUPLE）→ `11299 DEPOT-ARR veh=23 ... real=27(17) curType=17 stuck=0 tx=4 ty=11`（23 转 OT_WAIT_COUPLE）→ 此后全是 `CPL-GATE reject=pair-mismatch site=geo|scan act=26 tgt=23 aOrd=16 tOrd=17`，**958 行，无一行属于别的车对**。
+  5. `CPL-PAIR` 全日志**没有** `act=26` 任何一行（`findstr /c:"CPL-PAIR act=26"` = 0）；涉及 `tgt=23` 的最后一行是 `10654 CPL-PAIR act=24 tgt=23 dist=0`，即**第 1 步那次挂接之前**的过程（10654 到位 → 10768 挂上）。而且 `10654` 是**全日志最后一条** `CPL-PAIR`（共 155 条），`10655..12741` 区间内一条也没有 ⇒ 解挂之后**整个场景再没有任何一辆车建立起配对锁**。注：`R3RDbgEdge`（`train_cmd.cpp:6144-6165`）只在「同 key 同 payload」时抑制，**首次出现的 `(act,tgt)` 必定打印**，故计数检索在本条上是可靠证据（不是「被节流掉了」）。
+- **根因（更正后）**：不是「KI-182 的锁冻结在旧链 24 上并挡住了 26」。真实链路是：
+  1. 挂接成功（10768）与解挂（11159）时，`R3RUnpairCoupleTargets()` 都会把双方锁清掉（`train_cmd.cpp:7816-7822`，注释明说「neither part of a split is still on its way to couple onto the other」）⇒ **23 侧不可能停在 24 上**。
+  2. 真正的问题是**新锁建不起来**：`R3REnsureCouplePair()` 每 8 tick 重扫候选，筛选用 `R3RCoupleAllowedIgnoringPair(coupler, t)`（`train_cmd.cpp:11029` 一带）。26 的订单是**车库型**（`GetCoupleIsDepot()==true`），而 KI-288 在 `couple_group.cpp:321` 一带对此写了 `if (IsRailStationTile(target->tile)) return false;`；23 恰停在**站台格 4,11** ⇒ 被筛掉 ⇒ 扫描结果 `best=nullptr` ⇒ **根本不调用配对** ⇒ 没有 `CPL-PAIR` 行、26 的锁恒为 Invalid。
+  3. 闸门里 `pair-mismatch`（KI-182）排在 `dest-mismatch`（KI-288）之前（`:10872-10895`）⇒ 日志只能看到 `pair-mismatch`，**把真因 `dest-mismatch` 永久遮住**（这就是 958 行里一次 `dest-mismatch` 都没有的原因）。
+  4. 机车既不推进订单也不移动：`11283 CPL-PATHFOUND veh=26 found=0`（GOTO_COUPLE 的寻路目标是**等待车底**，车库 1,11 里没有 ⇒ 无路）；KI-193 的「目的地无车底，500 tick 后跳过订单」只在 **`u == nullptr` 且目的地已到**时计时，而 26 认为目的地（1,11）**还没到** ⇒ 计时器永不启动 ⇒ 永久停留。玩家看到的就是「卡死」，于是他手动反复掉头（=`REVERSEDIR veh=26` 6 次）。
+- **与 KI-291 的合流**：第 189 轮玩家已拍过「`GOTO_COUPLE → 车库` 的机车应**先入库再干等**，不该占用站台」（KI-291，状态=待实现）。本条是它的**下游后果**：机车没入库、停在站台，于是 KI-288 的目的地判据把它唯一的候选拒掉，死锁闭环。
+- **修法方向（下一轮，未拍板）**：
+  - (a) **给筛选器补观测**（最优先、零行为变更）：在 `R3REnsureCouplePair()` 的候选循环里，对「被 `R3RCoupleAllowedIgnoringPair` / locker / IsCoupleTarget 拒掉」的候选打节流只读行 `CPL-PAIR-SKIP act= tgt= why=dest|lock|notwait`。本轮教训就是「没有这行，只能靠推断，推错了」。
+  - (b) **推进订单**：把 KI-193 的「目的地无车底 ⇒ 超时跳过订单」判据从「`u == nullptr` 且已到目的地」放宽为「本扫描周期内**没有任何合格候选**且订单目的地已达 **或** 目的地/几何上不可能满足」⇒ 机车能自己开走，不再钉死。
+  - (c) **实现 KI-291**（先进库再等）：机车在站台上执行车库型 GOTO_COUPLE 时，先开到目标车库格再挂接判据生效。
+  - (d) 若 (c) 会长期不落地，退一步在 `R3RCoupleAllowedIgnoringPair()` 的 depot 分支补「机车自身也不在目标车库格上且目标与自身同格/相邻」的放行例外 —— 但这与 KI-288 的初衷有冲突（KI-288 现场就是「同格错挂」），**不建议**，默认选 (b)+(c)。
+- **复测判据**：①出现 `CPL-PAIR-SKIP ... act=26 tgt=23 why=dest`（证明确是目的地判据筛的，不再靠推断）；②`pair-mismatch` 不再刷屏；③26 不再原地卡死 —— 要么出现 `COUPLE-OK`，要么按 (b) 推进订单后打点离开站台；④其它车的 `CPL-PAIR-STEAL` 抢锁行为不回退（act=48 / 27 场景）；⑤KI-288 判据①（无 `COUPLE-OK ... tx=4 ty=11`）保持通过。
+
+### 本轮结论（更正后）
+
+- **KI-289：无法判定**（现场掉头是玩家手动，没有引擎自愈掉头，判据①无从判定）。
+- **KI-288：判据①通过，且已生效**（错挂消除）；但生效方式导致下游死锁（KI-292）。
+- **新增 KI-292（高）**：`GOTO_COUPLE→车库` + 车底在站台格 ⇒ 候选在配对阶段被筛掉、锁从未建立、订单不推进 ⇒ 机车永久钉死。修法首选「补 `CPL-PAIR-SKIP` 观测」+「放宽 KI-193 的订单跳过条件」，并与 KI-291（先进库）配套。
+
+---
+
+## 第 190 轮搁置声明（2026-10-01 玩家决定）
+
+玩家原话：「我选择搁置这些问题，因为我根据我看到的推断，你的修复生效了，但你需要探针判断，而我懒得再跑探针。」
+
+- **KI-288 / KI-289**：状态保持「已修」，**复测搁置**（玩家凭肉眼判断现象已消失；正式收口需要 `CPL-PAIR-SKIP` / `COUPLE-WAIT-HEAL` 一类探针，玩家暂不跑）。
+- **KI-290**：状态「未修」，**复测搁置**。
+- **KI-291**：状态「待实现」，**搁置**（不再作为后续项）。
+- **KI-292**：状态「未修」，**搁置**（修法方向 (a)(b)(c) 原样保留在条目内，供将来重启）。
+- 以上条目**一律不删除**；将来重启时从各自条目的「复测判据」继续。
+- 连带：这四条相关探针（`CPL-GATE` / `CPL-PAIR` / `COUPLE-WAIT-*` / `REVERSEDIR` 等）**保留不清除**（玩家明确「刚才搁置的不用」）。
+
+---
+
+## 第 191 轮（列车名称/编号继承：读档族，仅取证 + 加探针）
+
+玩家 2026-10-01 报告。取证过程、代码锚点、候选根因排序见临时报告 `R3R_name_inherit_round191_memo.md`。本轮**未改任何行为**，只加只读探针。玩家原话：「每次列车进行 R3R 行为，就把有关段的编号和名称打印出来」——故探针挂在**封闭提交点集合**上（不是每帧），共 5 条：
+
+| 标签 | 落点 | 时机 |
+| --- | --- | --- |
+| `SEGTR-SNAP tag=couple/decouple-v/decouple-u/depot-edit/load` | `src\train_cmd.cpp:5300`（`R3RSettleChainSegments()` 末尾） | 每次 R3R 行为**终值** |
+| `SEGTR-SNAP tag=load-raw` | `src\train_cmd.cpp:5421`（`R3RRebuildCouplePriorities()`，`R3RBorrowControlTraitsLive(chain,"load")` 之前） | **只经存档恢复、还没重建**的原始态 |
+| `SEGSAVE-PARK` | `src\sl\couple_group_sl.cpp`（`Save_R3VP()`） | 写档时每辆有停放态的车 |
+| `SEGSAVE-ROW` | `src\sl\couple_group_sl.cpp`（`Save_R3SG()`） | 写档时每个活段行 |
+| `SEGLOAD-PARK` / `SEGLOAD-ROW` | 同文件 `Load_R3VP()` / `Load_R3SG()` | 读回时的同一组字段 |
+
+每段一行打印三套号/名/组：`live`（段头车活字段）| `bk`（`*_backup` 停放副本）| `row`（`R3RSegmentRecord` 段行）。`load-raw` → `load` 配对 ⇒ "读档重建有没有改坏"；`SEGSAVE-*` → `SEGLOAD-*` 配对 ⇒ "存档往返有没有丢数据"。**两对组合即可把 KI-293/294/295 的元凶钉到具体一步。**
+
+### KI-293（未修，待取证，严重度：高）耦合态列车**存档 → 读档后车号错**
+
+> **第 192 轮补记**：首份现场（纯净版日志）**未复现** —— `SEGSAVE-PARK` → `SEGLOAD-PARK` 逐字段一致（veh=0 两侧 `unit=2 ubk=1`；veh=6 两侧 `unit=0 ubk=2`）。判定本条需「耦合 → 存档 → 读档」的专用现场（读档后不做任何操作先取日志）。详见 `## 第 192 轮` 小节第四节。
+
+- 来源：玩家 2026-10-01（原话「编号问题是耦合的列车存档再读档出现的」）。
+- 车号有**三个位置**：链头活字段 `unitnumber`（承载者）、`unitnumber_backup`（停放副本，走 R3VP）、段行 `R3RSegmentRecord::unitnumber`（第 152/159 轮定下的**正式宿主**，走 R3SG）。读档时三者分别还原，再由 `R3RBorrowControlTraitsLive(chain,"load")` + `R3RSettleChainSegments(chain,"load")`（内部 7 步）重建，任一步拿错源头即表现为号不对。
+- 待判定：①存档侧有没有写 `unitnumber_backup`（`R3RHasParkState()` 判据）；②`load-raw` → `load` 两次快照里链头 `live_unit` 的变化方向；③是真的号错还是仅**显示**错（界面读段行）而号池里仍唯一。
+- 复测判据：`SEGSAVE-PARK` 里该车有 `bk_unit`，且读档后 `SEGTR-SNAP` 的 `row unit` 等于存档前的段行值。
+
+### KI-294（**已修（第 192 轮）**，根因已于第 192 轮锁定，严重度：高）**链头列车名称被清空、不留备份**（车库合并「借名」时当场发生；现场签名=「号在、名丢」）
+
+> **第 192 轮结论（覆盖下方两条嫌疑）**：真凶 = `R3RBorrowControlTraitsLive()`（`src\train_cmd.cpp:5729`，调用点 `:5798-5804`）的名门禁 `!R3RNameIsBorrowed(chain)` 在 `R3RSyncDrivingOrders(chain,false)`（`:5799`，已把 `r3r_orders_borrowed` 置真）之后**恒真** ⇒ 链头自己的名**不停放**、紧接的 `chain->name = ctrl->name_backup` **直接覆盖** ⇒ 永久丢失；号侧无此门禁 ⇒ 号保住 ⇒ 现场签名 `DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2 own_bk=1 hasname=1 own_name=0` + `SEGTR-SNAP ... i=1 front=0 bk u=1 n=""`。
+> **下方嫌疑①（`R3RRecoverSegmentTraits()`）已排除**：全日志仅 1 次 `SEGTRAIT-RECOVER` 且在 `couple` 阶段，不在 depot-edit 路径上。
+> **下方嫌疑②（`R3RSyncSegmentTraits()` 取错源头）不成立**：它只是忠实镜像了**已被借用函数改坏**的链头活字段。
+> **建议修法（第 192 轮补记已给出精确形态）**：门禁改用「与将要借入的值比对」而非 `R3RNameIsBorrowed()`，与号侧**逐行同构**：
+> ```cpp
+> // 号侧现状（:5751-5755，正确，可照抄到名侧）：
+> if (ctrl->unitnumber_backup != 0 && chain->unitnumber != ctrl->unitnumber_backup) {
+>     if (chain->unitnumber_backup == 0 && chain->unitnumber != 0) chain->unitnumber_backup = chain->unitnumber;
+>     chain->unitnumber = ctrl->unitnumber_backup; changed = true;
+> }
+> ```
+> **为什么原门禁必然是错的**：`:5738` 已保证 `chain->r3r_orders_borrowed == true`，而 `R3RNameIsBorrowed(chain)` = `r3r_orders_borrowed && name_backup.empty() && !name.empty()`；与紧随的 `&& chain->name_backup.empty()` 合取后，整个条件**退化为 `chain->name.empty()`** ⇒ 只要链头有任何名字就永不寄存（这就是 `own_name=0` 的成因）。改成上面的**值比对**后：首次（自己的名 ≠ 将要借的名）自动寄存 ✓、二次（已在穿借名）自动跳过 ✓、幂等 ✓。
+> ⇒ 附带效果：**KI-295 随之消失**（不再有"滞留借名"这个中间状态）。详见 `## 第 192 轮` 小节第二节与「八、补记」。复测判据见该小节第七节 1~6 条。
+>
+> **第 192 轮落地与构建自证（2026-10-01）**：修法**已落地** —— `src\train_cmd.cpp` 的 `R3RBorrowControlTraitsLive()` 名侧停放门禁由 `!R3RNameIsBorrowed(chain) && chain->name_backup.empty()` 改为与号侧同构的**值比对** `chain->name_backup.empty() && !chain->name.empty() && !(chain->name == ctrl->name_backup.c_str())`（上方与 §2.2 的注释同步改写为「旧门禁在 5738 之后退化为 `chain->name.empty()`」）。仅此一处、仅 .cpp（未碰 `src\*.h` ⇒ 护栏判 `GUARD: incremental is safe`）。复用既有 `_tmp_inc_build.cmd`（未新建 .cmd）⇒ `[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done=EXIT_CODE=0`、日志 `error C*/fatal error/FAILED:/build stopped` 计数 **0**；`src\train_cmd.cpp` 23:17:34 → `train_cmd.cpp.obj` 23:18:56 → `build\openttd.exe` 2026-10-01 23:20:55（51 608 064 B）；read_lints 0。
+> **本轮未新增探针**：沿用既有 `DEPOT-XFER-ID depot-edit ... own_name=`（`own_name` 即 `!chain->name_backup.empty()`）与 `SEGTR-SNAP tag=depot-edit` 即可验证，判据见本小节第七节 1~2 条。
+> **状态＝已修 + 已编译，游戏内复测待做。**
+> **`R3RSyncHiddenSegmentTraits():5130` 的加固项经复核判定不必加**：该分支只有在 `seg->r3r_orders_borrowed` 为真时才可能是「借名」，而 KI-295 现场的隐藏段（被挂链头 `u`）借用标志已是 **0** ⇒ `R3RNameIsBorrowed(seg)` 恒假，守卫根本不会触发；真正的堵点是 KI-294，堵上即无滞留借名。故 `Couple():10423` 也**无需**另加门禁（与 §七.2 的结论一致）。
+
+- 来源：玩家 2026-10-01（原话「名称清空问题和乱继承问题在一次读档内就存在」）。
+- 首选嫌疑：`R3RRecoverSegmentTraits()`（`src/train_cmd.cpp:5025`）是**搬迁**语义 —— 段头缺任一样副本时，把本段**后续任意一节车**的 `name_backup` 赋过来并 `clear()` 原车。它只认 `*_backup`、不检查那辆车是不是另一段/控制段的承载者，入口判据又含 `group_id_backup != Invalid()`（绝大多数车没有自定义组 ⇒ 几乎每段都会进循环）。被搬空的车其段在 `R3RSyncHiddenSegmentTraits()` 里变成 `have_parked_name=0` ⇒ 行被写成活字段 ⇒ 表象即"名字空了"。
+- 次选嫌疑：`R3RSyncSegmentTraits()` 写控制段行时取的是**链头活字段**；若 `R3RBorrowControlTraitsLive(chain,"load")` 用错源头（拿 `ctrl->name`（耦合时已 `clear()`）而非 `ctrl->name_backup`）就会当场清空。
+- 判据：出现 `SEGTRAIT-RECOVER` 且其后某段 `bk_name=""`；或 `load-raw` → `load` 快照里链头 `live_name` 由非空变空。
+
+### KI-295（**名侧已修（第 192 轮，随 KI-294 一并修复）；号侧另有独立缺陷 → 见 KI-297**，现场已于第 192 轮抓到，严重度：高）**名称（及号）乱继承到别的段**
+
+> **第 192 轮结论**：现场 = `SEGTR-SNAP tag=couple head=29` 的 `i=2 id=2 front=23`（段 2）与 `i=3 id=3 front=5`（段 3）**`bk` 与 `row` 逐字段完全相同**（`u=2`、名同为 "T8701/2-国际段1"、`g=65534`）⇒ `row_name` == **另一段**的 `bk_name`（判据命中）。
+> **机制（第 192 轮补记已修订，以此版为准）**：①段 3（原「国内段」）自己的名在 KI-294 里已丢（`nbk` 空）⇒ 无自己的名可显示；②**借用结束却不归还** —— 行 1607 `SEGTR-SNAP tag=decouple-u head=0 borrowed=0 | live n="T8701/2-国际段1" | bk n=""` 证明借用标志已回 0 而借名仍滞留（归还端只在 `name_backup` 非空时归还，备份为空 ⇒ 无物可还）⇒ 借名滞留成"自己的活名"；③`Couple()` 的名块（第 160 轮 KI-261，`10423:NAME-XFER`）此刻 `u` 的 `r3r_orders_borrowed == 0` ⇒ 门禁 `!R3RNameIsBorrowed(u)` **放行**（它查不出"滞留借名"）⇒ 借名被合法停进 `u->name_backup`（行 5079 `bk u=7 n="T8701/2-国际段1"` 与行 1607 的 `live` 逐字段相同）；④`R3RSyncHiddenSegmentTraits()`（`:5122` / `:5130-5131`）**优先用备份**写隐藏段行（`6206:SEGTRAIT-SYNC-SEC ... parkedname=1`）⇒ 段 3 段行 = 段 2 段行的副本（行 6239 == 行 6238）。
+> ⇒ 同一病根（把**借来的名**当**自己的名**）：KI-294 = 承租方侧覆盖导致丢失、滞留 = 借用结束不还、KI-295 = 出租方侧合法寄存再被段行镜像导致污染。**KI-294 修好后本污染自动消失**（段 3 会拿回自己的名），**无需给 `10423` 另加门禁**。
+> ⇒ 待确认项 **R-1 已复核完毕**：`Couple()` 名块**本来就有** `!R3RNameIsBorrowed(u)` 门禁（`src\train_cmd.cpp:10423`），初稿"未设门禁"的说法**已推翻**。详见 `## 第 192 轮` 小节「八、补记」。
+
+> 【第 192 轮**号侧**补记（2026-10-02）】上面这一整套结论**只覆盖名侧**。同现场（`build\R3R_debug.log` 2026-10-01 23:36）的**号侧**仍在漂移：`1130:SEGTR-SNAP tag=decouple-u ... bk u=1 | row u=1`（健康）→ `1602:SEGTRAIT-SYNC-SEC tag=couple seg=1 unit=2` → `1634:SEGTR-SNAP tag=couple head=27 ... bk u=2 | row u=2`（段 1 的号变成段 2 的号）。根因是**另一个函数的另一个写点**（`DecoupleTrain():7772` 无条件清停放副本），**不是** KI-294 的下游连锁 ⇒ 已单独立条 **KI-297** 并于同日修复。⇒ **「修 KI-294 即可同时消灭 KI-295」这一口径仅对名侧成立，对号侧不成立**；KI-295 的复测判据 5（段 2 与段 3 的 `bk n=` 不再相同）描述的是名侧，号侧另见 KI-297 的判据。详见 `R3R_seg_trait_loss_round192_memo.md` §九。
+
+- 来源：玩家 2026-10-01（同上）。
+- 候选（按可能性排序）：①`R3RRecoverSegmentTraits()` 抢副本抢到了别人头上；②`R3RSegmentReconcileRows("load")` 的 `borrowed` 保护**只覆盖链头**（`src/couple_group.cpp:1187-1209`），非链头段头处于借用态时会把借来的真身写进自己的行；③读档后 `R3RSegmentAlloc()` 从表尾长新 ID（free list 不重建）与 R3SG 老行并存 ⇒ 段行错配；④段头（★）由 `R3RResyncSegmentFronts()` 读档后重新推导，与存档时不一致 ⇒ 行挂到别的车/段上。
+- 判据：某段 `row name` 恰等于**另一段**的 `bk name`；或同一段头在 `load-raw` 与 `load` 的 `id=` 不同。
+- 复测判据：读档后逐段比对，任何两段 `row name` 不得相同（除非玩家真的起了同名）。
+
+### KI-297（**已修（第 192 轮同日二次改码 + 已编译）**，现场已于第 192 轮复测日志抓到，严重度：高）**解挂提交点无条件清掉链头的停放副本 ⇒ 段号被邻居的号顶掉（+ 号泄漏）**
+
+- 来源：`R3R_seg_trait_loss_round192_memo.md` §九（对第 192 轮复测日志的逐行分析）。
+- 现场（`build\R3R_debug.log`，156 378 B / 2026-10-01 23:36，由第 192 轮修法 exe 产生；`=== ASSERT ===` 空、无新 `crash-*.log` ⇒ 现场有效）：
+  - `1130:SEGTR-SNAP tag=decouple-u head=0 nseg=2 ctrl=6 borrowed=1` → `i=1 id=1 front=0 | live u=2 n="T8701/2-国际段1" | bk u=1 n="T8701/2-国内段" | row use u=1 n="T8701/2-国内段"`（**此刻号侧健康：`row == bk`**）
+  - `1602:SEGTRAIT-SYNC-SEC tag=couple head=27 seg=1 unit=2 group=65534 parkedname=1`、`1634:SEGTR-SNAP tag=couple head=27 ... i=2 id=1 front=0 ... bk u=2 n="T8701/2-国内段" | row use u=2`（**段 1 的号由 1 变 2，与段 2 重合**）
+  - `1923:SEGTR-SNAP tag=decouple-v head=27 ... bk u=2 | row u=2`（污染落定、不自愈）
+  - 对照：同一现场的**名侧**已随 KI-294 修好（`387:DEPOT-XFER-ID depot-edit ... own_name=1`、`419:SEGTR-SNAP depot-edit i=1 ... bk u=1 n="T8701/2-国内段"`）⇒ 名/号两条链**不同源**。
+- 根因：`src\train_cmd.cpp` 的 `DecoupleTrain()` 号归还块（`:7758-7774`）把「`u->unitnumber_backup` 一定是 Couple 停放的、与 `u->unitnumber` **同一个池条目**的陈旧副本」当作前提，无条件执行 `:7772 u->unitnumber_backup = 0;`。当 `u` 本身是**借用态链头**（= 解出来的多段车底，控制段另有其人）时前提不成立：解挂提交点 `:7697/:7698 R3RSettleChainSegments()` → `:5271 R3RBorrowControlTraitsLive()` 刚把 **u 自己的号**（日志 `1101:DEPOT-XFER-ID decouple-u ... own_bk=1`）停进 backup、活字段穿上控制段 6 的 `2`；而 `v->unitnumber`(2) 是**控制段的号**，不是 u 自己的号 ⇒ 清零把号 `1` 一并抹掉。（调用顺序已逐行核对：`:7428 R3RRestoreUnitNumber(u)` → `:7697/:7698` settle → `:7744` DECOUPLE-DONE 探针 → `:7758` 号归还块。）
+- 后果两层：①**号泄漏** —— `1` 既没 `ReleaseID` 也没留在任何字段（`PreDestructor` 的回收判据是 `unitnumber_backup != 0`，此处已为 0 ⇒ 永不回收）；②**下一次耦合把借来的号当自己的号停放** —— 第二次 Couple 时 `u->unitnumber_backup == 0`，`Couple()` 的停放块（`if (u->unitnumber_backup == 0) u->unitnumber_backup = u->unitnumber;`）把当前**借来的** `2` 停进备份，段行随即被 `R3RSyncHiddenSegmentTraits()` 镜像成 `2`（日志 1602/1634）⇒ 段 1 与段 2 同号（玩家侧"号乱继承"）。
+- 与 KI-294/KI-295 的关系：**独立写点、独立函数**。KI-294/295 都在名侧（`R3RBorrowControlTraitsLive()` 的名门禁），本条在号侧的 `DecoupleTrain()`。⇒ 不能用「KI-294 的下游连带」解释本现场。
+- 修法（`:7772-7780`，**仅 1 行语义改动**）：`:7769-7771` 的原注释本就写明目的是"别留下同一池条目的第二份引用"，故把无条件清零改为按**同一池条目**判定 —— `if (u->unitnumber_backup == v->unitnumber) u->unitnumber_backup = 0;`。
+  - 等价性：**经典（非借用）路径** Couple 把 `u->unitnumber`(=`v->unitnumber`) 停进 backup ⇒ 条件**恒真** ⇒ 与旧行为逐字节相同；**借用态链头路径**（本现场）backup=1、`v->unitnumber`=2 ⇒ 条件假 ⇒ 保留 u 自己的号。
+- 构建自证（2026-10-02 00:04，复用既有 `_tmp_inc_build.cmd`，未新建 `.cmd`）：护栏 `GUARD: incremental is safe`；`build\R3R_incbuild.log:515` = `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`error C*`/`fatal error`/`FAILED:`/`build stopped` 全零命中；`src\train_cmd.cpp` 23:58:44 → `train_cmd.cpp.obj` 00:02:17 → `build\openttd.exe` 00:04:39（51 608 064 B）；`read_lints` 0 条。未碰任何 `src\*.h`。
+- 复测判据（用新 `build\openttd.exe` 复跑同一场景）：①第二次 `couple head=27` 后 `SEGTR-SNAP tag=couple` 里段 1 与段 2 的**号不相同**，且段 1 的 `bk u == row u`；②`SEGTRAIT-SYNC-SEC tag=couple seg=1 unit=` 打印 **1**（旧值 2）；③反复「挂→解→再挂」后任一段的 `bk u` 不等于**另一段**的 `bk u`；④号池不缩水（旧行为每次解挂吞一个号）；⑤无回归：`UNIT-RESTORE` 仍只在该出现时出现、无停放号的普通站台解挂不产生 `UNIT-RESTORE`、车库拖动 `DEPOT-XFER-ID depot-edit` 语义不变。
+- 状态：**已修（第 192 轮同日二次改码 + 已编译；游戏内复测待做）**。
+- 本轮未做/边界：不改号池记账口径（历史版本已吞掉的号**不追溯**）；R-4（`R3RRecoverSegmentTraits()` 段内多备份取谁）仍备查；未提交 git。
+
+### 本轮探针判读口径
+
+- `live` = 段头车活字段（承载者手上那套，**借用期就是控制段那套**）；`bk` = 该车 `*_backup`（**这一段的真身**）；`row` = 段行（**正式宿主**）。
+- 健康态：`row == bk`；控制段另加 `live == row`。
+- `bk_name=""` 而 `row_name!=""` ⇒ 停放副本丢（KI-294）；`row_name` == 另一段的 `bk_name` ⇒ 乱继承（KI-295）。
+- 未做：不清除任何现有探针（待玩家点选）；不改 `R3RRecoverSegmentTraits()` 的搬迁范围；不改读档重建顺序 —— 一律等新现场日志。
+
+### 第 191 轮构建自证
+
+- 复用既有 `_tmp_inc_build.cmd`（**未新建任何 `.cmd`**）；护栏 = `GUARD: incremental is safe`。
+- 第一次编译 `EXIT_CODE=1`：`error C2228`，`train_cmd.cpp(5230)` / `couple_group_sl.cpp(171)` —— `UnitID` 在本仓是 `typedef uint16_t`（`src\transport_type.h:14`），**不是** `PoolID` 强类型，`unitnumber.base()` 非法；4 处改 `(unsigned)v->unitnumber`。`group_id` 是 `GroupID`（`PoolID`）故 `.base()` 合法。
+- 修后：`[4/4] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done=EXIT_CODE=0`、`error C* / fatal error / FAILED: / build stopped` 计数 0。
+- 时间戳：`src\train_cmd.cpp` 22:09、`src\sl\couple_group_sl.cpp` 22:09 → 两个 `.obj` 22:10 → `build\openttd.exe` **2026-10-01 22:13（51 608 064 B）**；`read_lints` 两文件 0 条；exe 内 **5/5** 命中新字面量。
+- 本轮新增代码**全部是只读 `fprintf`**：不写车辆字段、不写段行、不动读档顺序。
+
+### 复测操作清单（给玩家）
+
+1. 用本 exe 跑：**耦合 → 存档 → 读档**（KI-293 路径），读档后**不要**做任何操作，先取日志。
+2. 再跑：**站台解耦**（KI-294/295 路径之一）。
+3. 取 `build\R3R_debug.log` 全量：判读只需四组串 —— `SEGSAVE-PARK` / `SEGLOAD-PARK`（KI-293 走这条）、`SEGSAVE-ROW` / `SEGLOAD-ROW`、以及 `SEGTR-SNAP tag=load-raw` / `tag=load`（KI-294/295 走这条）。
+4. 最好同时记下"界面里哪列车显示成什么号/什么名"（用 `dump_vehicle <id>` 或车队列表截图），便于把日志串与现象对齐。
+
+---
+
+## 第 192 轮（2026-10-01）：第 191 轮探针首份现场 —— **KI-294 根因锁定**（签名=「号在、名丢」）、**KI-295 现场抓到**、KI-293 本轮未复现，另开 KI-296；**同日已落地 KI-294 修法并编译通过**（见「八、补记」）
+
+> 本轮**未改任何源码**（纯取证）。无构建自证。
+> 临时分析报告 = `R3R_seg_trait_loss_round192_memo.md`。
+> 现场 = `build\R3R_debug.log`（纯净版，玩家 2026-10-01 提供），由第 191 轮 exe 产生，含第 191 轮全部只读探针。
+
+### 一、第 191 轮探针自证 = **全部生效**（不是"没打出来"）
+
+| 探针 | 命中 | 判读 |
+| --- | --- | --- |
+| `SEGTR-SNAP` | 129 行 | `load-raw` / `depot-edit` / `couple` / `decouple-v` / `decouple-u` / `load` 六类快照齐全 |
+| `SEGSAVE-PARK` / `SEGLOAD-PARK` | 各 24 行 | veh=0..23 的 `unit/ubk/nb/wbk/gid/gbk/seg/borrowed/prio` 全列出 |
+| `SEGSAVE-ROW` / `SEGLOAD-ROW` | 各 2 行 | 段行也进了存档往返 |
+| `SEGTRAIT-RECOVER` | 1 行 | 兜底回收只在必要点触发一次，**未刷屏、未大范围错回收** |
+| `INVAR-CTRL` | 10 行 | 每个提交点都校验了 ctrl/prio 不变式 |
+| `DEPOT-XFER-ID` | 9 行 | 车库拖动边每条留痕 |
+
+**存档往返自证（逐字段对齐）**：
+
+```
+226:SEGSAVE-PARK veh=0 unit=2 ubk=1 n="T8701/2-国际段1" nbk="" gid=65534 gbk=-1 seg=1 borrowed=1 prio=2
+252:SEGLOAD-PARK veh=0 unit=2 ubk=1 n="T8701/2-国际段1" nbk="" gid=65534 gbk=-1 seg=1 borrowed=1 prio=2
+232:SEGSAVE-PARK veh=6 unit=0 ubk=2 n="" nbk="T8701/2-国际段1" gid=65534 gbk=65534 seg=2 borrowed=0 prio=1
+258:SEGLOAD-PARK veh=6 unit=0 ubk=2 n="" nbk="T8701/2-国际段1" gid=65534 gbk=65534 seg=2 borrowed=0 prio=1
+```
+
+⇒ **存档往返没有丢身份**（`nbk` / `gbk` / `borrowed` / `prio` 全对齐）⇒ 名字变空**不是**存档格式问题。
+
+### 二、KI-294 根因锁定：`R3RBorrowControlTraitsLive()` 的**名门禁在车库路径恒真**（191 轮两条嫌疑全部排除）
+
+**现场锚点（逐字可复核）**：
+
+```
+178:DEPOT-BEFORE-HEAD-RANK head=6 tmax=1 amin=3
+179:DEPOT-BEFORE-HEAD sel=3 head=6 block=0 tail=5
+189:UNIT-PARK veh=6 bk=2
+191:DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2 own_bk=1 hasname=1 own_name=0     <<< 现场
+196:SEGTRAIT-SYNC tag=depot-edit head=0 seg=2 unit=2 group=65534 borrowed=0 ctrl=6
+197:INVAR-CTRL    tag=depot-edit head=0 nseg=2 ctrl=6 ctrl_pri=1 head_pri=2 borrowed=1
+224:SEGTR-SNAP   i=1 id=1 front=0 star=1 ctrl=0 | live u=2 n="T8701/2-国际段1" gid=65534 | bk u=1 n="" gbk=-1 | row use u=1 n="" g=-1
+```
+
+拖动**之前**（读档最初的未合并旧档）：`2:SEGTR-SNAP i=1 id=0 front=0 star=1 ctrl=1 | live u=1 n="T8701/2-国内段" | bk u=0 n=""` ⇒ 车 0 自己的名字是 **"T8701/2-国内段"**、备份为空。
+
+**签名 = 「号在、名丢」**：
+
+- 车 0 `unitnumber_backup = 1`（**自己的号保住了**）→ 行 191 `own_bk=1`；
+- 车 0 `name_backup = ""`（**自己的名丢了**）→ 行 191 `own_name=0`、行 224 `bk u=1 n=""`；
+- 车 0 活名已被换成控制段 6 的名 → 行 224 `live u=2 n="T8701/2-国际段1"`。
+- 随后落盘写死：`226:SEGSAVE-PARK veh=0 ... nbk=""` ⇒ 「T8701/2-国内段」在该链上**已不存在于任何字段**。
+
+**根因（`src\train_cmd.cpp:5729`，调用点 `:5798-5804`）**：
+
+```
+5798: R3RRenumberPriorities(chain);
+5799: R3RSyncDrivingOrders(chain, false);      // 先把 chain->r3r_orders_borrowed 置为 true
+5804: R3RBorrowControlTraitsLive(chain, "depot-edit");
+```
+
+函数内**号/名两块门禁不对称**：
+
+- **号侧无借用门禁**：`if (chain->unitnumber_backup == 0 && chain->unitnumber != 0) chain->unitnumber_backup = chain->unitnumber;` ⇒ 无条件停放自己的号。
+- **名侧有借用门禁**：`if (!R3RNameIsBorrowed(chain) && chain->name_backup.empty()) chain->name_backup = chain->name;` ⇒ **被挡掉，从不执行**；紧接着 `chain->name = ctrl->name_backup;` ⇒ **直接覆盖，自己的名字蒸发**。
+
+`R3RNameIsBorrowed(v)`（`:2773`）= `v->r3r_orders_borrowed && v->name_backup.empty() && !v->name.empty()`。进入借用函数时三条件**恒成立**：①`r3r_orders_borrowed` 刚被 5799 行置真（链头确实借控制段排程）；②链头此前一直是链头，名没被借走过（`name_backup` 空）；③身上挂的就是**它自己的**名。⇒ 返回 true ⇒ 把自己**没被借走的名字**当成借名丢弃。
+
+**一句话**：「排程借用」与「名字借用」共用 `r3r_orders_borrowed` 一个标志，而车库合并路径里前者**必然**先被置真 ⇒ 第 185 轮 KI-280 给名字加的保护，在这个场景里**保护对象错位**，门禁反而变成「把好名字扔掉」的开关。号侧没这个门禁，所以号完好 ⇒ 「号在、名丢」这个高辨识度签名。
+
+**建议修法（最小、与号侧同构、幂等）**：门禁不要用 `R3RNameIsBorrowed()`，改用**与将要借入的值比对**：
+
+```cpp
+if (!keep_name && !ctrl->name_backup.empty())
+{
+    if (chain->name_backup.empty() && !(chain->name == ctrl->name_backup.c_str()))
+        chain->name_backup = chain->name;          // 与借入值不同 ⇒ 是我自己的 ⇒ 先停放
+    if (!(chain->name == ctrl->name_backup.c_str()))
+    {
+        chain->name = ctrl->name_backup;
+        changed = true;
+    }
+}
+```
+
+第 2 行本来就以「是否等于借入值」为判据（幂等），把第 1 行统一到同一判据即可：首次进来自动停放、第二次进来自动跳过、不再误停。号侧建议同步收紧为 `... && chain->unitnumber != ctrl->unitnumber_backup`。替代加固（未选）= 给「名字借用」单开标志位与排程借用解耦。
+
+**191 轮两条嫌疑的裁决**：
+- 嫌疑① `R3RRecoverSegmentTraits()` **不是**本案元凶 —— 全日志仅 1 次 `SEGTRAIT-RECOVER`，且发生在 `couple` 阶段（行 6205），不在 depot-edit 路径上；本案的覆盖发生在**入库借用**那一刻。
+- 嫌疑② `R3RSyncSegmentTraits()` 取错源头 **不成立** —— 行 196 `SEGTRAIT-SYNC ... unit=2 group=65534` 取的是链头活值，而当时链头活值**已被借用函数改成控制段那套**，它只是忠实地镜像了一个已经坏掉的活字段。
+
+### 三、KI-295 现场抓到：借来的名被复制到**别的段**（与 KI-294 同源）
+
+```
+6237:SEGTR-SNAP   i=1 id=1 front=29 star=1 ctrl=0 | live u=2 n="T8701/2-国际段1" | bk u=4 n=""               gbk=-1 | row use u=4 n=""               g=-1
+6238:SEGTR-SNAP   i=2 id=2 front=23 star=1 ctrl=1 | live u=0 n="T8701/2-国际段1" | bk u=2 n="T8701/2-国际段1" gbk=-1 | row use u=2 n="T8701/2-国际段1" g=65534
+6239:SEGTR-SNAP   i=3 id=3 front=5  star=1 ctrl=0 | live u=0 n=""               | bk u=2 n="T8701/2-国际段1" gbk=-1 | row use u=2 n="T8701/2-国际段1" g=65534
+```
+
+⇒ **段 2（front=23）与段 3（front=5）的 `bk` 与 `row` 逐字段完全相同**（`u=2`、名同为 "T8701/2-国际段1"、`g=65534`）。段 3 本应是「国内段」，现在它的段行显示的是**别人段的名字** ⇒ 玩家看到的「名称（及号）乱继承到别的段」。
+⇒ 判据命中（191 轮口径）：`row_name` == **另一段**的 `bk_name` ✅。
+
+**机制链条（★ 本节表述已由「八、补记」修订，见下）**：①「国内段」自己的名已在 KI-294 里丢失（`nbk` 空）⇒ 段 3 没有自己的名可显示；②**借用结束却不归还**（行 1607 `borrowed=0` 而活名仍是借来的「T8701/2-国际段1」、备份为空 ⇒ 无物可还）⇒ 借名**滞留**成"自己的活名"；③机车 29 挂接时 `Couple()` 的名块（第 160 轮 KI-261，`NAME-XFER` 探针处，`src\train_cmd.cpp:10423`）把被挂链头 `u=0` 的**活名**停进 `u->name_backup` —— 而 `u` 此刻 `borrowed=0`（它不是借用方），故门禁 `!R3RNameIsBorrowed(u)` **放行**（该判据查不出"滞留借名"）；④于是**别人的名字**被复制进段 3 段内某车的备份（行 5079 `bk u=7 n="T8701/2-国际段1"`，与行 1607 的 `live` 逐字段相同）；⑤`R3RSyncHiddenSegmentTraits()`（`:5122` / `:5130-5131`）**优先用备份**写段行（行 6206 `parkedname=1`；行 6205 `SEGTRAIT-RECOVER seg=5 unit=2 group=65535 name=1` 是段头换人时把备份搬到新段头的留痕）⇒ 段 3 段行 = 段 2 段行的副本。
+⇒ **同一病根**：把「借来的名」当「自己的名」停放 —— KI-294 是「覆盖导致丢失」，KI-295 是「复制导致污染」。**KI-294 修好后段 3 会拿回自己的 "T8701/2-国内段"，污染自动消失。**
+⇒ 待确认项 **R-1**：`Couple()` 名块（`NAME-XFER`）对 `u` 侧是否设了 `R3RNameIsBorrowed(u)` 门禁；若无，需与 KI-280 同构补上（`u`/`v` 两侧都要判「这件名字是不是借来的」）。
+
+### 四、KI-293（耦合态存档→读档后车号错）：**本轮现场未复现**，判据待专用现场
+
+- 本轮 `SEGSAVE-PARK` → `SEGLOAD-PARK` 逐字段一致（见第一节），车号三处（链头活值 / `unitnumber_backup` / 段行）**没有出现错位**：veh=0 两侧都是 `unit=2 ubk=1`，veh=6 两侧都是 `unit=0 ubk=2`。
+- ⇒ 191 轮的"待判定①②③"在本现场均为**正常**。要判定 KI-293，需要一个「耦合 → 存档 → 读档」的**专用现场**（读档后不做任何操作先取日志），即 191 轮复测清单第 1 条。
+- **状态不变**（未修，待取证）；本节只补"本轮未复现"。
+
+### 五、新增 KI-296（低，观察项，严重度：低）车 6 的 `group_id_backup` 在读档流程里被清成 Invalid
+
+- `258:SEGLOAD-PARK veh=6 ... gbk=65534`（读档瞬间还在）→ `280:SEGTR-SNAP tag=load-raw i=2 front=6 ... bk u=2 n="T8701/2-国际段1" gbk=-1`（load-raw 快照已变 -1）。
+- 嫌疑：`R3RRestoreTrainGroupID()` 的「备份==活值 ⇒ 清备份」清理（`if (back == v->group_id) { v->group_id_backup = GroupID::Invalid(); return; }`）。车 6 是控制段，`group_id == gbk == 65534` ⇒ 清掉**无害**（值相同，取回与否结果一致）。
+- ⇒ **定性：不是缺陷，已收口**（R-2 复核完成，见本小节「九」）：清点是 `src\sl\couple_group_sl.cpp:228` 的 `Ptrs_R3VP()` 读档清洗（全库另两处候选 `R3RRestoreTrainGroupID()` 在本场景不命中），它对全池每辆车都跑、与车 6 是否为链头无关，且"备份==活值"时清掉结果等价。
+- 复测/复核判据：读档后车 6 `gbk` 变 Invalid 属预期；若某段头 `gbk` 被清后**活值又变了**（即"清掉落点"发生在归一化之前），才升级为缺陷。
+
+### 六、本轮结论
+
+- **KI-294 —— 已修**（高；第 192 轮已改码 + 增量编译通过，**游戏内复测待做**）：`R3RBorrowControlTraitsLive()` 名门禁 `R3RNameIsBorrowed(chain)` 在 `R3RSyncDrivingOrders(chain,false)` 之后恒真 ⇒ 链头自己的名被覆盖且不留备份 ⇒ 永久丢失。签名 = 「号在、名丢」（`DEPOT-XFER-ID ... own_bk=1 ... own_name=0`）。修法=门禁改为与「将要借入的值」比对（见上面「八、补记」的落地记录）。
+- **KI-295 —— 随 KI-294 一并修复**（高；已改码 + 已编译，**游戏内复测待做**）：**KI-294 的完整下游连带**。三段链 = 借名覆盖丢失（KI-294）→ 借用结束无备份可还、借名滞留成活名（本轮新定位，行 1607 实证）→ `Couple():10423` 门禁查不出滞留借名、合法寄存（行 5079）→ `R3RSyncHiddenSegmentTraits()` 优先用备份写隐藏段行（行 6239 == 行 6238）。修 KI-294 即可连带修好，**无需另加门禁**。
+- **KI-293**：本轮未复现，仍待专用现场。
+- **KI-296**：清点已定位到 `couple_group_sl.cpp:228` 读档清洗，判定无害，**已收口（非缺陷）**。
+- 本轮**源码改动（第二次修订后追加）**：仅 `src\train_cmd.cpp` 的 `R3RBorrowControlTraitsLive()` 名侧停放门禁一处（KI-294 修法），已增量编译通过（`[3/3] Linking`、`EXIT_CODE=0`、exe 2026-10-01 23:20:55 / 51 608 064 B）。R-1/R-2 复核本身未改源码，未新增探针。详见 `R3R_seg_trait_loss_round192_memo.md` 的「八、源码落地记录」。
+- **R-1/R-2 已在同轮二次复核中闭环**（见「八」「九」）；新开 **R-3**（号侧滞留链未逐点核对）、**R-4**（`R3RRecoverSegmentTraits()` 段内多备份时取谁不确定）。
+
+### 七、复测判据（修 KI-294 之后）
+
+1. 同场景（未合并旧档 + 车库拖动合并）⇒ `DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2 own_bk=1 hasname=1 own_name=**1**`（`own_name` 由 0 变 1）。
+2. `SEGTR-SNAP tag=depot-edit` 的 `i=1 front=0` 行应为 `bk u=1 n="T8701/2-国内段"`（备份里能看到自己的名字）。
+3. 该状态存档再读回 ⇒ `SEGSAVE-PARK veh=0 ... nbk="T8701/2-国内段"` 且 `SEGLOAD-PARK` 一致（不再为空）。
+4. 解挂 / 链头换人后 ⇒ 出现 `NAME-RESTORE veh=0 side=head`，界面名回到「T8701/2-国内段」。
+5. KI-295 连带：`couple head=29` 之后 `SEGTR-SNAP` 中 `i=2 front=23` 与 `i=3 front=5` 的 `bk n=` **不再相同**。
+6. 反例不误伤：健康链重复进入 `R3RBorrowControlTraitsLive` ⇒ 幂等（`own_name` 只在首次为 1，第二次不改写、不产生重复备份）。
+
+### 八、第 192 轮补记（同轮二次复核：**改正三、的机制表述**，仍未改源码）
+
+**R-1 复核结论：`Couple()` 名块的门禁"已存在但不生效"，不是"未设门禁"。**
+
+- 实测 `src\train_cmd.cpp:10423`（第 160 轮 KI-261 新增的 `NAME-XFER` 名块）**已有**：`if (!R3RNameIsBorrowed(u) && u->name_backup.empty()) u->name_backup = u->name;`
+  ⇒ 本小节第三点原写"（名块未设借用门禁）"**错误**，特此更正。
+- 门禁为什么不生效：本场景 `u`（等待车底链头）`r3r_orders_borrowed == 0`（`5039:NAME-XFER ... borrowed=0`）——它不是借用方而是控制段持有人 ⇒ `R3RNameIsBorrowed(u)` 返回 false ⇒ 放行。
+- 真正病根：`R3RNameIsBorrowed()`（`src\train_cmd.cpp:2773` = `r3r_orders_borrowed && name_backup.empty() && !name.empty()`）只能表达"**当前正在借用**"，无法表达"**这件名是早先借来、借用关系已结束却没还**"（= KI-294 制造的**滞留借名**）。
+- ⇒ 三个停放点（`R3RBorrowControlTraitsLive():5762`、`Couple():10423`、`R3RParkTrainName()`）共用同一判据，**单靠加门禁修不了**，必须先消灭"滞留借名"状态。
+
+**新增中间环节（本轮新定位，KI-294 → KI-295 之间缺的那一环）**：
+
+```
+[depot-edit 借名] :5762 门禁恒真 ⇒ 自己的名被覆盖且不留备份        ← KI-294（丢失）
+        ↓
+[decouple 还名]   name_backup 为空 ⇒ 无物可还 ⇒ 借名滞留在活字段    ← 本轮新增（行 1607 实证）
+        ↓
+[couple 寄存]     :10423 门禁查不出滞留借名 ⇒ 合法寄存 u 的活名      ← KI-295（污染的起点）
+        ↓
+[段行镜像]        :5122 / :5130-5131 优先用备份写隐藏段行           ← 污染可见化（行 6239）
+```
+
+- 行 1607 实证：`SEGTR-SNAP tag=decouple-u head=0 nseg=1 ctrl=0 borrowed=0` + `i=1 id=0 front=0 star=1 ctrl=1 | live u=7 n="T8701/2-国际段1" gid=65534 | bk u=0 n="" gbk=-1`
+  ⇒ **借用标志已回 0（借用关系结束），活名却仍是借来的「国际段1」、备份为空**（归还端只在 `name_backup` 非空时归还 ⇒ 没东西可还）。
+- 行 5079 实证：`i=2 id=3 front=0 ... bk u=7 n="T8701/2-国际段1"` —— 与行 1607 的 `live` **逐字段相同** ⇒ 停放确实发生在行 5039 那次 couple。
+- 行 6239 vs 6238 实证：段 3（非控制段，`R3RSyncHiddenSegmentTraits()` 写、命中 `have_parked_name=1`，见 `6206:SEGTRAIT-SYNC-SEC ... parkedname=1`）与段 2（控制段，`R3RSyncSegmentTraits()` 从链头借用活字段写）**逐字段相同** ⇒ 乱继承可见。
+
+**⇒ 结论收敛（与初稿一致，只是路径写清楚了）**：**KI-295 不是独立缺陷，是 KI-294 的完整下游连带**；修好 KI-294（链头首次借名会自动寄存自己的名 ⇒ 借用结束能归还）即可同时消灭 KI-295，**不需要给 `:10423` 另加门禁**。
+
+**次要加固项（可选，非必须）**：`R3RSyncHiddenSegmentTraits()` 的"没有备份就退回活名"分支（`:5130-5131`，行 583 `bk n=""` 而 `row n="国际段1"` 即此支）会把**借用中的活名**直接写进隐藏段行，建议加一句"`R3RNameIsBorrowed(seg)` 为真时不写名字"。
+
+### 九、KI-296 收口（R-2 复核完成）
+
+- **`group_id_backup` 被写成 Invalid 的清理点全库只有两处**：`src\train_cmd.cpp:2842` / `:2852`（`R3RRestoreTrainGroupID()`）+ **`src\sl\couple_group_sl.cpp:228`**（`Ptrs_R3VP()` 读档清洗：`if (v->group_id_backup == v->group_id) v->group_id_backup = GroupID::Invalid();`）。
+- 本场景命中的是**读档清洗**那一处（行 258 `gbk=65534` → 行 280 `gbk=-1` 的翻转点在其间），它对全池每辆车都跑、与车 6 是否为链头**无关**；车 6 的原值与备份值相同 ⇒ 清掉无害。
+- 另查明：`R3RBorrowControlTraitsLive()` 只处理号/名，**根本不碰分组**（全日志 `GRP-PARK` 只有 veh=6 一条、没有 veh=0 的）⇒ 行 224 段 1 的 `row g=-1` 是"它自己的组本来就是 Invalid"，不是被清掉。
+- ⇒ **KI-296 状态改为「非缺陷（设计内的字段归一）」，已收口**。
+
+### 十、仍未做 / 仍待确认（本轮新增）
+
+- **R-3**：行 1607 `live u=7`（不是 2）说明 191→1607 间还发生过一次号侧互换；**号侧**的滞留/归还链路未逐点核对（名侧已闭环）。将来若出现"号对名不对/反之"，优先查这一段。
+- **R-4**：`R3RRecoverSegmentTraits()` 的"从段内抢第一件非空备份"语义（`:5116-5128`）与段头换人绑定（`R3RMoveSegmentOwner` 把备份留在旧段头、再由它搬到新段头）。本场景它是**被动承受**污染（不是制造者）；但若一个段内同时有多辆车带备份，取谁不确定 ⇒ 未定性边界，记此备查。
+- 修法（`R3RBorrowControlTraitsLive():5762` 门禁由"查借用标志"改为"与将要借入的值比对"，与号侧 `chain->unitnumber != ctrl->unitnumber_backup` 同构）**已落地**（同日，见本小节「八、补记」的落地记录，exe 2026-10-01 23:20:55）。**本行原写的"仍未落地、等用户拍板"已作废**（拍板已完成）。
+- 本小节「八、补记」之前的那一轮**未改任何源码、未构建**；仅更新本小节 + 临时报告 `R3R_seg_trait_loss_round192_memo.md`（§3.2 已整体重写、§4.1 补 R-2 表、§五 结论表更新、新增 §七/§八 补记）。
+
+### 十一、号侧复核（R-3 收口，2026-10-02）：`DecoupleTrain():7772` 无条件清停放副本 ⇒ 段号被邻居的号顶掉（新开 KI-297）
+
+**本节把 §十 的 R-3 结清。** 复测现场 = `build\R3R_debug.log`（156 378 B / 2026-10-01 23:36，由第 192 轮修法 exe 产生）。日志体检：`=== ASSERT ===` 段为空、无本次新增 `crash-*.log`、无 `LOADCENSUS ... bad>0` ⇒ 现场有效。
+
+**（1）名侧修法在本现场已生效（§七 判据 1、2 通过）**
+
+- `387:DEPOT-XFER-ID depot-edit head=0 ctrl=6 unit=2 own_bk=1 hasname=1 own_name=1`（第 191 轮同位置是 `own_name=0`）
+- `419:SEGTR-SNAP tag=depot-edit ... i=1 id=1 front=0 | live u=2 n="T8701/2-国际段1" | bk u=1 n="T8701/2-国内段" | row use u=1 n="T8701/2-国内段"`（第 191 轮是 `bk u=1 n=""`）
+- ⇒ §七 判据 1、2 **通过**；判据 3/4/6 需玩家操作（存档往返 / 解挂后看界面名 / 重复进入幂等）后才能判。
+
+**（2）号侧独立缺陷（本节新发现）**
+
+`1130:SEGTR-SNAP tag=decouple-u ... bk u=1 | row u=1`（健康）→ 第二次耦合 `1602:SEGTRAIT-SYNC-SEC tag=couple seg=1 unit=2` → `1634:SEGTR-SNAP tag=couple head=27 ... bk u=2 | row u=2`（段 1 的号 = 段 2 的号）→ `1923` 仍 `bk u=2`。同一位置的**名侧**（国内段）全程正确 ⇒ 名/号两条链**不同源**。
+
+**（3）根因（调用顺序已逐行核对源码）**
+
+```
+:7428 R3RRestoreUnitNumber(u)                          → 日志 1096 UNIT-RESTORE u=0 id=1（u 取回自己的 1）
+:7697 R3RSettleChainSegments(v, "decouple-v")
+:7698 R3RSettleChainSegments(u, "decouple-u")
+        └ :5271 R3RBorrowControlTraitsLive()           → 日志 1101（u 的 1 停进 backup、活字段穿 6 的 2）
+:7744 DECOUPLE-DONE 探针                                → 日志 1139
+:7758 if (v->unitnumber_backup != 0) {                  ← 号归还块
+:7768     u->unitnumber = v->unitnumber;                // = 控制段的 2
+:7772     u->unitnumber_backup = 0;                     // ★ 无条件清零 ⇒ 号 1 被丢弃
+```
+
+`:7769-7771` 的原注释写明目的是"别留下同一池条目的第二份引用"，即它假设 backup 一定是「与 `u->unitnumber` 同一池条目」的陈旧副本。**u 是借用态链头时该前提不成立**（backup 里躺的是 settle 刚放进去的 u 自己的号）。
+
+**（4）修法（已落地，仅 1 行语义）**：`if (u->unitnumber_backup == v->unitnumber) u->unitnumber_backup = 0;` —— 经典路径条件恒真（行为不变）、借用路径条件假（保留 u 自己的号）。
+
+**（5）本次日志体检的旁证**：`1101:DEPOT-XFER-ID decouple-u ... own_bk=1` 说明 `R3RBorrowControlTraitsLive()` 在解挂提交点**确实**被调用（KI-263 的四道门禁在本轮未回归）。
+
+⇒ **结论**：§十 的 **R-3 结清**（号侧链路已逐点核对，唯一漂移写点已定位并修掉）；R-4 仍备查；KI-297 已登记。详见临时报告 `R3R_seg_trait_loss_round192_memo.md` §九。
+
+### 十二、第 192 轮号侧构建自证（2026-10-02 00:04）
+
+- 改码：`src\train_cmd.cpp:7772-7780`（**仅 `.cpp`，未碰任何 `src\*.h`**）。
+- 构建：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；护栏 `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.log:515` = `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`error C*` / `fatal error` / `FAILED:` / `build stopped` 全零命中。
+- 时间戳：`src\train_cmd.cpp` 2026-10-01 23:58:44 → `train_cmd.cpp.obj` 2026-10-02 00:02:17 → `build\openttd.exe` 2026-10-02 00:04:39（51 608 064 B）；`read_lints` 0 条。
+- 无 exe 串自证项（本次改动只在**注释**里新增文字，未新增代码字面量）。
+- 状态：**已修（改码 + 编译通过），游戏内复测待做**（判据见 KI-297 与备忘 §9.7）。
+
+### 十三、第 193 轮：控制段退回链头自己时，借来的名/号没人"脱下"（2026-10-02 00:12 现场）
+
+- 现场：`build\R3R_debug.log`（134 223 B / 2046 行 / 写入 2026-10-02 00:12:36），对照二进制 `build\openttd.exe`（2026-10-02 00:04:39，已含 KI-294 名侧修复）。
+- 判据核对（第 192 轮 §八/§九）：**KI-294 ①②④、KI-295、KI-297 ①② 全部通过**（逐条证据见 `R3R_name_return_round193_memo.md` §1）；KI-294 ③（存档→读档往返）本轮**未覆盖**（`SEGSAVE-PARK/ROW` 0 条，玩家未存档）；KI-293 仍未复现（`load-raw` 与 `load` 逐字段一致）。
+- **KI-298（本轮新登记，已修，待复测）**：`L1570 SEGTR-SNAP tag=couple head=27 nseg=3 ctrl=0 borrowed=1` 之下，控制段那一行
+  `i=2 id=1 front=0 ctrl=1 | live u=0 n="T8701/2-国际段1" | bk u=1 n="T8701/2-国内段" | row use u=1 n="T8701/2-国内段"` ——
+  玩家在车库列表里看到的就是"名/号没还回来"。
+- **判据订正（第 194 轮，重要）**：上面这段现场里 `ctrl=0` **不是**"控制段就是链头自己"。表头 `ctrl=` 打的是控制段的**车辆索引**，`0` 既表示"控制段是 0 号车"也表示"没有控制段"（`(ctrl != nullptr) ? ctrl->index.base() : 0u`）；本段 `i=2 front=0 ctrl=1` ⇒ 控制段是 0 号车、链头是 27 ⇒ 属**真借用态**。
+  ⇒ 原注释与旧备忘写的"健康态 = `row == bk`，控制段另加 `live == row`"在借用态是**错的**：借用态下控制段自己的 `live` 是"上一次借入后剩下的残留"（现场常见 `u=0 n=""`），**故意不等于**它的 `row`。
+  正确口径：①"本段自己那一套" = 本段是承载者且未被借用时取 `live`，其余取 `bk`；②**每一段**的 `row == 本段自己那一套`（控制段也一样）；③借用态另加跨车不变式 **链头 `live` == 控制段 `bk`**。
+  按此重读旧现场，破绽是③：链头 27 的 `live u=2 n=国际段1` 应等于控制段 0 的 `bk u=1 n=国内段`，实际等于 `i=3`（**上一任**控制段）那套 —— 即链头还穿着上一任控制段的衣服。修后现场（00:40 日志）控制段稳定在 6 号车且③成立。
+- 根因：`R3RBorrowControlTraitsLive()` 只管"穿上"不管"脱下"——旧 `src\train_cmd.cpp:5734` `if (ctrl == nullptr || ctrl == chain) return;`
+  在"控制段退回链头自己"这一态下什么都不做，而 `R3RRestoreTrainName()` 只认"活值为空"，于是借来的名/号永远留在链头身上。
+- 修法（一处门禁 → 一个脱下分支）：`ctrl == chain` 时把链头备份的那一套穿回来；号池记账沿用 `R3RSyncChainAfterDepotEdit()` 取回块的同一口径（仅当活号未被别人使用/停放时才 `ReleaseID`），名按值比对归还；**分组（第 194 轮补）**：`group_id_backup` 非空 ⇒ 交 `R3RRestoreTrainGroupID()` 取回（该函数自带 `num_vehicle` 的 -1/+1 簿记，取回后备份清空，`NormaliseTrainHead()` 再调即空操作，不会重复记账；分组的"借"发生在 `R3RNormaliseChainGroups()`/`R3RParkTrainGroupID()`，不在此函数里）；探针 `CTRL-UNBORROW <tag> head= unit= own_bk= hasname= own_name= own_g=`（`own_g` = 取回后的活分组，`-1` = Invalid；`own_bk`/`own_name` 打的是**归还之后**的值，故 `0` 表示"刚还过一次"而非"没还"）。
+- 复测判据：见 `R3R_name_return_round193_memo.md` §5（**第 194 轮已订正**：出现 `CTRL-UNBORROW`；每一段 `row == 本段自己那一套`；借用态另加 `链头 live == 控制段 bk`；分组借用需专门场景，见 §5 第 5 条）。
+- 本轮在场但不处理：车 48 的 `GOTO_COUPLE` 永久失败（50 `COUPLE-FAIL` / 24 `CPL-PATHFOUND found=0` / 23 `CPL-SKIP retryIn=8`）属 KI-288/289/292 族；5 次 `REVERSEDIR` 全为 `stuck=0`（KI-289 判据本轮未覆盖）；`NOCAB-SET this=27 db=1 last=23 ...` 复现 KI-290 签名（无零遥测）。
+
+### 十四、第 194 轮：KI-298 判据订正 + 分组侧补"脱下"（2026-10-02 01:09）
+
+本轮是 KI-298 的**收尾**：复测第 193 轮 exe（`build\openttd.exe` 01:03:05）产生的日志 `build\R3R_debug.log`（116 979 B，00:40），核对探针并就旧备忘的两处问题做订正。**未开新 KI**，改动落在 KI-298 条目上。
+
+- **探针实证（修后 exe 已生效）**：`CTRL-UNBORROW decouple-v head=24 unit=3 own_bk=0 hasname=1 own_name=0`（第 795 行）与 `CTRL-UNBORROW decouple-u head=6 unit=2 own_bk=0 hasname=1 own_name=0`（第 1579 行）两次命中；快照新增 `gid=`（活分组）/`gbk=`（备份分组）字段。
+  `own_bk=0 own_name=0` 是**归还之后**的值（备份已清零），表示"刚才还过一次"，不是"没还"。
+- **①判据订正（备忘 §2/§5 + `R3RLogSegmentTraits()` 头部注释，均为第 194 轮改）**：旧口径"健康态 = `row == bk`；控制段另加 `live == row`"在**借用态**是错的。订正后：①"本段自己那一套" = 本段是承载者且未被借用时取 `live`，其余取 `bk`；②每一段的 `row == 本段自己那一套`（控制段也一样，它的行记自己那套、不是它的 `live`）；③借用态（`borrowed=1` 且控制段 != 链头）另加跨车不变式 `链头 live == 控制段 bk`；④表头 `ctrl=` 的 `0` 有歧义（0 号车 / 无控制段），判定看每段 `ctrl=1` 落在哪节 `front=`。
+  按订正口径复读旧现场（§2 第一段）：控制段是 **0 号车**、链头 27，破绽属③（链头 `live u=2 n=国际段1` 应为控制段 0 的 `bk u=1 n=国内段`，实测等于 `i=3` 上一任控制段那套）。
+- **未确认项（如实记录，不假装已解决）**：③这条的旧现场破绽属"控制段从 A 段改判到 B 段时承载者活字段没重新同步"，而 193 的修法只管 `ctrl == chain`；修后现场（00:40）控制段稳定在 6 号车、③成立，但**不能据此断言是 193 修好的**（更可能是本次运行时序不同）。下次复测若再出现"链头 `live` 既不等于自己 `bk`、也不等于控制段 `bk`"的快照，按 KI-298 续条处理。
+- **②分组侧补"脱下"（本轮唯一代码改动，`src\train_cmd.cpp` 的 `ctrl == chain` 分支）**：`group_id_backup != GroupID::Invalid()` 时调 `R3RRestoreTrainGroupID(chain)` 取回自己那一组，并把 `own_g=` 加进 `CTRL-UNBORROW`。分组的"借"不发生在 `R3RBorrowControlTraitsLive()` 里，而是 `R3RNormaliseChainGroups()` 推平整链到控制段分组时顺手 `R3RParkTrainGroupID()`；不补这一步，`R3RSyncSegmentTraits()` 会把链头活字段（上一次借来的外来分组）写进控制段那一行，而 `R3RNormaliseChainGroups()` 的 uniform 判据又因"整链都等于那个外来分组"认为无需收敛 ⇒ 分组永远留在别人那组、自己的分组烂在备份里。交给 `R3RRestoreTrainGroupID()` 是刻意的：它自带 `num_vehicle` 的 -1/+1 簿记，与 `NormaliseTrainHead()` 同一支，取回后备份清空，后者再调即空操作，不会重复记账。
+- **本轮现场覆盖不到分组**：00:40 日志三段的分组全是 `65534`（`DEFAULT_GROUP`），即没有真正的分组借用，所以这条改动在本轮日志里看不到效果 —— 复测须用"给两端段各设不同分组"的存档，判据见 `R3R_name_return_round193_memo.md` §5 第 5 条。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；护栏 `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.log` 命中 `[3/3] Linking CXX executable openttd.exe`，`error C` / `fatal error` / `FAILED:` / `build stopped` 全零命中；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳 `src\train_cmd.cpp` 01:05:49 → `train_cmd.cpp.obj` 01:08:07 → `build\openttd.exe` 2026-10-02 01:09:41（51 609 600 B）；exe 串自证命中 `own_g=%d`；`read_lints` 0 条。构建前已确认 `openttd.exe` 未在运行。
+- **状态**：KI-298 = 已修（号/名/分组三特质齐备）+ 已编译，**游戏内复测仍待做**（用新 exe，判据见备忘 §5 五条，重点是订正后的 ②③ 两条与分组专用第 5 条）。
+
+### 十五、第 195 轮：控制段的两个缺口 —— 缺口 B（归还块凭证不统一）已修，缺口 A（选拔判据与排程归属脱钩）登记待拍板（2026-10-02）
+
+玩家需求（原话）："你肯定没按照我的规则好好选拔控制段 —— （a）选拔控制段 →（b）把控制段的特质提升为显性 →（c）把自己的特质盖到链头上面"。本轮先落需求（`R3R_control_segment_round195_memo.md` §0），再取数、再定位。
+
+- 现场：`build\R3R_debug.log`（113 514 B / 写入 2026-10-02 01:18:20），对照二进制 `build\openttd.exe`（01:09:41，已含第 194 轮改动）。五处提交点样本（车库拖动 191/223、耦合 330/359、解挂 885/911、耦合 1341/1370、解挂 1653/1664）。
+- **§1 硬结论**：(b)/(c) 两个搬运步骤在现场**每一步都对**（五处 `row` = 控制段自己那套、五处链头 `live` = 控制段那套）；五个样本 `ctrl_pri=1 < head_pri(2/3)`，即**控制段从来不是链头所在段**。⇒ 问题只在 **(a) 选拔**，不在搬运。
+- **KI-299a（缺口 A，**第 196 轮已修（改码 + 已编译），待复测**，严重度：中）**选拔判据只有一条 = `r3r_priority` 最小**（`R3RGetControlSegment()` ≡ `R3RGetPriorityHead()`，`src\train_cmd.cpp:4538-4581`），而 `r3r_priority` 记录的是**耦合时刻的角色排名**（`R3RMergePriorities()` `5360-5366`：被动方原秩不动、主动方全体 `+= passive.size()`），**除耦合/读档外没有任何一步按"谁真正拿着排程"重算过**（解挂 `7636-7637`、车库编辑 `5881` 都只是"按老次序压实"）。⇒ 持有排程的段被解挂切走、或排程按 ODOF 归还/继承换了手之后，选出的控制段**可能已经没有排程**；选拔判据与排程归属脱钩。修法（`R3RReelectControlSegment()`：先按 `R3ROrderListOwnedInChain()` 同款遍历定位"驱动表的主人"，命中则压到最小、未命中退回现状）**会改变"耦合后跑车底排程"的既有语义，属行为变更，需玩家拍板**；玩家 2026-10-02 已拍板"按这个来"，第 196 轮落地（`R3RReelectControlSegment()`，见备忘 §4.2 与「第 196 轮」节）。与第 194 轮如实记录的"未确认项"（控制段从 A 改判到 B 时承载者活字段没重新同步）同源。
+- **KI-299b（缺口 B，**本轮已修（改码 + 已编译），待复测**，严重度：高）**同一提交点内同一条链的两个相反结论各由一套凭证得出，谁后跑谁赢：**穿上**凭 `v->r3r_orders_borrowed`（`R3RBorrowControlTraitsLive()` `5808`，由 `R3RSettleChainSegments()` `5282` 调用），**归还**凭"有没有 `*_backup`"（`DecoupleTrain()` 归还块 `7826-7890`，在 settle **之后**执行）。现场 F（T8701：机车 27 + 0..5 段，第二次解挂，日志 1651-1726）：`DEPOT-XFER-ID decouple-v head=27 ctrl=0 unit=1 own_bk=4`（穿上控制段 0 那套）→ `SEGTR-SNAP` 1653/1664-1666 记 `ctrl=0 borrowed=1`、判据③成立（链头 `live u=1 国内段` == 控制段 `bk u=1 国内段`）→ 随后归还块凭 `unitnumber_backup != 0` / `!name_backup.empty()` 把链头换回自己那套（`NAME-RESTORE veh=27 side=head`，号静默回 4）⇒ 提交点结束时**活字段 = 27 自己那套**，而 `r3r_orders_borrowed`/`ctrl=0`/段表/探针说的还是"借用中、控制段是 0 段"，**第 194 轮订正的判据③当场变假**。这就是玩家看到的"链头身份被别的段覆盖 / 又换回来"。
+- **修法（一处门禁）**：`DecoupleTrain()` 归还块（号 + 名两段）整体加门禁 `!v->r3r_orders_borrowed`，借用态下一个字段都不写、只留痕 `UNIT-RESTORE-SKIP-BORROW` / `NAME-RESTORE-SKIP-BORROW`（新探针名，避免与 `NAME-RESTORE-SKIP`（`7891`，另一支）混淆）。口径依据：`R3RSyncChainAfterDepotEdit()`（`5902`）与 `R3RBorrowControlTraitsLive()`（`5808`）早已用同一布尔给同一件事（"取回自己的号"）上门禁，**只有解挂这一处的"脱下"还在凭 `*_backup` 无条件执行** ⇒ 本轮把它对齐。`u` 侧的号取回（`CTRL-UNBORROW`，1667 行）与名取回（`R3RRestoreTrainName(u)`，`7877`）不在此块内，照旧执行；真归还态（`borrowed=0` / `owner == chain` / T8701 #2 restore）完全走原逻辑，**不允许回归**。
+- 本轮**不改**：`R3RGetControlSegment()` 的乙口径（第 158 轮拍板）、(b)/(c) 两条搬运、`R3RSettleChainSegments()` 步骤顺序、KI-239 孤儿表归还路径（现场 1648-1649 的 `ORD-RETURN-ORPHAN veh=27` + `veh=0` 属正常触发）。
+- 复测判据：见 `R3R_control_segment_round195_memo.md` §5 六条（重点是 1 的两条 SKIP 留痕、2 的判据③、4 的非借用态回归）。
+- **落地位置与"为什么必须重新取一次标志"**：外层 `if (v->r3r_orders_borrowed)`（改码后 `7530`）读的是**耦合期**留下的标志，位置在 `R3RRenumberPriorities()`/`R3RSyncDrivingOrders()`（`7636-7639`）与 settle（`7767`）**之前**，只决定"要不要进这个块"；决定字段怎么写的必须是重判之后的当前值，故在归还块开头新增 `const bool head_borrows_now = v->r3r_orders_borrowed;`（`7846`），号归还分支 `7847`、新增 `UNIT-RESTORE-SKIP-BORROW` 分支 `7885`、名侧门禁与 `NAME-RESTORE-SKIP-BORROW` `7904`，原两个归还分支（`7912`/`7916`）顺次成为 `head_borrows_now == false` 时的分支。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；护栏 `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.log` 命中 `[3/3] Linking CXX executable openttd.exe`，`error C` / `fatal error` / `FAILED:` / `build stopped` 全零命中；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳 `src\train_cmd.cpp` 01:43:21 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 01:44:17 → `build\openttd.exe` 2026-10-02 01:46:43（51 609 600 B）；exe 串自证命中 `UNIT-RESTORE-SKIP-BORROW`、`NAME-RESTORE-SKIP-BORROW`（旧串 `UNIT-RESTORE veh=%d side=head-cleared` 仍在）；`read_lints` 0 条。构建前已确认 `openttd.exe` 未在运行。
+- **状态**：KI-299b = 已修（改码 + 编译通过），**游戏内复测待做**（判据见备忘 §5 六条）；KI-299a = 第 196 轮已修（见下）。
+
+### 十六、第 196 轮：落地缺口 A —— 重发号码牌（控制段重选）（2026-10-02）
+
+玩家拍板（原话）：「第一件——要不要给号码牌加一个"每次有人换手就重新发一次"的动作 / 你这个想法不错，就按这个来。不过，一定要先写临时备忘，我怕你沉浸的干事情的时候突然压缩上下文」。
+
+⇒ 落地第 195 轮登记的缺口 A（KI-299a）。**遵守"先写备忘后改码"**：本轮的取证、设计、调用点、风险、判据先写进 `R3R_control_segment_round195_memo.md` 的「第 196 轮」大节，再动 `src\train_cmd.cpp`（只改这一个 `.cpp`，不碰 `src\*.h`，避免 KI-183 全量）。
+
+- **问题一句话**：`r3r_priority` 是**耦合时刻的角色排名**（`R3RMergePriorities()`：被动方在前、主动方整体后移），此后除耦合/读档外没有任何一步按"谁真正拿着排程"重算（解挂 `7636-7637`、车库编辑 `5881` 只是按老次序压实）⇒ 持表段被切走或排程按 ODOF 换手后，选出的控制段可能已经没有排程。
+- **修法（重发号码牌）**：新增两个 `src\train_cmd.cpp` 文件内静态函数：
+  - `R3ROrderListHolderInChain(Train *chain, OrderList *ol)` —— 只遍历**段头**，先找"自持者"（`s->orders == ol && !s->r3r_orders_borrowed`，多段同时满足取物理最前），再找"停放者"（`s->orders_backup == ol`），都没有返回 nullptr；
+  - `R3RReelectControlSegment(Train *chain, const char *tag)` —— 门禁（nullptr / 段数 <2 直接 return，单段链不打日志）；`cur = R3RGetLowestPriority(segs)`；锚表 `ol` 取 `cur->orders` → `cur->orders_backup` → `chain->orders` 第一个非空者（与 `R3RSyncDrivingOrders()` 的 owner 交付口径对齐）；`holder = R3ROrderListHolderInChain()`；`holder == nullptr || holder == cur` ⇒ 退回现状（无主表交给 KI-239 孤儿归还路径）；否则 `holder->r3r_priority = 0; R3RRenumberPriorities(chain);` 并写探针 `CTRL-REELECT tag= head= nseg= old= old_pri= new= new_pri= borrowed=`。
+- **调用点（四个提交点，全部在 `R3RRenumberPriorities()` 之后、`R3RSyncDrivingOrders()` / 借用移交之前）**：车库编辑（`5881` 之后、`5882` 之前，`tag="depot-edit"`）；解挂（`7636-7637` 之后、`7638-7639` 之前，v/u 各一次，`tag="decouple-v"` / `"decouple-u"`）；耦合（`10423` 之后，`tag="couple"`）；读档（`R3RRebuildCouplePriorities()` 内 `5439` 之后，`tag="load"`，兜底统一口径）。
+- **与既有机制的交互**：KI-215b 的 `R3RPushProgressToOwner()`（`7763-7764`）排在重选之后 ⇒ 进度回写到**重选后的** owner（同向，预期）；（c）穿上与段行都由 `R3RGetControlSegment()` 自动跟随；（`INVAR-CTRL`）探针会反映新形态；`R3RNormaliseChainGroups()` 的控制段掩码等"读控制段"的点跟着变（属玩家已拍板的行为变更）。上一轮的缺口 B 门禁（`KI-299b`）与本轮互不覆盖，**不许回归**。
+- **明确不改**：`R3RGetControlSegment()` 乙口径定义本身（仍 = `r3r_priority` 最小者，只改"谁被排到最小"）、`R3RMergePriorities()` 耦合排名规则、`R3ROrderListOwnedInChain()` / KI-239 孤儿归还路径。
+- **未确认项（如实登记）**：R-1 真共享环上多段同时持表时取"物理最前段头"是否符合直觉，未验证；R-2 锚表取 `cur->orders_backup`（KI-214 停放形态）时的归属歧义，未验证；R-3 重选会改 `INVAR-CTRL`/段行宿主/`SEGTR-SNAP`，第 194 轮订正的判据③**必须重新取数**，不能套旧日志；R-4 重选后若 owner == 链头会走 `owner == chain` 当场归还借来的表（链头跑回自己停放的排程）——是设计意图，但复测要确认这正是玩家想要的；R-5 耦合块内其余读 `R3RGetPriorityHead()` 的代码需逐一核对（不能只看三个函数）。
+- **复测判据**：见 `R3R_control_segment_round195_memo.md`「第 196 轮」§5 六条（`CTRL-REELECT old != new` 且 `new_pri == 1`；号码牌本就指对时不出现该行；单段链零命中；缺口 B 两条 SKIP 留痕不回归；重选改 owner 后能一对一读出"继续借用"或"当场归还"；全日志无 `error`/`assert`/`fatal`、无"控制段既无 orders 也无 orders_backup"形态）。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**，只改 `src\train_cmd.cpp` 一个文件、未碰 `src\*.h`）；`build\R3R_incbuild.guard.log`（02:03:53）= `GUARD: incremental is safe`；`build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`、`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**；`build\R3R_incbuild.done`（02:05:59）= `EXIT_CODE=0`；时间戳三元组 `src\train_cmd.cpp` 02:03:38 → `train_cmd.cpp.obj` 02:04:27 → `build\openttd.exe` 02:05:45（51 609 600 B）；`read_lints` 0 条；exe 串自证含 `CTRL-REELECT`。**状态：已实现 + 已编译通过，游戏内复测待做**。
+
+### 十七、第 197 轮：复测第 196 轮 —— 缺口 A 的判据③在"号"这一项上仍破；控制段落到车厢上时缺一次"滞留号底稿"兜底（2026-10-02）
+
+现场：`build\R3R_debug.log`（277 341 B / 4340 行 / 写入 2026-10-02 02:13:02），对照二进制 `build\openttd.exe`（02:05:45，已含第 195/196 两轮改动）。
+
+- **T1（`CTRL-REELECT`）= 0 次命中，且本会话"应当"为 0**：本会话每个提交点上 `cur->orders` 都非空（控制段确实自己持着表），`R3ROrderListHolderInChain()` 第一趟就撞上 `cur` ⇒ 与 `cur_pri=1` 一致，函数正确地什么都不做。八处 `INVAR-CTRL`（191/334/715/1171/1359/2247/3227/4275 行）里 **`ctrl_pri=1 < head_pri` 全部成立**，即"控制段从来不是链头所在段"这条老结论在本会话未变。
+- **T2（回归项全绿）**：第 195 轮缺口 B 的留痕命中 1432-1433 行 `UNIT-RESTORE-SKIP-BORROW veh=27 u=6 borrowed=1 unit=1 own_bk=4` + `NAME-RESTORE-SKIP-BORROW veh=27 ...`（veh=27 一处、u=6 一处，无回归）；第 194 轮订正的判据②在每个多段 `SEGTR-SNAP` 上都是 `row == 本段自己那一套`；全日志 `error`/`assert`/`fatal` 计数 0。
+- **T3（`NAME-RESTORE` 一族）**：只出现 `veh=50 side=head-cleared`（3658 行），属 KI-277 已登记的"链头本来就没有自己的名字"分支；第 195 轮点名要消失的 `side=head` 未出现。
+- **T4 定性 —— 判据③在"号"上破**：最后一次耦合（4275 行 `INVAR-CTRL tag=couple head=48 nseg=2 ctrl=23 ctrl_pri=1 head_pri=2 borrowed=1`）之下，4299-4300 行快照是
+  `i=1 id=1 front=48 star=1 ctrl=0 | live u=2 n="T8701/2-国际段1" | bk u=6 n="" gbk=-1 | row use u=6 n=""`
+  `i=2 id=3 front=23 star=1 ctrl=1 | live u=0 n="" | bk u=0 n="T8701/2-国际段1" gbk=-1 | row use u=2 n="T8701/2-国际段1"`
+  ⇒ 名对上了（链头 `live n` == 控制段 `bk n`），**号对不上**（链头 `live u=2`，控制段 `bk u=0`）。判据③"链头 `live` == 控制段 `bk`"当场失败。
+- **根因（两条链，都在 `src\train_cmd.cpp`）**：
+  1. 折叠修正换 ★ 时，`R3RMoveSegmentOwner()` 只搬排程与 `name_backup`/`group_id_backup`，**刻意不搬 `unitnumber_backup`**（末段注释明说"非链头段可能滞留在旧段头上的那一份，由 `R3RRecoverSegmentTraits()` 在提交点兜底找回"）。
+  2. 但那个兜底**只**被 `R3RSyncHiddenSegmentTraits()` 调用，而它开头就 `if (seg == ctrl) continue;` ⇒ **控制段永远拿不到这次兜底**。
+  现场正好踩上：`4074` 行 `OWNER-MOVE from=6 to=23 orders=29 prio=1` 把车底段的 ★ 从引擎 6 迁到相邻的**车厢 23**（`4069` 行 `FOLD-U veh=23 ... subtype=0x04(...wagon=1) engType=371`）。车厢的 `unitnumber` 恒为 0、`unitnumber_backup` 从未被写过，而它正是新控制段；`R3RBorrowControlTraitsLive()` 的借号门禁是 `ctrl->unitnumber_backup != 0`（`5904`）⇒ 一个数都没借到，链头只好继续穿着上一轮借来的旧号 2，于是判据③在号侧崩掉。**玩家可见现象**：链头（D19Er 48）显示成 `u=2 国际段1` 而它自己那套号 6 停在 `bk`；控制段 23 自己 `live u=0 n=""`（既无号也无名）。
+- **修法（一处门禁，最小改动）**：在 `R3RSettleChainSegments()` 里，`R3RResyncSegmentFronts()` **之后**、`R3RBorrowControlTraitsLive()` **之前**插一段——若 `ctrl != nullptr && ctrl != chain`，先对**控制段**跑一次 `R3RRecoverSegmentTraits(ctrl)`（只搬 `*_backup`，区段扫描止于下一个 ★，不会偷走本段内普通车正在用的身份），并在此刻留探针 `CTRL-RECOVER <tag> head= ctrl= unit= name=`（仅当确实补到了东西才打）。位置是硬约束：`R3RRecoverSegmentTraits()` 靠 `IsSegmentFront()` 划界，必须在 `R3RResyncSegmentFronts()` 之后；它补出的 `ctrl->unitnumber_backup` 又正是紧接的 `R3RBorrowControlTraitsLive()` 的输入，所以必须在它之前。链头自己就是控制段（`ctrl == chain`）时跳过——那时不需要借号。同链内"停放"位置变化不影响号池记账（`R3RUnitNumberUsedByOther()` / `R3RUnitNumberParkedByOther()` 都遍历整链）。
+- **明确不改**：`R3RReelectControlSegment()` 的锚表口径（本会话已证明它在"控制段无表"时才是该出手的形态，本会话没这种形态，属正常不命中）；`R3RMoveSegmentOwner()` 不搬 `unitnumber_backup` 的决定（号牵号池记账，搬位置比搬值更危险）；`R3RGetControlSegment()` 定义；第 195 轮缺口 B 门禁。
+- **未确认项（如实登记）**：S-1 控制段是车厢时，"段头该不该是车厢"（`R3RArrangeIn()` 把与边界相邻的车厢提成链头）是更上游的设计问题，本轮只补号底稿，未动 ★ 选举；S-2 若旧 ★ 身上的滞留号已被别的车当活号穿走，`R3RRecoverSegmentTraits()` 只取 `*_backup`，这种情况下链头仍会穿旧号——本轮现场没有这种形态（6 的那份是停放态）。
+- **复测判据**：①新出现 `CTRL-RECOVER` 行（车厢当控制段时至少 1 次，`unit` 非 0）；②每个多段提交点仍满足判据③ = **链头 `live u/n` == 控制段 `bk u/n`**（第 197 轮现场的那一处必须由破转立）；③每个多段 `SEGTR-SNAP` 仍满足判据② = `row == 本段自己那一套`；④第 195 轮两条 SKIP 留痕不回归；⑤`NAME-RESTORE` 只允许 `side=head-cleared`（KI-277）；⑥全日志无 `error`/`assert`/`fatal`，无"控制段既无 `orders` 也无 `orders_backup`"形态。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**，只改 `src\train_cmd.cpp` 一个文件、未碰 `src\*.h`）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`；`build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`、`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳三元组 `src\train_cmd.cpp` 03:24:13 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 03:24:57 → `build\openttd.exe` 03:26:16（51 613 184 B）；`read_lints` 0 条；exe 串自证含 `CTRL-RECOVER`。**状态：已修（改码 + 编译通过），游戏内复测待做**。
+
+### 十八、第 198 轮：解挂出的车底"凭空多出一个列车 7" —— 借出去的号在归位前被抢先领了新号（KI-300，2026-10-02）
+
+现场：`build\R3R_debug.log`（229 504 B，写入 2026-10-02 03:33:22），对照二进制 `build\openttd.exe`（03:26:16，**已含第 195/196/197 三轮修复**，即本条是新缺陷不是旧回归）；完整取证（证据原文、逐步推演、未确认项）见工作区 `R3R_unit_borrow_decouple_round198_memo.md`。
+
+- **玩家报告**：「原本整个场景都没有列车 7，但是在一次 R3R 行为（挂接/解挂）之后，冒出来了一个列车 7，同时它的名称也出现了一个问题。」
+- **现场形态**：`2122 DECOUPLE-FIRE consist=27 ... real=2 mode=2 num=1 segs=1 eff=0` → `2127 TDTRY ok=1 v=27 u=0 ... borrowed=1 u_eng=0 v_eng=1 u_next=1`（解出侧是 car-only 车底，`u`=车 0 段）。前一次解挂留下的快照 `1669-1671`：链头 27 `live u=1 n="T8701/2-国内段"`、`bk u=4 n="DF4D-3058"`，而**控制段车 0** 是 `live u=0 n="T8701/2-国际段1" | bk u=1 n="T8701/2-国内段" | row use u=1 n="T8701/2-国内段"` —— 即**车 0 自己的号 1 正被链头 27 穿着**，车 0 保留着 `unitnumber_backup=1`（号池位未放）。本次解挂结果 `2133 CTRL-UNBORROW decouple-u head=0 unit=7 own_bk=0` / `2135 ... live u=7 n="T8701/2-国内段" | bk u=0` ⇒ 车 0 拿了**新号 7**、备份被清空、自己的号 1 随后被丢回池。
+- **根因（三处错位串成一条链，全在 `src\train_cmd.cpp`）**：①`DecoupleTrain()` 的 car-only 分支在 settle 之前就调 `R3RRestoreUnitNumber(u)`，此刻 27 还穿着号 1 ⇒ 查重必然命中；②`R3RRestoreUnitNumber()` 在"查重命中"分支**把 `unitnumber_backup` 清 0**（原注释假设是"旧档/手工改档被真占用"）⇒ 备份一丢，车 0 再也拿不回 1；③紧接着 `if (u->unitnumber == 0)` 无条件领新号 ⇒ 号池当时最小空闲号就是 7。之后 settle 阶段才轮到 `R3RBorrowControlTraitsLive(v,"decouple-v")` 让 27 脱下号 1，而它的释放块用 `R3RUnitNumberParkedByOther(27,27,1)` **只扫 27 自己那条链**，车 0 已被切到链外 ⇒ 判 false ⇒ `ReleaseID(1)`，号 1 空转回池（日志 `2130 unit=4`）；`R3RBorrowControlTraitsLive(u)` 进来时 `own_bk=0` 号块整块跳过；`DecoupleTrain()` 末尾的归还块三分支也因 `v->unitnumber_backup` 已被 settle 清零而全部空转。
+- **修法（三处，最小改动）**：**A** `R3RUnitNumberParkedByOther()` 由"本链扫描"改为**全池扫描**（签名 `(const Train *chain, const Train *self, uint16_t num)` → `(const Train *self, uint16_t num)`，两处调用点同步），因为"号仍停在别的活车备份里"这件事不该受是否同链限制——解挂恰恰把物主切到链外；**B** `R3RRestoreUnitNumber()` 查重命中时**保留备份、暂不取回**，只打 `UNIT-RESTORE-DEFER veh=%d id=%u` 后返回，把取回让给紧随的 settle（`R3RBorrowControlTraitsLive` 的 `ctrl==chain` 号块会在借用方脱下**之后**执行，那刻本车已独占该号）；**C** car-only 分支领新号的门禁加严为 `if (u->unitnumber == 0 && u->unitnumber_backup == 0)`，有备份时故意留 `unitnumber == 0` 的窗口等 settle / 末尾 `NormaliseTrainHead(u)` 取回，万一两条路都没取到，`NormaliseTrainHead()` 的兜底仍会发一个合法新号（宁可迟还，不可错丢）。
+- **预期执行序列**：`7626` 打 `UNIT-RESTORE-DEFER veh=0 id=1` → 不领新号 → `settle(v)` 因 A 不再 `ReleaseID(1)`、27 恢复 4 → `settle(u)` 的号块命中（`bk=1`、`unitnumber=0`）⇒ 车 0 取回 **1** 且不误放号 → 界面仍是"列车 1 / T8701/2-国内段"。
+- **明确不改**：`R3RRestoreTrainName()` 的"只在 `name.empty()` 时取回"口径（本现场 `u->name` 非空且值正确，名侧未复现）；`R3RMoveSegmentOwner()` 不搬 `unitnumber_backup` 的决定；第 195 轮缺口 B 门禁；第 156/197 轮既有释放块结构。
+- **未确认项（如实登记）**：R-1 玩家说的"名称也出现了问题"在日志里**未复现**——解出段的名终结为 `T8701/2-国内段`，与它自己的段行 `row use u=1 n="T8701/2-国内段"` 一致，属正确值；名侧与号侧共用"取回被借用态挡下"的同一机制，但本现场 `u->name` 非空故未触发。若玩家看到的是"列车 7 这一行名字是别的段名/空名"，需再补截图或日志锚点，本轮按 R-1 只登记不动码。R-2 全池扫描后"备份里残留的号"是否永不释放（号池位泄漏）：语义上"停放保留池位"是本项目一贯口径，且比"误释放正在使用的号"安全，仅作记录。R-3 `u->unitnumber == 0` 窗口内（`7902-8075`）的子系统依赖已核：`R3RSettleChainSegments` 写段行在 `CTRL-UNBORROW` 之后、`R3RNormaliseChainGroups` 与 `GroupStatistics` 均不读 `unitnumber` 作前置。
+- **复测判据**：①同场景（车 27 挂车底后解挂出车 0 段）复现时出现 `UNIT-RESTORE-DEFER veh=0 id=1`，**不再**出现车 0 的 `unit=7`；②解挂后 `SEGTR-SNAP tag=decouple-u` 那一行为 `live u=1 n="T8701/2-国内段"`，车辆列表里**不出现"列车 7"**；③全程无 `UNIT-RESTORE veh=0`（车 0 的取回应发生在 settle 里）或无异常新号；④既有三条路径无回归——正常"取回自己的号"仍打 `UNIT-RESTORE`，且不误 `ReleaseID` 别人的号；车库拖动（DEPOT-PARK / DEPOT-XFER-ID）与读档两条边照旧。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**，只改 `src\train_cmd.cpp` 一个文件、未碰 `src\*.h`）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`；`build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`、`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳三元组 `src\train_cmd.cpp` 17:06:20（917 680 B）→ `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 17:11:59 → `build\openttd.exe` 17:13:55（51 613 184 B），`build\R3R_incbuild.done` 写入时间 17:14:04；`read_lints` 0 条；exe 串自证含 `UNIT-RESTORE-DEFER` 与 `UNIT-RESTORE veh=`（各 1 命中）。**状态：已修（改码 + 编译通过），游戏内复测待做**。
+
+### 十九、第 199 轮：D19Er-XXXX（列车 6）在一次 R3R 行为后丢名 —— 换端重排的身份迁移把名字用空快照抹掉（KI-301，2026-10-02）
+
+现场：`build\R3R_debug.log`（280 754 B / 4 666 行，写入 2026-10-02 17:29:37），对照二进制 `build\openttd.exe`（17:13:55，**已含第 198 轮 KI-300 修复**，故本条是新缺陷不是上一轮回归）；完整取证（锚点原文、逐步推演、未确认项、复测判据）见工作区 `R3R_name_loss_flip_round199_memo.md`。本轮现场同日志另证第 198 轮修复已生效：`894 UNIT-RESTORE veh=0 id=1`，且全日志 `unit=7`/`un=7`/`id=7` **零命中**（"多出列车 7"未复现）。
+
+- **玩家报告**：「注意那个名为 D19Er-XXXX，编号为 6 号的列车，在日志后面一次 R3R 行为后，它自己的名称被清除了，变成了默认名字（列车 6）。」
+- **对象身份（先钉死"列车 6"是谁）**：`22 SEGTR-SNAP i=1 id=0 front=48 ... | live u=6 n="D19Er-XXXX"` + `R3RDUMP idx=48/49/50`（`head=48 tail=50`、48 为 `un=6 ARTH=1`、49/50 为 `ARTM=1 un=0`）⇒ 玩家说的"列车 6"= **车 48**（一个去铰接三节组的组头车，号 6、名 D19Er-XXXX）。`D19Er` 在本日志里**只出现在第 22/24 行**（两次读档快照），此后名称再未上屏。
+- **现场形态（决定性锚点）**：`4040 OWNER-MOVE from=48 to=50 orders=6 prio=1 borrowed=0`（A3 翻 v 的第 4b 步把身份从 48 迁到 50）→ `4102 NAME-XFER head=50 u=6 head_own=0 got_u=1 keep_u=1 borrowed=0 own=0`（链头 50 **在挂车那一刻就已经没有任何自己的名字、连备份都没有**）→ `4566 CTRL-UNBORROW decouple-v head=50 unit=6 own_bk=0 hasname=1 own_name=0` → `4628 NAME-RESTORE veh=50 side=head-cleared`（借来的名被清掉）⇒ 链头活名空 + 活号 6 ⇒ 界面显示默认名"列车 6"。**名字不是在挂/解里丢的，是在 `OWNER-MOVE` 那一步丢的。**
+- **根因（单点，`src\train_cmd.cpp:9179 R3RRelocateFrontIdentity()`）**：换端重排第 4b 步 `R3RMoveSegmentOwner(from=48,to=50)` 只 swap `name_backup`/`group_id_backup`（**不碰活字段 `name`**）；紧随其后的 `R3RRelocateFrontIdentity(from=48,to=50,owner_moved_by_flip=true)` 里 ①`9226` 快照 `kept_to_name = to->name`（50 是组员，活名为**空**）；②`9236 CopyVehicleConfigAndStatistics(from)` 让 50 拿到 `name="D19Er-XXXX"`（`base_consist.cpp` 只 `this->name = src->name`、**不清 src**，此刻 48/50 同时有名）；③**`9239 to->name = kept_to_name;` 用一个空快照把刚拷进来的名字当场抹掉**；④`9307 R3RParkTrainName(from,false)` 把 48 身上那份仍非空的名字**停进 48 的 `name_backup`**、`48->name` 清空 ⇒ 名字从"链头活字段"降级为"一节链内普通车厢的停放副本"，而 `R3RRestoreTrainName()` 只在车重新成为链头时才取，**再没有人会去取它**。第 144 轮（需求贰）那句"拷完还原 to 自己的名字"是为**直接拼接**路径写的（那时 `to` 是控制段段头、自己就有名字），被**身份迁移**路径复用即出错。号侧同一函数里反而是对的（`9250 to->unitnumber_backup = from->unitnumber_backup`，活号由拷贝带入）——这正是"名字丢了、号还在"的由来。
+- **修法（单点，最小改动）**：在 `R3RRelocateFrontIdentity()` 内加一次判据 `const bool name_follows_identity = owner_moved_by_flip && kept_to_name.empty() && !from->name.empty();`，并让两处分叉——`9239` 改为 `if (!name_follows_identity) to->name = kept_to_name;`（成立时不动 `to->name`，拷贝进来的 `from->name` 就是随身份走的名字）；`9307` 改为成立时 `from->name.clear();`（**不再**停备份，否则同一件名字同时活在链头与链内车上、`from` 将来重新当链头会冒出陈旧副本；借用态同理，借来的名随链头身份继续被 `to` 穿着），不成立时维持 `R3RParkTrainName(from, from_name_borrowed)`。**与号侧同一口径**：随前端身份迁移的数据必须无条件随身份走。
+- **预期执行序列**：翻 v 后链头 50 即应有自己的名字 → 挂车打 `NAME-XFER head=50 u=6 head_own=1 got_u=1 ... own=1`（名被停进 `v->name_backup`）→ 解挂打 `NAME-RESTORE veh=50 side=head`（**不再是 `side=head-cleared`**）⇒ 界面恢复 `D19Er-XXXX`、号仍为 6。
+- **明确不改**：`kept_to_name` 非空（`to` 自带名字）的翻转场景按第 144 轮原语义一字不动（现场未出现该形态，不做"两名互换"设计）；解挂端 `side=head-cleared` 分支（KI-277）不动——它不是病根，只是"链头本来就没名字"的如实反映；`R3RMoveSegmentOwner()` 只 swap `*_backup` 不搬活 `name`/`unitnumber` 的分工不动。
+- **判据更正（重要）**：第 197 轮的 T3 判据「`NAME-RESTORE` 只允许 `side=head-cleared`（KI-277）」把**本条现场**（同一场景的 `veh=50 side=head-cleared`）当成了已登记的正常分支而放过。**自本轮起该口径作废并按此更正：`side=head-cleared` 出现即视为名侧缺陷**，必须回溯该链头在本会话内是否经历过身份迁移（查 `OWNER-MOVE`）。
+- **未确认项（如实登记）**：R-1 `R3RMoveSegmentOwner()` 与 `CopyVehicleConfigAndStatistics` 在"活 `name` 由拷贝带入、`*_backup` 由 swap 带入"上的分工，在**其它调用点**（非翻 v 路径）是否也自洽，未逐一核对；R-2 `kept_to_name` 非空的翻转形态现场未出现过，本轮保守处理；R-3 若复测后仍出现 `side=head-cleared`，说明还有别的丢名路径，需按 `OWNER-MOVE` 逐次回溯。
+- **复测判据**：①同场景复跑后 `NAME-RESTORE veh=50 side=head-cleared` **消失**、代之以 `side=head`；②界面号 6 那一列显示 `D19Er-XXXX`（不再是"列车 6"）；③翻 v 后第一个 `SEGTR-SNAP` 的链头行 `live n=` 非空；④挂车那行 `NAME-XFER ... head_own=1 own=1`（此前 `0/0`）；⑤第 198 轮判据不退：出现 `UNIT-RESTORE-DEFER veh=0 id=1`、全程无 `unit=7`；⑥直接拼接路径（`owner_moved_by_flip == false`）的 `NAME-XFER` 逐字段与旧日志一致；⑦全日志无 `error`/`assert`/`fatal`。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**，只改 `src\train_cmd.cpp` 一个文件、未碰 `src\*.h`）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.log` 尾部 = `[3/3] Linking CXX executable openttd.exe`、`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳三元组 `src\train_cmd.cpp` 17:38:52（919 637 B）→ `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 17:41:15（10 495 806 B）→ `build\openttd.exe` 17:43:22（51 613 696 B，较第 198 轮同树 exe 51 613 184 B **+512 B**，确系本轮重编入镜像）；`read_lints` 0 条；本轮**未新增任何日志字面量**（纯分支条件改动、无新探针），故不做 exe 串自证，改以「obj 晚于源码 + exe 较上版增重 + 增量护栏判定 safe」三件套收口。**状态：已修（改码 + 编译通过），游戏内复测待做**。
+
+### 二十、第 200 轮：订单类型 5 位编码与停靠位置位域重叠（改停靠位置把命令变成"等待挂接"）+ 删除解挂命令旁"前半/后半"残留 UI（KI-302 / KI-303，2026-10-02）
+
+现场：`build\R3R_debug.log`（356 825 B / 5 559 行，写入 2026-10-02 17:54:12），对照二进制 `build\openttd.exe`（17:43:22，**已含第 199 轮 KI-301 修复**，故两条均为新缺陷不是旧回归）；完整取证（现场锚点、位域表、迁移启发式、未确认项、复测判据）见工作区 `R3R_order_type_stoploc_round200_memo.md`。
+
+> **编号更正**：`R3R_order_type_stoploc_round200_memo.md` 初稿把本轮两条写成 KI-300 / KI-301，与「第 198 轮 KI-300」（多出列车 7）和「第 199 轮 KI-301」（列车 6 丢名）**撞号**；自本小节起统一改为 **KI-302（订单类型位域）/ KI-303（删除前半/后半 UI）**，备忘正文编号已同步更正。
+
+现场同时复跑了第 195~199 轮的特质借用 / 返还 / 恢复，**三条边均正常**：`SEGTR-SNAP tag=load` 段行与活字段自洽（`head=0 nseg=1 ctrl=0 borrowed=0`）、`NAME-XFER head=24 ... head_own=1 own=1`、`CTRL-UNBORROW decouple-v head=24 unit=3 own_bk=0 hasname=1 own_name=0 own_g=65534`、`CTRL-UNBORROW decouple-u head=6 unit=2 own_g=65534`、`NAME-RESTORE-SKIP-BORROW veh=27 u=6 borrowed=1 own_name=1`、`UNIT-RESTORE-DEFER veh=6 id=2`、`CTRL-UNBORROW depot-edit head=0 unit=1` / `head=6 unit=2`。**问题 1 结案，本轮未改相关代码。**
+
+#### KI-302（高，已修·待复测）修改车站订单的停靠位置会把订单变成"等待挂接"（`OT_WAIT_COUPLE`）—— 订单类型 5 位编码与 `OrderStopLocation` 的 bit 4 重叠
+
+- **玩家报告**：「选择停靠在站台的远端近端，我手动在调度命令里更改它，会把命令变成等待挂接。」
+- **根因**：`Order::type` 是 8 位字段，pxp 提交 `3f8100c879` 把上游 4 位的 `GetType()`（`GB(type,0,4)`）改成 **5 位**（`GB(type,0,5)`）以容纳 `OT_DECOUPLE=15 / OT_GOTO_COUPLE=16 / OT_WAIT_COUPLE=17`，于是 **bit 4 同时属于"订单类型"和"停靠位置"**。`OrderStopLocation` 为 `NearEnd=0 / Middle=1 / FarEnd=2 / Through=3`，车站订单选 Middle / FarEnd 后字节为 `0x11 / 0x31`，5 位回读 = **17 = `OT_WAIT_COUPLE`**；反向 `MakeWaitCouple()` 写出的 `0x11` 在停靠位置读侧 = "中位停靠"。`order_gui.cpp:3498-3519` 名单行点击循环停靠位置（`(osl + 1) % End` → `ModifyOrder(sel, MOF_STOP_LOCATION, ...)`）从 NearEnd 点一下即 Middle ⇒ 当场变"等待挂接"；第 178 轮（KI-178）加的 `order->IsType(OT_GOTO_STATION)` 类型门控**挡不住**——命令没被拒绝，是**写入后位域串味**。
+- **修法**（`src/order_base.h` / `src/order_cmd.cpp` / `src/sl/order_sl.cpp` / `src/sl/extended_ver_sl.*`）：①恢复 4 位基址 + `OT_DECOUPLE` 扩展位——`GetType()` 取 `GB(type,0,4)`，`base != OT_DECOUPLE` 直接返回（0..14 与上游逐位一致），否则返回 `OT_DECOUPLE + GB(type,4,2)`（15 / 16 / 17）；新增 `SetType()`：`type < OT_DECOUPLE` 时只写 bit 0-3（保留 bit 4-7 载荷），否则写基址 15 + 扩展位。②`MakeGoToCouple` / `MakeWaitCouple` / `MakeDecouple` 改走 `SetType()`（`OT_DECOUPLE` 字节仍是 `0x0F` 向后兼容，`OT_GOTO_COUPLE` / `OT_WAIT_COUPLE` 变成 `0x1F` / `0x2F`）。③读档迁移：新增特性位 `XSLFI_R3R_ORDER_TYPE_ENC`，`Order::R3RMigrateOldTypeEncoding()` 在 `SlXvIsFeatureMissing(...)` 判为老档时执行（挂在 ORDL 载入之后）——`0x10` → `OT_GOTO_COUPLE`；`0x11` 有歧义（旧 `OT_WAIT_COUPLE` 或"中位停靠的车站订单"），用 `dest` 判：`dest` 无效 ⇒ 旧 `OT_WAIT_COUPLE`（`0x2F`），`dest` 有效 ⇒ 保持不动。
+- **明确不改**：保留 `MOF_DECOUPLE_ORDERS` 命令、`SetDecoupleFirstOrdersType/SecondOrdersType`、`ODOF_*` 枚举与 `train_cmd.cpp` 的解挂策略解析器（只删 UI，见 KI-303）。
+- **未确认项（如实登记）**：R-1 老档迁移的两条启发式是否够用（需玩家用现有测试档读一次确认无订单丢失，尤其"车站 #0 有效 + 中位停靠"这一理论歧义形态）；R-2 `GetStopLocation()` 对 `OT_GOTO_COUPLE` / `OT_WAIT_COUPLE` 会返回扩展位残值（1 / 2），本轮已全库核查未见未按类型门控的读点，仍待游戏内确认无副作用。
+- **复测判据**：①车站订单在名单行点击循环 4 档（近端 / 中间 / 远端 / 通过）类型全程保持 `GOTO_STATION`，不再变"等待挂接"；②`WID_O_MGMT_BTN` 下拉的停靠位置四项同样不再改类型；③`OT_WAIT_COUPLE` / `OT_GOTO_COUPLE` / `OT_DECOUPLE` 的语义、显示与解挂 / 挂接行为无回归；④读旧档：解挂 / 挂接类订单数量与类型与存档前一致；⑤"前半 / 后半"两个下拉框消失、解挂边界下拉仍可用。
+- **构建自证**（2026-10-02 20:42 回填）：复用既有 `_tmp_inc_build.cmd`（**未新建任何 .cmd**）；本轮改动 = `src\order_base.h` / `src\order_cmd.cpp` / `src\sl\order_sl.cpp`（三者仅把注释里的 KI 编号 `KI-300` 回填为 `KI-302`，无逻辑改动）+ `src\sl\extended_ver_sl.h`（18:40:46）/ `src\sl\extended_ver_sl.cpp`（18:40:57，注册 `XSLFI_R3R_ORDER_TYPE_ENC`）。`build\R3R_incbuild.guard.log` = `GUARD: 1 header/lang file(s) are newer than the newest object file` / `GUARD: newest object = 2026-10-02 19:31:53` / `GUARD:   newer: src\order_base.h  (2026-10-02 20:11:03)` / `GUARD: REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`（本次为纯注释编辑却触碰了 `order_base.h` 的 mtime ⇒ 按 KI-183 护栏如实升为**全量**，合规）；日志尾部 = `[692/692] Linking CXX executable openttd.exe`，`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**；`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-10-02 20:42:53）。时间戳链：`src\order_base.h` 20:11:03 / `src\order_cmd.cpp` 20:11:04 / `src\sl\order_sl.cpp` 20:11:05 → `build\CMakeFiles\openttd_lib.dir\src\sl\extended_ver_sl.cpp.obj` 20:25:31、`...\src\sl\order_sl.cpp.obj` 20:26:00、`...\src\order_cmd.cpp.obj` 20:34:04 → `build\openttd.exe` **2026-10-02 20:42:30（51 609 600 B）**；`read_lints` 6 个改动文件 **0** 条。串自证：exe 内命中新特性位注册名 `r3r_order_type_encoding`（`src\sl\extended_ver_sl.cpp:245` 的字面量已入镜像）；而 `Order::R3RMigrateOldTypeEncoding()` 本体**不打任何日志**（静默迁移、本轮无新探针字面量，`order_cmd.cpp:333-352`），故以「特征串命中 + obj 晚于源码 + exe 晚于全部源码」三件套替代探针自证。**状态：已修（改码 + 编译通过），游戏内复测待做**。
+
+#### KI-303（低，已删·待复测）删除解挂订单旁的"前半""后半"残留 UI
+
+- **玩家报告**：「关于前 R3R 时期借鉴朋友的 pxp 版本残留的"前半""后半"UI，这两个 UI 出现在解挂命令的选择解挂边界选项的旁边，我需要删除这两个 UI。」
+- **来源**：`decouple_first_orders` / `decouple_second_orders` 两个字段与 `ODOF_*` 枚举由 pxp 提交 `3f8100c879`（"Feature: Decouple and consist-group train features"，2026-08-14）引入，玩家口述来源属实。
+- **现状**：解挂订单（`OT_DECOUPLE`）被选中时，订单窗口顶行 `WID_O_SEL_TOP_YARD` 切到 **plane 5**，里面是一排放两个 30px 下拉框 `WID_O_DECOUPLE_FIRST_ORDERS` / `WID_O_DECOUPLE_SECOND_ORDERS`，紧挨着同一行被改成"解挂边界"的 `WID_O_REFIT_DROPDOWN`（`order_gui.cpp:3033`），正是玩家说的"选择解挂边界选项的旁边"。它们经 `ModifyOrder(..., MOF_DECOUPLE_ORDERS, (first << 4) | second)` 写 `OrderExtraInfo`，由 `train_cmd.cpp` 的解挂策略解析器决定"解出方 / 留下方各自继承哪一份排程"。
+- **修法（只删 UI、不动数据与语义，把风险面压到最小）**：①`src/widgets/order_widget.h` 删 `WID_O_DECOUPLE_FIRST_ORDERS` / `WID_O_DECOUPLE_SECOND_ORDERS` 两个常量；②`src/order_gui.cpp` 删 plane 5 的两个 NWidgetLeaf、删 `DP_YARD_DECOUPLE_ORDERS` 常量与切换分支、删两个下拉的点击 / 选中处理与 `SetStringTip` / 回显代码、删对应 `ODDI_*` 下拉索引（`OrderClick_DecoupleOrders` / `DecoupleOrdersDropDownList` / `DecoupleOrdersLabel` 三个函数一并删除）；`WID_O_SEL_TOP_YARD` 恢复为 5 plane（0 面板 / 1 场下拉 / 2 临时挂接分组 / 3 挂接侧 + 临时分组 / 4 临时分组），与 `DP_YARD_*` 枚举 0..4 一一对应。
+- **明确保留**：`MOF_DECOUPLE_ORDERS` 命令、`SetDecoupleFirstOrdersType/SecondOrdersType`、`ODOF_*` 枚举、`train_cmd.cpp` 策略解析器 ⇒ 新 / 老订单默认值不变，存档里已写下的非默认 `ODOF_*` 仍按原样生效（只是玩家无法再改）。
+- **遗留（如实登记）**：语言串 `STR_ORDER_DECOUPLE_FIRST_ORDERS_SEL` / `_SECOND_ORDERS_SEL` / `_ORDERS_TOOLTIP` / `_KEEP_ORDERS[_NO_LOAD]` / `_INHERIT_ORDERS` / `_WAIT_FOR_COUPLE` 暂留在 `src/lang/*.txt`（strgen 允许未被引用的串，HEAD 早已存在同类未引用串，故不影响构建）；是否连 `ODOF_*` 整套语义一并作废（即解挂恒走 `ODOF_KEEP_ORDERS`）**待玩家确认**，本轮按"删这两个 UI"的字面口径执行。
+- **复测判据**：①解挂订单窗口顶行只剩"解挂边界"下拉，无"前半 / 后半"；②订单窗口宽度无异常拉伸（`WID_O_SEL_TOP_YARD` 5 plane 布局不溢出）；③解挂行为、边界选择、存档往返无回归。
+- **构建自证**（2026-10-02 20:42 回填）：复用既有 `_tmp_inc_build.cmd`（**未新建任何 .cmd**）；改动 = `src\widgets\order_widget.h`（18:43:35，删 `WID_O_DECOUPLE_FIRST_ORDERS` / `WID_O_DECOUPLE_SECOND_ORDERS`）+ `src\order_gui.cpp`（18:45:50，删 plane 5 两个 NWidgetLeaf / `DP_YARD_DECOUPLE_ORDERS` 常量与切换分支 / 两个下拉的点击与回显 / `OrderClick_DecoupleOrders` / `DecoupleOrdersDropDownList` / `DecoupleOrdersLabel`，`WID_O_SEL_TOP_YARD` 恢复 5 plane）。这两个文件由本轮**首次全量构建**（`build\openttd.exe` 19:34:55）编入，其后因 `src\order_base.h` 注释触碰 mtime 触发第二次全量（20:42:30）再次全树重编，故最终 exe 覆盖本改动。静态自证：全 `src\` 递归检索 `WID_O_DECOUPLE_FIRST_ORDERS` / `WID_O_DECOUPLE_SECOND_ORDERS` / `OrderClick_DecoupleOrders` / `DecoupleOrdersDropDownList` / `DecoupleOrdersLabel` **命中 0**（已彻底删除）；`DP_YARD_*` 现仅存 `DP_YARD_EMPTY=0` / `DROPDOWN=1` / `COUPLE=2` / `COUPLE_DEPOT=3` / `WAIT_COUPLE=4` 五个（与 `order_gui.cpp:1794-1798` 一致）。因被删项全是枚举常量（非字符串字面量），exe 内无对应串可自证，故以「静态命中 0 + obj 晚于源码 + exe 晚于全部源码」收口；残留的 `STR_ORDER_DECOUPLE_FIRST_ORDERS_SEL` 等语言串按本轮口径**刻意保留**（见「遗留」段）。`build\R3R_incbuild.done` = `EXIT_CODE=0`、日志 `[692/692] Linking CXX executable openttd.exe`、错误计数 0、`read_lints` **0** 条。**状态：已删（改码 + 编译通过），游戏内复测待做**。
+- **第 201 轮更新（2026-10-02）**：玩家确认「这两个 UI 已经被消灭」，并授权把**残留接线**也一并消灭 ⇒ 见 **KI-305**（本轮新增）。本条的「明确保留 / 遗留」两段自 KI-305 起作废，改为「已随 KI-305 清除」。
+
+---
+
+### 二十一、第 201 轮：站场必须按「逐个站台」设置（现状把一次建设的站台算作一个）+ 清除「前半/后半」残留接线（KI-304 / KI-305，2026-10-02）
+
+现场：玩家口述报告（无日志附件）。本轮按长期规则先落备忘 `R3R_station_yard_per_platform_round201_memo.md` 再取证 / 改码。
+
+#### KI-304（高，已修·已编译）「设为站场」无法逐个站台设置 —— 现状把「一次性建设的站台」当作一个站台
+
+- **玩家报告**：「我希望，设为站场，是逐个站台进行站场的设置，但是现状是，一次性建设的站台都算作一个站台。」
+- **需求（已明确）**：站场的划分 / 设置粒度必须是**单个站台**（玩家能对同一车站的不同站台分别指定站场），而不是被系统按「一次建设动作 / 整站」合并成一个。
+- **取证结论（原「现象待确认」项作废）**：R3R 站场的**命令层与存储粒度本来就是「单个平台」** —— `CmdR3RSetStationYard()`（src\station_cmd.cpp）先 `R3RCollectPlatformTiles()` 沿站台轴双向收集**整条平台**，再逐 tile `R3RSetTileYard()`；GUI 的 `SetYardOfSelected()` 也只上传**选中的那一条平台的北端 tile**。坏掉的只有**枚举**：站场窗口列表由 `R3REnumeratePlatforms()` 生成。
+- **「站台」实体定义（已定）**：沿站台轴（`GetRailStationAxis`）连续、同站且轴兼容（`IsCompatibleTrainStationTile`）的 tile 串；一个平台在站场列表里占一行；北端判定 `R3RIsPlatformNorthEnd()`（`axis == Axis::X ? DiagDirection::NE : DiagDirection::NW`）。走查函数本身正确，不是根因。
+- **根因（已确认）**：`src\station_cmd.cpp` 的 `R3REnumeratePlatforms()` 原先写成**线性 tile 范围**遍历车站矩形：
+  `for (TileIndex t = ta.tile; t < ta.tile + ta.w * ta.h; t++) { ... }`
+  `TileArea`（`OrthogonalTileArea`）是矩形、地图行主序存放，线性递增只在 **`h == 1`** 时才等价于矩形遍历；`h > 1` 时它只沿矩形第一行前进 `w*h` 格，其余行（即其余平台）**根本不会被访问**（非车站格被 `TileBelongsToRailStation()` 静默过滤，不报错）。⇒ 平台沿 X 铺、多条平台沿 Y 叠放的车站只枚举出 **1 条平台**，站场窗口只画一行，表现即玩家所说「一次性建设的站台都算作一个站台」。该 bug **与朝向相关**（平台沿 Y、多条沿 X 并列时侥幸正确），所以现场可能「时对时错」。
+- **同类排查**：全库 `xx.w * xx.h` 形式的写法共 5 处，只有 `station_cmd.cpp` 这一处是**遍历**语义，其余（`industry_cmd.cpp:1117`、`waypoint_cmd.cpp:400`、`object_cmd.cpp:749`、`station_cmd.cpp` 的面积计算）均合法。
+- **历史关联**：`station_gui.cpp` 2026-09-23 的注释提到当时修过「列表看起来只有一条站台」——那轮只调了 GUI 呈现，没触及枚举本源，故本次仍复现。
+- **修法（已实现）**：`R3REnumeratePlatforms()` 改用 `TileArea` 的二维 range-for（与同文件其它 15 处一致；现 src\station_cmd.cpp:2089-2093，附说明注释）：
+  `for (TileIndex t : ta) { if (!st->TileBelongsToRailStation(t)) continue; if (!R3RIsPlatformNorthEnd(t)) continue; out.push_back(t); }`
+  不改数据结构、不改 `SYRD` 存档、不改命令层与其它遍历 ⇒ 影响面仅此一个函数。
+- **未确认项（如实登记）**：R-1 现场站台的**实际朝向**未取（修法对 X/Y 两种朝向都成立，修后两种都能逐条列出）；R-2 若玩家另指的「一次性建设」入口不是站场窗口而是订单的「目的地场」下拉，则需再取证（当前证据指向站场窗口列表；订单下拉读的是同一份场数据，粒度随之受益）；R-3 `SYRD` 格式未变 ⇒ **无需存档迁移**，旧档照读。
+- **复测判据**：①一次建设出的多站台车站，站场窗口应列出**与平台数相同**的行（每条平台一行）；②平台 1 划入 1 场、平台 2 划入 2 场后各自独立生效（互不牵连）；③东西向平台与南北向平台都能逐条列出；④存档往返后划分不变；⑤无平台 / 非站台情形不崩。
+- **构建自证**：见本小节末「第 201 轮构建自证」。
+- **状态**：**已修（已编译）**，游戏内复测待做。
+
+#### KI-305（低，已修·已编译）清除「前半/后半」UI 的残留接线（不误伤其它功能）
+
+- **玩家报告**：「这两个（前半，后半）UI 已经被消灭……这两个（前半，后半）UI 相关的接线也可以顺便消灭（不要误伤别的）。」
+- **来源**：第 200 轮 KI-303 的「明确保留」与「遗留」两段（当时只删 UI、刻意保留接线，等玩家拍板）。
+- **待清除清单（初步）**：`MOF_DECOUPLE_ORDERS` 命令及其在 `CmdModifyOrder` 的白名单分支；`Order::SetDecoupleFirstOrdersType/SecondOrdersType`；`ODOF_*` 枚举；`Order::GetDecoupleFirstOrdersType/SecondOrdersType` 与 `decouple_first_orders` / `decouple_second_orders` 两个字段；`src\train_cmd.cpp` 的解挂策略解析器；`src\lang\*.txt` 中已无引用的 `STR_ORDER_DECOUPLE_*` 串。
+- **硬约束**：①不得改变解挂的可观察语义（删解析器前先做「默认分支 = 什么」的明文对账）；②不得破坏存档兼容（若动 `Order` 字段布局，必须配 `XSLFI_*` + `SlXvIsFeatureMissing()` 迁移，参照 KI-302 做法）；③「不要误伤别的」⇒ 逐个符号核查全库引用后再生删。
+- **行为等价对账（为什么删解析器不改行为）**：UI 已删 ⇒ 唯一写入口 `MOF_DECOUPLE_ORDERS` 无人调用 ⇒ 两个字段恒为 0 = `ODOF_KEEP_ORDERS` ⇒ 解析器 `R3RApplyDecoupleOrdersStrategy()` 恒走默认分支、零副作用（`ODOF_WAIT_FOR_COUPLE` 的插单与 `ODOF_KEEP_ORDERS_NO_LOAD` 的 `VehicleFlag::StopLoading` **永不**触发）⇒ **删除解析器 ≡ 保留现状行为**。
+- **两案对账与选择（甲案采纳）**：字段 `decouple_first_orders` / `decouple_second_orders` 由 ORDR 的 `NSL(...)` + `SLE_CONDVAR_X(..., XSLFI_DECOUPLE_ORDERS)` 序列化。`XSLFI_DECOUPLE_ORDERS` 是 `_sl_xv_feature_versions[]` 的**数组下标**，删它会让其后所有特性位整体前移 ⇒ 直接破坏存档兼容；删 NSL 条目又会让「带该特性位的老档」出现无法匹配的具名扩展字段。⇒ **甲案（采纳）**：保留字段与序列化（恒写 0 的休眠数据）+ 保留 `ODOF_*` 枚举（加注说明「已无 UI 入口，仅为仍被序列化的字段提供取值文档」）+ 保留 `sl/order_sl.cpp` 两条 `NSL` 与 `XSLFI_DECOUPLE_ORDERS`；**乙案**（连字段一起删 + 特性位迁移）收益仅是每订单省 2 字节，代价是存档风险，不采纳。
+- **施工清单（逐符号）**：①`src\order_type.h` 删 `ModifyOrderFlags::MOF_DECOUPLE_ORDERS`（末尾项，`MOF_END` 自动前移 1；`MOF_END` 全库仅作 `mof >= MOF_END` 上界，安全），`OrderDecoupleOrdersFlags` 保留并加注；②`src\order_base.h` 删 `Get/SetDecoupleFirstOrdersType()`、`Get/SetDecoupleSecondOrdersType()`，**保留** `OrderExtraInfo` 的两个 `uint8_t` 字段；③`src\order_cmd.cpp` 删白名单分支、参数校验块、执行块；④`src\train_cmd.cpp` 删 `R3RApplyDecoupleOrdersStrategy()` 整个函数、`first_orders`/`second_orders` 读取块、`decouple_v_tag`/`decouple_u_tag` 两个变量与两处调用、`DECOUPLE-ODOF` 探针行（三处各留一条说明注释，避免后人以为漏了）；⑤`src\lang\english.txt` / `simplified_chinese.txt` 各删 7 条无引用串：`STR_ORDER_DECOUPLE_KEEP_ORDERS`、`_KEEP_ORDERS_NO_LOAD`、`_INHERIT_ORDERS`、`_WAIT_FOR_COUPLE`、`_FIRST_ORDERS_SEL`、`_SECOND_ORDERS_SEL`、`_ORDERS_TOOLTIP`（同段落 `STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP` 属**另一个**功能，保留）。
+- **施工坑（如实登记，重要）**：上一会话的删除**只做了一半** —— `first_orders` / `second_orders` / 两个 tag 变量已删，但 `DECOUPLE-ODOF` 的 `fprintf` 仍引用它们，工作区一度处于**编不过**的状态；本轮补齐该 `fprintf` 及注释后才恢复可编译。今后半自动删除务必以「编译通过」为收尾判据。
+- **未确认项（如实登记）**：R-1 老档里若已写下非默认 `ODOF_*` 值（实际上 UI 从未放开、不可能写下），新 exe 下**一律按默认解挂语义**处理——字段保留但不读取；R-2 甲案保留的休眠字段若将来 UI 回归需重新接线。
+- **复测判据**：①全库检索 `DECOUPLE-ODOF` / `MOF_DECOUPLE_ORDERS` / `SetDecoupleFirstOrdersType` / `SetDecoupleSecondOrdersType` / `GetDecoupleFirstOrdersType` / `GetDecoupleSecondOrdersType` / `R3RApplyDecoupleOrdersStrategy` 在 `src\*.cpp` / `src\*.h` 中 **0 命中**（仅说明注释除外）；②普通解挂 / 挂接 / 车库编辑 / 存档往返行为与第 200 轮逐字段一致（不再出现 `DECOUPLE-ODOF` 行属预期）；③老档读入不报错（`XSLFI_DECOUPLE_ORDERS` 与两条 `NSL` 未动）；④订单窗口无「前半 / 后半」且宽度正常；⑤`read_lints` 0；⑥新 exe 内**不含** `DECOUPLE-ODOF` 字面量，而 `DECOUPLE-DONE` 等解挂探针仍在。
+- **构建自证**：见本小节末「第 201 轮构建自证」。
+- **状态**：**已修（已编译）**，游戏内复测待做。
+
+#### 第 201 轮构建自证（2026-10-02）
+
+- 构建脚本：复用既有 `_tmp_inc_build.cmd`（**未新建任何 .cmd**）。
+- 护栏：`R3R_inc_guard.ps1` 判「4 header/lang file(s) are newer than the newest object file」（`src\lang\simplified_chinese.txt` / `src\lang\english.txt` @21:45:49、`src\order_type.h` @21:28:13、`src\order_base.h` @21:27:00 晚于最新 obj @20:39:37）⇒ `REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`，即本轮走**全量**。
+- 结果：`[702/702] Linking CXX executable openttd.exe`；日志 `build\R3R_incbuild.log` 中 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`build\R3R_incbuild.done` = **EXIT_CODE=0**（2026-10-02 22:17:29）。
+- 时间戳：`src\train_cmd.cpp` 21:45:47 → `train_cmd.cpp.obj` 22:11:59；`src\station_cmd.cpp` 21:26:00 → `station_cmd.cpp.obj` 22:10:25；`src\order_cmd.cpp` 21:37:04 → `order_cmd.cpp.obj` 22:08:03；`build\generated\table\strings.h` 21:48:32 → `strings.cpp.obj` 22:10:46；**`build\openttd.exe` @2026-10-02 22:17:08（51 607 552 B）晚于全部 obj 与源码**。
+- `read_lints`（train_cmd.cpp / station_cmd.cpp / order_cmd.cpp / order_base.h / order_type.h）**0 条**。
+- 产物自证：新 exe 内 **搜不到** `DECOUPLE-ODOF`，`DECOUPLE-DONE` **仍在**；`strings.h` 仍有 `STR_R3R_YARD_*`（0xC53+）与 `STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP`，已被删的 7 条 `STR_ORDER_DECOUPLE_*` 已从 `strings.h` 与 `build\lang\*.lng` 中消失（`.lng` 内亦无「前半」/「Keep orders」）。注意：语言文本在 exe 内非明文，不能用 findstr 搜 exe 判定串是否入库。
+- 附注（工具链坑，如实登记）：本轮首次以后台方式启动构建时，第二个实例在**第一个实例仍在写日志**的情况下重入，写了 `EXIT_CODE=0` 的**伪完成标记**（21:47:42，ninja 当时才 211/702），且护栏因「已有新 obj」改判 incremental safe；已删除该伪标记并以日志进度 + obj/exe 时间戳为准判定真实完成。**结论：同一棵树不得并发跑两个 `_tmp_inc_build.cmd`；判定完成必须以日志出现 `[n/n] Linking` + `.done` 的 `LastWriteTime` 晚于 exe 为准。**
+
+
+### 二十二、第 202 轮：命令级「临时挂接分组」对同公司挂接完全失效（KI-306 / KI-307，2026-10-03）
+
+现场：`build\R3R_debug.log`（玩家用「临时挂接分组」时的实录），对照二进制 `build\openttd.exe`（2026-10-02 22:17:08，51 607 552 B，**已含第 201 轮 KI-304/KI-305**，故本条是新缺陷不是旧回归）；完整取证（锚点原文、逐行推演、未确认项、复测判据）见工作区 `R3R_temp_couple_group_round202_memo.md`。
+
+#### KI-306（高，已修·已编译）「临时挂接分组」设了等于没设 —— 白名单闸门被第 109 轮 KI-195 删除后，命令级临时分组在同公司路径上成了死代码
+
+- **玩家报告**：「我们在尝试使用**临时挂接分组**的时候遇到了一些问题」。
+- **自述语义（给玩家看的 tooltip）**：`src\lang\simplified_chinese.txt:4775` —— 「执行这条命令期间临时加入的挂接分组：除了本段本来就有的分组，再额外拥有该分组，**因此可以挂上属于它的车底**；挂接成功后这个临时身份立即消失」。
+- **现场证据 1（玩家确实在测这个功能）**：`586-607` 连续 6 组 `CG-SHOW` / `CG-INIT` / `CG-RBG` / `CG-PAINT` 探针，`groups=0→4` 且**每一行 `segments=0`**（4 个组都是空的；"添加段"按钮全程 `add_disabled=0` 可用，但全日志无 `CG-CLICK-ADD`）⇒ 玩家只需要"有名字的空组"来在订单窗口的下拉框里选临时分组，UI 侧（`order_gui.cpp:3651-3656` → `CoupleTempGroupDropDownList()`）列组正常。
+- **现场证据 2（设了没效果）**：`667/795/801/840/...` 起无限刷 `CPL-PAIR act=54 tgt=0 dist=0 actTile=1,15 tgtTile=1,15` 与 `CPL-PAIR act=48 tgt=0 dist=46 actTile=42,10 tgtTile=1,15` —— 两台机车交替把目标锁到**同一条 27 节、执行 `WAIT_COUPLE`、停在车库 1,15 的车底**（`tgt=0`；`NOABSORB-SEG veh=0 n=0 len=27`）。机车 48 在 42,10 执行**车站**目的地的挂接，却锁了 46 格外的车库车底 ⇒ 永远挂不上，只会一直 `COUPLE-FAIL`。临时分组完全没能改变候选筛选。
+- **根因（代码）**：唯一判据 `src\couple_group.cpp:279 R3RCoupleAllowedIgnoringPair()`（自陈是 yapf 目的地测试 / 回溯安全测试 / 到点闸门三处共用的唯一判据，见 `:295-301`）里：
+  - `348-367` 把命令级临时分组并进掩码（`coupler_groups |= temp_group`、`target_groups |= wait_temp_group`）—— 这段是好的；
+  - 但第 109 轮 **KI-195** 把白名单 `R3RCoupleGroupMasksCompatible(coupler_groups, target_groups)` **整个删掉**了，同公司路径只剩 `403: return true;`（`400-402` 的跨公司分支才读掩码）⇒ 合并出来的掩码**算了没人看**；
+  - KI-195 自己的注释（`:383-385`）已逐字承认：「命令级的「临时挂接分组」(`GetCoupleTempGroup`) 对同公司挂接**不再有任何作用**」——与 tooltip、与 KI-170 注释（`:331-337`）**直接矛盾**，属遗漏而非设计变更。
+- **修法（仅 `src\couple_group.cpp`，未碰任何 `src\*.h`，增量合规）**：在 KI-195 的"同公司默认不设门槛"之上补一条**窄**闸门 —— **只有命令显式声明了临时分组时才恢复白名单**：
+  1. hoist 两个布尔 `const bool coupler_declared_temp` / `target_declared_temp`（分别判 `OT_GOTO_COUPLE` / `OT_WAIT_COUPLE` 上 `R3RIsValidCoupleGroup(GetCoupleTempGroup())`）；
+  2. 跨公司分支**一字不动**（仍只走 `R3RCoupleGroupMasksAllowCrossCompany()`）；
+  3. 同公司：`if (coupler_declared_temp || target_declared_temp) return R3RCoupleGroupMasksCompatible(coupler_groups, target_groups);`，否则仍 `return true;`；
+  4. 新增节流探针 `CG-GATE same-company whitelist coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X compatible=%d`（只在启用白名单时打），补上"订单到底有没有设临时分组"这个此前**无探针可证**的空白。
+- **为什么这样修最小且不回归**：不声明临时分组的玩家**行为逐字节不变**（KI-195 想治的"忘记加分组 ⇒ 到了站台找不到挂接目标、沿站台乱跑"不受影响）；只有玩家主动声明时才启用分组判定，此时无分组的目标掩码为 `COUPLE_GROUP_MASK_NONE`，`R3RCoupleGroupMasksCompatible()`（`:121-129`）走 `a==b` 分支判 false ⇒ 现场那条车库车底被剔出候选集，机车改去别处或走 KI-193 的 `COUPLE-DEST-EMPTY`，不会卡死。
+- **复测判据**：①不设临时分组时普通挂接行为与第 201 轮逐字一致、无 `CG-GATE` 行；②设一个**空组** ⇒ `CPL-PAIR act=48 tgt=0` / `act=54 tgt=0` **消失**，出现 `CG-GATE ... cdecl=1 compatible=0` 与"找不到候选"（`CPL-PATHFOUND found=0` 或 500 tick 后 `COUPLE-DEST-EMPTY`）；③设临时分组**并把目标车底真的加进该组** ⇒ 正常 `COUPLE-OK` 且 `compatible=1`；④跨公司挂接仍要求共享一个 `AllowsOthers()` 的组；⑤`read_lints` 0、增量 `EXIT_CODE=0`、`build\openttd.exe` 晚于 `src\couple_group.cpp`。
+- **状态**：**已修（已编译）**，游戏内复测待做。
+
+#### KI-307（中，未修·待玩家拍板）车站目的地的挂接候选不排除「躺在车库里的车底」
+
+- **来源**：第 202 轮 KI-306 的现场（`R3R_temp_couple_group_round202_memo.md` 第七节 U-1）。
+- **现象**：`CPL-PAIR act=48 tgt=0 dist=46 actTile=42,10 tgtTile=1,15` —— 机车执行**车站**目的地的 `GOTO_COUPLE`，却把目标锁到**停在车库格 1,15** 的车底。车站目的地只排除了"别的车站"（该格是车库格，不触发排除），于是任何停在车库/无轨道格上的 `WAIT_COUPLE` 车底都能被选中并锁死。
+- **代码**：`src\couple_group.cpp:322-328`（`if (IsRailStationTile(target->tile) && GetStationIndex(...) != dest.ToStationID()) return false;`）。这是 KI-165（`:283-301`）与 KI-288（`:312-319`）的**明确设计**（"Candidates in a depot, or off any permanent way, are untouched"），本条不擅自更改。
+- **影响**：是 KI-306 症状的**放大器** —— 即使一个分组都不设，机车也会被自己车库里的车底吸引过去并锁死；KI-306 修好后，玩家可用临时分组自救（把目标限定在组内），但"不设分组时车库候选仍然吸人"这一点依旧。
+- **候选修法（待拍板）**：甲＝车站目的地的候选不收车库格（与 KI-288 的"车库命令不收车站格"对称）；乙＝车库候选只在"没有其它候选"时才参与；丙＝维持现状（靠 KI-306 的临时分组由玩家自己限定）。
+- **第 203 轮补证（2026-10-03）**：`CG-GATE compatible=1 coupler=54 target=0 cdecl=1 tdecl=1 cmask=0x1 tmask=0x1` ⇒ 玩家把**两列车都加进了同一个临时分组**、闸门已放行，配对仍锁到**同车库 (1,15)** 的车底（`CPL-PAIR act=54 tgt=0 dist=0 actTile=1,15 tgtTile=1,15`），结果只留下 `CPL-PATHFOUND found=0` ⇒ 本条不解除，仍是"车库候选吸人"的一环；且**单独修本条无法让玩家场景耦合**（机车会改为去站台找、找不到就 COUPLE-DEST-EMPTY），必须与 KI-309 的修法 A 配套。
+- **状态**：**未修（待玩家拍板）**。
+
+#### KI-308（低，未修·待查）两台机车交替锁定同一个挂接目标（配对锁被反复改写）
+
+- **来源**：第 202 轮现场（同上备忘 U-2）。
+- **现象**：`CPL-PAIR act=54 tgt=0` 与 `CPL-PAIR act=48 tgt=0` 交替刷屏 —— 配对锁的 `r3r_couple_requester` 是**单值**字段（`couple_group.cpp:421-428 R3RCouplePairMatches()`），两台机车不可能同时合法持有 ⇒ 锁在被反复改写（抢锁/重设）。
+- **影响**：本条是"谁抢到就算谁的"的既有语义，暂未见新的破坏（现场两台车本来就都挂不上）；但"两台车反复抢同一目标"会额外消耗寻路，且可能掩盖真正的候选筛选问题。
+- **第 203 轮补证（2026-10-03）**：第 203 轮现场（同一份 `build\R3R_debug.log` 的新版本，671 行）**不再出现 `CPL-PAIR act=48`**（全日志只有 `act=54`），因为车48 未声明分组被 `CG-GATE compatible=0 coupler=48 cdecl=0 cmask=0x0` 正确拒绝 ⇒ "两台车抢同一目标"在本现场已不复现，本条降级为**待查（当前无复现现场）**。
+- **状态**：**未修（待查，与本轮 KI-306 根因无关；第 203 轮起现场不再复现）**。
+
+
+### 二十三、第 203 轮：两车同库 + 同临时分组，闸门已放行却仍不耦合（KI-309，2026-10-03）
+
+现场：`build\R3R_debug.log`（**48 826 B / 671 行**），由**含第 202 轮 KI-306 修复**的 exe 产生（证据：出现 KI-306 新增的 `CG-GATE` 探针）。完整取证（锚点原文、事实表 F1–F12、逐行推演、未确认项、复测判据）见工作区 `R3R_temp_couple_group_round203_memo.md`。
+
+**本轮定性**：KI-306 的修复**本身正确且已生效**（三重反证：`CG-GATE compatible=1 cdecl=1 tdecl=1 cmask=0x1 tmask=0x1` 放行 / `CPL-PAIR act=48` 一条也没有 / `CG-GATE compatible=0 coupler=48 cdecl=0 cmask=0x0` 正确拒绝未声明分组）——但**闸门之下还有一层没解决**，第 202 轮被闸门挡住因而未暴露。故 KI-306 状态不变（已修），新增 KI-309。
+
+#### KI-309（高，未修·待玩家拍板）两车同处一个车库、配对锁已成功且距离为 0，机车仍既挂不上也开不出去（车库死锁）
+
+- **来源**：第 203 轮现场（`R3R_temp_couple_group_round203_memo.md` 第三节）。
+- **现象**（逐字锚点）：机车 54（HXN5B，3 节）与等待车底 0（`OT_WAIT_COUPLE`）**同在车库 (1,15)**；两车都在同一个临时挂接分组 ⇒ 闸门放行（L313 `CG-GATE compatible=1`）⇒ 配对成功且 **`dist=0`**（L314 `CPL-PAIR act=54 tgt=0 dist=0 actTile=1,15 tgtTile=1,15`，全日志 19 次全部 dist=0）⇒ 但耦合寻路**每次** `found=0`（L316-318 `CPL-ENTRY tile=1,15` / `CPL-ORIGIN origin=1,15 td=8` / `CPL-PATHFOUND found=0`，11 次全 0）⇒ `TRP … => ok=0 res=0`（L319）⇒ `stuck=1`（L320）⇒ `CPL-SKIP retryIn=8`（L321）循环。**全日志 0 条 `COUPLE-OK`，机车 54 从未离开 (1,15)。**
+- **根因（两层，缺一不可）**：
+  1. **车库格在耦合寻路里是死胡同**：`src\pathfinder\yapf\yapf_rail.cpp:770-771`（`if (IsRailDepotTile(old_node.GetLastTile()) && old_node.parent != nullptr) return;`）。起点节点放行故能出库，但**任何扩展都不能进入车库格**；目标整条链就在车库格上 ⇒ 拓扑上不可达，**`dist=0` 也救不了**。
+  2. **库内就地挂接分支被"订单目的地必须是本车库"挡住**：`src\train_cmd.cpp:16647-16663` 的 `couple_targets_this_depot` 要求 `current_order.GetCoupleIsDepot()` 且订单目的地 depot == 当前 depot；机车 54 的订单是**站台 (5,13) 挂接**（`DEPOT-ARR veh=54 … destTx=5 destTy=13 destDepot=0 depotDir=-1`，L312；`TRP dest=1669` = (5,13)）⇒ 该分支整块跳过。而 `16719-16721` 的兜底 `else if (!consist->current_order.IsType(OT_GOTO_COUPLE)) NormalizeTrainVehInDepot(consist, true);` 又因订单**就是** `OT_GOTO_COUPLE` 而被跳过 ⇒ **也不出库**。⇒ 就地挂接 / 耦合寻路 / 出库**三条路全断** ⇒ 死锁。
+- **影响**：玩家按 KI-306 复测判据③（"把目标车底真的加进该组"）操作后**仍然耦合不成功**，表现为"两列车都加了临时挂接分组却一直不耦合"，且机车主被永久钉在车库里（连带 `stuck=1` 常驻）。
+- **候选修法（待拍板）**：
+  - **甲（本轮推荐·治本）**＝把 `couple_targets_this_depot` 由"订单目的地 == 本车库"放宽为"**我的挂接目标（KI-182 配对锁）此刻就在本车库里**"。语义从"订单声明"改为"**事实**"，因此不会重犯 `16648-16657` 注释里那个旧 bug（订单指向别处且库内无我方目标时仍照常出库）。玩家场景可直接 `COUPLE-OK`。
+  - **乙**＝修法 C：`16719` 兜底放宽为"订单不是 GOTO_COUPLE **或** 目标不在本库" ⇒ 止住卡死，但玩家场景仍不耦合。
+  - **丙**＝维持现状（不修）。
+- **配套（非必须）**：KI-307 甲（站台目的地的候选不收车库格）与本法甲组合可让候选更干净，但**单独采用无法满足本轮需求**。
+- **状态**：**未修（待玩家拍板）**。
+
+## 第 204 轮（2026-10-03）
+
+#### KI-310（高，未修·根因待定位）同库「前往挂接」+「等待挂接」两车，第二次运行静默跳过 GOTO_COUPLE 直接执行下一条命令
+
+- **来源**：第 204 轮现场，临时分析报告 `R3R_depot_couple_skip_round204_memo.md`。
+- **玩家原话**：两个列车处于同一个车库，分别处于前往该车库挂接和等待挂接的状态，但是处于不同的临时挂接分组，于是，主动挂接的列车没有和被挂的列车耦合，但也不是我期望的等待符合条件的列车，而是直接跳过到下一条命令。
+- **现场**：`build\R3R_debug.log`（716 行，2026-10-03 01:05:02）。车库 `1,15`（`depotIdx=0`）内 7 条链（0/6/27/48/51/54/57）；主动车 54（HXN5B 3 节）排程 `i=0 type=16(GOTO_COUPLE) dest=0`、`i=1 type=6(GOTO_DEPOT) dest=19`；等待方为拖动后形成的 `head=0 / n=27 / nseg=2 / ctrl=6` 合并链（链头 `OT_WAIT_COUPLE`）。
+- **现象**：
+  - **第一次运行（L1-440）成功**：`CG-GATE compatible=1 coupler=54 target=0 cmask=0x1 tmask=0x1`（L272）→ `CPL-PAIR act=54 tgt=0 dist=0`（L273-291）→ `COUPLE-OK loco=54 rear=26`（L305）。
+  - **第二次运行（L441-716；重读同一存档、同样拖动，仅 `sel` 由 3 变 0）失败**：全程**无** `CG-GATE`/`CPL-PAIR`/`CPL-GATE`/`COUPLE-OK`；L706 `DEPOT-ARR veh=54 … real=1(6) curType=6 … destTx=16 destTy=14 destDepot=0 tileEqDest=0` ⇒ `cur_real_order_index` 已由 dump 时刻的 0 变为 1（**跳过 `i=0` 的 `OT_GOTO_COUPLE`**），L714/L715 显示它已挂上去 depot 19 的路线并开走。
+- **待确认**：玩家所述"不同临时挂接分组"与日志唯一 `CG-GATE` 行（`cmask=0x1 tmask=0x1`，**同组**）冲突，且第二次运行根本未走到分组闸门。
+- **根因候选（未定论）**：①车库编辑提交点（`R3RSyncChainAfterDepotEdit`/`R3RRenumberPriorities`/`R3RSyncDrivingOrders`/`R3RSettleChainSegments`，`src\train_cmd.cpp` 约 :5455 一带）对**非本次拖动的独立链 54** 误做进度同步；②同进程内第二次读档的会话级静态残留（已确认 `s_dbg_dump_sigs`(:16784) 会造成"链头 0 第二次无 `DEPOT-ARR`"这类**日志缺失**，须区分日志缺失与逻辑未执行）；③`R3RSkipCoupleOrdersForRealArtic()`(:16408) 静默推索引——但它两个分支都会写 `ARTIC-SKIP-R3R`，日志 0 条，暂不成立。
+- **影响**：挂接命令被无声吞掉 ⇒ 主动车不挂、不等、直接去下一条命令（玩家诉求正是"应原地等待符合条件的车底"）。
+- **第 207 轮已定位（很可能非 R3R 缺陷，待玩家确认）**：玩家补充原话"我在重设调度之后，忘记调整当前调度命令了！这会导致排程本身就在下一条命令（我重设唯二调度里面的第一条，导致索引跳到了第二条，而我还以为它在第一条！）"。代码依据＝上游 `InsertOrder()`（`src\order_cmd.cpp:1650`）的 `if (sel_ord <= cur_real_order_index) cur_real_order_index++`，即"在当前命令位置或它之前插入命令 ⇒ 当前命令索引 +1（当前命令仍是原来那条，只是后移一位）"；玩家观感即"静默跳过 `GOTO_COUPLE`"。第 207 轮日志里 veh=54 唯一一次 `real=1` 出现在 `cmd-skip-in`（打点在赋值之前，说明进入 `CmdSkipToOrder` 时已是 1）且随后被 `sel_ord=0` 指回 0，全日志无"无来源静默写"证据；`0->1` 那一步落在**无站点的订单编辑命令**里（见 KI-312）。详见 memo 第十一节。
+- **状态**：**已结案·非缺陷（第 208 轮）**（根因＝玩家订单编辑触发上游 `InsertOrder()` 索引后移语义）。第 208 轮日志已按 KI-312 判据 ② 验证黑箱窗关闭：见本文件「第 208 轮」小节与该轮 memo §一。第 207 轮追加证据（2026-10-03）：全日志只有一次 `cmd-skip-*`（`build\R3R_debug.log` 行 289/290，veh=54），玩家已确认该次跳命令为其**本人手动操作**；`veh=54` 在读档三站点（:36 `load-rebuild` / :39 `settle-in` / :42 `settle-out`）与手动 dump（:221 `R3RDUMP-CHAIN head=54 … curReal=0 curImpl=0 realType=16`，命令表 i=0 `type=16` GOTO_COUPLE、i=1 `type=6` GOTO_DEPOT dest=19）均为 **0** ⇒ `real=1` **不是存档带入/读档残留**，`0->1` 的写者落在日志行 231（dump 结束）~ 289 之间的**订单编辑命令**（无站点，见 KI-312），与玩家"重设唯二调度第一条 ⇒ 索引跳到第二条"逐字吻合。第 207 轮并已按 KI-312 给订单编辑命令补齐 16 个只读哨兵（`ordlist-insert/delete` + `cmd-declone/delete/move/reverse/modify/bulk`，已编译入 exe，见 KI-312 状态），下次复现即可把 `0->1` 钉死在某条具体编辑命令上。第 204 轮**未改任何源码**。
+
+## 第 205 轮（2026-10-03）
+
+#### KI-311（诊断工具，非缺陷）订单索引哨兵 `R3RWatchOrderIndex`：给 KI-310 的"静默跳命令"铺观测网
+
+- **来源**：第 204 轮 KI-310（`R3R_depot_couple_skip_round204_memo.md` 第六节）；玩家指示"直接添加探针"。
+- **目的**：KI-310 的现象是某条链头的 `cur_real_order_index` 在**没有任何既有探针记录**的情况下由 0 变 1（`i=0` 的 `OT_GOTO_COUPLE` 被静默跳过，列车直接跑去 `i=1` 的 `GOTO_DEPOT`）。既有探针只在少数离散点打行，无法回答"这个索引究竟在哪一行代码被改"。本轮不预判根因，先铺观测网：在**所有可能改写订单索引的提交点两侧成对取样**，把"索引发生变化"这一事件本身变成可检索的日志行。
+- **实现（仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`，增量合规）**：
+  - 新增文件内静态哨兵 `static void R3RWatchOrderIndex(const Train *t, const char *site, const char *tag = nullptr)`（`src\train_cmd.cpp:1898`，定义于 `R3RChainHasRealArticPart()` 之后）。
+  - 按 `t->index.base()` 维护一张**进程静态**快照表 `static std::unordered_map<uint32_t, R3RIdxSnap> seen;`；快照字段＝`real / impl / tt / ol(OrderList*) / count / artic / valid`。
+  - **仅当**上述任一字段相对上次快照发生变化（含"进程首次见到该车"）才写一行：
+    `ORD-IDX-WATCH site=%s tag=%s veh=%d real=%d->%d impl=%d->%d tt=%d->%d n=%d->%d artic=%d->%d ord=%p->%p front=%d spd=%d parked=%d`
+    `-1->X` 前缀表示进程首次见到该车（无历史快照）。
+  - **纯只读**：不改任何字段、不调任何转移函数，符合 `R3R_PROBES` 无副作用纪律。
+  - 快照表刻意**跨读档保留**：这样第 204 轮"同进程内第二次读档后索引不一致"（KI-310 候选②的会话级残留）会以 `...->...` 的形式直接暴露，而非被重置掩盖。
+- **10 个调用点（站点名 → 位置）**：
+
+  | site | 行 | 位置说明 |
+  |---|---|---|
+  | `settle-in` | :5351 | `R3RSettleChainSegments()` 入口 |
+  | `settle-out` | :5433 | 同上末尾（`R3RLogSegmentTraits` 之后） |
+  | `ord-push` | :5472 | `R3RPushProgressToOwner()` 写回之前 |
+  | `ord-push-owner` | :5473 | 同上、写回 owner 之后 |
+  | `depot-edit-in` | :6097 | `R3RSyncChainAfterDepotEdit()` 入口 |
+  | `depot-edit-out` | :6223 | 同上末尾 |
+  | `loco-entry` | :16681 | TrainLocoHandler：`r3r_pending_depot_couple` 计算后、Stopped 闸门之前 |
+  | `post-skipgate` | :16726 | `R3RSkipCoupleOrdersForRealArtic()` 之后 |
+  | `post-depotblk` | :16816 | 车库挂车块 + `NormalizeTrainVehInDepot` 之后、DECOUPLE 之前 |
+  | `post-processorders` | :17103 | `ProcessOrders()` 之后 |
+
+- **判读口径**：把 `ORD-IDX-WATCH` 按 `veh` 过滤、按行序读，即得该链头索引的**完整变更轨迹**；`real=0->1` 那一行的 `site` 就是"改索引的现场"：
+  - 落在 `site=depot-edit-in` 与 `depot-edit-out` 之间 ⇒ 命中 KI-310 候选①（车库编辑提交点误及非本次拖动的链 54）；
+  - 落在 `site=loco-entry` 与 `post-skipgate` / `post-depotblk` 之间 ⇒ 命中候选③（`R3RSkipCoupleOrdersForRealArtic` 静默路径）或引擎侧；
+  - 第一次 tick 即 `-1->1`（进程首次见到就已是 1）⇒ 命中候选②（读档/静态残留，索引在读档后本就为 1）。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe`；`[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done=EXIT_CODE=0`；`read_lints` 0；`src\train_cmd.cpp` → `train_cmd.cpp.obj` → `build\openttd.exe` 时间戳单调；`findstr /C:"ORD-IDX-WATCH" build\openttd.exe` 命中（`EXE-HIT-ORD-IDX-WATCH`）。
+- **状态**：**探针已就绪（已编译、已入 exe）**，等待现场日志复现 KI-310 后取数。本条为诊断工具，不改变任何行为，不解除 KI-310。
+
+#### KI-312（诊断工具，非缺陷）订单编辑命令未布哨兵 ⇒ `ORD-IDX-WATCH` 存在黑箱窗（第 207 轮据此定位 KI-310）
+
+- **来源**：第 206 轮 memo 第十节（站点扩充）+ 第 207 轮现场，分析报告 `R3R_depot_couple_skip_round204_memo.md` 第十一节。
+- **事实**：KI-311 的观测网（第 205 轮 10 处 + 第 206 轮 16 处，共 26 处）覆盖了 tick 前后、R3R 各提交点、读档、`CmdSkipToOrder`，但**未覆盖订单编辑命令本体**：`InsertOrder()`（`src\order_cmd.cpp:1632`，由 `CmdInsertOrder` 调用）、`CmdDeleteOrder`（:1808 一带）、`CmdMoveOrder`（:1984 一带）、`CmdModifyOrder`、清空订单、反转订单均无打点——而这些命令**会写 `cur_real_order_index` / `cur_implicit_order_index`**（例：`InsertOrder()` 的 `if (sel_ord <= u->cur_real_order_index) u->cur_real_order_index++`，:1650）。
+- **现场证据**：第 207 轮日志（381 行）中 veh=54 的 real 在 `cmd-skip-in` 站点**首行即 1**（`real=-1->1`），而该链在读档段全部为 0、在拖动段无行 ⇒ `0->1` 的写者落在**无站点的订单编辑命令**里，构成第十节判据 4 所述黑箱窗。结论：KI-310 的"静默跳命令"由此归因到玩家重设调度（插入第一条命令）触发的上游索引后移语义，而非 R3R 的隐藏写点。
+- **建议**：在 `CmdInsertOrder` / `CmdDeleteOrder` / `CmdMoveOrder` / `CmdModifyOrder` / `CmdClearOrderList` / `CmdReverseOrder` 的 Execute 体前后各加一对 `R3RWatchOrderIndexSite(Train::From(v), "cmd-insert-in"/"cmd-insert-out", …)`（与 `cmd-skip-in/out` 同构，只动 `src\order_cmd.cpp` 与 `src\train_cmd.cpp`，不碰 `src\*.h`，保持 KI-183 增量合规）。
+- **第 207 轮已实现（玩家 2026-10-03「好，请你动手」）**，实际落点比建议更严（只动 `src\order_cmd.cpp`，未碰任何 `src\*.h`）：
+  - 新增文件内匿名命名空间 RAII 包裹 `struct R3ROrderIdxWatch`（`src\order_cmd.cpp:61`，位于 `safeguards.h` 之后）：构造打 `site_in`、**析构**打 `site_out`。之所以不用手写 in/out，是因为 `CmdModifyOrder` / `CmdBulkOrder` 内部有多条 `return CMD_ERROR;` 提前返回路径，手写 out 必漏；RAII 让所有 return 路径天然成对。非 `VehicleType::Train` 的车辆自动跳过（构造时判类型，`Train::From` 只在列车时执行）。
+  - **底层出口 2 对**（覆盖一切插入/删除，含建议里没列到的路径）：`OrderList::InsertOrderAt()` → `ordlist-insert-in/out`（:838）；`OrderList::DeleteOrderAt()` → `ordlist-delete-in/out`（:867）。车主取 `this->GetFirstSharedVehicle()`。这一对能覆盖 `CmdInsertOrdersFromVehicle` 直调 `InsertOrderAt`、`CmdMassChangeOrder`、`CmdBulkOrder` 内部批量，以及 R3R 自己在 Couple/Decouple 里插等待点。
+  - **命令层 6 对**：`DecloneOrder` → `cmd-declone-in/out`（这就是订单窗口的"清空订单列表"，也被 `CmdDeleteOrder` 的越界分支调用）；`CmdDeleteOrder` → `cmd-delete-in/out`；`CmdMoveOrder` → `cmd-move-in/out`；`CmdReverseOrderList`（Reverse 分支）→ `cmd-reverse-in/out`；`CmdModifyOrder` → `cmd-modify-in/out`；`CmdBulkOrder` → `cmd-bulk-in/out`。
+  - 全部纯只读（只读 real/impl/tt/条数/orders 指针），不改任何索引语义、不改任何字段。
+- **构建自证**：复用既有 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`build\R3R_incbuild.guard.log=GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.done=EXIT_CODE=0`（2026-10-03 04:40）；`src\order_cmd.cpp` @04:36 → `order_cmd.cpp.obj` @04:38 → `build\openttd.exe` @04:40（51 634 176 B，时间戳单调）；构建日志 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 0；`read_lints` 0 条；`findstr` 在 exe 内命中 7 个新字面量（`ordlist-insert-in` / `ordlist-delete-out` / `cmd-move-in` / `cmd-reverse-in` / `cmd-modify-in` / `cmd-bulk-in` / `cmd-declone-in`）。
+- **复测判据**：①复现"重设调度"后应出现 `ordlist-insert-in/out`（或 `cmd-bulk-in/out`）夹住 `real=0->1`，且 `veh` 与该链头一致；②该 `0->1` 不再出现在任何其它 site（黑箱窗关闭）；③随后点第一条命令仍是 `cmd-skip-in/out` 且 `1->0`（既有行为不回退）；④未做订单编辑的会话里新 site 一行不出现（无噪声）。
+- **状态**：**已实现（已编译、已入 exe）**，第 208 轮现场已按判据取数，黑箱窗确认关闭（见「第 208 轮」小节）；不解除 KI-310（KI-310 已于第 208 轮结案）。严重度：低（仅观测网缺口，不影响运行行为）。
+
+## 第 208 轮（2026-10-03）
+
+本轮**未改任何源码**，只做取证与结案；临时分析报告 `R3R_order_index_probes_round208_memo.md`。现场 `build\R3R_debug.log`（371 行 / 38 744 B / 2026-10-03 04:44），由 `build\openttd.exe`（51 634 176 B / 04:40，含第 207 轮 16 个订单编辑哨兵）产生。
+
+#### KI-310（结案：非缺陷）观测网闭合，`cur_real_order_index` 静默跳命令＝上游 `InsertOrder()` 语义
+
+- **来源**：第 208 轮现场；memo §一。
+- **证据**：订单编辑段 L232-239（veh=54）为 `cmd-delete-in`(real -1→0) → `ordlist-delete-in`(n 2) → `ordlist-delete-out`(n 2→1) → `cmd-delete-out`(tt 0→65535) → `ordlist-insert-in`(n 1) → `ordlist-insert-out`(n 1→2) → `cmd-skip-in`(**real -1→1**) → `cmd-skip-out`(**real 1→0**)。整个"删一条 + 插一条"过程 `real` 恒为 **0**，未出现 `0->1`；全日志 `real=1` 仅出现在 `cmd-skip-in/out` 一对（玩家手动"跳过命令"），除该 site 外**无任何 site 出现 `0->1`**。⇒ KI-312 判据 ②（黑箱窗关闭、R3R 无隐藏写点）成立；第 207 轮根因（`src\order_cmd.cpp` 的上游 `InsertOrder()` 按 `sel_ord <= cur_real_order_index ⇒ ++` 后移当前索引）维持。
+- **状态**：**已结案·非缺陷**。严重度：低。玩家 2026-10-03 自述「重设唯二调度里面的第一条，导致索引跳到了第二条」与语义逐字吻合；挂车被"吞"是玩家观感，不是 R3R 缺陷。
+
+#### KI-313（已搁置：玩家拍板否）重设调度后 `GOTO_COUPLE` 丢失「临时挂接分组」⇒ 分组白名单拒挂
+
+- **来源**：第 208 轮现场；memo §1.2。
+- **现象**：同一车库 `1,15`，主动车 54 到达 `GOTO_COUPLE` 目的地后挂不上：`CG-GATE compatible=0 coupler=54 target=0 cdecl=0 tdecl=1 cmask=0x0 tmask=0x1`（L332）→ `CPL-GATE reject=pair-mismatch act=54 tgt=0 aOrd=16 tOrd=17`（L361）→ `COUPLE-FAIL loco=54 order=16`（L362）→ `COUPLE-DEST-EMPTY loco=54 real=0 num=2 next=1 (waiting in place, order kept)`（L365）。
+- **对照**：第 204 轮同场景成功挂接为 `CG-GATE compatible=1 coupler=54 target=0 cmask=0x1 tmask=0x1`（目标声明 0 号组、主动方也在 0 号组）。本轮 `cmask=0x0` ⇒ **主动方（54）的 `GOTO_COUPLE` 上没有临时挂接分组**，与玩家本次"删一条 + 插一条"（L232-237）一致：订单窗口新建命令默认不带分组。
+- **判定**：属**编辑后的数据**问题，非代码缺陷（白名单按设计工作，KI-306 第 202 轮口径）。
+- **状态**：**已搁置（玩家 2026-10-03 拍板「否」）**——不做"编辑/复制命令时保留临时挂接分组"这条便利行为，维持"新命令默认不带分组"。恢复办法（玩家侧）：把主动方 `GOTO_COUPLE` 的「临时挂接分组」重新设成与等待方一致的组，或清掉等待命令上的分组声明。严重度：低。
+
+#### KI-314（已搁置：玩家拍板否）被手动停止（`vehstatus.Stopped`）的等待车底永远不能作为挂接目标
+
+- **来源**：第 208 轮现场；memo §1.2。
+- **现象**：veh 27 排程 `i=0 type=17`（WAIT_COUPLE）、与 54 同在库 `1,15`，但每帧 `SKIP-STOPPED veh=27 order=0 real=17 spd=0 tile=1,15 parked=0 front=1 nord=33`（L312/L339/L345/…）；结果 `CPL-GATE reject=target-not-wait act=54 tgt=27 tOrd=0 tStop=1`（L360）恒定拒绝。对照 veh 0（未被停止）L308 `DEPOT-ARR veh=0 real=0(17) curType=17` 正常加载 WAIT_COUPLE 并成为唯一有效候选。
+- **根因**：`TrainLocoHandler()` 的 Stopped 闸门在 `ProcessOrders()` 之前 return，`current_order` 恒为 `OT_NOTHING`；而挂接目标判据读 `current_order`（`R3RIsCoupleTarget`，`src\train_cmd.cpp:2081` 一带）。R3R 自身停放（`r3r_parked`）有豁免，玩家手动停止没有。
+- **选项**：(a) 维持现状（手动停止＝不接受挂接，语义自洽，可用"开始"恢复）；(b) 放宽判据，允许"链头排程当前条为 OT_WAIT_COUPLE"的停止车底作为目标。
+- **状态**：**已搁置（玩家 2026-10-03 拍板「否」）**——维持选项 (a)：手动停止是玩家的显式意图，与 R3R 的「停放等待」（`r3r_parked`，豁免保留不动）必须区分；恢复办法＝对该车按「开始」。已知副作用（不修，记录备查）：停住的等待车底会让日志持续出现 `CPL-GATE reject=target-not-wait` + `COUPLE-FAIL` + `COUPLE-DEST-EMPTY`（第 208 轮 L359-365）。严重度：中。
+
+#### KI-315（已修：第 209 轮）第 205~207 轮的订单索引哨兵未受编译开关保护 ⇒ `R3R_PROBES=0` 的发行版仍留记账开销
+
+- **来源**：第 208 轮源码取证；memo §三 + 第 209 轮 memo §三。
+- **事实**：`R3RWatchOrderIndex()`（`src\train_cmd.cpp:1898`）函数体**没有** `if (!R3RDbgOn()) return;` 早退门，进入后立即算 key、查写 `static std::unordered_map<uint64_t, R3RIdxSnap>` 并调 `R3RChainHasRealArticPart(t)`；末尾的 `R3RDbgWrite(...)`（:1931）在 `R3R_PROBES=0` 下展开为 `((void)0)`（`src\r3r_perf.h:240-242`），**只丢日志与格式串，记账与全链扫描留下**。调用点亦未加 `#if R3R_PROBES`（`src\train_cmd.cpp:16733` 为裸调用）。全树 26 个调用点，其中 10 个位于 `TrainLocoHandler` 每列车每 tick 路径，订单编辑命令另有 6 对（`src\order_cmd.cpp:83-100` 的 RAII `R3ROrderIdxWatch`）。
+- **编译开关实测（第 209 轮更正）**：第 208 轮曾用 `search_content(outputMode="count")` 得出"两文件计数均为 0"，该数字**不可靠**（见第 209 轮「工具陷阱」）。改用 `content` 模式复核实测：`src\train_cmd.cpp` 的 `#if R3R_PROBES` **只有 1 处**（:1695-1706，KI-144/145 探针宏的声明块，与哨兵无关），`src\order_cmd.cpp` 为 **0 处** ⇒ 结论（哨兵未受编译开关保护）成立且更精确。
+- **实证**：发行版 `build-release\openttd.exe`（2026-09-20 13:53）内 `FOLDCHK` **搜不到**（旧探针确实被编译掉），而 `ORD-IDX-WATCH` 不在该 exe 的生成时间范围内、无法用 exe 字符串证明新版也干净 ⇒ 只能靠源码判定。
+- **修法（已实施，第 209 轮）**：两处各加一行运行期门禁 —— ① `R3RWatchOrderIndex()` 首行 `if (!R3RDbgOn()) return;`；② `R3RWatchOrderIndexSite()`（供 `order_cmd.cpp` 等跨 TU 打点的非 static 包装）首行同一门禁。`R3RDbgOn()` 在 `R3R_PROBES=0` 时是常量 `false`（`:153-155`）⇒ 门禁被折叠为 `if (false) return;`、函数体（静态表 + 链扫描）整块删除、不产生指令；运行期 `R3R_DBG=0`（KI-26 的 A/B 基准）同样短路；探针开启时日志逐字不变。未碰 `src\*.h`（增量合规），未改 `R3RDbgWrite` 宏，未改任何探针判据/字段，`order_cmd.cpp` 的 RAII 未动（已被第 ② 条覆盖）。
+- **状态**：**已修（第 209 轮）**。严重度：低~中（发行版原先"不写日志但仍做每 tick 每列的 map 记账与铰接扫描"）。复测判据见第 209 轮 memo §五。
+
+## 第 209 轮（2026-10-03）
+
+本轮＝玩家对第 208 轮三条新 KI 的拍板落实 + 一处修码。临时分析报告 `R3R_order_index_probe_gate_round209_memo.md`。改动仅 `src\train_cmd.cpp` 两行门禁（未碰 `src\*.h` ⇒ 增量合规），无任何行为变更。
+
+- **KI-313**：玩家拍板**否** ⇒ 不做"编辑/复制命令时保留临时挂接分组"，状态改「已搁置」；给玩家的恢复办法写在条目里（重设主动方分组，或清掉等待方分组声明）。
+- **KI-314**：玩家拍板**否** ⇒ 维持"手动停止的车底不作挂接目标"（`r3r_parked` 停放豁免不变），状态改「已搁置」；已知日志噪音副作用照实记录、不修。
+- **KI-315**：玩家拍板**修**，已实施（见上）；状态改「已修」。
+- **工具陷阱（重要，修正第 208 轮论据）**：本环境 `search_content` 的 `outputMode="count"` **不可靠** —— 对同一行 `R3RDbgWrite("ORD-IDX-WATCH ...`（`src\train_cmd.cpp:1931`）它报 0 匹配，而 `outputMode="content"` 命中 1 处；`R3RDbgOn\(` 同样误报 0。⇒ 此后判定"某写法是否存在/有几处"一律用 `content` 模式（或 `findstr /c`），不再用 `count`。
+- **构建自证**：复用 `_tmp_inc_build.cmd`（未新建 `.cmd`）；护栏 `GUARD: incremental is safe`；`[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；错误计数 0；时间戳链 `src\train_cmd.cpp` 15:30 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 15:32 → `build\openttd.exe` 2026-10-03 15:35（51 637 248 B，较上一版 +3 072 B）；`read_lints` 0 条；内测 exe 仍命中 `ORD-IDX-WATCH`（探针开启时日志/行为不变）。发行树（`build-release\`）未重编 ⇒ 发行版"零记账"目前为源码层判定（`R3RDbgOn()` 在 `R3R_PROBES=0` 下为常量 `false`）。
+- **复测判据**：①探针 ON 时 `ORD-IDX-WATCH` 内容/条数不变；②`R3R_DBG=0 R3R_PERF=1` 组合下 `TrainLocoHandler` 桶 ns 相比修复前下降（注意 `R3R_debug.log` 无 `ORD-IDX-WATCH` 这一点修复前后相同，因 `R3RDbgWrite` 自身有门禁）；③判"写法是否存在/几处"一律用 `content` 模式，禁用 `count`。
+
+## 第 210 轮（2026-10-03）
+
+本轮＝玩家「HXN5B 停在机待线不去挂车」的现场取证，**未改任何源码**（不改判据/行为，不构建）。临时分析报告 `R3R_hxn5b_stuck_round210_memo.md`。现场 `build\R3R_debug.log`（257 376 B / 4 150 行，mtime 2026-10-03 15:22:40）。
+
+- **两个互不相同的问题**：①「不去车库挂车」＝ **KI-314**（目标车底 27 被手动停止，`tStop=1` ⇒ 永不作目标；玩家第 208 轮已拍板维持现状，本轮不改）；②「一直停在机待线」＝ **KI-316（本轮新增，高）**：GOTO_COUPLE 目的地无可挂目标 ⇒ `CPL-PATHFOUND found=0` ⇒ 不订路 ⇒ `Stuck` ⇒ 永久停驻。
+- **身份（`SEGTR-SNAP` 反查）**：veh 54=`HXN5B-XXXX`；veh 57=`HXN5B-XXXX2`（停在 21,13）；veh 48=`DF4D-3058`（未卡死）；veh 51=车号未定（另一台 GOTO_COUPLE 机车，停在 99,108）。
+- **KI-317（本轮新增，中）**：`found=0` 型卡死拿不到任何自愈出口 —— KI-289 `COUPLE-WAIT-HEAL`/`NOHEAL`（需 `pf.reverse_at_signals` 或 `TPRRF_REVERSE_AT_SIGNAL`）与 KI-193 `COUPLE-DEST-EMPTY`（需已到目的地）双双够不着；现场两探针均 0 命中。
+- **KI-318（复核：非缺陷）**：5 条 scan `CPL-GATE reject`（邻车还在执行自己订单）+ `SVC-DEPOT-SKIP`（KI-220 守卫）均为设计行为，登记备查不修。
+- **计数（`findstr` 实测）**：`CPL-PATHFOUND` 且 `found=0` = 63；`COUPLE-OK` = 4；`CPL-GATE reject` = 6；`COUPLE-DEST-EMPTY` = 0；`COUPLE-WAIT-HEAL` = 0；`COUPLE-WAIT-NOHEAL` = 0。
+- **工具坑**：`build\` 被 `.gitignore` 覆盖 ⇒ `search_content` 在其下恒返 0，读日志用 `cmd /c findstr /n`。
+- **本轮未做**：不改源码、不构建（纯取证）；KI-316/317 的修法待玩家拍板（"继续驶向目的地" vs "有界自愈"）。
+- **复测判据**：见第 210 轮 memo §七（5 条）。
+
+#### KI-316（新增：第 210 轮；第 212 轮 已修·变体 (a)；**第 214 轮 按玩家口径回退**）`GOTO_COUPLE` 目的地无可挂目标 ⇒ 不订路 ⇒ 机车**原地等待**（第 214 轮认定：这是正确行为，不是缺陷）
+
+- **来源**：第 210 轮现场；临时报告 `R3R_hxn5b_stuck_round210_memo.md` §四。
+- **现象**：L1943 `DEPOT-ARR veh=51 spd=0 real=3(16) curType=16 stuck=1 tx=99 ty=108 destTx=99 destTy=97 tileEqDest=0`；L1984 同型 `veh=57 … tx=21 ty=13 destTx=27 destTy=7 tileEqDest=0`。此后两台机车**不再移动**（L3956/L3959 仍只有 `CPL-PATHFOUND veh=51/57 found=0` 重试）。
+- **根因**：`OT_GOTO_COUPLE` 的寻路目标是**可挂目标**（couple 专用寻路），**不是订单目的地**。目的地 (99,97)/(27,7) 无 `OT_WAIT_COUPLE` 车底 ⇒ `CPL-PATHFOUND found=0`（全日志 63 次）⇒ `TryPathReserveWithResultFlags()` 拿不到 `TPRRF_RESERVATION_OK` ⇒ 无路径 ⇒ `VehicleRailFlag::Stuck`（`stuck=1`）。
+- **连锁死结**：`R3RCoupleOrderDestinationReached()` 需"停稳在目的地"才为真，而车到不了目的地（全日志 `tileEqDest=0`）⇒ KI-193 的 `COUPLE-DEST-EMPTY` 兜底（到点后 500 tick 跳过命令）**永不武装**（0 命中）。⇒ 车"既不走、也不跳命令"。
+- **状态**：**第 214 轮已回退**（删除变体 (a)，恢复「原地等待」，见本条末「第 214 轮回退」）。第 212～213 轮曾标「已修」。严重度：**低**（回退后＝玩家指定行为，不再是缺陷）。
+- **第 212 轮修复（变体 (a)：找不到可挂目标时仍驶向订单目的地）**：`src\train_cmd.cpp` 的 `ChooseTrainTrack()` 中 `DoTrainCouplePathfind()` 返回 `INVALID_TRACK` 的失败分支（原 `:13372-13377`）不再直接放弃，改为①`MarkSingleSignalDirty()`；②`FreeTrainTrackReservation()`；③当 `res_dest.tile != INVALID_TILE && !res_dest.okay` 时调用普通寻路 `DoTrainPathfind(consist, …, do_track_reservation, &res_dest, &final_dest)` 驶向订单目的地。找到即 `HandlePathfindingResult(true)`、置 `CTTRF_RESERVATION_MADE`、返回 `best_track`，并打边沿触发探针 `COUPLE-NOTARGET-FALLBACK veh=%d tile=x,y dest=x,y ord=%d`（节流表 `_r3r_couple_fb_news`，离开 GOTO_COUPLE 订单时清）。到达目的地后由既有 KI-193 停驻门接管（`COUPLE-DEST-EMPTY`，命令保留；满 `R3R_COUPLE_DEST_IDLE_LIMIT`=500 tick 后跳过命令）⇒「永久冻住」变为「开到、等待、继续」。
+- **保留的旧行为（安全边界）**：只有 couple 寻路**失败**时才回退；「目的地暂时到不了」（等待车底挡路、信号未放）时普通寻路同样失败，仍走原 `MarkTrainAsStuck()` + `FindFirstTrack()` ⇒ 不会把车导向别处，不会丢"原地等待重试"语义。
+- **历史修复方向记录（现已实施 (a)）**：(a) 找不到可挂目标时仍按订单目的地驱动（到达后交由 KI-193 跳过）；(b) 补齐 `found=0` 型的有界自愈（见 KI-317，未做）。
+- **第 212 轮附记（2026-10-03，只读代码，未改码/未重编；详见本轮小节 §六）**：R-1（机车是否会真停在站台型目的地）**结案**——`UpdateOrderDest()`（`order_cmd.cpp:4512-4520`）为 `OT_GOTO_COUPLE` 写了 `dest_tile`，`YAPF SetDestination()` 的 `default` 分支（`yapf_destrail.hpp:176-180`）正是读它，车库型与普通 `OT_GOTO_DEPOT` 走同一段代码；再加 `IsBaseStationOrder()` 为假 + `AdvanceOrdersFromVehiclePosition():12946` 早退 ⇒ 机车驶到并停在目的地，随后由 KI-193 门接管。R-2（`res_dest.okay` 是否恒假）**降级为可接受残余**：能执行到 `:13397` 已蕴含 `!okay || long_reserve`（`okay && !long_reserve` 会在 `:13335-13356` 提前返回），最坏配置下 `:13423` 门为假 ⇒ 走 `:13449` 旧路径，行为与本轮之前逐字一致。**新登记残余 R-1b（中）**：站台型回退目标是**单一格** `st->xy`（普通 `OT_GOTO_STATION` 允许任意站台格），该格被不可挂列车压住时回退也失败 ⇒ 仍永久停驻；判据＝「有 `found=0`、**无** `COUPLE-NOTARGET-FALLBACK`、机车不动」。
+- **第 214 轮回退（2026-10-03，玩家拍板；详见 `R3R_couple_no_target_wait_round214_memo.md`）**：玩家原话「全图找不到符合条件的车就立刻回滚？这可不行，这不是我想要的。我想要的是如果没有车等挂机车就在机待线等到有车。我认为应该删除」⇒ **删除变体 (a)**：`ChooseTrainTrack()` 里 `if (res_dest.tile != INVALID_TILE && !res_dest.okay) { … }` 整块（改动前 `:13469-13494`，探针 `COUPLE-NOTARGET-FALLBACK` @ `:13484`）＋死代码 `_r3r_couple_fb_news`（声明 `:11624-11631`、清表 `:11735-11737`）。删除后该分支只剩 `MarkSingleSignalDirty()` → `FreeTrainTrackReservation()` → `MarkTrainAsStuck()` → `return { FindFirstTrack(tracks), result_flags }`（丢预留、标 Stuck、原地不动、每轮重试 CPL）。⇒「永久停驻」被玩家认定**不是缺陷**（＝在机待线等车）。M2（车库型）与 `:13463`／「路径找到但订不下」两处门**保留**。
+
+#### KI-317（新增：第 210 轮；第 212 轮 部分缓解）`found=0` 型卡死拿不到任何自愈出口（KI-289 / KI-193 都够不着）
+
+- **来源**：第 210 轮现场；临时报告 `R3R_hxn5b_stuck_round210_memo.md` §五。
+- **代码**：`src\train_cmd.cpp:17335-17393`（`TrainLocoHandler` Stuck 分支）。`:17352` `turn_around = (wait_counter % (wait_for_pbs_path*DAY_TICKS)==0) && _settings_game.pf.reverse_at_signals`；`:17353` heal 用尽 ⇒ false；`:17359` `r3r_rev_wanted = turn_around || (path_result & TPRRF_REVERSE_AT_SIGNAL)`；`:17367`/`:17375` `COUPLE-WAIT-NOHEAL`/`HEAL`；`:17393` `return true`。
+- **缺口**：①KI-289 的 `COUPLE-WAIT-HEAL` 入口需 `turn_around`（要求 `pf.reverse_at_signals` 开启 + 周期命中）或 `TPRRF_REVERSE_AT_SIGNAL`，而 `found=0` 产生不了后者；②KI-193 的 `COUPLE-DEST-EMPTY` 入口需"已到目的地"（KI-316 已证永假）。
+- **实证**：`COUPLE-WAIT-HEAL` = 0、`COUPLE-WAIT-NOHEAL` = 0（`findstr` 实测）⇒ 整段 Stuck 逻辑对 `found=0` 型卡死零产出；唯一出现过的一次掉头（L1919/L1965）之后即转 `stuck=1`、再无动作。
+- **定性**：自愈只覆盖"已到目的地、无目标"（`_r3r_couple_no_target`@`:11830` 注册后的 KI-289 路径），**不覆盖"途中找不到目标"**。
+- **状态**：**第 214 轮改判：按玩家口径＝设计行为（原地等待），不再是缺陷**（第 212～213 轮曾标「部分缓解」）。严重度：**低**。注：第 214 轮删除了 KI-316 变体 (a) 的回退后，`found=0` 型又回到「原地无限等待、无自愈出口」——这正是玩家要的语义；KI-289 的 `COUPLE-WAIT-HEAL` 仍够不着 `found=0`。第 212 轮按变体 (a) 修掉 KI-316 后，`found=0` 不再「原地永久停驻」（机车改为驶向订单目的地，到点后由 KI-193 的 `COUPLE-DEST-EMPTY` 兜底跳过命令），本条的「无自愈出口」在主路径上不再致命。**残余未修**：KI-289 的 `COUPLE-WAIT-HEAL` 仍够不着 `found=0`（入口仍需 `pf.reverse_at_signals` 周期命中或 `TPRRF_REVERSE_AT_SIGNAL`），若目的地本身不可达（回退寻路也失败），机车依旧只能 `Stuck` 且无有界自愈 —— 待复测数据再定是否补 (b)。另有一条**已定型的失效子情形 R-1b**（见本轮小节 §六.2 与 KI-316 第 212 轮附记）：站台型回退目标是单一格 `st->xy`，被不可挂列车压住时回退同样失败 ⇒ 本条的「无自愈」在该子情形下依旧成立。
+
+#### KI-318（复核：第 210 轮，非缺陷）6 条 `CPL-GATE reject`（5 条 scan）+ `SVC-DEPOT-SKIP` 均为正常行为
+
+- **来源**：第 210 轮现场；临时报告 `R3R_hxn5b_stuck_round210_memo.md` §六。
+- **复核**：6 条 `CPL-GATE reject` 中 1 条 `site=depot act=54 tgt=27 tOrd=0 tStop=1`（=KI-314，手动停止的目标）；5 条 `site=scan`（L556/603 `act=57 tgt=54 tOrd=6`、L954/974/1004 `act=54 tgt=57 tOrd=1`）—— 9 格扫描把正在执行自己订单（type 6 路点 / type 1 车站）的邻车当候选后按 `R3RCanCoupleNow` 设计拒绝，**正常**。`SVC-DEPOT-SKIP`（veh=0/veh=6/veh=48，`tag=couple-protocol`）＝ KI-220「耦合协议车辆不回库自动检修」守卫，**正常**。
+- **状态**：**非缺陷（已澄清）**。严重度：低。仅登记备查，不修。
+
+
+## 第 211 轮（2026-10-03）
+
+同现场追问（只读取证，未改码、未构建）：玩家要求「veh57 在日志后面的行为，把你所知的问题列出来」。现场仍是 `build\R3R_debug.log`（4150 行，mtime 2026-10-03 15:22:40，与第 210 轮同一份）。veh57 后半段时间线＝耦合（L771/L845/L880，`n=6->33`、`nseg=3 ctrl=6 borrowed=1`）→ 解挂（L1135/L1171，`decouple-v head=57` / `decouple-u head=0`）→ 回到自己的 6 条排程（`real=4 type=16 dest=923`）→ L1943/L1984 `DEPOT-ARR stuck=1` @21,13 → 之后永久停驻到日志末行。已登记问题：KI-316（目的地无可挂目标）、KI-317（无自愈出口）、KI-318（gate 属正常）。本节新增两条，另排除三项（见报告 §八.4）。
+
+### KI-319（新增：第 211 轮；第 212 轮 已修）`CPL-PAIR-STEAL` 打在准入判据之前 —— 把「注定被拒的候选」报成「抢锁」
+
+- **来源**：第 211 轮现场；临时报告 `R3R_hxn5b_stuck_round210_memo.md` §八.2。
+- **现场**：L3951/L4010 `CPL-PAIR-STEAL act=51 tgt=6 from=48 myEnter=13793 hisEnter=16893`、L3952/L4013 `act=57 tgt=6 from=48 myEnter=13809 hisEnter=16893`；而全日志**没有** `CPL-PAIR act=57 tgt=6`，L3943/L3987 始终是 `CPL-PAIR act=48 tgt=6 dist=7 actTile=102,68 tgtTile=100,63` ⇒ 锁从未易主，日志里的「51/57 与 48 争抢」是假象。
+- **代码**：`src\train_cmd.cpp:11445-11457` 在 `R3RCouplePairOutranks` 放行后打印 STEAL（**只打印，不改 `_r3r_couple_pairs`**，`R3RGetCouplePairPartner` 读到的仍是旧持有者）；紧接着 `:11458 if (!R3RCoupleAllowedIgnoringPair(coupler, t)) continue;` 才是真正准入。`R3RCoupleAllowedIgnoringPair()`（`src\couple_group.cpp:322`）内含 KI-165 的订单目的地判据 `:370`（站台候选 `GetStationIndex(target->tile) != dest.ToStationID()` ⇒ 拒）。veh6 在 100,63、veh57 的订单目标是站 923 ⇒ 必被 `:370` 拒 ⇒ `best==nullptr`（`:11467`）⇒ 只记扫描时刻，`R3R_PAIR_RESCAN_TICKS=8`（`:11415-11417`）后重来，每来一次再打一条 STEAL。
+- **讽刺点**：同一函数 `:11471-11475` 的注释明确写着 KI-188「Do not report a lock which was never taken -- that lie is what made the KI-188 log read as a self-lock」，但那条修复只覆盖 `CPL-PAIR`；`CPL-PAIR-STEAL` 的同类谎报仍在。
+- **代价**：①日志误导（把「每 8 tick 空转一圈」读成「抢锁争用」）；②每次注定失败的全池 `Train::Iterate` 遍历。
+- **修法建议（第 212 轮已按此落地）**：把目的地判据（或 `R3RIsCoupleTarget` 旁的等效预筛）提到候选循环最前面、STEAL 打印之前；`best` 选择改为「先过目的地、再按距离」。
+- **第 212 轮修复**：`src\train_cmd.cpp` 的成对扫描候选循环里，在 `if (t->vehstatus.Test(VehState::Stopped)) continue;` 之后、成对锁/`CPL-PAIR-STEAL` 打印之前，插入 `if (!R3RCoupleTargetAtOrderStation(coupler, t)) continue;`（该静态助手早已存在，原本只用于挑 `reject=dest-mismatch` 标签；本轮把它的文档注释改为"兼作预筛"）。准入集合一字不改（`R3RCoupleAllowedIgnoringPair()` 稍后本会以同一判据拒掉这些候选，但那是**在 STEAL 打印之后**），因此只有日志与少量无用的成对查询被省掉。
+- **状态**：**已修（第 212 轮）**。严重度：低（不改变任何走车结果，仅去掉谎报）。
+- **复测判据**：①同场景不再出现 `CPL-PAIR-STEAL act=57 tgt=6`，或出现即必伴随 `CPL-PAIR act=57 tgt=6`；②51/57 不再长期停在原地（KI-316 已修，应见 `COUPLE-NOTARGET-FALLBACK` 并驶向目的地）；③48 的 `CPL-PAIR act=48 tgt=6` 不受影响；④同站多机车争抢同一车底的正常场景，抢锁语义不回退（`CPL-PAIR`/`CPL-PAIR-STEAL` 的打印条件本身未改）。
+
+### KI-320（新增：第 211 轮，待核实·推论）耦合优先权只看「进入订单的先后」，不看距离/目的地
+
+- **来源**：第 211 轮，由 KI-319 现场旁证推出（本现场未实际触发）；同一临时报告 §八.3。
+- **代码**：`R3RCouplePairOutranks()`（`src\train_cmd.cpp:6568-6574`，`mine < his` ⇒「更早进入耦合订单者胜」，`R3RCoupleEnterTick` 取 `:6552`，时间戳注册见 `R3REnsureCouplePair` 路径）；候选选择 `:11460-11464` 只按 `DistanceManhattan` 取最近、**无距离上限**，也不先按订单目的地过滤。
+- **推论**：若两台机车进入耦合订单的时间先后与「离目标的远近」相反（远处先进入订单、近处后进入），远处的车会凭更早的 enter-tick 夺走近处车已锁定的车底 ⇒ 近处车白跑一趟。本现场 veh57（21,13）enter 更早（13809 < 16893）却因 KI-319 所述的目的地判据被拦下，故未发生。
+- **状态**：**待核实（推论）**。严重度：中（若成立，属排程不公平 + 无谓往返）。需要一次「两车同目的地、距离明显不同、进入订单先后相反」的现场日志确认。
+- **复测/确认判据**：构造上述场景，观察是否出现「远车 `CPL-PAIR` 抢到、近车被 `CPL-PAIR-STEAL from=<远车>` 且抢不回」。
+
+---
+
+## 第 212 轮（2026-10-03）
+
+延续第 210/211 轮的 KI-316 / KI-317 / KI-319 / KI-320 未收口项。**本轮改动仅 `src\train_cmd.cpp` 一个 .cpp**（未碰任何 `src\*.h`、未改 `src\lang\*.txt`），实现 **KI-316 变体 (a)** 与 **KI-319**；KI-317 在主路径上被消解（残余未修）、KI-320 仍待现场数据。完整取证与结论 = 工作区报告 `R3R_couple_no_target_round212_memo.md`。
+
+### 一、KI-316 已修（变体 (a)：找不到可挂目标时仍驶向订单目的地）
+
+- **落点**：`ChooseTrainTrack()` 中 `DoTrainCouplePathfind()` 返回 `INVALID_TRACK` 的失败分支（原 `:13372-13377`）。
+- **改法**：① `MarkSingleSignalDirty()`；② `FreeTrainTrackReservation()`（先清失败方残留）；③ 当 `res_dest.tile != INVALID_TILE && !res_dest.okay` 时调用普通寻路 `DoTrainPathfind(consist, …, do_track_reservation, &res_dest, &final_dest)` 驶向订单目的地；④ `HandlePathfindingResult()`，成功即 `CTTRF_RESERVATION_MADE`（仅当 `do_track_reservation`）+ 返回 `best_track`；⑤ 回退也失败则一字不改回落 `MarkTrainAsStuck()` + `FindFirstTrack(tracks)`。
+- **探针**：`COUPLE-NOTARGET-FALLBACK veh=%d tile=%d,%d dest=%d,%d ord=%d`，节流表 `_r3r_couple_fb_news`（`btree_map<VehicleID, TileIndex>`，声明在 `_r3r_couple_dest_idle` 旁 `:11610` 一带；在 `TrainCoupleHandler()` 非 `OT_GOTO_COUPLE` 早退处 `erase`）⇒ 每次「目的地变了/重新进入订单」各报一行。
+- **为什么算修好**：到达目的地后由既有 KI-193 停驻门接管（`R3RCoupleOrderDestinationReached()` 按 depot id / station id 判到点 ⇒ `COUPLE-DEST-EMPTY`，命令保留；满 `R3R_COUPLE_DEST_IDLE_LIMIT`=500 tick 无车底 ⇒ 跳过命令、`real=` 前进）⇒「永久冻住」变为「开到、等待、继续」。
+- **安全边界**：只有 couple 寻路**失败**才回退；「目的地暂时到不了」（等待车底挡路/信号未放）时普通寻路同样失败 ⇒ 仍 `Stuck` 原地等待重试，不被导向别处；正常挂车 `found=1` 根本不进本分支。
+- **原「未确认项」现状（2026-10-03 同日静态结案，详见 §六）**：R-1 **已结案**（站台 / 车库两型机车都会驶到并停在订单目的地，代码证据 4 条）；R-2 **降级为可接受残余**（能执行到回退分支本身已蕴含 `!res_dest.okay || long_reserve`，最坏配置下行为与本轮之前逐字一致、不引入新回归）。**新增派生残余 R-1b**（站台型回退目标只是单一格 `st->xy`，被不可挂列车压住时本轮修复失效）——见 §六.2。
+
+### 二、KI-319 已修（`CPL-PAIR-STEAL` 谎报）
+
+- **落点**：成对扫描候选循环，`if (t->vehstatus.Test(VehState::Stopped)) continue;` 之后、成对锁 / `CPL-PAIR-STEAL` 打印**之前**，插入 `if (!R3RCoupleTargetAtOrderStation(coupler, t)) continue;`。
+- **依据**：该静态助手早已存在（原本只用于挑 `reject=dest-mismatch` 标签），语义与 `R3RCoupleAllowedIgnoringPair()` 的目的地部分逐字一致，而后者是在 STEAL 打印**之后**才拒 —— 于是「注定被拒的候选」被广告成「被别人抢锁」。准入集合一字不改，只是不再谎报（同处已把该助手的文档注释改为「兼作候选预筛」）。
+
+### 三、KI-317 / KI-320
+
+- **KI-317**：状态改为**部分缓解（第 212 轮）**。主路径上 `found=0` 不再「原地永久停驻」。残余未修：KI-289 的 `COUPLE-WAIT-HEAL` 仍够不着 `found=0`（仍需 `pf.reverse_at_signals` 周期命中或 `TPRRF_REVERSE_AT_SIGNAL`），目的地不可达时仍无有界自愈。
+- **KI-320**：未动，仍待「两车同目的地、距离明显不同、进入订单先后相反」的现场日志。
+
+### 四、构建自证
+
+- 入口：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-10-03 18:01:59）
+- 日志 `build\R3R_incbuild.log`：`[3/3] Linking CXX executable openttd.exe`；`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**
+- 时间戳链：`src\train_cmd.cpp` 17:50:32 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 17:52:11 → `build\openttd.exe` **18:01:35（51 672 064 B）**
+- `read_lints(src\train_cmd.cpp)` = 0 条
+- 产物自证：exe 内命中 `COUPLE-NOTARGET-FALLBACK veh=%d tile=%d,%d dest=%d,%d ord=%d`
+
+### 五、本轮待复测（4 条）
+
+1. 同场景（veh=51 @99,108 → 99,97；veh=57 @21,13 → depot 27,7）应出现 `COUPLE-NOTARGET-FALLBACK veh=51 …` / `veh=57 …`，且机车**开动**驶向目的地（不再停在机待线/库门口）。
+2. 到达后应出现 `COUPLE-DEST-EMPTY`（KI-193 停驻门，命令保留）；满 500 tick 后订单被跳过、`real=` 前进、列车继续后续运输。
+3. 同场景不再出现 `CPL-PAIR-STEAL act=57 tgt=6`；若出现则必伴随 `CPL-PAIR act=57 tgt=6`。
+4. **无回归**：等待车底确实在目的地时仍是 `CPL-PATHFOUND found=1` → `COUPLE-OK`，且**不出现** `COUPLE-NOTARGET-FALLBACK`；「目的地暂不可达」（挡路/信号）仍 `Stuck` 原地等待重试；同站争抢的 `CPL-PAIR` / `CPL-PAIR-STEAL` 语义不回退。
+
+### 六、R-1 / R-2 静态结案（2026-10-03 追加；**只读代码，未改任何源码、未重新构建**）
+
+把 §一 的 R-1 / R-2 两个「必须靠复测判」的未确认项用代码证据收口；同时暴露一条新残余 R-1b。当前 exe 仍是本轮的 `build\openttd.exe` @18:01:35（51 672 064 B）。
+
+**6.1 R-1 = 机车会驶到订单目的地并停下（站台 / 车库两型均已证）——结案**
+
+1. **`GOTO_COUPLE` 订单确实写 `dest_tile`**：`src\order_cmd.cpp` `UpdateOrderDest()` 的 `case OT_GOTO_COUPLE`（`:4512-4520`）——车库型 ⇒ `Depot::Get(id)->xy`；站台型 ⇒ `v->GetOrderStationLocation(order->GetDestination().ToStationID())`；`ProcessOrders()`（`src\train_cmd.cpp:4663-4673`）对 `OT_GOTO_COUPLE` 会调用它 ⇒ 每 tick 有效。
+2. **普通寻路拿得到该目的地**：`CYapfDestinationRailBase::SetDestination()`（`src\pathfinder\yapf\yapf_destrail.hpp:146`）的 `switch` **无 `OT_GOTO_COUPLE`** ⇒ 落 `default:`（`:176-180`）= `dest_tile = v->dest_tile; dest_station_id = Invalid(); dest_trackdirs = GetTileTrackdirBits(...)`。车库型与普通 `OT_GOTO_DEPOT` 走同一段代码（后者 `:170-174` 后 `[[fallthrough]]` 进 `default`）⇒ 定位机制逐字相同。
+3. **到达判定即「订单目的地」**：`PfDetectDestination()`（`:207-229`）在 `dest_station_id == Invalid()` 且 `any_depot == false`（`any_depot` 仅在 `OT_GOTO_DEPOT + ODATFB_NEAREST_DEPOT` 置位）下取 `tile == dest_tile && HasTrackdir(dest_trackdirs, td)`。站台型 `dest_tile` = `Train::GetOrderStationLocation()` 的返回值 = **`st->xy`**（`src\train_cmd.cpp:13982`，铁轨车站基准格）。
+4. **到了不停留推进、而是停住等人**：`OT_GOTO_COUPLE` 的 `IsBaseStationOrder()` 为假（`src\order_base.h`：`OT_IMPLICIT || OT_GOTO_STATION || OT_GOTO_WAYPOINT`）⇒ `ChooseTrainTrack()` 的到站推进分支（`:13570` 一带）不进；`AdvanceOrdersFromVehiclePosition()`（`:12946`）对 `OT_GOTO_DEPOT`/`OT_GOTO_COUPLE` 提前 `return` —— 其上方注释（`:12930-12935`）原文即写明「the platform entrance tile **which is the GOTO_COUPLE destination**」⇒ 预留终点 = 目的地，无路可续 ⇒ 停住。
+
+⇒ 闭环落到 KI-193 停驻门：`R3RCoupleOrderDestinationReached()`（`:11691-11701`）对站台型判「车头所在格是该车站**任一**铁轨格（`HasStationTileRail` + `GetStationIndex == dest`）」⇒ 一进入目的地车站即成真。**变体 (a) 的「开到 → 等待 → 继续」成立。**
+
+**6.2 R-1b（新登记残余，中）站台型回退目标只是单一格 `st->xy`，被不可挂列车压住时本轮修复失效**
+
+- 差异来源：普通 `OT_GOTO_STATION` 走 `SetDestination()` 的 `case OT_GOTO_STATION`（`:164-168`）⇒ `dest_station_id` 有效 ⇒ `PfDetectDestination()` 接受**该站任意站台格**（`:209-222`）；`GOTO_COUPLE` 走 `default` ⇒ **只接受 `st->xy` 这一格**。
+- 后果：若 `st->xy` 恰被一列**不可挂**列车（分组 / 公司 / 订单不符，或根本没在等待）压住 ⇒ `DoTrainCouplePathfind()` = `found=0`，回退 `DoTrainPathfind()` 也到不了 `st->xy` ⇒ `MarkTrainAsStuck()` ⇒ **与本轮之前逐字相同地永久停驻**（KI-193 门也够不着，因为没到目的地）。
+- 判据：复测若「有 `CPL-PATHFOUND found=0`、**无** `COUPLE-NOTARGET-FALLBACK`、机车不动」即命中。
+- 候选修法（**本轮未做**，避免无数据改行为）：①回退前把 `consist->dest_tile` 临时指向空闲站台格（如 `CalcClosestStationTile(...)`）再调 `DoTrainPathfind()`，用完还原；②复刻 `:13488-13506` 的「找不到预留目标 ⇒ `TryReserveSafeTrack()` 找任意安全点」兜底；③把 KI-193 的到点判据放宽为「已进入目的地车站接近范围」。
+
+**6.3 R-2 = 能进到回退分支本身已蕴含 `!res_dest.okay || long_reserve`；最坏配置不引入新回归——降级为可接受残余**
+
+- `res_dest` 在 `:13423` 处的值来自 `ExtendTrainReservation()`（`:13328`）。若 `res_dest.okay == true && !long_reserve`，函数在 `:13335-13356` 一带**提前返回**，**到不了 `:13397`**。
+- 第 210 轮现场有 63 条 `CPL-PATHFOUND found=0`（即已进到 `:13388` 的 couple 寻路）⇒ 现场必然满足 `!okay || long_reserve`；按 `okay == false`（"路线在目的地前被挡住 / 只到车底站台"）解读与 `:13476-13480` 既有注释自洽。
+- 最坏配置（`okay && long_reserve`）：`:13423` 的 `!res_dest.okay` 为假 ⇒ 回退不执行 ⇒ 走 `:13449 MarkTrainAsStuck()` + `:13450 return`。该路径上 `FreeTrainTrackReservation()`（`:13422`）**是本轮之前就有的旧代码**，本轮只是把回退插在其后 ⇒ **行为与旧版逐字一致**，只是"修复在该罕见配置下不生效"。
+- 备用判据：若复测「机车不动且**无** `COUPLE-NOTARGET-FALLBACK`」，除命中 6.2 外即本配置；届时把 `:13423` 门放宽为只看 `res_dest.tile != INVALID_TILE` 即可（该值在 `:13329-13333` 已保证非 `INVALID_TILE`）。
+
+**6.4 结论**：R-1 结案；R-2 降级为可接受残余；新登记 R-1b 残余（已写入 KI-316 附记与 KI-317）。**本轮（静态结案）未改源码、未重新构建**，§五 的 4 条复测判据不变，另加 6.2 的 R-1b 判据。完整取证见 `R3R_couple_no_target_round212_memo.md` §七。
+
+## 第 213 轮（2026-10-03）
+
+#### KI-321（高，已修·第 213 轮实现 + 已编译）GOTO_COUPLE 目的地是车库时，耦合寻路看不见库内等待车底，机车到不了库
+
+- **来源**：玩家口述（承接第 210～212 轮遗留场景：机车 57 → 车库 27,7；与 KI-309 互为反面）。临时分析报告 `R3R_couple_depot_dest_round213_memo.md`。
+- **玩家原话**：「列车的挂接寻路总是寻路到等挂列车所在 tile，但是那个场景等挂列车在车库里，挂接寻路根本找不到！所以我们需要的修复是当前往挂接的目标是车库的时候，直接去目标车库，再在车库里扫描符合列车，而非站台的先扫描后寻路」。
+- **根因（三层，互相叠加）**：
+  1. `yapf_destrail.hpp:357-359` 的 `if (!has_res && !IsRailStationTile(tile)) return false;` ⇒ CPL 里**车库格必须带轨道预留**才算挂接目标，而停稳在库里的等待车底在车库格上**没有预留**；站台格另有「整站台扫描」补丁（`:370-381`），**车库格没有对应分支** ⇒ 库内车底永远进不了目标集 ⇒ `CPL-PATHFOUND found=0`。
+  2. `yapf_rail.cpp:112-121` 的 `FindSafeCouplePositionProc()` 对任何车库格直接 `FSCP … fail=depot` / `return false`；叠加 KI-309 已记的 `yapf_rail.cpp:770-771`（扩展不能从车库格继续）⇒ **车库在 CPL 里是拓扑死胡同**。
+  3. 第 212 轮兜底（`train_cmd.cpp:13397-13448`）**只在 `!res_dest.okay` 时**才改走普通寻路开往命令目的地；车库型目的地能否吃到这条兜底取决于 `res_dest.okay`（未确认项 U1）。吃不到即 `:13449 MarkTrainAsStuck()` ⇒ 机车停在库门口（第 210 轮 `veh=57` 现场形态）。
+  4. 库内挂接块（`train_cmd.cpp:16778-16950`）要求 `track == TRACK_BIT_DEPOT`（机车已在库里）⇒ 进不去则整块够不着。库内扫描能力**本身已存在**（`train_cmd.cpp:11600-11601` 注释：只查车库格 + 门口那一格），缺的只是「让机车进来」。
+- **影响**：车库型挂接命令永久无效——机车既挂不上也进不了库（`stuck=1` 常驻），与 KI-309（订单写站台、车底在库内 ⇒ 库内死锁）构成两个方向的同族缺陷：**「订单目的地类型」与「车底实际所在」不一致时三条路互不衔接**。
+- **修法（已实现，仅改 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：
+  - **S1（核心，已落地）**：`ChooseTrainTrack()` 中新增 `const bool r3r_couple_depot = consist->current_order.IsType(OT_GOTO_COUPLE) && consist->current_order.GetCoupleIsDepot();`（`:13414`）。为真时**完全不跑 CPL**（`:13430` 的耦合块多加 `&& !r3r_couple_depot` 门），改由普通寻路处理 —— 与 `OT_GOTO_DEPOT` 走同一条路：`YapfTrainChooseTrack` 的目的地函子 `CYapfDestinationTileOrStationRailT::SetDestination()` 对 `OT_GOTO_COUPLE` 落 `default:` 分支，取 `v->dest_tile`（`UpdateOrderDest()` 对车库型耦合订单已设为 `Depot::Get(id)->xy`），`PfDetectDestination()` 判 `tile == dest_tile && HasTrackdir(dest_trackdirs, td)` ⇒ 直达车库格。为此把第 212 轮兜底的两个 `OT_GOTO_COUPLE` 门放宽为 `(!IsType(OT_GOTO_COUPLE) || r3r_couple_depot)`（`:13501` 与 `:13527`），使车库型不再被「保留 CPL 预留就早退」拦下、也不再受 U1 的 `res_dest.okay` 门限制。
+  - **探针（新增）**：`COUPLE-DEPOT-DIRECT veh=%d tile=%d,%d dest=%d,%d`（`:13421`），边沿触发（新静态节流表 `_r3r_couple_depot_news`，`:11639`，随离开 `GOTO_COUPLE` 订单一起 `erase`，`:11733`）。
+  - **S2**：进库后停住由 `CheckTrainStayInDepot()`（`train_cmd.cpp:12161-12163`，KI-291 已修）负责，**未改**。
+  - **S3**：库内扫描由现有 `TrainCoupleHandler()` 库内分支负责，**未改**。
+  - **S4**：与 KI-309 修法甲**互补**（S1 保证到得了库，甲保证到库必挂）；与 KI-307 甲方向相反、互不冲突。**不建议只做 S1 就宣布玩家场景闭环**（若订单写站台而车底在库，那是 KI-309 甲的活）。
+- **未确认项**：U1 `res_dest.okay` 的取值（**已因 S1 绕过该门而失去相关性**）；U2 进库后是否被 `NormalizeTrainVehInDepot()` 踢出；U3 目标库已被等待车底占用时机车能否进入；U4 配对锁在库内是否先锁到别的候选（S1 跳过 CPL 后不再由 CPL 上锁，改由库内 `TrainCoupleHandler()` 走 KI-309 甲路径）。
+- **复测判据（实现后）**：①车库型不再常驻 `CPL-PATHFOUND found=0`（不该再跑 CPL）；②出现 `COUPLE-DEPOT-DIRECT` 且随后出现「进入目标车库」证据（`DEPOT-ARR … tileEqDest=1` / 进库探针）；③库内出现 `CG-GATE` / `CPL-PAIR dist=0` / `COUPLE-OK`；④站台型 `GOTO_COUPLE` 行为逐字不变（仍走 CPL，仍可 `CPL-PATHFOUND found=1`）；⑤`read_lints` 0、增量 `EXIT_CODE=0`、`build\openttd.exe` 晚于所改 `.cpp`。
+- **构建自证（第 213 轮）**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`[3/3] Linking CXX executable openttd.exe`，日志内 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 0；`src\train_cmd.cpp` 18:52:01 → `train_cmd.cpp.obj` 18:53:33（晚于源码）→ `build\openttd.exe` 2026-10-03 18:55:11（51 672 576 B）；`build\R3R_incbuild.done` = `EXIT_CODE=0`（18:55:42）；`read_lints` 0 条；exe 内可检索到新字面量 `COUPLE-DEPOT-DIRECT`。
+- **状态**：**已修（第 213 轮实现 + 已编译；游戏内复测待做）**。
+
+> **编号更正（第 213 轮内）**：本条初次登记时误编为 `KI-320`，与第 211 轮已有的 `KI-320`（耦合优先权只看「进入订单的先后」，见上）撞号；自本条起改编号为 **KI-321**，旧编号作废。
+
+#### KI-322（中，待确认口径）玩家不想要「找不到挂接目标就回滚普通寻路 / 等太久就放弃」这一族兜底行为
+
+- **来源**：玩家 2026-10-03 追问（承接第 213 轮 KI-321 的交付说明）：**「额，那么你之前添加的那个等太久就直接回滚普通寻路改回去了吗，我不希望有这个功能」**。临时报告 `R3R_couple_depot_dest_round213_memo.md` §九。
+- **先答问（事实）**：**没有改回去**。第 212 轮 KI-316 的兜底仍在 `src\train_cmd.cpp:13443-13497`，**站台型路径一字未动**；第 213 轮只是在它**之前**插入车库型分支（`:13414` 声明 / `:13430` 跳过 CPL / `:13421` 探针），并放宽 KI-316 时期给 `OT_GOTO_COUPLE` 加的两处守卫（`:13501`、`:13527`）为 `(!IsType(OT_GOTO_COUPLE) || r3r_couple_depot)`。
+- **三处候选机制（触发条件与后果不同，需玩家指定要删哪一个）**：
+  - **M1「找不到就回滚普通寻路」** = `COUPLE-NOTARGET-FALLBACK`，`src\train_cmd.cpp:13443-13497`（门 `:13469` = `res_dest.tile != INVALID_TILE && !res_dest.okay`；打印 `:13484`；节流表 `_r3r_couple_fb_news`）。触发＝CPL 返回 `INVALID_TRACK`（全图找不到任何可挂目标），**立即**执行，**不是**等太久。后果＝机车放弃挂接，用普通寻路驶向 `GOTO_COUPLE` 订单目的地。
+  - **M2「车库型直接去车库」**（第 213 轮新增，玩家上一条明确要求的） = `src\train_cmd.cpp:13414` / `:13430`。触发＝订单为 `OT_GOTO_COUPLE` 且 `GetCoupleIsDepot()`，立即且无条件。后果＝完全不跑 CPL，直达车库格。
+  - **M3「等太久就放弃」** = `COUPLE-SKIP-COMMIT-FAIL`，`src\train_cmd.cpp:11996-12034`，常量 `R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`（`:11659`）。触发＝**候选就在眼前却挂不上**（折叠修正回滚 / NewGRF 拒绝等），4 个等待窗口 × `R3R_COUPLE_DEST_IDLE_LIMIT = 500` tick（`:11616`，≈15 s/窗口）⇒ 约 1 分钟后自动跳过订单。后果＝放弃本次挂接、`real=` 前进到下一命令。
+- **「等太久」的真正归属（本轮核对结论：文档过期）**：真正**没候选**（找不到 `u`）的分支**不会**跳过命令 —— `src\train_cmd.cpp:11893-11921` 是**原地无限等待**，每 500 tick 只打一行心跳 `COUPLE-DEST-EMPTY … (waiting in place, order kept)`，**命令保留**。KI-316 条目（本文件 `:10089`）与代码注释 `src\train_cmd.cpp:13457-13460` 仍写着「满 `R3R_COUPLE_DEST_IDLE_LIMIT` tick 后跳过命令」——那是第 109 轮的旧行为（第 112 轮起已改为保留），属**过期描述**，待随本次口径一并清理（注释/文档清理不含行为变更）。
+- **玩家 2026-10-03 追问（口径指认）**：玩家确认其记忆中「我之前添加的那个找不到路就回滚普通寻路的功能」**确实存在**，且**指的就是 M1**（＝ KI-316 第 212 轮变体 (a)），并明确「**但是现在，先不删，我要谨慎的询问你**」⇒ 本条**暂缓执行**，等玩家最终拍板。
+- **轮次归属（供玩家核对）**：**第 211 轮无任何代码改动**（同现场只读取证，见上「第 211 轮」小节开头）；「找不到路就回滚普通寻路」是 **第 212 轮** 落地的（KI-316 变体 (a)）；**第 213 轮（上一轮）没有新增同类机制**，它只加了车库型无条件直去车库（M2），并把本条 M1 给 `OT_GOTO_COUPLE` 加的两处门（`:13501`、`:13527`）放宽 —— 即第 213 轮反而**扩大了 M1 的适用范围**（车库型现在也会走那条普通寻路）。
+- **待玩家拍板**：要移除的是 **M1**、**M3**，还是 **M1+M3**？（M2 为第 213 轮新功能；若连 M2 也不要，则退回 KI-321 修复前的状态。）
+- **状态**：**已执行（第 214 轮，2026-10-03）**：玩家已拍板删除 M1 ⇒ 源码回退到第 212 轮之前的「原地等待」并已编译。**M2 保留；M3 仍未动**（玩家上一轮把两者混述为一件，本轮只删 M1；M3 是否也删待另行拍板）。严重度：中（口径问题，不涉崩溃/丢数据）。
+
+---
+
+## 第 214 轮（2026-10-03）删除 KI-316 变体 (a)：找不到挂接目标改为原地等待
+
+- **玩家原话**：「全图找不到符合条件的车就立刻回滚？这可不行，这不是我想要的。我想要的是如果没有车等挂机车就在机待线等到有车。我认为应该删除」
+- **改动**（仅 `src\train_cmd.cpp`，未碰 `src\*.h` / `src\lang\*.txt`）：删除 `ChooseTrainTrack()` 里 `if (path_found == INVALID_TRACK)` 分支内的 `if (res_dest.tile != INVALID_TILE && !res_dest.okay) { … }` 整块（改动前 `:13469-13494`，探针 `COUPLE-NOTARGET-FALLBACK` @ `:13484`）；删除死代码 `_r3r_couple_fb_news`（`:11624-11631` 声明 + `:11735-11737` 清表）；重写该分支注释。恢复为「丢预留 → `MarkTrainAsStuck()` → `return { FindFirstTrack(tracks), result_flags }`」。
+- **口径确认**：找不到可挂目标 ＝ **原地等待**（在机待线等车），每轮重试 CPL，订单保留；**不是缺陷**（KI-316 已改判、KI-317 已改判为设计行为）。
+- **新增 KI-323（中，按口径＝设计行为）**：删除 M1 后，站台型 `GOTO_COUPLE` 若机车不在等待位，**不会自行驶向订单目的地**。判据＝「订单目的地 ≠ 机车当前格 ＋ 无合法目标 ＋ 机车不动」（`COUPLE-NOTARGET-FALLBACK` 探针已不存在）。若日后判定「该开过去等却没开」不可接受，可选补偿＝仅当机车不在订单目的地的站/库范围内时允许**一次**驶向目的地（与本轮口径冲突，需玩家再拍板）。
+- **保留未动**：M2（车库型直去车库，第 213 轮）、M3「等太久就放弃」（`COUPLE-SKIP-COMMIT-FAIL`，`:11996` 一带，`R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`）、`:13463` 与「路径找到但订不下」两处门。
+- **临时报告**：`R3R_couple_no_target_wait_round214_memo.md`（含 §七 复测判据 4 条）。
+- **构建自证（第 214 轮）**：复用既有 `_tmp_inc_build.cmd`（**未新建 .cmd**）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；时间戳链 `src\train_cmd.cpp` 2026-10-03 19:15:37 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 19:17:30 → `build\openttd.exe` **19:18:30（51 672 576 B）**；`error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`read_lints(src\train_cmd.cpp)` = 0 条；产物自证：`Select-String -SimpleMatch` on exe 得 `COUPLE-NOTARGET-FALLBACK` = **False**（旧 exe 为 True，M1 已从二进制消失）、`COUPLE-DEPOT-DIRECT` = **True**（M2 未回归）、全库 `_r3r_couple_fb_news` = 0 命中。
+- **状态**：已实现 + 已编译，游戏内复测待做（判据见临时报告 §七 4 条）。**M3 结清**：玩家 2026-10-03 明确「M3 不用改了」⇒ 保持现状（详见「第 215 轮」小节末尾附带更新）。
+
+---
+
+## 第 215 轮（2026-10-03）提案评估：邻车边界框持续重叠超过 N 秒判撞毁
+
+- **玩家原话**：「如果我们的列车耦合了很久（我初设 2 秒），我们就判它们撞毁，也就是边界框重叠了很久之后判定撞毁，这是用于防止穿模的，你觉得这个想法怎么样，先不上手」。
+- **本轮性质**：**只评估，未改任何源码、未构建、未新建任何 `.cmd`**（玩家明示「先不上手」）。报告 = `R3R_seam_overlap_crash_round215_memo.md`。
+- **新增 KI-324（中，待拍板 · 未实现）**：以「相邻车节边界框重叠持续 ≥ N 秒」为判据触发 `TrainCrashed()`，作为防穿模兜底。**评估结论＝方向可理解、手段不合适，不建议按原样落地。**
+  - **前提纠正**：引擎碰撞本就是**瞬时**判定（`CheckTrainCollision()` `:15007`，一帧重叠即 `TrainCrashed()` `:14995`，全程无计时）。改成"持续 2 秒"实为**放宽** ⇒ 真追尾获得 2 秒穿透窗口。可讨论的形态只能是"在 R3R 自己放行的那些重叠上加稳态看门狗"。
+  - **判据已被实证不可靠**：`:14922-14941`（KI-241 现场注释）原话「Distance alone can never tell a seam from a rear-end collision - both sit at or inside min_diff - but the direction can」。距离 + 时间**必要但不充分**，必须叠加 `r3r_seam_ahead` 与 `WAIT_COUPLE` 语境。
+  - **正常重叠是稳态而非瞬态**：①挂接命中**设计上就是** 1px 重叠（`min_diff = (len+1)/2 + (len+1)/2 - 1`，`>=` 改 `>`，`:14851` / 车库 `:14794`）；②拼接后不做位置重排 ＋ `R3R_RESPACE_MAX_ERROR = 8`（`:7126`、`:7413`）承认 8px 内合法；③解挂 seam-to-seam，**下一帧必然紧贴**（`:14908-14913`）。⇒ 计时器会大面积误伤已挂好/刚解挂的列车；KI-241 现场 **13 行 `SEAM-FREE`（`maxd 0..4`）**＝"连续多 tick 重叠但完全正常"的现成反例（当时若存在 2 秒计时，机车 27 会原地爆炸）。
+  - **车库在射程外**：`CheckTrainCollision()` 首行 `if (moving_front->track == TRACK_BIT_DEPOT) return false;`（`:15011`）⇒ 库内编辑造成的重叠永不被看见，而穿模恰恰常在库里产生。
+  - **先例不足以背书**：`COUPLE-SEAM-CRASH`（90° 拼缝立即撞毁，`:10518-10535`）是**提交点上的瞬时几何断言**，与本提案"任意 tick 的稳态看门狗"性质不同；它之所以安全正因其一次性。
+  - **代价不对等**：`TrainCrashed()`（`:14733`）会伤乘客、清预订、发新闻、掉评级，**不可逆**；而穿模是渲染/几何不自洽（`UpdateDeltaXY()` 的 `bounds` 与 `gcache.cached_veh_length` 两套几何不同步，见 KI-98 / KI-106 / KI-214）⇒ 用玩家的钱与乘客为 R3R 自身的 bug 买单，且会把"接缝错位 8px"的案发现场变成"车炸了"，反而断掉根因线索。
+  - **时间尺度**：`MILLISECONDS_PER_TICK = 27`（`gfx_type.h:424`）、`TICKS_PER_SECOND ≈ 37`（`date_type.h:30`）⇒ 玩家的 2 秒 ≈ **74 tick**；须先定义"2 秒"是**真实毫秒**还是**游戏 tick**（`_game_speed`/快进、`_pause_mode` 都会改变两者关系；用 tick 计数器确定性更友好，联网不吃 desync）。
+  - **建议替代（优先级 A > B > C）**：**A**＝只观测不惩罚（统计 \|dist − nominal\| 分布 + 连续 tick 数，判据可复用既有 `overlap=fit-maxd`），先取数再定阈值；**B**＝提交前拒绝 + 回滚（先例 `COUPLE-REFUSE-STILL-FOLDED`，第 172 轮）；**C**＝拼接后沿轨道整体平移吸附（治本，重叠消失后根本不需要兜底）。若坚持撞毁：①只作用于 R3R 放行的重叠，不动引擎原生追尾；②判据必须叠加方向与订单语境；③先有 A 的数据证伪误伤面；④给玩家可辨识提示；⑤全程确定性、无随机。
+  - **待拍板 5 项**：①形态（放宽瞬时碰撞 vs 在 R3R 放行的重叠上做稳态看门狗）②阈值语义（真实毫秒 vs 游戏 tick）③是否接受"必须叠加方向/订单语境"④先做 A（只观测）还是直接选 B/C（治本）⑤若本轮即定为搁置，请标「**已搁置**」。
+- **附带更新（结清第 214 轮遗留）**：**M3 不用改** —— 玩家 2026-10-03 明确拍板。M3 ＝ `TrainCoupleHandler` 的"有候选却提交失败"分支：`R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`，每次换候选清零、每 500 tick 窗口只记一次（≈4×500 tick），满 4 次打 `COUPLE-SKIP-COMMIT-FAIL` → `R3RUnpairCoupleTargets()` → 完整复刻 `CmdSkipToOrder()` 簿记 → 机车执行下一条命令（代码注释自陈是"坏掉挂接的安全阀"，正常挂接够不到）。⇒ 第 214 轮小结里"M3 是否也删除待另行拍板"至此**结清：保持现状**。
+
+---
+
+## 第 216 轮（2026-10-03）提案评估：两车接触但 attach 失败 ⇒ 直接判撞毁
+
+- **玩家原话**：「哦，那我想要知道，如果两个列车接触了，结果发现无法 attach wagon，那么这两列车会怎么样，我希望它们直接判定撞毁」。
+- **本轮性质**：**只评估，未改任何源码、未构建**。报告 = `R3R_attach_fail_crash_round216_memo.md`。
+- **新增 KI-325（中，已搁置）** —— 玩家 2026-10-03 次轮放弃「撞毁」路线，改走第 217 轮「几何准入」预防路线（见下文第 217 轮小节）：在 `TryTrainCouple()` 的 `CheckTrainAttachment` 失败分支改调 `TrainCrashed()`，替代"回滚 + 每 tick 重试"。评估结论＝**触发点选错，不建议按原样落地**；建议改挂在 M3 的 4 次窗口上（方案 A）或按失败原因分工（方案 B）。
+- **现状取证（回答"会怎么样"）**：`CheckTrainAttachment(head)` 失败 ⇒ `:9986-9997` 走 `RestoreTrainBackup(original_src/dst)` + `R3RUndoLogicalFlip(v/u)` + `R3RRefreshChainCaches` + `ConsistChanged(CCF_ARRANGE)` + `return false` ⇒ **两列车完全恢复接触前状态**（链序/方向/段头/artic 角色全还原），不合并、不移动、不损坏、不扣钱、不伤乘客。之后每 tick 由 `TrainCoupleHandler()` 重试 ⇒ **无限僵持**（机车贴着车底，既不挂也不撞，KI-106 同族形态）。该失败分支**本身不打日志**，现场只能靠"没有 `COUPLE-OK`"反推。
+- **⚠️ 与 M3 同一路径（本轮最重要发现）**：`:11951-11964` 的 M3 注释**逐字点名本场景**——`It is "the partner is standing there, but the merge does not happen": a fold-correction rollback, a NewGRF "can attach wagon" veto, an articulation deadlock, ...`。即「无法 attach wagon」已被 M3 覆盖，动作是 4 次失败（`R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`，每个窗口 `R3R_COUPLE_DEST_IDLE_LIMIT = 500` tick，约 1 分钟）后 `COUPLE-SKIP-COMMIT-FAIL` → **跳过订单**。玩家同日先说「M3 不用改了」，又说希望撞毁 ⇒ **同一触发点两个动作，必须先分工**。
+- **attach 失败的只有两个原因**（`:2600-2710`）：①`allowed_len < 0` → `STR_ERROR_TRAIN_TOO_LONG`（合并后超过 `_settings_game.vehicle.max_train_length`，默认 7 格，**是玩家编组规模设置、不是相撞**）；②NewGRF attach/articulation 回调拒绝（探针 `ATTACH-FAIL … cb=0x%X`，`:2584`）。
+- **"接触"的两种语义**：无挂接意图 ⇒ `CheckTrainCollision()`（`:15007`）**本来就会 `TrainCrashed()`**（`:14995`）；有挂接意图（`GOTO_COUPLE` + `WAIT_COUPLE`）⇒ `min_diff` 故意 -1px（`:14851`）+ `SEAM-FREE` 放行（`:14942`）构成**免死金牌**。玩家提案的实质＝**关掉挂接意图的免死金牌**，是真问题，但该金牌正是挂接功能赖以工作的东西（见第 215 轮 §二）。
+- **反对"首次失败即撞毁"的硬证据**：第 172 轮现场机车连续 6 次失败、每次**北推 1px**，第 6 次才 `COUPLE-OK` ⇒ 重试是挂接成功的正常组成部分，首次失败即炸会把那次成功变成车毁事故。另：`TrainCrashed()` 只毁一条链（`:14733`），此时两车已被 `RestoreTrainBackup` 还原成两条独立链，要毁两列需分别调用，而车底可能载客载货（`Crash()` 计入 victims）；撞毁后还需清 `_r3r_couple_commit_fail`（`:11642`）/pair lock（`R3RUnpairCoupleTargets`）等表，且崩溃车会继续占轨阻塞（`ReserveTrackUnderConsist()`）。
+- **先例**：`COUPLE-SEAM-CRASH`（`:10518-10535`，90° 拼缝立即撞毁 + `STR_NEWS_TRAIN_CRASH`）证明"拼错就炸"可运行，但那是**提交点上的瞬时几何断言**，与本提案的语义不同。
+- **待拍板 5 项**：①触发时机（首次失败 vs M3 的 4 次窗口）②与 M3 的分工 ③销毁范围（是否含车底链）④是否排除 `STR_ERROR_TRAIN_TOO_LONG` ⑤配套清理是否一并做。
+- **本轮未取的第一手数据**：`ATTACH-FAIL` 探针行在历史 `build\R3R_debug.log` 里出现几次、何原因；以及第 172 轮的 6 次重试是否发生在单次 `TryTrainCouple` 内部（不触发 M3 计数）还是跨了 4 个等待窗口（会触发）——后者直接决定方案 A 是否安全。
+
+---
+
+## 第 217 轮（2026-10-03）：避免「无法 arrange trains」时的穿模
+
+- **玩家原话**：「那换一个方法。我只是想要避免在无法 arrange trains 的时候两个列车开始闹穿模，你能帮我想想吗」。
+- **本轮性质**：**只取证 + 方案设计，未改任何源码、未构建**。报告 = `R3R_arrange_anti_clip_round217_memo.md`。
+- **KI-325 状态变更**：**已搁置**（玩家本轮明确放弃「attach 失败即撞毁」路线，改走预防路线）。
+- **新增 KI-326（中，待拍板 · 未实现）**：在 `TryTrainCouple()` 的提交硬闸门 `COUPLE-REFUSE-STILL-FOLDED`（第 172 轮，`:9193-9223`，位于 `CheckTrainAttachment` 之前）把判据由「方向折叠」扩展为「**几何不可排**」（拼接点对 `|dist − nominal| > R3R_RESPACE_MAX_ERROR(8)`）⇒ 走已有回滚骨架后 `return false`。效果＝永不留「合并了但修不动」的坏链 ⇒ 穿模无法产生；代价＝有时挂不上，由 **M3**（4 次 × 500 tick，约 1 分钟）跳过订单兜底（玩家已拍板保留 M3）。
+- **⚠️ 根因（本轮最重要结论）：「无法 arrange」＝ `R3RRespaceChainAfterEdit()` 自陈修不动，且这是设计取舍而非 bug。** 两条各自正确的约束在同一个接缝上互相抵消：
+  - **A. 超界不许动**（R170-A）：`R3R_RESPACE_MAX_ERROR = 8`，某对 `|dist − nominal| > 8` ⇒ `skipped++; continue;` 完全不碰，理由是玩家第 170 轮实报「位置被搬到站台另一端」（`:7411-7417`）。
+  - **B. 必须动才不穿模**（本轮诉求）：接缝错位只能靠移动像素消除。
+  - **致命处**：错得越离谱的接缝越会被 A 跳过 ⇒ **工具恰好在最该修的那一处放手**。故任何"把 8 放大"的调参做法都会重新踩响 R170-A。
+  - 证据闭环：`unfixed != 0` 被代码注释明确称为**「结构性坏链」的签名 —— 工具自己承认修不动**（`:7504-7513`，第 173 轮 KI-265 探针），而第 172 轮现场 `RESPACE-AFTER-EDIT couple head=48 … unfixed=1` 正紧跟在那次穿模提交之后。
+- **引擎侧取证：`ArrangeTrains()` 完全没有几何能力。** 定义 `:2782`，返回 `void`，全部动作只有 `RemoveFromConsist()` / `InsertInConsist()` / `NormaliseDualHeads()` —— **三处都只改 `Next`/`Previous` 指针，无一处触碰 `x_pos`/`y_pos`/`tile`/`track`/`direction`**。上游从不出问题是因为它只在**车库**里用（库里按索引堆叠、位置无意义）；R3R 把它用在**真实轨道上**（`GOTO_COUPLE` 在站台拼车），位置就有意义了。⇒ 「arrange 失败」不是某函数返回错误码，而是「**链序成功、几何没跟上**」这一状态本身。
+- **穿模的完整生成链（四步，各有锚点）**：①**命中即重叠** —— 挂接分支 `min_diff = (len+1)/2 + (len+1)/2 - 1` 且 `>=` 改 `>`，注释自陈 `the loco freezes already overlapping by 1px`（KI-106）⇒ 挂上前机车已在对方像素范围内；②**失败重试往里挤** —— 第 172 轮现场每失败一次**北推 1px**，`worst_gap` 7→2，重叠由 1px 变若干 px；③**提交点不校验几何** —— `COUPLE-REFUSE-STILL-FOLDED` 只查方向折叠，不查间距/位置序列；④**respace 超界 skip** ⇒ `unfixed>0` ⇒ 穿模留存。
+- **另两处放大因素**：`COUPLE-SEAM-FLIP`（`:10537-10546`，接缝自交 `seam_circ >= 3` 时执行 `R3RReverseChainDirections`）**只翻方向不动位置**，治不了位置交错；`InsertInConsist()` 的 `assert(dst->Next() == nullptr || !dst->Next()->IsArticulatedPart())` 在 Debug 版会直接断言崩溃（不是穿模来源，但说明「插进 artic 组中间」是引擎级禁止的）。
+- **四套方案（报告 §四详述，含对比表）**：**方案 1 提交前几何预检拒绝**（★推荐，零位置风险、复用同构分支与现成阈值）；**方案 4 `unfixed>0` 则回滚提交**（★推荐、与 1 配对，但有**唯一技术难点：`RestoreTrainBackup`/`R3RUndoLogicalFlip` 都不还原像素位置**，须补位置还原，素材是现成的 `std::vector<R3RGeoPoint> geo_before`（`:7365`））；**方案 2 拒绝时停车**（治前因、从源头不产生重叠，但**第 173 轮已记录**清 `cur_speed` 会让机车停在挂车距离外再也挂不上 ⇒ 须先取数，缓做）；**方案 3 轨道约束下整体平移吸附**（治本、工作量最大，长期）。
+- **贯穿原则**：**绝不留下「半修」状态** —— 任何一次合并，结果只允许是「几何连续」或「没合并」两种。
+- **复测判据 5 条**：①新拒绝标签之后**不得**出现 `RESPACE-BADCHAIN`；②第 172 轮形态的穿模提交从日志消失、被拒绝行取代；③`RESPACE-AFTER-EDIT` 的 **`unfixed=` 恒为 0**（关键判据）；④健康紧贴同向挂车仍须 `COUPLE-OK`，不得误伤；⑤挂不上场景由 M3 收尾（`COUPLE-COMMIT-FAIL` 满 4 次 → `COUPLE-SKIP-COMMIT-FAIL` → 执行下一条命令），不得永久僵持。
+- **未确认 4 项**：**U-1** `unfixed>0` 现场出现几次（本轮未统计；现场日志 4150 行停在挂接发生之前，无 `COUPLE-OK` 故无 respace 记录）——**这是决定方案 1 优先级的唯一数据**；**U-2** 判据只看拼接点对还是看整链位置单调性（建议先按前者，观察后再收紧）；**U-3** 第 172 轮「北推 1px」发生在哪一层（寻路 / `TrainController` / 判据容差），未逐行定位；**U-4** 挂接分支那个 `-1`（故意留 1px 重叠）能否直接去掉 —— 若能，重叠从**判据层面**就不存在，是方案 2 的更低风险替代。
+
+---
+
+## 第 218 轮（2026-10-03）：把可行性验证提前到「挂接配对」阶段
+
+- **玩家原话**：「我们能不能在进行挂接配对的时候就验证挂接可行性，如果不行就拒绝配对」。
+- **本轮性质**：**只取证 + 方案评估，未改任何源码、未构建**。报告 = `R3R_pair_precheck_round218_memo.md`。
+- **结论**：**能，而且代码里已经有一半了**；有现成先例与现成落点。但配对期只能做**静态**预检，动态几何必须在提交点拦 —— 与第 217 轮 KI-326 是**串联的两道**，非替代关系。
+- **配对的确切位置（本轮取证）**：`R3REnsureCouplePair(Train *v)`（`train_cmd.cpp:11374`）—— 唯一建立点，每 tick 由 `TrainLocoHandler()` 调一次，函数头注释自陈「This function is what establishes and maintains the lock」；数据是 KI-182 的一对一目标锁（`r3r_couple_target` / `r3r_couple_requester`），解除走 `R3RUnpairCoupleTargets()`。候选筛选链（稳态短路 → 解旧配对 → 全池重扫）依次为：①非独立链头/自家链 ⇒ heal ②`R3RIsCoupleTarget(t)` ③停驻车 ④`R3RCoupleTargetAtOrderStation(coupler,t)` ⑤locker（`CPL-PAIR-STEAL`）⑥`R3RCoupleAllowedIgnoringPair(coupler,t)` ⑦取 `DistanceManhattan` 最近 ⑧`R3RPairCoupleTargets(coupler,best)` 落锁。**落点＝第 ⑥ 与第 ⑦ 之间。**
+- **极强先例：第 212 轮 KI-319 完全同构。** `R3RCoupleTargetAtOrderStation()` 就是把一条原本只在到达时生效的规则**提前到配对扫描**（动机写在注释里：否则会给一个「永远拿不到」的候选打「已被别人锁定」的假报告，第 210 轮曾误读成 contention）。⇒ 这条路已走通过一次，配对扫描点被验证为可靠预检点；玩家提议不是新架构，而是把既有做法从 1 条闸门扩到 N 条。
+- **⚠️ 本轮最重要发现：现有配对期闸门存在真实不对称缺口，而它恰是第 172 轮穿模的前因。** `R3RIsCoupleTarget(const Train *t)`（`:2062`）对真铰接的否决（`:2095` 的 `if (R3RChainHasRealArticPart(t)) return false;`）**只覆盖候选方 `t`，不检查机车自己 `coupler`**；而提交点的 `FOLDCHK-REFUSE-REAL-ARTIC`（第 170 轮，`TryTrainCouple()` 折叠修正入口）判的是**任一参与方**含真 artic 就拒。⇒ 机车自己含真 artic 时：配对通过 → 机车开过去 → 命中即重叠 1px（KI-106 的 `-1`）→ 提交被拒 → 每失败一次北推 1px（`worst_gap` 7→2）→ `gap=2` 恰满足 `FOLDCHK-DIR-OVERRIDE` 前提 → 真折叠被丢弃 → **穿模**。**即配对期闸门在「谁含真铰接」维度上比提交点宽一格，中间空档就是穿模生成链的第①②步。玩家的方案正好补上这一格。**
+- **配对期能预检（静态、与位置无关）**：**S-1** 两侧都不得含真 artic（`R3RChainHasRealArticPart(coupler) || R3RChainHasRealArticPart(t)` ⇒ 拒）—— 直接消灭第 172 轮根因②；**S-2** 合并后总长 ≤ `_settings_game.vehicle.max_train_length * TILE_SIZE`（用 `gcache.cached_total_length` 之和）—— 覆盖 `CheckTrainAttachment()` 的 `allowed_len < 0` 分支，是 attach 失败原因中**唯一能静态预判**的一类；S-3（可选）段数/分组等。
+- **配对期查不了（动态）**：**D-1** 折叠方向 `R3RCheckChainFoldedDirection()`（需两车实际相邻 + 各自 direction，而配对时机车还在路上、direction 会随掉头/绕站台变化）—— 留提交点（第 172 轮 `COUPLE-REFUSE-STILL-FOLDED`）；**D-2** 拼接点间距（位置尚不存在）—— 留提交点（KI-326）；**D-3** NewGRF 跨链 attach 回调（需「合并后的链」才能问）—— 留提交点。
+- **新增 KI-327（中，待拍板 · 未实现）**：在 `R3REnsureCouplePair()` 候选链第 ⑥ 之后加**配对期静态可行性预检**（先落 S-1，再补 S-2），被拒候选 `continue` 掉即可（第 ⑦ 步最近者自动取次近，无需额外改动）。
+- **新增 KI-328（中，须与 KI-327 同批 · 未实现）**：**配对拒绝的出口**。现状 `best == nullptr` 只「记 scan tick、每 8 tick 重扫」；若全候选被静态闸门拒 ⇒ 永远 `best == nullptr` ⇒ 每 8 tick 全池扫描 + **机车无目的地**（同族症状见 KI-195 第 109 轮：候选被剔出目的地集合 ⇒ 无预留 ⇒ 沿站台乱跑）。且 **M3（`R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`，玩家已拍板保留）挂在「提交失败」上、不挂「配对拒绝」上** ⇒ 只加 KI-327 会永远走不到提交、M3 永不触发。建议先取报告 §5.2(a)：**新增「配对拒绝计数」**，同一 `(coupler, 目标)` 连续被拒 N 次（4 次量级）⇒ 直接走 M3 那套出口（解配对 + 跳过订单）；不建议 (b) 把 M3 入口整体上移（会改第 172 轮刚验证过的提交失败语义）。**顺序要求：KI-327 与 KI-328 必须同批上线，否则「穿模」会退化成「僵持/乱跑」，比原来更糟。**
+- **诚实边界（能不能"预演到能挂上"）**：NewGRF 跨链 attach 回调**无法在配对期问**，要预演只能「临时合并 → `CheckTrainAttachment(head)` → 回滚」；而这条回滚路径已知有坑 —— 第 170/216 轮确认 `RestoreTrainBackup()` **只还原链序**、`R3RUndoLogicalFlip()` **只还原方向与角色位**，**两者都不还原像素位置**（即 KI-326 方案 4 的唯一难点）。⇒ 在配对期（机车还在路上、每 8 tick 才扫一次）做临时合并回滚**不划算且不安全**。建议**配对期只做 S-1/S-2 静态三项**，动态几何与 NewGRF 回调全部留给提交点（那里本来就是「临时合并 + 逐候选自撤销」的既有机制）。
+- **推荐落地顺序**：①S-1（最小、最有价值，纯只读零位置风险，直接消灭第 172 轮根因②）②S-2 ③KI-328 出口（**必须与①同批**）④提交点闸门按 KI-326 与第 172 轮 `COUPLE-REFUSE-STILL-FOLDED` 保留补齐 ⇒ 形成「静态 + 动态」双重闸门。
+- **复测判据 5 条**：①新拒绝标签出现后**不得**再出现 `FOLDCHK-REFUSE-REAL-ARTIC`（关键：证明机车不再对着注定被拒的目标靠上去）②同场景 `RESPACE-BADCHAIN`/`unfixed>0` 消失（第 172 轮形态穿模提交从日志消失）③**健康挂接不得误伤**（两侧均无真铰接时新闸门一字不放行）④拒绝计数满额必须走出口、机车执行下一条命令，**不得永久 `best == nullptr` 空转**⑤原生真铰接列车（无 ★/⊗）行为不变（它本来就进不了配对，新闸门对其为空操作）。
+- **未确认 4 项**：**U-1** 现场 `FOLDCHK-REFUSE-REAL-ARTIC` 的 `v`（机车）到底是「机车自己含真 artic」还是「车底含」——**这决定 S-1 是否真的命中第 172 轮根因②**（与第 217 轮 U-1 同源，本轮未统计）；**U-2** `gcache.cached_total_length` 在配对扫描点是否一定是最新值（与 `ConsistChanged` 的时序关系），否则 S-2 可能误判；**U-3** 配对拒绝计数的键用 `(coupler, best)` 还是只 `coupler`（目标可能在多次重扫间变化，只记 `coupler` 更稳，避免计数被分散而永不满额）；**U-4** `R3RCoupleTargetAtOrderStation()` 是否已隐含覆盖部分 S-1（需读实现确认，若是则落点可与之合并）。
+
+

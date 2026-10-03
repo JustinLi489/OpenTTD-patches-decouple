@@ -22,6 +22,7 @@
 #include "tbtr_template_vehicle.h"
 #include "tracerestrict.h"
 #include "group_cmd.h"
+#include "couple_group.h"
 
 #include "table/strings.h"
 
@@ -1079,6 +1080,12 @@ void SetTrainGroupID(Train *v, GroupID new_g)
 		u->InvalidateImageCache();
 		u->UpdateViewport(true);
 	}
+
+	/* R3R (第 155 轮 / 落地清单 ③): the group is a trait of the segment, so the row of
+	 * the control segment is kept in step right here and not only at the next commit
+	 * point (R3RSettleChainSegments). A single segment chain has no row and this is a
+	 * no-op there, exactly like for the other vehicle types. */
+	R3RSegmentStoreTraits(v);
 
 	if (_group_change_deferred_updates.refcount != 0) return;
 

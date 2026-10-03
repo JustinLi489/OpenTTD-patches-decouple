@@ -169,12 +169,27 @@ enum OrderCoupleSide : uint8_t {
 
 /**
  * What to do with the orders of the (first/second) part of the train after decoupling.
+ *
+ * R3R (第 152 轮): the two values were declared per DECOUPLE order. The UI that let the
+ * player choose them was removed in the 200th round (KI-303) and the wiring that read
+ * them was removed in the 201st round (KI-305), so nothing writes them any more and
+ * both always read back as #ODOF_KEEP_ORDERS.
+ *
+ * The enum and the two OrderExtraInfo fields are deliberately kept: they are still
+ * serialized (NSL + XSLFI_DECOUPLE_ORDERS), and that feature bit is an index into
+ * _sl_xv_feature_versions[] -- removing it would shift every later feature and break
+ * savegame compatibility. They are dormant data now; do not add new users without
+ * re-wiring the UI as well.
+ *
+ * "First part" is the half that keeps the chain head (it stays), "second part"
+ * is the half that is released; both are measured on the consist the order
+ * fires on.
  */
 enum OrderDecoupleOrdersFlags : uint8_t {
-	ODOF_KEEP_ORDERS         = 0, ///< Keep the current orders.
-	ODOF_KEEP_ORDERS_NO_LOAD = 1, ///< Keep the current orders, but do not load.
-	ODOF_INHERIT_ORDERS      = 2, ///< Inherit the remaining orders of the original train.
-	ODOF_WAIT_FOR_COUPLE     = 3, ///< Insert a WAIT_COUPLE order.
+	ODOF_KEEP_ORDERS         = 0, ///< Keep the current orders. R3R: the default; for the first part this restores its own parked schedule when it has one, for the second part this leaves its own schedule alone (an order-less part gets a WAIT_COUPLE so that it waits where it was left).
+	ODOF_KEEP_ORDERS_NO_LOAD = 1, ///< Keep the current orders, but do not load. R3R: same as #ODOF_KEEP_ORDERS plus VehicleFlag::StopLoading on that part.
+	ODOF_INHERIT_ORDERS      = 2, ///< Inherit the remaining orders of the original train. R3R: that part carries on with the schedule the coupled consist was running, resuming at the order after the DECOUPLE. The first part keeps the very list, the second part gets a copy of the remainder (the two halves must never alias one OrderList, KI-180).
+	ODOF_WAIT_FOR_COUPLE     = 3, ///< Insert a WAIT_COUPLE order. R3R: that part keeps its own schedule but waits where it is left, so that a later locomotive can pick it up.
 	ODOF_END
 };
 

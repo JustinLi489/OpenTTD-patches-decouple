@@ -47,10 +47,12 @@
 #include "core/y_combinator.hpp"
 #include "3rdparty/robin_hood/robin_hood.h"
 #include "3rdparty/svector/svector.h"
+#include "couple_group.h"
 #include <stack>
 #include <charconv>
 #include <cmath>
 #include <optional>
+#include <string_view>
 
 #include "table/strings.h"
 #include "table/control_codes.h"
@@ -2354,21 +2356,33 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 					const Vehicle *v = Vehicle::GetIfValid(id);
 					if (v == nullptr) break;
 
-					if (!v->name.empty()) {
-						FormatRawString(builder, v->name);
-					} else if (v->group_id != DEFAULT_GROUP && vehicle_names != 0 && v->type < VehicleType::CompanyEnd) {
+					/* R3R (第 155 轮 / 落地清单 ③): the name, the unit number and the group
+					 * belong to the *segment* (see R3RSegmentRecord), so trains read them
+					 * through the segment table (couple_group.h). For the control segment --
+					 * which is the chain head, and also the only segment a single segment
+					 * chain has -- those accessors answer with the car's own values, so
+					 * ordinary vehicles are completely unaffected; a hidden segment answers
+					 * with the values its row holds, which is what the vehicle list's
+					 * sub-rows (P2a) and the depot's section display need. */
+					const std::string v_name = (v->type == VehicleType::Train) ? R3RSegmentName(v) : std::string(static_cast<std::string_view>(v->name));
+					const UnitID v_unitnumber = (v->type == VehicleType::Train) ? R3RSegmentUnitNumber(v) : v->unitnumber;
+					const GroupID v_group_id = (v->type == VehicleType::Train) ? R3RSegmentGroupID(v) : v->group_id;
+
+					if (!v_name.empty()) {
+						FormatRawString(builder, v_name);
+					} else if (v_group_id != DEFAULT_GROUP && vehicle_names != 0 && v->type < VehicleType::CompanyEnd) {
 						/* The vehicle has no name, but is member of a group, so print group name */
-						uint32_t group_name = v->group_id.base();
+						uint32_t group_name = v_group_id.base();
 						if (_settings_client.gui.show_vehicle_group_hierarchy_name) group_name |= GROUP_NAME_HIERARCHY;
 						if (vehicle_names == 1) {
-							auto tmp_params = MakeParameters(group_name, v->unitnumber);
+							auto tmp_params = MakeParameters(group_name, v_unitnumber);
 							GetStringWithArgs(builder, STR_FORMAT_GROUP_VEHICLE_NAME, tmp_params);
 						} else {
-							auto tmp_params = MakeParameters(group_name, STR_TRADITIONAL_TRAIN_NAME + to_underlying(v->type), v->unitnumber);
+							auto tmp_params = MakeParameters(group_name, STR_TRADITIONAL_TRAIN_NAME + to_underlying(v->type), v_unitnumber);
 							GetStringWithArgs(builder, STR_FORMAT_GROUP_VEHICLE_NAME_LONG, tmp_params);
 						}
 					} else {
-						auto tmp_params = MakeParameters(v->unitnumber);
+						auto tmp_params = MakeParameters(v_unitnumber);
 
 						StringID string_id;
 						if (v->type < VehicleType::CompanyEnd) {

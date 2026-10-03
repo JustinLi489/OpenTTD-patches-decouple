@@ -3968,7 +3968,7 @@ STR_R3R_YARD_NEW_TOOLTIP                                        :{BLACK}在本�
 STR_R3R_YARD_SHARED                                             :{BLACK}共享
 STR_R3R_YARD_SHARED_TOOLTIP                                     :{BLACK}选择当前选中的场停满时要回落到哪个场。{}多个场可以选同一个场，例如 1 场与 2 场都回落到 3 场
 STR_R3R_YARD_SHARED_NONE                                        :{BLACK}无
-STR_R3R_YARD_SHARED_SEL                                         :{BLACK}共享: {STRING}
+STR_R3R_YARD_SHARED_SEL                                         :{BLACK}共享: {RAW_STRING}
 STR_R3R_YARD_LOCATE                                             :{BLACK}定位
 STR_R3R_YARD_LOCATE_TOOLTIP                                     :{BLACK}将主视图滚动到选中的站台
 STR_R3R_YARD_WORKSHOP                                           :{BLACK}检修所
@@ -3984,13 +3984,13 @@ STR_R3R_YARD_QUERY_RENAME                                       :{WHITE}重命�
 STR_R3R_YARD_DELETE                                             :{BLACK}删除
 STR_R3R_YARD_DELETE_TOOLTIP                                     :{BLACK}删除选中的场。它的站台回归整站，其后的场号依次前移
 STR_R3R_YARD_QUERY_DELETE_CAPTION                               :{WHITE}删除站场
-STR_R3R_YARD_QUERY_DELETE                                       :{WHITE}删除 {STRING}？{}{}它的站台会回归「整站」，其后的场号依次前移，指向这些场的订单会跟着新场号走
-STR_R3R_YARD_NAME_CUSTOM                                        :{BLACK}[{STRING}]
-STR_R3R_YARD_NAME_CUSTOM_SHARED                                 :{BLACK}[{STRING}·共享]
-STR_R3R_YARD_NAME_CUSTOM_WORKSHOP                               :{BLACK}[{STRING}·检修]
-STR_R3R_YARD_NAME_CUSTOM_SHARED_WORKSHOP                        :{BLACK}[{STRING}·共享·检修]
-STR_ORDER_R3R_YARD_CUSTOM                                       :{STRING}
-STR_ORDER_R3R_YARD_CUSTOM_SHARED                                :{STRING}（共享）
+STR_R3R_YARD_QUERY_DELETE                                       :{WHITE}删除 {RAW_STRING}？{}{}它的站台会回归「整站」，其后的场号依次前移，指向这些场的订单会跟着新场号走
+STR_R3R_YARD_NAME_CUSTOM                                        :{BLACK}[{RAW_STRING}]
+STR_R3R_YARD_NAME_CUSTOM_SHARED                                 :{BLACK}[{RAW_STRING}·共享]
+STR_R3R_YARD_NAME_CUSTOM_WORKSHOP                               :{BLACK}[{RAW_STRING}·检修]
+STR_R3R_YARD_NAME_CUSTOM_SHARED_WORKSHOP                        :{BLACK}[{RAW_STRING}·共享·检修]
+STR_ORDER_R3R_YARD_CUSTOM                                       :{RAW_STRING}
+STR_ORDER_R3R_YARD_CUSTOM_SHARED                                :{RAW_STRING}（共享）
 
 # R3R:目的地场(订单窗口)
 STR_ORDER_R3R_YARD_WHOLE                                        :整站
@@ -4761,10 +4761,6 @@ STR_ORDER_DECOUPLE_DETAILS_AUTO                                 :解挂尾部段
 STR_ORDER_DECOUPLE_DETAILS_HEAD                                 :在第 {COMMA} 段与第 {COMMA} 段之间解挂
 STR_ORDER_DECOUPLE_BOUNDARY                                     :{BLACK}解挂边界
 STR_ORDER_DECOUPLE_BOUNDARY_TOOLTIP                             :{BLACK}选择该解挂命令的切割位置：自动 / 解挂尾部 N 段 / 在第 n 段与第 n+1 段之间切开（将其后段全部解走）
-STR_ORDER_DECOUPLE_KEEP_ORDERS                                  :保留命令
-STR_ORDER_DECOUPLE_KEEP_ORDERS_NO_LOAD                          :保留命令, 不装货
-STR_ORDER_DECOUPLE_INHERIT_ORDERS                               :继承剩余命令
-STR_ORDER_DECOUPLE_WAIT_FOR_COUPLE                              :等待挂接
 STR_ORDER_COUPLE_ANY                                            :挂接任意
 STR_ORDER_COUPLE_EMPTY                                          :挂接空车
 STR_ORDER_COUPLE_FULL                                           :挂接满载
@@ -4773,7 +4769,7 @@ STR_ORDER_COUPLE_SIDE_FRONT                                     :在前
 STR_ORDER_COUPLE_SIDE_REAR                                      :在后
 STR_ORDER_COUPLE_SIDE_SEL                                       :{BLACK}挂接侧: {STRING}
 STR_ORDER_COUPLE_SIDE_TOOLTIP                                   :{BLACK}本车挂在被挂列车的哪一侧（按挂接后的链序）：在前 = [本车][被挂车]，在后 = [被挂车][本车]
-STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}临时挂接分组: {STRING}
+STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}临时挂接分组: {RAW_STRING}
 STR_ORDER_COUPLE_TEMP_GROUP_NONE                                :无
 STR_ORDER_COUPLE_TEMP_GROUP_NAMED                               :分组 {NUM}
 STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP                             :{BLACK}执行这条命令期间临时加入的挂接分组：除了本段本来就有的分组，再额外拥有该分组，因此可以挂上属于它的车底；挂接成功后这个临时身份立即消失
@@ -6135,6 +6131,7 @@ STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION                          :从车头数起�
 STR_DEPOT_CHAIN_LOOSE                                          :散链
 STR_DEPOT_CHAIN_SEGMENT_POS                                    :第 {NUM}/{NUM} 段
 STR_R3R_TEMP_COUPLE_GROUP                                      :临时挂接分组
+STR_VEHICLE_LIST_SEGMENT_SUBROW                                :第 {NUM}/{NUM} 段
 
 STR_COUPLE_GROUP_CAPTION                                        :{WHITE}挂接分组
 STR_COUPLE_GROUP_GROUPS_TOOLTIP                                 :挂接分组

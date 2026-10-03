@@ -4758,6 +4758,18 @@ void DumpVehicleFlagsGeneric(const Vehicle *v, T dump, U dump_header)
 		dump('J', "ConsistSpeedReduction",       t->flags.Test(VehicleRailFlag::ConsistSpeedReduction));
 		dump('X', "PendingSpeedRestriction",     t->flags.Test(VehicleRailFlag::PendingSpeedRestriction));
 		dump('c', "SpeedAdaptationExempt",       t->flags.Test(VehicleRailFlag::SpeedAdaptationExempt));
+		/* R3R: segment boundaries and de-articulated group roles. A *real*
+		 * articulated group derives its roles from the GVSF_ARTICULATED_PART
+		 * subtype bit ("st:" shows it as 'A') and never carries H/M; it is the
+		 * explicit H (group head, the former parent) / M (group member, the
+		 * former part) pair that marks a chain whose real articulated groups
+		 * have been split into independent vehicles. */
+		dump('H', "ArticGroupHead",              t->flags.Test(VehicleRailFlag::ArticGroupHead));
+		dump('M', "ArticGroupMember",            t->flags.Test(VehicleRailFlag::ArticGroupMember));
+		dump('S', "SegmentFront",                t->flags.Test(VehicleRailFlag::SegmentFront));
+		dump('E', "SegmentBack",                 t->flags.Test(VehicleRailFlag::SegmentBack));
+		dump('Z', "SegmentFlipped",              t->flags.Test(VehicleRailFlag::SegmentFlipped));
+		dump('O', "ForceReserveOnce",            t->flags.Test(VehicleRailFlag::ForceReserveOnce));
 	}
 	if (v->type == VehicleType::Road) {
 		const RoadVehicle *rv = RoadVehicle::From(v);

@@ -31,6 +31,7 @@
 #include "group_cmd.h"
 #include "group_gui.h"
 #include "couple_group_gui.h"
+#include "couple_group.h"
 #include "zoom_func.h"
 #include "vehicle_cmd.h"
 
@@ -776,8 +777,11 @@ public:
 					Rect mr = r.WithHeight(this->resize.step_height);
 					auto [first, last] = this->vscroll->GetVisibleRangeIterators(this->vehgroups);
 					for (auto it = first; it != last; ++it) {
-						const Vehicle *v = it->GetSingleVehicle();
-						if (v->group_id != this->vli.ToGroupID()) {
+						/* R3R (第 155 轮 / 落地清单 ⑤): a segment sub-row belongs to its own segment,
+						 * so it is marked after that segment's group rather than after the chain's
+						 * (which is the control segment's). */
+						const Vehicle *v = it->R3RIsSegmentSubRow() ? it->r3r_hidden_section : it->GetSingleVehicle();
+						if (R3RSegmentGroupID(v) != this->vli.ToGroupID()) {
 							GfxFillRect(mr.Shrink(WidgetDimensions::scaled.bevel), GetColourGradient(Colours::Grey, Shade::Dark), FillRectMode::Checker);
 						}
 						mr = mr.Translate(0, this->resize.step_height);

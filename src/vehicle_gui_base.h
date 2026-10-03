@@ -36,8 +36,25 @@ struct GUIVehicleGroup {
 	VehicleList::const_iterator vehicles_begin;    ///< Pointer to beginning element of this vehicle group.
 	VehicleList::const_iterator vehicles_end;      ///< Pointer to past-the-end element of this vehicle group.
 
-	GUIVehicleGroup(VehicleList::const_iterator vehicles_begin, VehicleList::const_iterator vehicles_end)
-		: vehicles_begin(vehicles_begin), vehicles_end(vehicles_end) {}
+	/**
+	 * R3R (第 155 轮 / 落地清单 ⑤): the hidden segment (a segment which is not the
+	 * control one) this row stands for, or nullptr for a normal row.
+	 *
+	 * A sub-row is a row which the vehicle list adds below the row of its chain, one
+	 * per further segment of that chain -- the "segment inventory" of a coupled
+	 * consist (P2a). It shares the chain's iterators, so it also shares every
+	 * chain-wide figure (profit, age, sort key); it differs only in the three traits
+	 * which belong to the segment (name, unit number and group), which are read for
+	 * it through R3RSegmentName() and friends instead of from the chain head (P3).
+	 */
+	const Vehicle *r3r_hidden_section = nullptr;
+
+	GUIVehicleGroup(VehicleList::const_iterator vehicles_begin, VehicleList::const_iterator vehicles_end,
+			const Vehicle *r3r_hidden_section = nullptr)
+		: vehicles_begin(vehicles_begin), vehicles_end(vehicles_end), r3r_hidden_section(r3r_hidden_section) {}
+
+	/** R3R: whether this row is one of a chain's hidden segments rather than the chain itself. */
+	bool R3RIsSegmentSubRow() const { return this->r3r_hidden_section != nullptr; }
 
 	std::ptrdiff_t NumVehicles() const
 	{
@@ -152,6 +169,8 @@ public:
 	void DrawVehicleListItems(VehicleID selected_vehicle, int line_height, const Rect &r) const;
 	void UpdateVehicleGroupBy(GroupBy group_by);
 	void SortVehicleList();
+	/** R3R (第 155 轮 / 落地清单 ⑤): put the segment sub-rows back below their chain after a sort. */
+	void R3RReorderSegmentSubRows();
 	void CountOwnVehicles();
 	void BuildVehicleList();
 	void SetCargoFilter(CargoType cargo_type);

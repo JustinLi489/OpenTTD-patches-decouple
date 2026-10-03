@@ -207,6 +207,7 @@ enum SlXvFeatureIndex {
 	XSLFI_JOKERPP,                                ///< This is a JokerPP game, use this for loading some settings
 	XSLFI_CHILLPP,                                ///< This is a ChillPP game, use this for loading some settings
 	XSLFI_DECOUPLE_ORDERS,                        ///< Decouple / couple order feature (uncoupling/coupling of trains)
+	XSLFI_R3R_ORDER_TYPE_ENC,                     ///< R3R order type encoding v2 (types >= OT_DECOUPLE stored as base 15 + sub-type in bits 4..5)
 
 	XSLFI_SIZE,                                   ///< Total count of features, including null feature
 };

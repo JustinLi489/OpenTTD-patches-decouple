@@ -3418,6 +3418,10 @@ public:
 		if (widget == WID_SY_WORKSHOP) {
 			return GetString(this->SelectedYardIsWorkshop() ? STR_R3R_YARD_WORKSHOP_SET : STR_R3R_YARD_WORKSHOP_NONE);
 		}
+		/* R3R (KI-262): the caption contains a {STATION} parameter, so it has to be
+		 * filled in here. The default implementation renders the string without any
+		 * parameters at all, which showed "(invalid parameter)" in the title bar. */
+		if (widget == WID_SY_CAPTION) return GetString(STR_R3R_YARD_CAPTION, this->station_id);
 		return this->Window::GetWidgetString(widget, stringid);
 	}
 

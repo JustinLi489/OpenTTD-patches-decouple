@@ -212,6 +212,104 @@ static bool TrainDepotDropSplitsSegment(const Vehicle *before)
 }
 
 /**
+ * R3R（第 159 轮 / q-1=叁 玩家口径）：链内是否存在「没有右边界（⊗）的非链头段」。
+ *
+ * R3R 只有两级：散车厢与段，段由两端标记闭合 —— 段首 ★(SegmentFront)、段尾 ⊗(SegmentBack)；
+ * 两者总是同时由升级(CmdMakeSegment)、挂接(Couple)、车库拖动(CmdMoveRailVehicle) 打上。
+ * 于是「链头那一段」（本务机车所在的控制段）之外，任何一段从 ★ 起却没有 ⊗ 收尾的车节串，
+ * 都只可能是尚未升级为段的散车厢（例如刚买来、从未挂接过的普通车厢链）。
+ * @param chain Head of the chain to inspect.
+ * @return true iff some non-head run of the chain is not closed by ⊗.
+ */
+static bool TrainDepotChainHasLoosePart(const Train *chain)
+{
+	for (const Train *run = chain; run != nullptr; ) {
+		const Train *t = run;
+		while (t->Next() != nullptr && !t->Next()->IsSegmentFront()) t = t->Next();
+		/* The head run (the commanding locomotive's own control segment) is an
+		 * implicit segment and carries no ⊗; only the runs behind it must be closed. */
+		if (run != chain && !t->IsSegmentBack()) return true;
+		run = t->Next();
+	}
+	return false;
+}
+
+/**
+ * R3R（第 159 轮 / q-1=叁）：链内是否有「成段」车节（带 ★ 的段首）。
+ * @param chain Head of the chain to inspect.
+ * @return true iff at least one vehicle of the chain carries SegmentFront.
+ */
+static bool TrainDepotChainHasSegment(const Train *chain)
+{
+	for (const Train *t = chain; t != nullptr; t = t->Next()) {
+		if (t->IsSegmentFront()) return true;
+	}
+	return false;
+}
+
+/**
+ * R3R（第 159 轮 / q-1=叁）：一侧是否为「非成段的部分」（散车厢材质）。
+ *
+ * 两种形态：①自由车厢链（没有本务机车，即尚未升级为段的车厢链）；②链内存在没有 ⊗
+ * 收尾的非链头段（见 TrainDepotChainHasLoosePart）。健康的多段链两者皆否。
+ * @param chain Head of the chain to inspect.
+ * @return true iff the chain still contains loose (non-segment) material.
+ */
+static bool TrainDepotSideIsLoose(const Train *chain)
+{
+	if (chain == nullptr) return false;
+	if (Train::From(chain)->IsFreeWagon()) return true;
+	return TrainDepotChainHasLoosePart(chain);
+}
+
+/**
+ * R3R（第 159 轮 / q-1=叁 玩家口径）：收紧「判定为挂接」的条件。
+ *
+ * 旧行为：车库内把一块车节拖到别处，只要落点上还有车，R3R 就按"挂接"处理
+ * （打 ★/⊗、停放特质、重排优先级），哪怕另一侧只是散车厢 —— 于是段与散车厢被
+ * 判进了同一条链。玩家口径：**只有双方都没有非成段的部分时，才算一次挂接**，
+ * 也就是段不得与散车厢同处一条链（有段参与的车库内拖动只可能是段与段之间）。
+ *
+ * 判据只在「有段参与」时生效（拖动块是整段，或落点链里含成段车节）；散车厢与
+ * 本务机车所在的控制段之间的普通拼挂（例如机车 + 新车厢）不受影响。
+ * @param sel The dragged vehicle.
+ * @param wagon The final drop anchor (nullptr = empty row / end of the depot list).
+ * @param head The chain head the drag was dropped on (may be nullptr).
+ * @return true iff the drag has to be refused.
+ */
+static bool TrainDepotRefuseSegLooseMix(const Vehicle *sel, const Vehicle *wagon, const Vehicle *head)
+{
+	if (sel == nullptr || sel->type != VehicleType::Train) return false;
+
+	const Train *v = Train::From(sel);
+	const Train *drag_chain = Train::From(v->First());
+	const Train *seg_front = TrainDepotGetSegmentFront(v);
+	const bool drag_is_segment = (seg_front != nullptr);
+
+	const Train *dst_chain = nullptr;
+	if (wagon != nullptr) {
+		dst_chain = (wagon->type == VehicleType::Train) ? Train::From(wagon->First()) : nullptr;
+	} else if (head != nullptr) {
+		dst_chain = (head->type == VehicleType::Train) ? Train::From(head->First()) : nullptr;
+	}
+	if (dst_chain == nullptr || dst_chain == drag_chain) return false;
+
+	const bool dst_is_segment = TrainDepotChainHasSegment(dst_chain);
+
+	/* Only a *coupling* is tightened: at least one side has to carry a segment. */
+	if (!drag_is_segment && !dst_is_segment) return false;
+
+	const bool drag_loose = TrainDepotSideIsLoose(drag_chain);
+	const bool dst_loose = TrainDepotSideIsLoose(dst_chain);
+	if (!drag_loose && !dst_loose) return false;
+
+	R3RDbgWrite("DEPOT-SEG-MIX-SKIP sel=%d dst=%d dragSeg=%d dstSeg=%d dragLoose=%d dstLoose=%d\n",
+			(int)v->index.base(), (int)dst_chain->index.base(), drag_is_segment ? 1 : 0,
+			dst_is_segment ? 1 : 0, drag_loose ? 1 : 0, dst_loose ? 1 : 0);
+	return true;
+}
+
+/**
  * R3R: cut a whole coupled-on segment out of its chain. Any vehicles trailing
  * the segment (behind its last vehicle, marked by the segment's own right
  * boundary) are re-attached to the original chain first, leaving the
@@ -380,6 +478,12 @@ static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Veh
 	const Vehicle *v = Vehicle::Get(sel);
 
 	if (v == wagon) return;
+
+	/* R3R（第 159 轮 / q-1=叁 玩家口径）：段不得与散车厢同处一条链 —— 只有双方都没有
+	 * 非成段的部分时，这次拖动才算一次挂接；否则按"落点不存在"处理，两条链各自保持纯态。
+	 * 闸门放在工具层唯一的漏斗上，因此这条拖动路径上的三种落点（段内部、链头之前、
+	 * 普通车节之后）都先过它。 */
+	if (TrainDepotRefuseSegLooseMix(v, wagon, head)) return;
 
 	if (wagon == nullptr) {
 		if (head != nullptr) wagon = head->Last();

@@ -8,6 +8,7 @@
 /** @file train_cmd.cpp Handling of trains. */
 
 #include "stdafx.h"
+#include <string_view>
 #include <unordered_map>
 #include "r3r_perf.h"
 #include "error.h"
@@ -1851,6 +1852,188 @@ bool R3RIsCarOnlyFormation(const Train *v)
 }
 
 /**
+ * R3R (2026-09-30, R170-A): does this chain hold at least one *genuine*
+ * articulated part?
+ *
+ * Only the subtype bit counts (IsArticulatedPart()), never the role layer
+ * (IsArticGroupMember()): a de-articulated group is made of independent
+ * vehicles whose identity comes from their own engine record, so the chain can
+ * be re-ordered, flipped and rebuilt freely, whereas a genuine part is created
+ * by AddArticulatedParts() and stays owned by its parent -- its position,
+ * rendering and NewGRF articulated variables are the parent's business.
+ *
+ * Used as a hard veto for the logical flip: the fold correction refuses to flip
+ * a chain holding genuine parts (see TryTrainCouple and R3RFlipChainBySegments).
+ * @param head Chain head (nullptr allowed).
+ * @return True when a genuine articulated part (subtype bit) is present.
+ */
+static bool R3RChainHasRealArticPart(const Train *head)
+{
+	for (const Train *v = head; v != nullptr; v = v->Next()) {
+		if (v->IsArticulatedPart()) return true;
+	}
+	return false;
+}
+
+/* R3R（一次性探针批次 / 第 205 轮，item 3「神秘跳命令」）：订单索引变更哨兵。
+ *
+ * 现象：某条链头的 cur_real_order_index 在**没有任何既有探针记录**的情况下从 0 变成 1，
+ * 于是那条 GOTO_COUPLE 被静默跳过、列车改去跑后面的 GOTO_DEPOT。要区分三种可能——
+ *   (a) R3R 自己的某个提交点（settle / 借用交接 / 车库编辑）在改；
+ *   (b) 引擎侧（ProcessOrders / CmdSkipToOrder / CheckTrainStayInDepot）在改；
+ *   (c) 只是进程静态态/上一次会话残留导致读档后索引与预期不一致——
+ * 就必须在**决策点两侧成对**取快照。
+ *
+ * 本函数按 VehicleID 缓存上一次快照，只要 real / impl / tt / orders 指针 / 条数 /
+ * 真铰接位 任一变化就写一行 ORD-IDX-WATCH。快照表刻意是进程静态且跨读档保留：
+ * 第二次读档时上一次会话的残值会立刻把"读档后索引与上一次不同"显示出来
+ * （`-1->` 前缀表示本次进程首次见到该车）。artic= 就是 R3RChainHasRealArticPart()
+ * 的取值，因此本行同时回答"这条链到底算不算真铰接链"（第 180 轮的悬置项）。
+ *
+ * 纯只读：只读 real/impl/tt/orders/条数/artic，绝不改写任何字段。
+ * @param t    要观察的列车（任意链上车辆，nullptr 安全）。
+ * @param site 调用位置标签，用来在日志里给出"变更发生在哪两个站点之间"。
+ * @param tag  可选补充标签（例如提交点名 couple / depot-edit），nullptr 打 '-'。
+ */
+static void R3RWatchOrderIndex(const Train *t, const char *site, const char *tag = nullptr)
+{
+	/* R3R (第 209 轮 / KI-315): 探针关闭时立刻返回，别做记账。
+	 *
+	 * 本函数是唯一"先做真活、后调 R3RDbgWrite"的哨兵：R3R_PROBES=0 时
+	 * R3RDbgWrite(...) 展开成 ((void)0)（r3r_perf.h），日志与格式串会消失，
+	 * 但下面的静态表查找/插入与 R3RChainHasRealArticPart() 的全链扫描原本
+	 * 仍会执行；本函数有 26 个调用点，其中 10 个位于 TrainLocoHandler 每列车
+	 * 每 tick 的路径上、订单编辑命令另有 6 对。R3RDbgOn() 在 R3R_PROBES=0 时
+	 * 是常量 false（r3r_perf.h），故此门禁在发行版被折叠为 if (false) return
+	 * 并把整个函数体删掉，不产生任何指令；运行期 R3R_DBG=0（KI-26 的 A/B
+	 * 基准）同样受益。探针开启时本行恒为真，日志逐字不变。 */
+	if (!R3RDbgOn()) return;
+	if (t == nullptr) return;
+
+	struct R3RIdxSnap {
+		int real;
+		int impl;
+		int tt;
+		const OrderList *ol;
+		int count;
+		int artic;
+		bool valid;
+	};
+	/* R3R (第 206 轮修订): 快照按 (站点, 车号) 分桶，而不是只按车号。原实现
+	 * 所有站点共用一个桶 ⇒ A 站点打过一行后，B 站点看到相同的值就静默不打，
+	 * 于是"日志里没有 B 站点"无法区分 "B 站点没被执行" 与 "B 站点执行了但
+	 * 值没变"。分桶后每个站点各自有首次行 + 各自的边沿行。site 恒为字符串
+	 * 字面量（每个调用点地址固定），故直接用指针当键的高位。 */
+	static std::unordered_map<uint64_t, R3RIdxSnap> seen;
+
+	const uint64_t key = ((uint64_t)reinterpret_cast<uintptr_t>(site) << 32) | (uint64_t)t->index.base();
+	R3RIdxSnap &s = seen[key];
+	const OrderList *const ol = t->orders;
+	const int count = (ol != nullptr) ? (int)ol->GetNumOrders() : -1;
+	const int artic = R3RChainHasRealArticPart(t) ? 1 : 0;
+
+	if (s.valid && s.real == (int)t->cur_real_order_index &&
+			s.impl == (int)t->cur_implicit_order_index &&
+			s.tt == (int)t->cur_timetable_order_index &&
+			s.ol == ol && s.count == count && s.artic == artic) {
+		return;
+	}
+
+	R3RDbgWrite("ORD-IDX-WATCH site=%s tag=%s veh=%d real=%d->%d impl=%d->%d tt=%d->%d n=%d->%d artic=%d->%d ord=%p->%p front=%d spd=%d parked=%d\n",
+			site, (tag != nullptr) ? tag : "-", (int)t->index.base(),
+			s.valid ? s.real : -1, (int)t->cur_real_order_index,
+			s.valid ? s.impl : -1, (int)t->cur_implicit_order_index,
+			s.valid ? s.tt : -1, (int)t->cur_timetable_order_index,
+			s.valid ? s.count : -1, count,
+			s.valid ? s.artic : -1, artic,
+			(const void *)s.ol, (const void *)ol,
+			(int)t->IsFrontEngine(), (int)t->cur_speed, (int)t->r3r_parked);
+
+	s.real = (int)t->cur_real_order_index;
+	s.impl = (int)t->cur_implicit_order_index;
+	s.tt = (int)t->cur_timetable_order_index;
+	s.ol = ol;
+	s.count = count;
+	s.artic = artic;
+	s.valid = true;
+}
+
+/**
+ * R3R (第 206 轮探针, 只读): 非 static 薄包装，供 order_cmd.cpp 等别的 TU 打点。
+ * 之所以在这里手写一个包装、而不把 R3RWatchOrderIndex 本身改成非 static 并在
+ * 头文件里声明，是为了让本轮保持"只改 .cpp"——一旦碰 src\*.h，KI-183 的构建
+ * 护栏会把全部 object 删掉、把增量构变成全量（约 700 步 / 半小时）。
+ * @param t    要观察的列车（nullptr 安全）。
+ * @param site 调用位置标签。
+ * @param tag  可选补充标签，可为 nullptr。
+ */
+void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag)
+{
+	/* R3R (第 209 轮 / KI-315): 跨 TU 调用点（order_cmd.cpp 的 RAII 与 6 对命令层
+	 * 哨兵）无法内联，这里再挡一层 ⇒ 探针关闭时退化为一次普通函数调用 + 常量
+	 * false 判断，绝不进入下面的静态表记账与链扫描。 */
+	if (!R3RDbgOn()) return;
+	R3RWatchOrderIndex(t, site, tag);
+}
+
+/* R3R (第 180 轮 / 选项 C): defined in vehicle_cmd.cpp, right next to the
+ * "upgrade to segment" command which is its other caller. Declared here by hand
+ * instead of in vehicle_cmd.h so that this round stays a .cpp-only change and
+ * the KI-183 build guard does not drop every object file. */
+void DearticulateChainWithSnapshot(Train *head);
+
+/**
+ * R3R (第 180 轮 / 选项 C): one-shot load-time migration of a legacy consist
+ * which carries BOTH an R3R segment marker (★ SegmentFront / ⊗ SegmentBack) and
+ * *genuine* articulated parts (AddArticulatedParts() children).
+ *
+ * Such a consist is what the round-180 report is about. Savegames written before
+ * the round-176 gates can hold one: back then "upgrade to segment" did not split
+ * the articulated groups first, so a segment could be declared over a genuine
+ * group. Two things go wrong with it today:
+ *  - the couple gate vetoes it -- R3RChainHasRealArticPart() is true, so
+ *    TryTrainCouple() refuses it and R3RFlipChainBySegments() will not flip it;
+ *  - the round-176 order gate R3RSkipCoupleOrdersForRealArtic() silently drops
+ *    its WAIT_COUPLE order and advances the index, so a consist that is waiting
+ *    to be coupled onto drives off to the next order instead (row 585 of the
+ *    round-180 log: ARTIC-SKIP-R3R veh=0 from=0 to=1 type_from=17 type_to=1).
+ *
+ * The consist was already meant to be a segment, so the fix is to make it a
+ * legal one: de-articulate it once, exactly like the upgrade command does (baked
+ * per-vehicle statistics plus explicit ArticGroupHead / ArticGroupMember roles),
+ * keep the ★/⊗ markers, and re-run ConsistChanged() so the cached lengths and
+ * the NewGRF caches match the new (non-articulated) identity. From then on it is
+ * an ordinary segment: it can wait, be coupled onto and be flipped.
+ *
+ * Native articulated trains carry no ★/⊗ -- only the R3R segment layer grants
+ * those -- so they are never touched. Called once per chain head from
+ * R3RRebuildCouplePriorities(), i.e. only from AfterLoadVehiclesPhase2(), never
+ * on a live chain.
+ * @param head Chain head (nullptr allowed).
+ */
+static void R3RDearticulateLegacyArticSegment(Train *head)
+{
+	if (head == nullptr) return;
+
+	/* Narrow scope on purpose: only a chain which R3R itself already treats as a
+	 * segment is migrated. Without a marker this is a plain native articulated
+	 * train and must be left exactly as the GRF built it. */
+	bool has_marker = false;
+	for (const Train *v = head; v != nullptr; v = v->Next()) {
+		if (v->IsSegmentFront() || v->IsSegmentBack()) { has_marker = true; break; }
+	}
+	if (!has_marker || !R3RChainHasRealArticPart(head)) return;
+
+	uint n = 0;
+	for (const Train *v = head; v != nullptr; v = v->Next()) n++;
+
+	DearticulateChainWithSnapshot(head);
+	head->ConsistChanged(CCF_SAVELOAD);
+	R3RDbgWrite("LEGACY-ARTIC-DEARTIC head=%d n=%u (load migration, round 180 option C)\n",
+			(int)head->index.base(), n);
+}
+
+/**
  * R3R (KI-62): whether a consist may be the destination of an automatic coupling
  * (and may therefore be coupled onto once a locomotive has reached it).
  *
@@ -1896,6 +2079,20 @@ bool R3RIsCoupleTarget(const Train *t)
 	 * scene ended with one chain parked at a platform and another one running
 	 * around with a GOTO_COUPLE it could never finish. */
 	if (Train::From(t->First()) != t) return false;
+	/* R3R（2026-09-30 玩家拍板「双管齐下」之一，寻路侧）: 含**真** artic part 的链
+	 * 一律不是耦合目标。
+	 *
+	 * 玩家现场(build\R3R_debug.log)里被挂的车底 u 是 `u_real=1` —— 它的整条链里有
+	 * 一节是 AddArticulatedParts() 造出来的真 artic part，而不是 R3R 打散后的
+	 * 「假铰接 + 角色位」。这种链一旦被挂上，Couple() 的提交点照样给它打 ★，于是
+	 * 一条「焊死」的整节车底就成了段，之后所有段语义（翻转/解挂/包围盒）都建立在
+	 * 一个"组内每节是独立车"的假设上而不成立。
+	 *
+	 * 判据只认 subtype 位（R3RChainHasRealArticPart），与折叠修正入口的同一门禁
+	 * 一致：打散组每节都挂 ArticGroupMember 角色位，用角色层会把好链也拒掉。
+	 * 从这里开始（yapf 的目标探测与回溯、TrainCoupleHandler 的到达闸门都走本函数）
+	 * 寻路就再也瞄不到它，机车自然也就不会对着它做 GOTO_COUPLE。 */
+	if (R3RChainHasRealArticPart(t)) return false;
 	return t->current_order.IsType(OT_WAIT_COUPLE);
 }
 
@@ -2376,6 +2573,25 @@ static CommandCost CheckNewTrain(Train *original_dst, Train *dst, Train *origina
 	return CommandCost(STR_ERROR_TOO_MANY_VEHICLES_IN_GAME);
 }
 
+/* R3R (KI-215 decisive probe, 2026-09-30): "the DECOUPLE order did nothing" turned
+ * out to be ValidateTrains() rejecting the attempted rearrangement, and the three
+ * checks are indistinguishable from the log. Print exactly which chain, which part
+ * and which callback/limit rejected it. Only the (rare) failure paths log. */
+static void R3RDumpAttachFail(Train *head, Train *part, int allowed_len, uint16_t callback, StringID error)
+{
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "ATTACH-FAIL head=%d head_et=%d head_eng=%d part=%d part_et=%d part_eng=%d cb=0x%X allowed=%d err=0x%X\n",
+			head != nullptr ? (int)head->index.base() : -1,
+			head != nullptr ? (int)head->engine_type.base() : -1,
+			head != nullptr ? (head->IsEngine() ? 1 : 0) : -1,
+			part != nullptr ? (int)part->index.base() : -1,
+			part != nullptr ? (int)part->engine_type.base() : -1,
+			part != nullptr ? (part->IsEngine() ? 1 : 0) : -1,
+			(unsigned)callback, allowed_len, (unsigned)error);
+	fclose(dbg);
+}
+
 /**
  * Check whether the train parts can be attached.
  * @param t the train to check
@@ -2399,7 +2615,10 @@ static CommandCost CheckTrainAttachment(Train *t)
 			t = t->Next();
 		}
 
-		if (allowed_len < 0) return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
+		if (allowed_len < 0) {
+			R3RDumpAttachFail(t, nullptr, allowed_len, 0, STR_ERROR_TRAIN_TOO_LONG);
+			return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
+		}
 		return CommandCost();
 	}
 
@@ -2470,7 +2689,10 @@ static CommandCost CheckTrainAttachment(Train *t)
 					}
 				}
 
-				if (error != STR_NULL) return CommandCost(error);
+				if (error != STR_NULL) {
+					R3RDumpAttachFail(head, t, allowed_len, callback, error);
+					return CommandCost(error);
+				}
 			}
 		}
 
@@ -2480,7 +2702,10 @@ static CommandCost CheckTrainAttachment(Train *t)
 		t = next;
 	}
 
-	if (allowed_len < 0) return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
+	if (allowed_len < 0) {
+		R3RDumpAttachFail(head, nullptr, allowed_len, 0, STR_ERROR_TRAIN_TOO_LONG);
+		return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
+	}
 	return CommandCost();
 }
 
@@ -2496,14 +2721,27 @@ static CommandCost CheckTrainAttachment(Train *t)
  */
 static CommandCost ValidateTrains(Train *original_dst, Train *dst, Train *original_src, Train *src, bool check_limit)
 {
+	/* R3R (KI-215 decisive probe, 2026-09-30): a decouple that "did nothing" is
+	 * indistinguishable from "never reached" unless the failing stage is named.
+	 * Print which of the three checks rejected the rearrangement and with which
+	 * error StringID. Failures are rare, so this stays cheap. */
+	FILE *vdbg = R3RFopenDbg("a");
+	auto probe = [vdbg](const char *stage, const CommandCost &cc) {
+		if (vdbg == nullptr) return;
+		fprintf(vdbg, "VALIDATE-FAIL stage=%s err=0x%X\n", stage, (unsigned)cc.GetErrorMessage());
+	};
 	/* Check whether we may actually construct the trains. */
 	CommandCost ret = CheckTrainAttachment(src);
-	if (ret.Failed()) return ret;
+	if (ret.Failed()) { probe("attach-src", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
 	ret = CheckTrainAttachment(dst);
-	if (ret.Failed()) return ret;
+	if (ret.Failed()) { probe("attach-dst", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
 
 	/* Check whether we need to build a new train. */
-	return check_limit ? CheckNewTrain(original_dst, dst, original_src, src) : CommandCost();
+	if (!check_limit) { if (vdbg != nullptr) fclose(vdbg); return CommandCost(); }
+	ret = CheckNewTrain(original_dst, dst, original_src, src);
+	if (ret.Failed()) { probe("new-train", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
+	if (vdbg != nullptr) fclose(vdbg);
+	return CommandCost();
 }
 
 /**
@@ -2622,11 +2860,34 @@ static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train 
  * non_leading_engines_keep_name 打开时原生语义就是保留非链头引擎的名字，这里照旧
  * 什么都不做（名字仍留在本车上，也就没有"借出"一说）。
  */
-static void R3RParkTrainName(Vehicle *v)
+/**
+ * R3R (第 185 轮 / KI-280): 这辆车此刻身上的列车名是不是「借来的」。
+ *
+ * 借用中的链头（r3r_orders_borrowed 为真）若 name_backup 为空，说明耦合那一刻它
+ * 本来就没有自己的名字 —— 有名字的话 Couple() 早把原件停进 name_backup 了。于是
+ * 活字段上那件名字只可能是 lender（等待方 / 控制段）的，绝不能被当成"自己的名字"
+ * 再停进备份：那正是玩家报的「名字乱传播」（KI-280 三处写点共用这条判据）。
+ *
+ * 只读判定，不改任何字段。与号侧（KI-279 的 was_borrowing、KI-215 的"排程只在第一次
+ * 寄存"）同一条规则：借用中不寄存。
+ */
+static bool R3RNameIsBorrowed(const Vehicle *v)
+{
+	return v != nullptr && v->r3r_orders_borrowed && v->name_backup.empty() && !v->name.empty();
+}
+
+/**
+ * R3R (第 144 轮 / 需求贰) + (第 185 轮 / KI-280): 名字停放。
+ * @param name_is_borrowed 调用点若已知"此刻身上的名字是借来的"，用这个参数传进来
+ *        （身份迁移路径要在借用标志被 swap 之前采样，见 R3RRelocateFrontIdentity）。
+ */
+static void R3RParkTrainName(Vehicle *v, bool name_is_borrowed = false)
 {
 	if (v == nullptr) return;
 	if (_settings_game.vehicle.non_leading_engines_keep_name) return;
-	if (v->name_backup.empty() && !v->name.empty()) v->name_backup = v->name;
+	/* R3R (第 185 轮 / KI-280): 借来的名字不是"自己的名字"，停成备份会在归还时
+	 * 把别人的名字还回来。 */
+	if (!name_is_borrowed && v->name_backup.empty() && !v->name.empty()) v->name_backup = v->name;
 	v->name.clear();
 }
 
@@ -2704,8 +2965,18 @@ static void R3RRestoreUnitNumber(Train *head)
 	if (head == nullptr || head->unitnumber != 0 || head->unitnumber_backup == 0) return;
 
 	if (R3RUnitNumberUsedByOther(head, head->unitnumber_backup)) {
-		/* 号已被别的活车占用（旧档 / 手工改档）：放弃取回，交给调用方按老规矩领新号。 */
-		head->unitnumber_backup = 0;
+		/* R3R (第 198 轮 / KI-300): 旧代码在这里把 unitnumber_backup 清 0，假设"号被真的
+		 * 别人占了（旧档 / 手工改档）"。但解挂现场存在另一种形态：号正被**借用态的链头**
+		 * 穿着 —— 而它借的恰恰就是本车自己的号。此时查重必然命中，于是备份被销毁 ⇒ 本车
+		 * 再也拿不回自己的号、只能领新号（玩家报的"凭空冒出列车 7"），而那个号随后在
+		 * 借用方脱下归还时被 ReleaseID 丢回池里。
+		 *
+		 * 正确做法是**保留备份、暂不取回**：解挂紧接着的 settle 里
+		 * R3RBorrowControlTraitsLive() 会先让借用方脱下（那一刻本车已独占该号），再由它的
+		 * 号块把号还给本车；万一那条路没跑到，NormaliseTrainHead() 的兜底仍会发一个合法
+		 * 新号（备份留着占池位，宁可迟还，不可错丢）。 */
+		R3RDbgWrite("UNIT-RESTORE-DEFER veh=%d id=%u\n",
+				(int)head->index.base(), (unsigned)head->unitnumber_backup);
 		return;
 	}
 
@@ -2901,6 +3172,12 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 	 * drag may strip its fake front engine (cases #2/#3 below). */
 	Train *const moved_block_tail = move_chain ? src->Last() : nullptr;
 	const bool moved_was_caronly = move_chain && R3RIsCarOnlyFormation(src);
+	/* R3R（2026-09-30 玩家拍板「双管齐下」之二，源头）: whether the dragged block
+	 * carries a *genuine* articulated part has to be sampled here too. After the
+	 * merge src->Last() would return the merged chain's end and the block itself is
+	 * no longer addressable as a whole; and the ★/⊗ marking below must never weld a
+	 * chain whose parts R3R can not re-order individually. */
+	const bool moved_block_real_artic = move_chain && R3RChainHasRealArticPart(src);
 
 	/* (Re)arrange the trains in the wanted arrangement. */
 	ArrangeTrains(&dst_head, dst, &src_head, src, move_chain);
@@ -2950,6 +3227,11 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 		 */
 		if (src == original_src_head && src->IsEngine() && (!src->IsFrontEngine() || new_head)) {
 			/* Cases #2 and #3: the front engine gets trashed. */
+			/* R3R (第 185 轮 / KI-280): 名字侧与号侧一样，必须在下面把
+			 * src->r3r_orders_borrowed 清掉【之前】采样 —— src 此刻若穿着借来的名字
+			 * （耦合状态下车库拖动），后续 R3RParkTrainName() 绝不能把这件借名当成
+			 * 它自己的原名停进 name_backup。 */
+			const bool src_name_borrowed = R3RNameIsBorrowed(src);
 			CloseWindowById(WindowClass::VehicleView, src->index);
 			CloseWindowById(WindowClass::VehicleOrders, src->index);
 			CloseWindowById(WindowClass::VehicleRefit, src->index);
@@ -3056,8 +3338,14 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 			src->dispatch_records.clear();
 			/* R3R (第 144 轮 / 需求贰): 名字与排程、车号一起停放 —— src 不再是链头，
 			 * 它自己的列车名先存进 name_backup（而不是直接丢掉），等它重新成为链头
-			 * 时由 NormaliseTrainHead() → R3RRestoreTrainName() 取回。 */
-			R3RParkTrainName(src);
+			 * 时由 NormaliseTrainHead() → R3RRestoreTrainName() 取回。
+			 * R3R (第 185 轮 / KI-280): 传采样到的"借名"标志，见本块开头。 */
+			R3RParkTrainName(src, src_name_borrowed);
+			/* R3R (第 156 轮 / 车库内挂车分支): 分组必须与车号、车名**同时**停放。
+			 * 旧代码让"分组"只靠提交点的 R3RNormaliseChainGroups() 收敛，而被收敛掉的
+			 * 那节段自己的分组在被覆盖的那一刻没有备份 —— 玩家把它从链里拖回来时，
+			 * 分组已经变成控制段的组，段特质丢失。这里补上停放（幂等：已有备份不覆盖）。 */
+			R3RParkTrainGroupID(src);
 			if (src->vehicle_flags.Test(VehicleFlag::HaveSlot)) {
 				TraceRestrictRemoveVehicleFromAllSlots(src->index);
 				src->vehicle_flags.Reset(VehicleFlag::HaveSlot);
@@ -3069,6 +3357,11 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 		/* We weren't a front engine but are becoming one. So
 		 * we should be put in the default group. */
 		if ((original_src_head != src || new_head) && dst_head == src) {
+			/* R3R (第 156 轮): 上游只看"前端列身份"，不认我们的段特质，会直接把玩家
+			 * 给这节段设好的分组抹成默认组。先把当前分组停进 group_id_backup，
+			 * 紧接着的 NormaliseTrainHead() → R3RRestoreTrainGroupID() 会把它取回，
+			 * 于是"拖出来成一列新链头"后玩家看到的分组不变（段特质优先于上游默认行为）。 */
+			R3RParkTrainGroupID(src);
 			SetTrainGroupID(src, DEFAULT_GROUP);
 			SetWindowDirty(WindowClass::Company, _current_company);
 		}
@@ -3098,8 +3391,22 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 		if (move_chain && original_dst_head != nullptr && moved_block_tail != nullptr &&
 				!HasFlag(move_flags, MoveRailVehicleFlags::Virtual) &&
 				(moved_was_caronly || TrainHasEngine(src))) {
-			src->SetSegmentFront();
-			moved_block_tail->SetSegmentBack();
+			if (moved_block_real_artic) {
+				/* R3R（2026-09-30 玩家拍板「双管齐下」之二，源头）: a dragged block
+				 * which still holds a genuine articulated part is exactly the shape
+				 * that must not become a segment. Welding it with ★/⊗ here was one
+				 * of the two paths which produced the player's "整节列车被焊死" field
+				 * case (the other one is Couple()'s submit point, now refused at
+				 * TryTrainCouple's entrance). Unlike CmdMakeSegment -- which runs
+				 * DearticulateChainWithSnapshot() first -- the depot drag has no
+				 * de-articulation step, so the block simply keeps its loose form and
+				 * stays out of the segment table. */
+				R3RDbgWrite("DEPOT-SEG-SKIP-REAL-ARTIC src=%d block_head=%d block_tail=%d -> ★/⊗ withheld (genuine articulated part)\n",
+						(int)src->index.base(), (int)original_src_head->index.base(), (int)moved_block_tail->index.base());
+			} else {
+				src->SetSegmentFront();
+				moved_block_tail->SetSegmentBack();
+			}
 		}
 
 		/* R3R (couple priority, route A): a depot edit can split or join chains,
@@ -4355,6 +4662,813 @@ static Train *R3RGetPriorityHead(Train *chain)
 }
 
 /**
+ * R3R (第 159 轮 / q-0=贰乙): the consist's control segment -- **the command
+ * owner segment**, i.e. the segment with the lowest #Train::r3r_priority.
+ *
+ * 第 152 轮曾把口径定成 P1=甲（控制段 ≡ 链头所在段），并计划用一个"强制不变式"
+ * （在每个提交点重排 `r3r_priority`，让链头段恒为最低）来维持它。玩家在第 158 轮
+ * 改判为**乙**：控制段就是命令所有者段，特质与排程都跟着它走 —— 字面实现
+ * "由控制段显现"。代价与落地代价都已认可：
+ *  · 链头不再是唯一门面：链头（引擎唯一 tick 的那一节、车队列表的主行）成为
+ *    **承载者**，它借用控制段的 orders（`r3r_orders_borrowed`）与三特质
+ *    （unitnumber / name / group_id）：各交接点把控制段那一套换到链头的活字段上、
+ *    把链头段自己的那一套停进 *_backup，提交点再由 R3RBorrowControlTraits()
+ *    把停放的那一套收进链头段的行；
+ *  · `R3RSegmentTraitRow()` 的"控制段无行"约定改成按**控制段**判（不再按链头段判），
+ *    于是"回退到 v->First()"读出来的正好是控制段的那一套；
+ *  · 甲口径下的强制重排优先级**作废**（它会把 owner 变成链头自己，从而当场归还
+ *    借来的排程、废掉耦合后跑车底排程与 KI-215b 的进度回写）。
+ *
+ * 现场样本（第 158 轮日志）：`INVAR-CTRL tag=couple head=48 nseg=2 ctrl=48 ctrl_pri=2
+ * owner=21 owner_pri=1 borrowed=1` —— 乙口径下控制段是 21 那一段，链头 48 借用它。
+ *
+ * @param chain 链头（可为 nullptr）。
+ * @return 控制段（命令所有者）的段头；chain 为 nullptr 时返回 nullptr。
+ */
+static Train *R3RGetControlSegment(Train *chain)
+{
+	if (chain == nullptr) return nullptr;
+	return R3RGetPriorityHead(chain);
+}
+
+/**
+ * R3R (第 152 轮 / P1=甲 取数探针): 记录「控制段」与「命令所有者」分歧的现场。
+ *
+ * **只读，不改任何状态** —— 本函数存在的唯一目的是在把甲口径接线（强制重排
+ * `r3r_priority`，使控制段恒为 1）之前先拿到真实场景的取数，因为两者不等价：
+ * `R3RGetPriorityHead()` 同时**就是借用层的主人判据**（`R3RSyncDrivingOrders()`
+ * 与 `R3RPushProgressToOwner()` 都用它决定"这张表是不是借来的"）。若在提交点
+ * 末尾把链头强行排到 1，owner 立刻变成链头自己 ⇒ 借来排程会被当场归还，
+ * 耦合后跑车底排程的语义、T8701 的 INHERIT 与 KI-215b 的进度回写都会一起失效。
+ * 因此强制重排必须与"排程归属从借用层迁到控制段行"（落地清单第 3 项）同时落地。
+ *
+ * 分歧只在 `segs.size() >= 2` 时才有意义（单段链里链头就是唯一段，甲恒成立），
+ * 且只在**提交点**调用，所以不会刷屏。
+ *
+ * @param chain 链头（可为 nullptr）。
+ * @param tag 提交点名（couple / decouple-v / decouple-u / depot-edit）。
+ */
+static void R3RCheckControlSegment(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+	const std::vector<Train *> segs = R3RGetSegmentHeads(chain);
+	if (segs.size() < 2) return;
+
+	Train *const ctrl = R3RGetControlSegment(chain);
+	if (ctrl == nullptr) return;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	/* 第 159 轮 / q-0=贰乙: 控制段 = 命令所有者段（= r3r_priority 最小者），链头
+	 * 退化为它的**承载者**。甲口径那条"ctrl(链头所在段) vs owner(优先级最小者)"
+	 * 的对比在乙口径下恒等（ctrl 就是 owner），故这里只报告实际形态：
+	 * head_pri 最小 ⇒ 链头自己就是控制段（退化形态，borrowed 应为 0）；
+	 * borrowed=1 表示链头手上的表是借来的。多段链只在提交点各打一行。 */
+	fprintf(dbg, "INVAR-CTRL tag=%s head=%d nseg=%u ctrl=%d ctrl_pri=%u head_pri=%u borrowed=%d\n",
+			tag, (int)chain->index.base(), (unsigned)segs.size(),
+			(int)ctrl->index.base(), (unsigned)ctrl->r3r_priority,
+			(unsigned)chain->r3r_priority,
+			chain->r3r_orders_borrowed ? 1 : 0);
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 152 轮 / P3=B): is \a id currently held by a live car outside \a chain?
+ *
+ * A segment ID has to be unique over the whole map, not just inside one chain:
+ * splitting a segment in two (depot drag out of the middle) hands the same ID
+ * to both halves, and both halves would then settle onto one and the same table
+ * row -- two segments sharing a row is exactly the kind of double authority the
+ * round-152 design exists to remove. So a candidate ID is only reused while
+ * every car carrying it belongs to the chain being settled; otherwise it is
+ * treated as taken and a fresh ID is minted for this segment.
+ *
+ * Order therefore decides which half keeps the old ID: the chain settled *last*
+ * inherits it, because the half settled first has by then already dropped it.
+ * Commit points may rely on that, though in practice it rarely matters -- a
+ * decouple always splits at a ★ boundary, so no segment is ever torn in two
+ * there, and a depot drag settles the (unchanged) source chain not at all.
+ *
+ * Cost is one pass over the vehicle pool per candidate ID, i.e. once per
+ * segment per commit point, not per tick.
+ *
+ * @param id Candidate segment ID (never #R3R_SEGMENT_NONE).
+ * @param chain Chain being settled; cars of it do not count as foreign.
+ * @return True when some live car outside \a chain still points at \a id.
+ */
+static bool R3RSegmentIdHeldElsewhere(uint16_t id, const Train *chain)
+{
+	for (const Vehicle *w : Vehicle::Iterate()) {
+		if (w->type != VehicleType::Train) continue;
+		if (w->r3r_segment_id != id) continue;
+		if (w->First() == chain) continue;
+		return true;
+	}
+	return false;
+}
+
+/**
+ * R3R (第 152 轮 / P3=B): hand every car of \a chain the ID of the segment it
+ * currently belongs to.
+ *
+ * The ID lives on each car (form B), so a segment stays identifiable whichever
+ * car a path happens to be holding, and "move ★ to the physical front of the
+ * segment" degenerates into "recompute the segment's first car" without
+ * migrating any data.
+ *
+ * Conventions:
+ * - A chain of a single segment keeps #R3R_SEGMENT_NONE everywhere: the chain
+ *   head is then the only authority for the three traits and a row would merely
+ *   duplicate it (see the degenerate form in §1.1 of the round-152 notes).
+ * - An ID a segment already carries is kept, so a consist which is coupled and
+ *   later decoupled again keeps its own row (its parked schedule/number/name);
+ *   only a segment which never had one is minted a fresh ID.
+ * - An ID the chain no longer uses goes back to the pool, and only after every
+ *   car has dropped it -- the precondition of R3RSegmentFree().
+ *
+ * @param chain Chain head to walk; may be nullptr.
+ * @param tag Commit point name, for the debug log.
+ */
+static void R3RSyncSegmentIds(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+
+	/* Sample what the chain still holds *before* rewriting it: the IDs the new
+	 * layout does not keep have to go back to the pool. */
+	std::vector<uint16_t> old_ids;
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		if (w->r3r_segment_id != R3R_SEGMENT_NONE) old_ids.push_back(w->r3r_segment_id);
+	}
+
+	const std::vector<Train *> segs = R3RGetSegmentHeads(chain);
+
+	/* Single segment: no ID at all, the head field is the whole authority. */
+	if (segs.size() < 2) {
+		for (Train *w = chain; w != nullptr; w = w->Next()) w->r3r_segment_id = R3R_SEGMENT_NONE;
+		for (size_t i = 0; i < old_ids.size(); i++) R3RSegmentFree(old_ids[i]);
+		return;
+	}
+
+	std::vector<uint16_t> used;
+	for (size_t i = 0; i < segs.size(); i++) {
+		Train *const first = segs[i];
+		Train *const stop = (i + 1 < segs.size()) ? segs[i + 1] : nullptr;
+
+		/* Keep the first ID this segment already carries which neither an
+		 * earlier segment of this chain nor a car of another chain has claimed;
+		 * otherwise mint a fresh one (see R3RSegmentIdHeldElsewhere()). */
+		uint16_t id = R3R_SEGMENT_NONE;
+		for (Train *w = first; w != stop && id == R3R_SEGMENT_NONE; w = w->Next()) {
+			const uint16_t cand = w->r3r_segment_id;
+			if (cand == R3R_SEGMENT_NONE) continue;
+			bool taken = false;
+			for (size_t k = 0; k < used.size(); k++) {
+				if (used[k] == cand) { taken = true; break; }
+			}
+			if (!taken && !R3RSegmentIdHeldElsewhere(cand, chain)) id = cand;
+		}
+		if (id == R3R_SEGMENT_NONE) {
+			id = R3RSegmentAlloc();
+			if (id == R3R_SEGMENT_NONE) return; /* Table full: leave the chain untouched. */
+		}
+		used.push_back(id);
+		for (Train *w = first; w != stop; w = w->Next()) w->r3r_segment_id = id;
+	}
+
+	for (size_t i = 0; i < old_ids.size(); i++) {
+		bool kept = false;
+		for (size_t k = 0; k < used.size(); k++) {
+			if (used[k] == old_ids[i]) { kept = true; break; }
+		}
+		if (!kept) R3RSegmentFree(old_ids[i]);
+	}
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "SEGID-SYNC tag=%s head=%d nseg=%u\n",
+			tag, (int)chain->index.base(), (unsigned)segs.size());
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 157 轮 / 落地清单 ④ 第一步): derive the ★ markers from the segment IDs
+ * instead of relocating them by hand.
+ *
+ * P3=B keeps the identity of a segment on the cars of that segment
+ * (#Vehicle::r3r_segment_id), so "which car carries ★" is no longer data of its
+ * own -- it is the first car of the segment's section, i.e. the first car of a run
+ * of equal IDs along the linked chain. Every edit path (fold-fix flip, couple,
+ * depot move) still relocates ★ by hand and carries the parked traits along; this
+ * pass makes the ID authoritative again and reports every place where the two
+ * disagreed. That report is the evidence needed before the hand-made relocation
+ * can be deleted (the second half of item ④).
+ *
+ * Runs right after #R3RSyncSegmentIds(), so the IDs of the settled layout already
+ * exist; a single-segment chain carries no ID at all and is left alone. A car
+ * whose ID is out of place (the same ID showing up in two separate runs) is only
+ * reported, never rewritten: the ID bookkeeping itself would be wrong there, and a
+ * blind rewrite would hand two sections the same row.
+ *
+ * @param chain Chain head to walk; may be nullptr.
+ * @param tag Commit point name, for the debug log.
+ */
+static void R3RResyncSegmentFronts(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+
+	bool any_id = false;
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		if (w->r3r_segment_id != R3R_SEGMENT_NONE) { any_id = true; break; }
+	}
+	if (!any_id) return;   /* Single segment: the head field is the whole authority. */
+
+	/* The section starts (one per run of equal IDs) which ★ should mark. */
+	std::vector<Train *> should;
+	std::vector<uint16_t> should_ids;
+	/* The ★ markers which are there right now, chain head excluded (it is a section
+	 * start by definition -- see R3RGetSegmentHeads()). */
+	std::vector<Train *> have;
+
+	uint16_t run_id = R3R_SEGMENT_NONE;
+	Train *run_first = nullptr;
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		if (w != chain && w->IsSegmentFront()) have.push_back(w);
+
+		const uint16_t id = w->r3r_segment_id;
+		if (id != run_id) {
+			if (run_id != R3R_SEGMENT_NONE && run_first != nullptr) {
+				should.push_back(run_first);
+				should_ids.push_back(run_id);
+			}
+			run_id = id;
+			run_first = nullptr;
+		}
+		/* An articulated part never carries ★, so a section whose first car is one
+		 * takes the first non-part car of the run instead. */
+		if (run_first == nullptr && id != R3R_SEGMENT_NONE && !w->IsArticulatedPart()) run_first = w;
+	}
+	if (run_id != R3R_SEGMENT_NONE && run_first != nullptr) {
+		should.push_back(run_first);
+		should_ids.push_back(run_id);
+	}
+	if (should.empty()) return;
+	if (should[0] == chain) {
+		should.erase(should.begin());          /* The chain head is implicit. */
+		should_ids.erase(should_ids.begin());
+	}
+
+	/* Proof of life: the pass is silent while the IDs and the markers agree, so a
+	 * periodic line shows that it really ran and found nothing to fix. */
+	/* R3R (第 165 轮, KI-157 判据修法): the line used to be sampled every 64th call,
+	 * i.e. it almost never appeared at all (settle runs a handful of times per
+	 * session, not per tick), which made "no line in the log" unreadable. Print it
+	 * on the first call and whenever the fix counter changes instead: one line
+	 * proves the pass ran, a further line proves it had something to repair. */
+	static uint32_t checks = 0;
+	static uint32_t fixed_total = 0;
+	static uint32_t reported_fixed = 0;
+	static bool reported_once = false;
+	checks++;
+	if (!reported_once || fixed_total != reported_fixed) {
+		reported_once = true;
+		reported_fixed = fixed_total;
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "SEGFRONT-RESYNC-CHECK runs=%u fixed=%u\n",
+					(unsigned)checks, (unsigned)fixed_total);
+			fclose(dbg);
+		}
+	}
+
+	/* The same ID in two separate runs: report only (see the header comment). */
+	for (size_t i = 0; i < should_ids.size(); i++) {
+		for (size_t k = i + 1; k < should_ids.size(); k++) {
+			if (should_ids[i] != should_ids[k]) continue;
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg == nullptr) return;
+			fprintf(dbg, "SEGFRONT-RESYNC-ANOM tag=%s head=%d seg=%u runs=%u\n",
+					tag, (int)chain->index.base(), (unsigned)should_ids[i],
+					(unsigned)should_ids.size());
+			fclose(dbg);
+			return;
+		}
+	}
+
+	if (should == have) return;   /* Settled: nothing to report, nothing to write. */
+
+	size_t dropped = 0;
+	for (Train *w : have) {
+		bool wanted = false;
+		for (size_t i = 0; i < should.size(); i++) {
+			if (should[i] == w) { wanted = true; break; }
+		}
+		if (!wanted) { w->ClearSegmentFront(); dropped++; }
+	}
+	size_t added = 0;
+	for (Train *w : should) {
+		if (!w->IsSegmentFront()) { w->SetSegmentFront(); added++; }
+	}
+	fixed_total += (uint32_t)(added + dropped);
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "SEGFRONT-RESYNC tag=%s head=%d nseg=%u added=%u dropped=%u\n",
+			tag, (int)chain->index.base(), (unsigned)(should.size() + 1),
+			(unsigned)added, (unsigned)dropped);
+	fclose(dbg);
+}
+
+/**
+ * R3R（第 159 轮 / q-0=贰乙）: 把**链头段自己**那一套特质收进它自己的段行。
+ *
+ * q-0 的口径是"控制段=命令所有者段，特质与排程跟命令所有者段走（字面实现
+ * 『由控制段显现』）"。引擎只会 tick 链头、车队列表的主行也永远是链头，所以
+ * "由控制段显现"只能这样做：链头把控制段的那一套**借**过来（与排程借用层
+ * `r3r_orders_borrowed` 同构），而它自己原来的那一套停进它自己的 *_backup，
+ * 由本函数收进**它自己那个段的行**（段行是特质的持久住所），谁也不丢。
+ *
+ * 提交点只做这一件事：填段行。落到活字段上的"借"与"还"由各交接点负责 ——
+ * Couple 把等待方(控制段)的号给链头、链头自己那套进 `unitnumber_backup`，并把
+ * 控制段的活车号清零（号仍占池位）；车库拖动与折叠修正同理；解挂与
+ * NormaliseTrainHead() 再把停放的那一套还回去。
+ *
+ * **绝不要在这里"对调链头与控制段的活字段"**（第 159 轮初版如此，已废弃）：
+ * 交接点把控制段的活车号清零，对调会把 0 换到链头上 —— 车号当场从界面上消失，
+ * 随后 NormaliseTrainHead() 会给它发一个全新的号，KI-237 刚修好的"解挂后不换号"
+ * 立刻复发。车号在号池里必须唯一这条记账约束也要求"借"只发生在交接点那一次。
+ *
+ * 值规则：停放副本（*_backup）优先；只有在**没有借用关系**
+ * （`Vehicle::r3r_orders_borrowed` 为假）时才允许回退到活字段 —— 借用生效时链头的
+ * 活字段就是控制段的那一套，把它写进链头段的行等于给控制段的特质复制了一份。
+ * 幂等：段行里已经有值就不再改动。
+ *
+ * @param chain 链头；可为 nullptr。
+ * @param tag 提交点名（couple / decouple-v / decouple-u / depot-edit / load）。
+ */
+static void R3RBorrowControlTraits(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+
+	Train *const ctrl = R3RGetControlSegment(chain);
+	/* 链头就是控制段（含单段链）：没有第二套特质，它的段行由 R3RSyncSegmentTraits() 填。 */
+	if (ctrl == nullptr || ctrl == chain) return;
+
+	R3RSegmentRecord *const own_row = R3RSegmentGet(chain->r3r_segment_id);
+	if (own_row == nullptr) return;
+
+	const bool borrowed = chain->r3r_orders_borrowed;
+
+	const UnitID own_unit = (chain->unitnumber_backup != 0) ? chain->unitnumber_backup
+			: (borrowed ? 0 : chain->unitnumber);
+	const GroupID own_group = (chain->group_id_backup != GroupID::Invalid()) ? chain->group_id_backup
+			: (borrowed ? GroupID::Invalid() : chain->group_id);
+
+	std::string own_name;
+	if (!chain->name_backup.empty()) {
+		own_name = static_cast<std::string_view>(chain->name_backup);
+	} else if (!borrowed) {
+		own_name = static_cast<std::string_view>(chain->name);
+	}
+
+	bool changed = false;
+	if (own_unit != 0 && own_row->unitnumber != own_unit) { own_row->unitnumber = own_unit; changed = true; }
+	if (own_group != GroupID::Invalid() && own_row->group_id != own_group) { own_row->group_id = own_group; changed = true; }
+	if (!own_name.empty() && !(own_row->name == own_name.c_str())) { own_row->name = own_name; changed = true; }
+
+	if (changed) {
+		R3RDbgWrite("CTRL-PARK tag=%s head=%d seg=%u unit=%u\n", tag,
+				(int)chain->index.base(), (unsigned)chain->r3r_segment_id,
+				(unsigned)own_row->unitnumber);
+	}
+}
+
+/**
+ * R3R (第 152 轮 / P1=甲，第 159 轮改 q-0=贰乙): mirror the control segment's
+ * three traits into its row, so the segment table becomes their complete
+ * persistent home.
+ *
+ * 第 159 轮：控制段 = **命令所有者段**（`R3RGetControlSegment()`，即
+ * `R3RGetPriorityHead()`），不再是链头所在段。链头只是承载者：各交接点把控制段的
+ * 那一套换到它的活字段上（同时把链头段自己的那一套停进 *_backup），提交点再由
+ * R3RBorrowControlTraits() 把停放的那一套收进链头段的行。因此这里写进控制段行的
+ * 三个特质要取**链头的活字段**（那正是控制段的那一套，玩家看到的就是它）；排程与两个
+ * 索引仍取控制段段头自己（借用期链头持的是借来的表、而所有者那边才是"账"，
+ * 见 R3RPushProgressToOwner()）。
+ *
+ * The row never owns the schedule: #R3RSegmentRecord::orders is a pointer, and
+ * the OrderList itself keeps being written by the ORDL chunk and, while shared,
+ * registered with the sharing chain exactly like #Vehicle::orders.
+ *
+ * 第 155 轮 / 落地清单 ③: its sibling R3RSyncHiddenSegmentTraits() runs at the
+ * same commit point and collects the traits of every *hidden* segment (a segment
+ * which is not the control one, 第 159 轮起含**链头段自己**), so the row of such
+ * a segment is filled with the values it parked (#Vehicle::unitnumber_backup,
+ * #Vehicle::name_backup, #Vehicle::group_id_backup) and can act as their formal
+ * home -- see R3RSegmentName() and friends (couple_group.cpp) which read them
+ * back. Without that pass a hidden segment's row stays empty and its own name /
+ * number / group would be lost the moment the cars stop carrying them.
+ *
+ * @param chain Chain head to read; may be nullptr.
+ * @param tag Commit point name, for the debug log.
+ */
+static void R3RSyncSegmentTraits(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+
+	Train *const ctrl = R3RGetControlSegment(chain);
+	if (ctrl == nullptr || ctrl->r3r_segment_id == R3R_SEGMENT_NONE) return;
+
+	R3RSegmentRecord *const row = R3RSegmentGet(ctrl->r3r_segment_id);
+	if (row == nullptr) return;
+
+	/* 三个特质的来源：控制段段头本人（没有借用关系时它手上就是自己的那一套），
+	 * 或者是承载者链头（借用生效时它的活字段才装的是控制段的那一套）。 */
+	const Train *const traits = (ctrl == chain || !chain->r3r_orders_borrowed) ? ctrl : chain;
+
+	bool changed = false;
+	if (row->orders != ctrl->orders) { row->orders = ctrl->orders; changed = true; }
+	if (row->real_index != ctrl->cur_real_order_index) { row->real_index = ctrl->cur_real_order_index; changed = true; }
+	if (row->implicit_index != ctrl->cur_implicit_order_index) { row->implicit_index = ctrl->cur_implicit_order_index; changed = true; }
+	if (row->timetable_index != ctrl->cur_timetable_order_index) { row->timetable_index = ctrl->cur_timetable_order_index; changed = true; }
+	if (row->orders_borrowed != ctrl->r3r_orders_borrowed) { row->orders_borrowed = ctrl->r3r_orders_borrowed; changed = true; }
+	if (row->unitnumber != traits->unitnumber) { row->unitnumber = traits->unitnumber; changed = true; }
+	if (row->group_id != traits->group_id) { row->group_id = traits->group_id; changed = true; }
+	/* R3R (KI-245): BaseConsist::name is a TinyString whose storage is a plain char*
+	 * which stays nullptr while the name is empty, so c_str() returns a nullptr and
+	 * must never be handed to std::string -- doing so dereferences it inside strlen
+	 * and dies on address 0 with no assertion (crash 2026-09-28T185855Z, this line).
+	 * TinyString::operator==(const char*) maps that nullptr onto "", and the
+	 * assignment goes through TinyString's implicit string_view conversion. */
+	if (!(traits->name == row->name.c_str())) { row->name = traits->name; changed = true; }
+
+	if (!changed) return;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "SEGTRAIT-SYNC tag=%s head=%d seg=%u unit=%u group=%d borrowed=%d ctrl=%d\n",
+			tag, (int)chain->index.base(), (unsigned)ctrl->r3r_segment_id,
+			(unsigned)traits->unitnumber, (int)traits->group_id.base(),
+			ctrl->r3r_orders_borrowed ? 1 : 0, (int)ctrl->index.base());
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 156 轮 / KI-248 补): recover the parked traits of a hidden segment
+ * which were left behind on the car that used to be its head.
+ *
+ * #R3RMoveSegmentOwner relocates the segment head when a fold-fix flip reverses a
+ * segment. It swaps the parked name / group copies of the two cars, but it
+ * deliberately leaves the unit number copy alone (that one carries unit-pool
+ * bookkeeping and is handled by #R3RRelocateFrontIdentity for the chain head).
+ * The same "left behind" state also appears in a savegame written before this
+ * fix, or when the traits of two segments are re-shuffled between two commit
+ * points.
+ *
+ * Without this, such a segment shows up in the vehicle list as "no number /
+ * unnamed / default group" even though its identity is sitting on a car two
+ * positions further back. Searching only the segment's own section (from its head
+ * up to, but not including, the next ★) keeps the recovery local, and only the
+ * *parked* copies are taken -- a live value would steal the identity of a car
+ * which is simply riding in the middle of the section.
+ *
+ * @param seg Segment head (★ car, or the chain head) to recover onto.
+ */
+static void R3RRecoverSegmentTraits(Train *seg)
+{
+	if (seg == nullptr) return;
+	if (seg->unitnumber_backup != 0 && !seg->name_backup.empty() &&
+			seg->group_id_backup != GroupID::Invalid()) {
+		return;
+	}
+
+	bool moved = false;
+	for (Train *u = seg->Next(); u != nullptr; u = u->Next()) {
+		if (u->IsSegmentFront()) break;         // Next segment: not ours to take.
+		if (u->IsArticulatedPart()) continue;
+
+		if (seg->unitnumber_backup == 0 && u->unitnumber_backup != 0) {
+			seg->unitnumber_backup = u->unitnumber_backup;
+			u->unitnumber_backup = 0;
+			moved = true;
+		}
+		if (seg->name_backup.empty() && !u->name_backup.empty()) {
+			seg->name_backup = u->name_backup;
+			u->name_backup.clear();
+			moved = true;
+		}
+		if (seg->group_id_backup == GroupID::Invalid() && u->group_id_backup != GroupID::Invalid()) {
+			seg->group_id_backup = u->group_id_backup;
+			u->group_id_backup = GroupID::Invalid();
+			moved = true;
+		}
+
+		if (seg->unitnumber_backup != 0 && !seg->name_backup.empty() &&
+				seg->group_id_backup != GroupID::Invalid()) {
+			break;
+		}
+	}
+
+	if (!moved) return;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	fprintf(dbg, "SEGTRAIT-RECOVER seg=%d unit=%u group=%d name=%d\n",
+			(int)seg->index.base(), (unsigned)seg->unitnumber_backup,
+			(int)seg->group_id_backup.base(), seg->name_backup.empty() ? 0 : 1);
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 155 轮 / 落地清单 ③): collect the traits of every hidden segment of
+ * the chain into that segment's own row.
+ *
+ * A hidden segment is one which is not the control segment, i.e. one whose head
+ * is not the chain head. Such a segment has parked its three player-facing
+ * traits when it stopped being a chain head (#Vehicle::unitnumber_backup,
+ * #Vehicle::name_backup, #Vehicle::group_id_backup -- the coupling and depot
+ * edit paths park them), and the row is where they now live formally so that the
+ * vehicle list can still show them (P2a) and so that a load which drops the
+ * NOSAVE #Vehicle::name_backup does not lose the name.
+ *
+ * The live field is used when nothing was parked: a segment which is hidden
+ * without ever having been parked (e.g. one which was only just cut off by a
+ * fold-fix flip) still carries its own values.
+ *
+ * Only the three traits are collected. The schedule and the order indices of a
+ * hidden segment are deliberately left alone: while the borrow rules (KI-04) are
+ * still keyed on the chain head, the row must not become a second schedule owner.
+ *
+ * @param chain Chain head to read; may be nullptr.
+ * @param tag Commit point name, for the debug log.
+ */
+static void R3RSyncHiddenSegmentTraits(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+
+	const std::vector<Train *> segs = R3RGetSegmentHeads(chain);
+	if (segs.size() < 2) return;   // Single segment: no hidden segment, no row to fill.
+
+	/* 第 159 轮 / q-0=贰乙: 隐藏段 = **非控制段**（控制段 = 命令所有者段），不再是
+	 * "链头段之后的所有段"。于是当控制段不是链头那一段时，链头段自己（segs[0]）
+	 * 也算隐藏段、也要有自己的行 —— 但那一行由 R3RBorrowControlTraits() 负责：
+	 * 借用期链头的活字段是**控制段那一套**，这里绝不能拿它当链头段自己的值。 */
+	Train *const ctrl = R3RGetControlSegment(chain);
+
+	for (size_t i = 0; i < segs.size(); i++) {
+		Train *const seg = segs[i];
+		if (seg == ctrl) continue;    // 控制段的行由 R3RSyncSegmentTraits() 负责
+		if (seg == chain) continue;   // 链头段自己的行由 R3RBorrowControlTraits() 负责
+		if (seg->r3r_segment_id == R3R_SEGMENT_NONE) continue;
+
+		/* R3R (第 156 轮): a relocated segment head may not carry the parked
+		 * copies itself (see R3RRecoverSegmentTraits); bring them back before the
+		 * row is read, so the row never reports an empty trait. */
+		R3RRecoverSegmentTraits(seg);
+
+		R3RSegmentRecord *const row = R3RSegmentGet(seg->r3r_segment_id);
+		if (row == nullptr) continue;
+
+		const UnitID unit = (seg->unitnumber_backup != 0) ? seg->unitnumber_backup : seg->unitnumber;
+		const GroupID group = (seg->group_id_backup != GroupID::Invalid()) ? seg->group_id_backup : seg->group_id;
+		const bool have_parked_name = !seg->name_backup.empty();
+
+		bool changed = false;
+		if (row->unitnumber != unit) { row->unitnumber = unit; changed = true; }
+		if (row->group_id != group) { row->group_id = group; changed = true; }
+		/* TinyString::operator==(const char*) maps its nullptr onto "" (KI-245), and
+		 * the assignment goes through its implicit string_view conversion, so an empty
+		 * parked name leaves the row empty and never dereferences a nullptr. */
+		if (have_parked_name ? !(seg->name_backup == row->name.c_str()) : !(seg->name == row->name.c_str())) {
+			row->name = have_parked_name ? std::string(static_cast<std::string_view>(seg->name_backup)) : std::string(static_cast<std::string_view>(seg->name));
+			changed = true;
+		}
+
+		if (!changed) continue;
+
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg == nullptr) continue;
+		fprintf(dbg, "SEGTRAIT-SYNC-SEC tag=%s head=%d seg=%u unit=%u group=%d parkedname=%d\n",
+				tag, (int)chain->index.base(), (unsigned)seg->r3r_segment_id,
+				(unsigned)unit, (int)group.base(), have_parked_name ? 1 : 0);
+		fclose(dbg);
+	}
+}
+
+/* R3R (第 165 轮): the settle pass dumps the chain it just finished (segment IDs
+ * and markers only become final there), so the geometry dumper — defined much
+ * further down the file — must be declared before R3RSettleChainSegments(). */
+static void R3RDumpChainGeometry(const char *tag, const Train *head);
+
+/* R3R (第 170 轮, R170-B): the settle pass re-asserts the borrow layer (see the
+ * body of R3RSettleChainSegments), so the live borrow — defined far below — has
+ * to be declared here as well. */
+static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
+
+/**
+ * R3R (第 165 轮 probe): is this chain worth a full post-settle geometry dump?
+ *
+ * Only multi-section or long chains can show the "section collapsed / cars
+ * stacked" shapes this probe exists for; a single-section short train has
+ * nothing to say. Keeps the log readable when a session couples a dozen trains.
+ */
+static bool R3RSettleWorthDumping(const Train *chain)
+{
+	if (!R3RDbgOn()) return false;
+	int n = 0;
+	bool multi = false;
+	/* Literal bound: R3R_CHAIN_WALK_LIMIT is declared further down the file and
+	 * cannot be referenced from here. */
+	for (const Train *w = chain; w != nullptr && n < 512; w = w->Next(), n++) {
+		if (w != chain && w->IsSegmentFront()) multi = true;
+	}
+	return multi || n > 8;
+}
+
+/**
+ * R3R (第 191 轮 probe, read-only): 把一条链里每个段的"号与名"在三个位置上摊平。
+ *
+ * 号/名有三个权威位置，读档族的三个症状（KI-293/294/295）全都出在"谁是权威"上：
+ *
+ *  - `live` = 段头车的活字段（#Vehicle::unitnumber / #Vehicle::name）。借用期它承载
+ *    的是**控制段**那一套（第 159 轮 / q-0=贰乙），所以它本身不是本段的真身。
+ *  - `bk`   = 同一辆车的停放副本（#Vehicle::unitnumber_backup / name_backup）。
+ *    这一套才是**本段自己的**。
+ *  - `row`  = 段行（#R3RSegmentRecord），第 152 轮定下的**正式宿主**，入 R3SG chunk。
+ *
+ * 判读口径（第 194 轮订正）：
+ *  - "本段自己那一套" = 本段是承载者且未被借用时取 `live`，其余取 `bk`。
+ *  - 健康态 = **每一段**的 `row == 本段自己那一套`；控制段同样如此 —— 它的行记的是
+ *    它自己那一套，**不是**它的 `live`。
+ *  - 借用态（`borrowed=1` 且控制段 != 链头）另加一条**跨车**不变式：
+ *    链头（承载者）的 `live == 控制段的 bk`（链头手上那套正是命令所有者的）。
+ *    此时控制段自己的 `live` 只是"上一次借入后剩下的残留"（现场常见 `u=0 n=""`），
+ *    **故意不等于**它的 `row`，不能当坏账读。
+ *  - 非借用态（控制段 == 链头）时 `live` 就是链头自己的，`bk` 应为空
+ *    （`CTRL-UNBORROW` 已把它排空）；单段链不建行（`row none`）时界面直接读 `live`。
+ *  - `bk n=""` 而 `row n!=""` ⇒ 停放副本丢了（KI-294 名称清空）。
+ *  - 某段 `row n` 恰等于**另一段**的 `bk n` ⇒ 乱继承（KI-295）。
+ *  - `row none/off` ⇒ 该段还没有自己的行（单段链是正常形态）。
+ *  - 表头 `ctrl=` 的 `0` 有歧义：控制段是 0 号车、或压根没有控制段
+ *    （`R3RGetControlSegment()` 返回 nullptr）都打 `0`；判定必须看下面每段的
+ *    `ctrl=1` 落在哪一节 `front=` 上，不能只看表头。
+ *
+ * 提交点是封闭事件集（不是每帧），故无条件打；玩家 2026-10-01 的要求是
+ * "每次列车进行 R3R 行为，就把有关段的编号和名称打印出来"。
+ *
+ * @param chain 链头；可为 nullptr。
+ * @param tag   提交点名（couple / decouple-v / decouple-u / depot-edit / load / load-raw）。
+ */
+static void R3RLogSegmentTraits(const Train *chain, const char *tag)
+{
+	if (!R3RDbgOn() || chain == nullptr) return;
+
+	/* R3RGetSegmentHeads()/R3RGetControlSegment() 收 Train*；本条只读，故此处转换。 */
+	Train *const head = const_cast<Train *>(chain);
+	const std::vector<Train *> segs = R3RGetSegmentHeads(head);
+	Train *const ctrl = R3RGetControlSegment(head);
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+
+	fprintf(dbg, "SEGTR-SNAP tag=%s head=%u nseg=%u ctrl=%u borrowed=%d\n",
+			tag, (unsigned)chain->index.base(), (unsigned)segs.size(),
+			(ctrl != nullptr) ? (unsigned)ctrl->index.base() : 0u,
+			chain->r3r_orders_borrowed ? 1 : 0);
+
+	for (size_t i = 0; i < segs.size(); i++) {
+		const Train *const seg = segs[i];
+		const R3RSegmentRecord *const row = (seg->r3r_segment_id != R3R_SEGMENT_NONE)
+				? R3RSegmentGet(seg->r3r_segment_id) : nullptr;
+
+		fprintf(dbg, "SEGTR-SNAP   i=%u id=%u front=%u star=%d ctrl=%d"
+				" | live u=%u n=\"%s\" gid=%d"
+				" | bk u=%u n=\"%s\" gbk=%d"
+				" | row %s u=%u n=\"%s\" g=%d\n",
+				(unsigned)(i + 1),
+				(unsigned)((seg->r3r_segment_id != R3R_SEGMENT_NONE) ? seg->r3r_segment_id : 0),
+				(unsigned)seg->index.base(),
+				seg->IsSegmentFront() ? 1 : 0,
+				(seg == ctrl) ? 1 : 0,
+				(unsigned)seg->unitnumber,
+				seg->name.empty() ? "" : seg->name.c_str(),
+				(seg->group_id == GroupID::Invalid()) ? -1 : (int)seg->group_id.base(),
+				(unsigned)seg->unitnumber_backup,
+				seg->name_backup.empty() ? "" : seg->name_backup.c_str(),
+				(seg->group_id_backup == GroupID::Invalid()) ? -1 : (int)seg->group_id_backup.base(),
+				(row == nullptr) ? "none" : (row->in_use ? "use" : "off"),
+				(unsigned)((row != nullptr) ? row->unitnumber : 0),
+				(row != nullptr && !row->name.empty()) ? row->name.c_str() : "",
+				(row == nullptr || row->group_id == GroupID::Invalid()) ? -1 : (int)row->group_id.base());
+	}
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 152 轮): run the whole segment bookkeeping of one commit point.
+ *
+ * Order matters: the IDs have to exist before a row can be written, and the
+ * probe has to run last so that it reports the settled state of the chain.
+ *
+ * 第 157 轮 / 落地清单 ④: the ★ markers are re-derived from those IDs right after
+ * they exist (R3RResyncSegmentFronts), so the hand-made relocation of the edit
+ * paths is now only a first guess which this pass confirms or corrects. It has to
+ * run *before* the two trait passes: should it move a section start, the parked
+ * copies stay on the old car and R3RRecoverSegmentTraits() -- called by the hidden
+ * pass -- has to be the one which brings them back.
+ *
+ * @param chain Chain head of one resulting chain; may be nullptr.
+ * @param tag Commit point name (couple / decouple-v / decouple-u / depot-edit).
+ */
+static void R3RSettleChainSegments(Train *chain, const char *tag)
+{
+	/* R3R 探针（item 3）：提交点进出成对快照。本函数是"每次 R3R 行为"的收口处
+	 * （couple / decouple-v / decouple-u / depot-edit），最可疑的索引改写都在里面。 */
+	R3RWatchOrderIndex(chain, "settle-in", tag);
+	R3RSyncSegmentIds(chain, tag);
+	R3RResyncSegmentFronts(chain, tag);
+	/* R3R (第 197 轮 / KI-299a 收尾): 控制段也要跑一次"滞留特质找回"。
+	 *
+	 * `R3RMoveSegmentOwner()`（折叠修正换 ★）只搬排程与 `name_backup` /
+	 * `group_id_backup`，**刻意不搬 `unitnumber_backup`**（见该函数末段注释：号牵着号池
+	 * 记账，"非链头段可能滞留在旧段头上的那一份，由 `R3RRecoverSegmentTraits()` 在提交点
+	 * 兜底找回"）。但那个兜底只在 `R3RSyncHiddenSegmentTraits()` 里被调用，而它开头就
+	 * `if (seg == ctrl) continue;` —— **控制段永远拿不到这次兜底**，于是"滞留在旧 ★ 身上
+	 * 的那一份号"没人接。
+	 *
+	 * 第 197 轮现场（2026-10-02 02:13 日志，最后一次耦合）：折叠把车底段的 ★ 从引擎 6
+	 * 迁到相邻的**车厢 23**（4074 行 `OWNER-MOVE from=6 to=23 orders=29 prio=1`；
+	 * 4069 行 `FOLD-U veh=23 ... subtype=0x04(... wagon=1) engType=371`），车厢的
+	 * `unitnumber` 恒为 0、`unitnumber_backup` 也从未被写过，而它正是新的控制段
+	 * （4275 行 `INVAR-CTRL ... ctrl=23 ctrl_pri=1`）。后续 4299-4300 行快照里：
+	 * 控制段 `i=2 front=23 | live u=0 n="" | bk u=0 n="T8701/2-国际段1"`，链头
+	 * `i=1 front=48 | live u=2 n="T8701/2-国际段1" | bk u=6 n=""` ——
+	 * 名对上了（`OWNER-MOVE` 搬过去了），**号对不上**（2 vs 0），第 194 轮判据③
+	 * "链头 live == 控制段 bk" 当场在号这一项上失败。根因就是这里少了一次兜底：
+	 * `R3RBorrowControlTraitsLive()` 的借号门禁是 `ctrl->unitnumber_backup != 0`
+	 * （5904），控制段的 `unitnumber_backup` 是 0 ⇒ 什么都没借，链头只好继续穿着
+	 * 上一轮借来的旧号。
+	 *
+	 * 放在这里的原因：`R3RRecoverSegmentTraits()` 靠 `IsSegmentFront()` 划界，必须在
+	 * `R3RResyncSegmentFronts()` 之后；而它补出来的 `ctrl->unitnumber_backup` 正是
+	 * 紧接的 `R3RBorrowControlTraitsLive()` 的输入，所以又必须在它之前。链头自己就是
+	 * 控制段时跳过（那时不需要借号，`ctrl == chain` 分支走的是"脱下"）。
+	 * 只搬 `*_backup`（不碰活字段），且区段扫描止于下一个 ★，所以不会偷走本段内
+	 * 普通车正在用的身份；同链内"停放"位置变化不影响号池记账（`R3RUnitNumberUsedByOther()`
+	 * / `R3RUnitNumberParkedByOther()` 都遍历整链）。 */
+	if (chain != nullptr) {
+		Train *const ctrl = R3RGetControlSegment(chain);
+		if (ctrl != nullptr && ctrl != chain) {
+			const UnitID unit_before = ctrl->unitnumber_backup;
+			const bool name_before = !ctrl->name_backup.empty();
+			R3RRecoverSegmentTraits(ctrl);
+			if (ctrl->unitnumber_backup != unit_before || (!name_before && !ctrl->name_backup.empty())) {
+				R3RDbgWrite("CTRL-RECOVER %s head=%d ctrl=%d unit=%u name=%d\n", tag,
+						(int)chain->index.base(), (int)ctrl->index.base(),
+						(unsigned)ctrl->unitnumber_backup, ctrl->name_backup.empty() ? 0 : 1);
+			}
+		}
+	}
+	/* R3R (第 170 轮 / R170-B): 提交点先补一次"活字段借用"，再收行。第 159 轮
+	 * （q-0=贰乙）规定链头的**活字段**永远承载控制段那一套，而 R3RBorrowControlTraitsLive()
+	 * 原先只挂在车库拖动（KI-263）、读档、以及 Couple() 自己的内联块上 —— 解挂这条
+	 * 路径漏了：DecoupleTrain() 的归还块把链头自己的号/名写回活字段，若这条链解挂后
+	 * 仍然处于借用态（排程还是控制段的），界面就会显示"承载者自己"的号与名（现场
+	 * R170-B：控制段已是 B，显示的却是 A 的号/名）。放在两个行写入之前是必须的：
+	 * 下面两步都是拿链头的活字段当控制段那一套去镜像段的。 */
+	R3RBorrowControlTraitsLive(chain, tag);
+	/* 先收链头段自己的那一套（借用层的停放副本），再填控制段的行 —— 后者读的是
+	 * 链头的**活字段**（承载者手上的正是控制段那一套），两步写的行互不相交。 */
+	R3RBorrowControlTraits(chain, tag);
+	R3RSyncSegmentTraits(chain, tag);
+	R3RSyncHiddenSegmentTraits(chain, tag);
+	R3RCheckControlSegment(chain, tag);
+
+	/* R3R (第 165 轮 probe, read-only): 上面这些步骤写完，段 ID / ★⊗ 标记 / 控制段
+	 * 才第一次是终值 —— 所有在此之前的 dump（GEO respace-after 等）打出来的
+	 * segid 都是 0（现场 5176 行），"这一段应该是一段还是六段"没法从日志判读。
+	 * 所以 settle 之后无条件补一条完整几何 —— 但要挡住两处噪声：(1) 读档会对
+	 * **每一列车** settle 一次（tag="load"），(2) 单段短链是绝大多数。只有
+	 * "多段链或长链"才打，一列车一行成本可忽略。 */
+	if (chain != nullptr && std::string_view(tag) != "load" && R3RSettleWorthDumping(chain)) {
+		/* The commit points are a closed set (see the @param above), so the label
+		 * is spelled out instead of building it with snprintf/seprintf. */
+		const std::string_view t(tag);
+		const char *label = (t == "couple")     ? "settle-couple" :
+		                    (t == "decouple-v") ? "settle-decouple-v" :
+		                    (t == "decouple-u") ? "settle-decouple-u" :
+		                    (t == "depot-edit") ? "settle-depot-edit" : "settle-other";
+		R3RDumpChainGeometry(label, chain);
+	}
+
+	/* R3R (第 191 轮 probe, read-only): 玩家 2026-10-01 要求"每次列车进行 R3R 行为，
+	 * 就把有关段的编号和名称打印出来"。提交点是封闭事件集（couple / decouple-v /
+	 * decouple-u / depot-edit / load），不是每帧，故无条件打：SEGTR-SNAP 之后才是
+	 * 该次行为终值（上面的步骤全跑完），GEO 只对多段/长链打，本行对每次行为都给。 */
+	R3RLogSegmentTraits(chain, tag);
+	R3RWatchOrderIndex(chain, "settle-out", tag);
+}
+
+/**
  * R3R (KI-215b, 2026-09-26): push the driven position back onto the command owner.
  *
  * During a borrow only the chain head is ticked, so the position it reaches lives
@@ -4388,6 +5502,10 @@ static void R3RPushProgressToOwner(Train *chain)
 	owner->cur_real_order_index = chain->cur_real_order_index;
 	owner->cur_implicit_order_index = chain->cur_implicit_order_index;
 	owner->cur_timetable_order_index = chain->cur_timetable_order_index;
+	/* R3R 探针（item 3）：这是唯一一处"把链头位置写回所有者"的地方，也是
+	 * KI-04 借用层最常见的"索引回灌"来源（冻结值被喂给下一个接手者）。 */
+	R3RWatchOrderIndex(chain, "ord-push");
+	R3RWatchOrderIndex(owner, "ord-push-owner");
 }
 
 /**
@@ -4435,6 +5553,91 @@ static void R3RRenumberPriorities(Train *chain)
 }
 
 /**
+ * R3R (第 196 轮 / 缺口 A): which segment of this chain really holds the given
+ * order list?
+ *
+ * 重发号码牌（见 R3RReelectControlSegment）需要先回答"这张表在本链上的主人是
+ * 哪一段"。判据只看段头（段的数量很小）：
+ *  - "自持者"：s->orders == ol 且 s 没有处于借用态 —— 表就握在它自己手上，这是
+ *    唯一权威的主人；真共享环上多段同时满足时取物理最前的那一个（未确认项 R-1）。
+ *  - "停放者"：s->orders_backup == ol —— 主人把表停在自己身上（KI-214 形态）。
+ * 都没有 ⇒ nullptr（本链无人持有，属孤儿表，交给 KI-239 的归还路径，本函数不插手）。
+ *
+ * @param chain Head of the consist.
+ * @param ol    The order list to look for (may be nullptr).
+ * @return The segment head holding it, or nullptr.
+ */
+static Train *R3ROrderListHolderInChain(Train *chain, OrderList *ol)
+{
+	if (chain == nullptr || ol == nullptr) return nullptr;
+
+	std::vector<Train *> segs = R3RGetSegmentHeads(chain);
+	Train *parked = nullptr;
+	for (Train *s : segs) {
+		if (s == nullptr) continue;
+		if (s->orders == ol && !s->r3r_orders_borrowed) return s;
+		if (s->orders_backup == ol && parked == nullptr) parked = s;
+	}
+	return parked;
+}
+
+/**
+ * R3R (第 196 轮 / 缺口 A): re-issue the priority numbers of a chain so that the
+ * segment which actually holds the schedule becomes the command owner.
+ *
+ * 缺口 A（KI-299a、备忘「第 196 轮」）：r3r_priority 是**耦合那一刻**的角色排名
+ * （R3RMergePriorities：被动方在前、主动方整体后移），此后除耦合/读档外没有任何
+ * 一步按"谁真正拿着排程"重算过 —— 解挂与车库编辑里的 R3RRenumberPriorities() 只
+ * 是按老次序压实。一旦持表段被切走、或排程按 ODOF 归还/继承换了手，选出来的控制
+ * 段就可能已经没有排程，选拔判据与排程归属脱钩。
+ *
+ * 本函数按"当前控制段准备交付的那张表"重发号码牌：表的主人如果不是当前控制段，
+ * 就把主人的 rank 压到最前（其余按物理序压实）。号码牌本来就指对、或本链无人持
+ * 有该表（孤儿表）时一概不动，因此单段链与非分歧场景逐字节不变。
+ *
+ * 调用顺序约束：必须在 R3RRenumberPriorities() 之后、R3RSyncDrivingOrders() /
+ * Couple() 的借用移交之前 —— 前者保证 rank 连续（压到 0 才是唯一最小），后者保证
+ * 下游读到的 owner 就是重发后的那一位。
+ *
+ * @param chain Head of the consist.
+ * @param tag   Probe tag of the calling commit point.
+ */
+static void R3RReelectControlSegment(Train *chain, const char *tag)
+{
+	if (chain == nullptr) return;
+	std::vector<Train *> segs = R3RGetSegmentHeads(chain);
+	if (segs.size() < 2) return; /* 单段链：链头就是唯一段，重选无意义，也不打日志 */
+
+	Train *const cur = R3RGetLowestPriority(segs);
+	if (cur == nullptr) return;
+
+	/* 锚表 = 当前控制段准备交付的那张（与 R3RSyncDrivingOrders() 的 owner 口径一致）。 */
+	OrderList *ol = cur->orders;
+	if (ol == nullptr) ol = cur->orders_backup;
+	if (ol == nullptr) ol = chain->orders;
+	if (ol == nullptr) return;
+
+	Train *const holder = R3ROrderListHolderInChain(chain, ol);
+	if (holder == nullptr || holder == cur) return; /* 号码牌已指对，或表无主 */
+
+	const uint16_t old_pri = cur->r3r_priority;
+	holder->r3r_priority = 0;
+	R3RRenumberPriorities(chain);
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg != nullptr) {
+		fprintf(dbg, "CTRL-REELECT tag=%s head=%d nseg=%u old=%d old_pri=%u new=%d new_pri=%u borrowed=%d\n",
+				tag, (int)chain->index.base(), (unsigned)segs.size(),
+				(int)cur->index.base(), (unsigned)old_pri,
+				(int)holder->index.base(), (unsigned)holder->r3r_priority,
+				(int)(chain->r3r_orders_borrowed ? 1 : 0));
+		fclose(dbg);
+	}
+}
+
+static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
+
+/**
  * R3R (couple priority, route A): rebuild the runtime priority/borrow state of a
  * freshly loaded consist.
  *
@@ -4460,12 +5663,34 @@ void R3RRebuildCouplePriorities(Train *chain)
 {
 	if (chain == nullptr) return;
 
+	/* R3R (第 206 轮探针, 只读): 读档重建入口的索引基线。本函数只被
+	 * AfterLoadVehiclesPhase2() 调用 ⇒ 这条只在读档时出现一次，用来把
+	 * "读档过程中已被改" 与 "读档之后（tick 之间）才被改" 分开：若
+	 * load-rebuild 就已经是 1，则写者在读档阶段；若这里是 0 而随后第一个
+	 * tick-in 才是 1，则写者在"读档结束到第一个 tick 之间"。 */
+	R3RWatchOrderIndex(chain, "load-rebuild");
+
+	/* R3R (第 180 轮 / 选项 C): migrate a legacy "genuine articulated + ★/⊗"
+	 * consist before anything else looks at it. This runs at load only (this
+	 * function is called once per head from AfterLoadVehiclesPhase2) and is a
+	 * no-op for every consist which does not carry that illegal combination. */
+	R3RDearticulateLegacyArticSegment(chain);
+
+	/* R3R (第 191 轮 probe, read-only): 读档重建的**入口**快照 —— 此时段 ID / 段行
+	 * 都还是存档里读回来的原样（本函数随后才 R3RSettleChainSegments 重收），与
+	 * tag="load" 的那一条配对使用即可看出"读档过程本身有没有改坏号/名"：
+	 * load-raw 是文件里的样子，load 是重建后的样子。 */
+	R3RLogSegmentTraits(chain, "load-raw");
+
 	/* R3R (KI-169a): a loaded head which parked its own schedule is borrowing
 	 * whatever its orders pointer says. Dropping the park here is what made the
 	 * vehicle come back as "no schedule" after a save/load. */
 	if (chain->orders_backup != nullptr) {
 		chain->r3r_orders_borrowed = true;
 		R3RRenumberPriorities(chain);
+		/* R3R (KI-263): see the note at the end of this function. */
+		R3RBorrowControlTraitsLive(chain, "load");
+		R3RSettleChainSegments(chain, "load");
 		return;
 	}
 
@@ -4488,6 +5713,26 @@ void R3RRebuildCouplePriorities(Train *chain)
 	chain->orders_backup = nullptr;
 	chain->orders_backup_real_index = INVALID_VEH_ORDER_ID;
 	chain->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
+
+	/* R3R (第 152 轮 / P1=甲): rebuild the segment IDs and the segment rows
+	 * once after a load. It is the only place where the table is filled from
+	 * scratch: a savegame written before round 152 has no r3r_segment_id field
+	 * (every car reads back as R3R_SEGMENT_NONE) and R3RSegmentTableReset() has
+	 * just emptied the table, so the chains themselves are the only source of
+	 * truth. A single-segment chain stays at NONE and creates no row. */
+	/* R3R (KI-263 / 事项三「旧 R3R 存档字段兼容口径与处置」): 借用态链头如果没穿着
+	 * 控制段那一套车号/车名（本 exe 之前存的档里，车库拖动这条交接路径不做这一步，
+	 * 玩家看到的就一直是"号/名跟链头、排程跟控制段"），读档时在这里补穿一次。
+	 * 口径与安全边界：
+	 *  - 只对**确实是借用态**的链动手（r3r_orders_borrowed，KI-169a 起随 R3VP 入档）；
+	 *    R3VP 之前的旧档读回标志恒为 false ⇒ 一个字都不改，绝不凭空发明身份。
+	 *  - 控制段那套来自它自己的 *_backup（本来就是停放态），链头自己那一套先停进
+	 *    链头自己的 *_backup 再穿 ⇒ 谁也没丢，解耦/解借时原样还回。
+	 *  - 幂等：已经穿着同一个号/名时无动作，所以本 exe 之后的档读进来不会反复搬。
+	 * 必须在 R3RSettleChainSegments() 之前调用：那个提交点会把链头活字段镜像进
+	 * 控制段行（R3RSyncSegmentTraits）。 */
+	R3RBorrowControlTraitsLive(chain, "load");
+	R3RSettleChainSegments(chain, "load");
 }
 
 /**
@@ -4611,9 +5856,15 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	if (chain == nullptr) return;
 	Train *owner = R3RGetPriorityHead(chain);
 
+	/* R3R (第 206 轮探针, 只读): 借用层的入口/出口。这是"没有任何提交点却静默改索引"
+	 * 的头号嫌疑：它专门把 owner 的冻结索引回灌给链头（见 KI-04 / KI-215b），
+	 * 而且读档 / 车库编辑 / 解挂三条边都会经过它。 */
+	R3RWatchOrderIndex(chain, "syncdriving-in", inherit_progress ? "inherit" : "keep");
+
 	if (owner == chain) {
 		/* Head is the command owner: give the borrow back. */
 		R3RReturnBorrowedOrders(chain, false);
+		R3RWatchOrderIndex(chain, "syncdriving-out-owner");
 		return;
 	}
 
@@ -4653,7 +5904,10 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 		owner_real = owner->orders_backup_real_index;
 		owner_implicit = owner->orders_backup_implicit_index;
 	}
-	if (owner_orders == nullptr) return;  /* Nothing to drive yet. */
+	if (owner_orders == nullptr) {
+		R3RWatchOrderIndex(chain, "syncdriving-out-nolist");
+		return;  /* Nothing to drive yet. */
+	}
 	/* Parked without a recorded position: adopting it would corrupt the chain's
 	 * indices, so keep driving what it has and let the owner hand over later. */
 	if (owner_real == INVALID_VEH_ORDER_ID) inherit_progress = false;
@@ -4667,6 +5921,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 			 * otherwise UpdateVehicleTimetable asserts on the next station stop. */
 			chain->cur_timetable_order_index = chain->cur_real_order_index;
 		}
+		R3RWatchOrderIndex(chain, "syncdriving-out-samelist");
 		return;
 	}
 
@@ -4700,6 +5955,173 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	chain->DeleteUnreachedImplicitOrders();
 	InvalidateVehicleOrder(chain, 0);
 	R3RCheckTtSync(chain, "sync-borrow");
+	R3RWatchOrderIndex(chain, "syncdriving-out-adopted");
+}
+
+/**
+ * R3R (KI-263 / 需求贰): 号 num 是否正停在链上**别的车**的 unitnumber_backup 里。
+ *
+ * 与 R3RUnitNumberUsedByOther() 的区别：那个查的是"别人正拿它当活号用"，这个查的
+ * 是"这本来是别人的号，被本链头借来穿在身上" —— 车库拖动进入借用态时就是这样：
+ * 控制段（落点链链头）把自己的号停进 unitnumber_backup，链头穿着同一个值。
+ * 这种号在释放时必须跳过，否则会把号池里控制段仍然占着的那一位放掉。
+ */
+static bool R3RUnitNumberParkedByOther(const Train *self, uint16_t num)
+{
+	if (num == 0) return false;
+	/* R3R (第 198 轮 / KI-300): 旧实现只扫 self 所在的那一条链，于是"号被借出去、物主
+	 * 却已经不在本链上"的形态看不到 —— 解挂正好把物主那一段切到链外，借用方随后归还
+	 * 时会把物主仍在号池里占着的号 ReleaseID 掉（现场：车 0 的号 1 被丢回池，车 0 自己
+	 * 只能领到 7）。物主可能在任意一条链上，因此必须遍历全池。只在"归还/取回号"这条
+	 * 事件级路径调用，代价可忽略。 */
+	for (const Vehicle *w : Vehicle::Iterate()) {
+		if (w->index == self->index) continue;
+		if (w->unitnumber_backup == num) return true;
+	}
+	return false;
+}
+
+/**
+ * R3R (KI-263 / 需求贰): 车库拖动这条交接路径漏掉的"把控制段的特质穿到链头活字段上"。
+ *
+ * 第 159 轮（q-0=贰乙）把控制段定成"命令所有者段"（R3RGetControlSegment() ==
+ * R3RGetPriorityHead()），并规定**每个交接点**都要把控制段的那一套特质换到链头的活
+ * 字段上，同时把链头段自己的那一套停进 *_backup，提交点再由 R3RBorrowControlTraits()
+ * 收进行里。Couple() 与 DecoupleTrain() 都照此办了，唯独**车库拖动**漏了：
+ * TrainDepotMoveBeforeHead()（"拖动到列车前面"）把落点链的那一段整体挪到拖动块之后，
+ * 合并链头 = 拖动块的链头，而排程已由 TrainDepotRankDropTargetFirst() 正确地交给落点
+ * 链 —— 于是出现玩家报的"排程继承非拖动段，车号和名称却还继承拖动段"。
+ *
+ * 号池记账与 Couple() 同一套：控制段把自己的号停在 unitnumber_backup 里（车库
+ * CmdMoveRailVehicle() 的 DEPOT-PARK 块在整条链被并进来时放过），这里只把它"穿"到
+ * 链头的活字段上，绝不动任何 *_backup 的值，因此两边在号池里的占用都还在，谁再当链头
+ * 谁就能拿回自己那一个（本函数下方的还原块 / R3RNormaliseChainGroups 的取值块）。
+ *
+ * 幂等：链头一旦停放过（unitnumber_backup != 0 / name_backup 非空）就不再动手，且
+ * "已经穿着同一个号/名"时也不再写，所以同一条链被连续编辑多次不会重复搬运。
+ * 控制段自己就是链头时直接返回（它手上本来就是自己那一套）。
+ *
+ * @param chain 链头（可为 nullptr）。
+ * @param tag 提交点名，仅用于日志。
+ */
+static void R3RBorrowControlTraitsLive(Train *chain, const char *tag)
+{
+	if (chain == nullptr || !chain->IsFrontEngine()) return;
+
+	Train *const ctrl = R3RGetControlSegment(chain);
+	if (ctrl == nullptr) return;
+
+	/* R3R (第 193 轮 / KI-298): 控制段退回链头自己时，必须把借来的那一套**脱下**。
+	 *
+	 * 旧代码在这里 `|| ctrl == chain` 直接 return，于是"链头自己就是命令所有者"
+	 * 这一态下没人把身份换回来：链头身上若还留着上一次交接点借来的名/号，它就
+	 * 一直是别人的（玩家在车库列表里看到的名字与车号就是错的）。现场（2026-10-02
+	 * 00:12 日志 / couple head=27）：`SEGTR-SNAP ... ctrl=0 borrowed=1`，控制段那一段
+	 * `i=2 id=1 front=0 ctrl=1 | live u=0 n="T8701/2-国际段1" | bk u=1
+	 * n="T8701/2-国内段" | row use u=1 n="T8701/2-国内段"` —— 判据"控制段 live == row"
+	 * 不成立：名是国际段1 的、号干脆是 0，而它自己的一套（国内段 / 1）就躺在备份里。
+	 *
+	 * 归还口径与 R3RSyncChainAfterDepotEdit 的取回块（见本文件下方）同一套：号池
+	 * 只回收"确实是本车此刻活着、且没有别人在用、也没有别人停放"的那一位，因此
+	 * 不会把别的段占着的号放掉。整块按值比对，二次进入即跳过（幂等）。 */
+	if (ctrl == chain) {
+		bool unborrowed = false;
+
+		if (chain->unitnumber_backup != 0 && chain->unitnumber != chain->unitnumber_backup) {
+			if (chain->unitnumber != 0 && !R3RUnitNumberUsedByOther(chain, chain->unitnumber) &&
+					!R3RUnitNumberParkedByOther(chain, chain->unitnumber)) {
+				Company::Get(chain->owner)->freeunits[chain->type].ReleaseID(chain->unitnumber);
+			}
+			chain->unitnumber = chain->unitnumber_backup;
+			chain->unitnumber_backup = 0;
+			Company::Get(chain->owner)->freeunits[chain->type].UseID(chain->unitnumber);
+			unborrowed = true;
+		}
+
+		if (!chain->name_backup.empty() && chain->name != chain->name_backup.c_str()) {
+			chain->name = chain->name_backup;
+			chain->name_backup.clear();
+			unborrowed = true;
+		}
+
+		/* R3R (第 194 轮): 分组与号/名同属"跟控制段走"的三个特质，但它的"借"不在
+		 * 这里发生 —— R3RNormaliseChainGroups() 把整链推平到控制段分组时，顺手把被
+		 * 改写段自己的分组停进 group_id_backup（R3RParkTrainGroupID）。所以这里只补
+		 * 对称的"脱下"：控制段退回链头自己时，把停放的自己那一个取回。交由
+		 * R3RRestoreTrainGroupID() 处理（自带 num_vehicle 的 -1/+1 簿记，与
+		 * NormaliseTrainHead() 用的是同一支；取回后备份清空，后者再调即空操作，
+		 * 不会重复记账）。若不做，R3RSyncSegmentTraits() 会把链头的**活字段**
+		 * （上一次借来的外来分组）写进控制段那一行，而 R3RNormaliseChainGroups() 的
+		 * uniform 判据又因"整链都等于那个外来分组"认为无需收敛 —— 分组就永远留在
+		 * 别人那一组里，自己原来的分组烂在备份里。 */
+		if (chain->group_id_backup != GroupID::Invalid()) {
+			const bool group_differs = chain->group_id != chain->group_id_backup;
+			R3RRestoreTrainGroupID(chain);
+			if (group_differs) unborrowed = true;
+		}
+
+		if (unborrowed) {
+			R3RDbgWrite("CTRL-UNBORROW %s head=%d unit=%u own_bk=%u hasname=%d own_name=%d own_g=%d\n", tag,
+					(int)chain->index.base(), (unsigned)chain->unitnumber,
+					(unsigned)chain->unitnumber_backup, chain->name.empty() ? 0 : 1,
+					chain->name_backup.empty() ? 0 : 1,
+					(chain->group_id == GroupID::Invalid()) ? -1 : (int)chain->group_id.base());
+		}
+		return;
+	}
+
+	/* 只有真正处在借用态才换身份：没有借到排程（例如控制段自己还没有排程）时
+	 * 链头必须留着它自己的号与名，否则会穿上一套根本不属于它的身份。 */
+	if (!chain->r3r_orders_borrowed) return;
+
+	/* 控制段必须还在本链上，否则那套特质不在本链的保管范围内。 */
+	bool ctrl_on_chain = false;
+	for (Train *w = chain; w != nullptr; w = w->Next()) {
+		if (w == ctrl) { ctrl_on_chain = true; break; }
+	}
+	if (!ctrl_on_chain) return;
+
+	bool changed = false;
+
+	/* 车号：链头段自己那一个先停放好，再穿上控制段停放的那一个。
+	 * 控制段没有号可借时什么都不做 —— 不能让链头把活号与备份号填成同一个值。 */
+	if (ctrl->unitnumber_backup != 0 && chain->unitnumber != ctrl->unitnumber_backup) {
+		if (chain->unitnumber_backup == 0 && chain->unitnumber != 0) chain->unitnumber_backup = chain->unitnumber;
+		chain->unitnumber = ctrl->unitnumber_backup;
+		changed = true;
+	}
+
+	/* 列车名：与号侧 5751-5755 逐行同构 —— 停放门禁的判据是「身上这件名字是否等于
+	 * 将要借入的那一件」，而不是去查借用标志。
+	 *
+	 * R3R (第 192 轮 / KI-294): 旧门禁 `!R3RNameIsBorrowed(chain) && chain->name_backup.empty()`
+	 * 在本函数里**恒假** —— 5738 行已确立 chain->r3r_orders_borrowed 为真，而
+	 * R3RNameIsBorrowed() = r3r_orders_borrowed && name_backup.empty() && !name.empty()，
+	 * 与紧随的 name_backup.empty() 合取后整条门禁退化为 `chain->name.empty()`：
+	 * 只要链头身上有任何名字就永不寄存，紧接着的赋值便直接覆盖 ⇒ 链头自己的名字
+	 * 既没进备份也没了（现场签名"号在、名丢"，DEPOT-XFER-ID ... own_bk=1 ... own_name=0）。
+	 * 车号侧没有这道门禁，所以号安然无恙。
+	 *
+	 * 值比对同时满足两个目标：首次进入（身上是自己的名 != 将要借的名）⇒ 自动寄存；
+	 * 二次进入（已在穿借来的名 == 将要借的名）⇒ 自动跳过，仍然不会把借名停成自己的名
+	 * —— 第 185 轮 / KI-280 的意图由此保留，且整块幂等。
+	 * 号侧同理（外层的 chain->unitnumber != ctrl->unitnumber_backup 已提供同一保护）。 */
+	if (!_settings_game.vehicle.non_leading_engines_keep_name && !ctrl->name_backup.empty()) {
+		if (chain->name_backup.empty() && !chain->name.empty() && !(chain->name == ctrl->name_backup.c_str())) {
+			chain->name_backup = chain->name;
+		}
+		if (!(chain->name == ctrl->name_backup.c_str())) {
+			chain->name = ctrl->name_backup;
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		R3RDbgWrite("DEPOT-XFER-ID %s head=%d ctrl=%d unit=%u own_bk=%u hasname=%d own_name=%d\n", tag,
+				(int)chain->index.base(), (int)ctrl->index.base(), (unsigned)chain->unitnumber,
+				(unsigned)chain->unitnumber_backup, chain->name.empty() ? 0 : 1,
+				chain->name_backup.empty() ? 0 : 1);
+	}
 }
 
 /**
@@ -4723,8 +6145,20 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 {
 	if (chain == nullptr) return;
 
+	/* R3R 探针（item 3）：车库拖动提交点的入口快照。拖动是"读档后第一 tick 索引
+	 * 就已经是 1"的头号嫌疑：它整段跑在 tick 之外的命令执行期。 */
+	R3RWatchOrderIndex(chain, "depot-edit-in");
+
 	R3RRenumberPriorities(chain);
+	/* R3R (第 196 轮 / 缺口 A): 压实老次序之后先重发号码牌 —— 车库拖动可能把持表
+	 * 段切走，此时"谁真正拿着排程"才是控制段（见 R3RReelectControlSegment()）。 */
+	R3RReelectControlSegment(chain, "depot-edit");
 	R3RSyncDrivingOrders(chain, false);
+
+	/* R3R (KI-263 / 需求贰): 排程一旦借到手上，号与名也要跟着控制段走（见
+	 * R3RBorrowControlTraitsLive() 的注释）。必须紧跟在 R3RSyncDrivingOrders() 之后、
+	 * 下面的"取回自己的号"块之前 —— 那两块互斥（一块管借用态、一块管非借用态）。 */
+	R3RBorrowControlTraitsLive(chain, "depot-edit");
 
 	/* R3R (couple priority, route A): a depot edit must neither leave an
 	 * independent train without a schedule nor silently renumber it.
@@ -4741,9 +6175,13 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 	 * the depot empty. */
 	if (!chain->r3r_orders_borrowed && chain->unitnumber_backup != 0 && chain->IsFrontEngine()) {
 		/* R3R (第 144 轮 / 需求壹): 只有"确实是本车从池里新领的号"才能在这里回收 ——
-		 * 这个号也可能是合并期间由别的车接管/共用的号，清掉它等于把别人的编号弄丢。 */
+		 * 这个号也可能是合并期间由别的车接管/共用的号，清掉它等于把别人的编号弄丢。
+		 * R3R (KI-263 / 需求贰): 车库拖动期间链头穿的是控制段借给它的号（控制段把它
+		 * 停在自己的 unitnumber_backup 里），这类号同样不能回收，否则号池里控制段
+		 * 仍然占着的那一位会被放掉。 */
 		if (chain->unitnumber != 0 && chain->unitnumber != chain->unitnumber_backup &&
-				!R3RUnitNumberUsedByOther(chain, chain->unitnumber)) {
+				!R3RUnitNumberUsedByOther(chain, chain->unitnumber) &&
+				!R3RUnitNumberParkedByOther(chain, chain->unitnumber)) {
 			Company::Get(chain->owner)->freeunits[chain->type].ReleaseID(chain->unitnumber);
 		}
 		chain->unitnumber = chain->unitnumber_backup;
@@ -4830,6 +6268,12 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 		R3RNormaliseChainGroups(chain);
 		GroupStatistics::CountVehicle(chain, 1);
 	}
+
+	/* R3R (第 152 轮 / P1=甲): 车库编辑提交点末尾。
+	 * 拖动会拆链/并链，是"链头段与命令所有者分离"的第三个主现场。 */
+	R3RSettleChainSegments(chain, "depot-edit");
+	/* R3R 探针（item 3）：车库拖动提交点出口快照，与 depot-edit-in 成对。 */
+	R3RWatchOrderIndex(chain, "depot-edit-out");
 }
 
 /**
@@ -4867,8 +6311,13 @@ static void R3RInvalidateDepotWindowsForChain(const Train *v)
  *
  * num_vehicle 簿记不在这里做：它以「前端列」为单位，由调用方按现有
  * CountVehicle(-1)/(+1) 配对负责（本函数被调用时前端列尚未/已经计入的时序见各调用点）；
- * 这里只推平 group_id 并维护 num_engines（SetTrainGroupID），以及把控制段的挂接分组
- * 掩码复制到链内每一个段头。
+ * 这里只推平 group_id 并维护 num_engines（SetTrainGroupID），以及把**全链各段头的挂接
+ * 分组掩码并集**广播到每一个段头。
+ *
+ * 挂接分组口径（第 159 轮 / q-2=肆 玩家拍板）：耦合时取并集（OR），不是照抄控制段那一段。
+ * 旧口径是"取控制段掩码 → 清空每段头 → 重填"即**覆盖** —— AB 挂上 AC 之后，挂车方 B 那一侧
+ * 的挂接分组会被等待方 C 的分组直接抹掉。现在改成先把链内所有段头的掩码 OR 起来、再回填给
+ * 每个段头，于是 AB∪AC = ABC（代价：跨公司授权变宽、段级差异消失，玩家已认可）。
  *
  * @param head 该链的任一车辆（内部先用 First() 归一到链头）。
  */
@@ -4908,8 +6357,20 @@ static void R3RNormaliseChainGroups(Train *head)
 		}
 	}
 
-	/* 挂接分组：把控制段的掩码复制到链内每一个段头，使整条链的白名单处处一致。 */
-	const CoupleGroupMask target = R3RGetCoupleGroupsOfSegment(owner);
+	/* 挂接分组（第 159 轮 / q-2=肆）：先取**全链段头掩码的并集（OR）**，再广播回每一个段头。
+	 * 旧口径只照抄控制段（覆盖），会把被并入那一侧的挂接分组整片抹掉。 */
+	CoupleGroupMask target = COUPLE_GROUP_MASK_NONE;
+	uint nseg = 0;
+	for (Train *t = front; t != nullptr; ) {
+		if (t->Previous() == nullptr || t->IsSegmentFront()) {
+			target |= R3RGetCoupleGroupsOfSegment(t);
+			nseg++;
+		}
+		Vehicle *next = t->Next();
+		t = (next != nullptr) ? Train::From(next) : nullptr;
+	}
+	R3RDbgWrite("CGRP-NORM-UNION head=%d nseg=%u mask=%llu\n", (int)front->index.base(), nseg,
+			(unsigned long long)target);
 	for (Train *t = front; t != nullptr; ) {
 		if (t->Previous() == nullptr || t->IsSegmentFront()) {
 			if (R3RGetCoupleGroupsOfSegment(t) != target) {
@@ -4961,6 +6422,9 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_OWNERMOVE,    ///< KI-187: a segment head handed its schedule/priority to the new head
 	R3REDGE_TRP,          ///< KI-199: a TryPathReserveWithResultFlags() attempt (result + order/destination context)
 	R3REDGE_SEAMFREE,     ///< KI-240: a touch/overlap on a decouple seam was released instead of crashing
+	R3REDGE_DECOUPLETRY,  ///< KI-215: TryTrainDecouple outcome (a DECOUPLE that looks like it did nothing)
+	R3REDGE_FOLDOVR,      ///< KI-265: the tight-splice direction OVERRIDE was itself overruled (fold verdict kept)
+	R3REDGE_CPLSUM,       ///< KI-265: the geometry summary written at *every* couple commit point
 	R3REDGE_COUNT,
 };
 
@@ -5460,6 +6924,11 @@ static Train *GetDecoupleVehicle(Train *v)
  */
 static bool TryTrainDecouple(Train *v, Train *u)
 {
+	/* R3R (KI-215 decisive probe, 2026-09-30): "the DECOUPLE order did nothing" is
+	 * otherwise indistinguishable from "the attempt silently failed" -- the
+	 * DECOUPLE-JUMP / DECOUPLE-DONE lines only appear when this returns true.
+	 * Log the outcome (and the ValidateTrains error) once per distinct state. */
+	const uint64_t td_try_key = ((uint64_t)v->index.base() << 16) | (uint64_t)u->index.base();
 	TrainList original_src;
 	MakeTrainBackup(original_src, v);
 	Train *first_param = nullptr;
@@ -5484,6 +6953,20 @@ static bool TryTrainDecouple(Train *v, Train *u)
 	_current_company = old_company;
 
 	bool ok = !ret.Failed();
+	if (R3RDbgEdge(R3REDGE_DECOUPLETRY, td_try_key,
+			(uint64_t)(ok ? 1u : 0u) | ((uint64_t)(unsigned)ret.GetErrorMessage() << 1))) {
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "TDTRY ok=%d v=%d u=%d err=0x%X v_head=%d u_head=%d borrowed=%d u_eng=%d v_eng=%d u_next=%d\n",
+					(int)ok, (int)((td_try_key >> 16) & 0xFFFF), (int)(td_try_key & 0xFFFF),
+					(unsigned)ret.GetErrorMessage(),
+					(int)v->index.base(), (int)u->index.base(),
+					(int)(v->r3r_orders_borrowed ? 1 : 0),
+					(int)(u->IsEngine() ? 1 : 0), (int)(v->IsEngine() ? 1 : 0),
+					u->Next() != nullptr ? (int)u->Next()->index.base() : -1);
+			fclose(dbg);
+		}
+	}
 	u->ConsistChanged(CCF_ARRANGE);
 	v->ConsistChanged(CCF_ARRANGE);
 	if (!ok) {
@@ -5582,10 +7065,65 @@ static void R3RSettleLoadingBeforeChainEdit(Train *chain, const char *site)
 static const int R3R_CHAIN_WALK_LIMIT = 512;
 
 /** Upper bound for the "push the half ahead forward" steps
- *  R3RRespaceChainAfterEdit() performs on a pair whose boxes overlap. A splice
- *  error is a pixel or two wide, so this only exists so a pathological chain can
- *  never march off along the track. */
+ *  R3RRespaceChainAfterEdit() performs on a *single* pair whose boxes overlap.
+ *  A splice error is a pixel or two wide, so this only exists so a pathological
+ *  chain can never march off along the track.
+ *
+ *  R3R (第 166 轮, KI-253): this is a per-pair budget, not a per-call one. It
+ *  used to be shared by the whole sweep, and because the sweep walks the chain
+ *  in order the front of the train spent it first: a 21-car chain whose tail
+ *  units had lost 5 px each came out of the pass with the last four pairs still
+ *  stacked (settle-couple dump: dist=0 against nom=5), which is exactly the
+ *  "chewed up" look the player reported. Widening pair (i, i+1) only moves cars
+ *  head..i, so it cannot disturb any pair the sweep has already fixed — the
+ *  budget may safely be granted per pair. */
 static const int R3R_RESPACE_MAX_STRETCH = 16;
+
+/** How many times R3RRespaceChainAfterEdit() may walk the whole chain looking
+ *  for pairs that are off their nominal spacing.
+ *
+ *  R3R (第 167 轮, KI-253): one pass cannot be enough, because a single
+ *  TrainController() call is not guaranteed to move every car it was asked to
+ *  move -- it stops on blocked track or at a tile it may not enter, and the
+ *  cars it *did* move then end up compressed against the ones it did not. That
+ *  can leave a pair the sweep has already walked past off its nominal spacing,
+ *  which the 2026-09-30 retest showed: pair (19,20) went from a nominal 5 px to
+ *  0 (the tail had been pulled 5 px too far forward) and was never looked at
+ *  again (unfixed=1, the residual "chewed" seam the player sees).
+ *
+ *  Repeating the sweep is safe and converges: widening pair (a,b) only moves
+ *  cars head..a and tightening only moves b..tail, so a pass in which every
+ *  requested move succeeds cannot disturb any other pair, and a following pass
+ *  only has to repair what a partial (blocked) move left behind. The cap only
+ *  exists so a pair that permanently refuses to settle cannot spin here. */
+static const int R3R_RESPACE_MAX_PASSES = 4;
+
+/** R3R (第 170 轮, R170-A): how far a pair's spacing may differ from its nominal
+ *  value before the pass refuses to touch that pair at all.
+ *
+ *  The pass exists to clean up the *splice error* a re-link leaves behind, and
+ *  that error is "a pixel or two" (see R3R_RESPACE_MAX_STRETCH). A pair that is
+ *  off by much more is not a splice error at all: it is a structural mismatch --
+ *  e.g. a chain whose segment order was inverted without laying the cars out
+ *  again (R3RFlipChainBySegments with whole_chain_invert, KI-201 附记 3), where
+ *  every artic block still runs "backwards" while the block order runs forwards.
+ *  Pulling such a pair forward cannot make the chain consistent, and the two
+ *  branches feed each other: every pull made the following pair too close, which
+ *  the widening branch then repaired by advancing the moving front, so the whole
+ *  train crawled along the track instead of settling.
+ *
+ *  Probe evidence (第 170 轮, build/R3R_debug.log:5810): a 21-car reverse-couple
+ *  merge reported "px=109 stretch=62 passes=3" and the chain head moved from
+ *  y=1448 to y=1386 -- two tiles, which is what the player reported as "the
+ *  logical flip moved my train to the other end of the platform" (R170-A
+ *  预期口径：逻辑反转必须位置不变). The pairs that were chased were off by
+ *  9..20 px (50->21: 11 against nom=2, 23->18: 21 against nom=2, ...), i.e.
+ *  exactly the structural mismatch this bound now rejects.
+ *
+ *  8 is the engine's own "these two belong to one weld" tolerance: the fold
+ *  check exempts a pair when |pair_dist - pair_expected| <= 8 (KI-201 附记 4),
+ *  so a pair the fold logic would not even look at is not repaired here either. */
+static const int R3R_RESPACE_MAX_ERROR = 8;
 
 /**
  * R3R (KI-217, 2026-09-27): repair a chain whose DrivingBackwards flag is not
@@ -5611,12 +7149,21 @@ static const int R3R_RESPACE_MAX_STRETCH = 16;
  * Only an inconsistent chain is touched: a uniform chain (including one that
  * legitimately drives backwards, and a depot chain normalised by
  * R3RNormaliseDepotMergeDirection()) is left exactly as it is. A mixed chain is
- * pulled back onto "the head's end leads", i.e. DB clear -- the same state the
- * couple clean-up below forces on a locomotive that arrived while reversing.
+ * converged onto the HEAD's value -- see the round-158 note in the body.
+ *
+ * R3R (第 158 轮 / KI-257): the convergence used to be "always clear to 0". That
+ * is only correct while the head drives forwards. Upstream makes the flag a
+ * chain-wide property by copying the HEAD's bit onto every car in
+ * Train::ConsistChanged(), so a head that legitimately reverses (the depot merge
+ * rule, R3RNormaliseDepotMergeDirection(), can set it) must be propagated as 1.
+ * Forcing 0 there silently turned a reversing chain into a forward-driving one,
+ * and because the flag is exactly what makes GetMovingFront() pick Last(), the
+ * 32 km/h no-driving-cab cap computed from it disappeared -- the "sometimes the
+ * train is not penalised for having no cab while driving backwards" report.
  *
  * @param head Head of the chain to check.
  * @param tag  Probe label.
- * @return Number of vehicles whose flag was cleared (0 = chain was consistent).
+ * @return Number of vehicles whose flag was changed (0 = chain was consistent).
  */
 static int R3RNormaliseMixedChainDrivingBackwards(Train *head, const char *tag)
 {
@@ -5631,28 +7178,127 @@ static int R3RNormaliseMixedChainDrivingBackwards(Train *head, const char *tag)
 	if (!mixed) return 0;
 
 	int cleared = 0;
+	int set = 0;
 	visited = 0;
 	for (Train *w = head; w != nullptr && visited < R3R_CHAIN_WALK_LIMIT; w = w->Next(), visited++) {
-		if (!w->vehicle_flags.Test(VehicleFlag::DrivingBackwards)) continue;
+		if (w->vehicle_flags.Test(VehicleFlag::DrivingBackwards) == head_db) continue;
+
+		if (head_db) {
+			w->vehicle_flags.Set(VehicleFlag::DrivingBackwards);
+			set++;
+		} else {
+			w->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
+			cleared++;
+		}
 
 		/* Mirror ReverseTrainDirection()'s backup branch: the going-up/down bits
 		 * are tied to the flag, so they are inverted together with it. */
-		w->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
 		if (HasBit(w->gv_flags, GVF_GOINGUP_BIT) || HasBit(w->gv_flags, GVF_GOINGDOWN_BIT)) {
 			ToggleBit(w->gv_flags, GVF_GOINGDOWN_BIT);
 			ToggleBit(w->gv_flags, GVF_GOINGUP_BIT);
 		}
 		UpdateStatusAfterSwap(w, false);
-		cleared++;
 	}
 
 	/* Refresh the flags/speed caches for the now uniform chain, exactly like the
-	 * couple clean-up does after clearing a stale driving-backwards state. */
+	 * couple clean-up does after clearing a stale driving-backwards state. This is
+	 * what recomputes TCF_NO_DRIVING_CAB from Last()->CanLeadTrain(). */
 	head->ConsistChanged(CCF_TRACK);
 
-	R3RDbgWrite("[R3R] DB-NORMALISE %s head=%d headDB=%d cleared=%d n=%d\n",
-			tag, (int)head->index.base(), (int)head_db, cleared, visited);
-	return cleared;
+	R3RDbgWrite("[R3R] DB-NORMALISE %s head=%d headDB=%d cleared=%d set=%d n=%d nocab=%d\n",
+			tag, (int)head->index.base(), (int)head_db, cleared, set, visited,
+			(int)((head->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0));
+	return cleared + set;
+}
+
+/**
+ * R3R (KI-253 取数探针): dump the per-vehicle geometry of a chain.
+ *
+ * The round-158 report ("the train's image falls apart as if chewed by a dog")
+ * could only be narrowed down to two candidate causes: the segment division
+ * collapsed (21 cars in 2 segments although the car numbers prove 7 articulated
+ * triplets) and the geometry never expanded (three cars sharing one pixel
+ * position, 82~83 px gaps between the clumps). The existing CHAIN-ATTRS probe
+ * could not tell those apart, and its `len=0` was ambiguous (it may have run
+ * before ConsistChanged()). This dump is the missing measurement, in physical
+ * chain order (`Next()`):
+ *
+ *   veh / tile / pixel position / direction / DrivingBackwards / articulated
+ *   part / ★ / ⊗ / segment id / cached per-vehicle length, plus the pixel
+ *   distance to the next car and the nominal offset (CalcNextVehicleOffset())
+ *   that should separate the two.
+ *
+ * Read it as: `dist == nom` is healthy; `dist == 0` with `nom > 0` is "two cars
+ * stacked on one spot"; `dist > nom` is the "segment split apart" symptom.
+ * Articulated parts legitimately share their parent's position (`dist == 0`,
+ * `nom` small). Strictly read-only.
+ *
+ * @param tag  Probe label.
+ * @param head First vehicle of the chain to dump.
+ */
+static void R3RDumpChainGeometry(const char *tag, const Train *head)
+{
+	if (!R3RDbgOn() || head == nullptr) return;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+
+	int n = 0;
+	for (const Train *w = head; w != nullptr && n < R3R_CHAIN_WALK_LIMIT; w = w->Next(), n++) {
+		const Train *nx = w->Next();
+		const int dist = (nx == nullptr) ? -1 : std::max(std::abs((int)w->x_pos - (int)nx->x_pos), std::abs((int)w->y_pos - (int)nx->y_pos));
+		const int nom = (nx == nullptr) ? -1 : w->CalcNextVehicleOffset();
+		fprintf(dbg, "GEO %s n=%d veh=%d tile=%d,%d x=%d y=%d dir=%d db=%d artic=%d starF=%d starB=%d segid=%d clen=%d dist=%d nom=%d\n",
+				tag, n, (int)w->index.base(), (int)TileX(w->tile), (int)TileY(w->tile),
+				(int)w->x_pos, (int)w->y_pos, (int)w->direction,
+				w->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0,
+				w->IsArticulatedPart() ? 1 : 0,
+				w->IsSegmentFront() ? 1 : 0, w->IsSegmentBack() ? 1 : 0,
+				(int)w->r3r_segment_id, (int)w->gcache.cached_veh_length, dist, nom);
+	}
+	fprintf(dbg, "GEO-END %s head=%d n=%d capped=%d\n",
+			tag, (int)head->index.base(), n, (n >= R3R_CHAIN_WALK_LIMIT) ? 1 : 0);
+	fclose(dbg);
+}
+
+/**
+ * R3R (第 165 轮 probe, KI-253 §5.1): one car as it was *before* a respace pass.
+ *
+ * A respace only moves pixels, so everything except tile/x/y can still be read
+ * off the vehicle afterwards -- but tile/x/y must be captured, they are exactly
+ * what the pass rewrites.
+ */
+struct R3RGeoPoint { const Train *veh; int tx; int ty; int x; int y; };
+
+/**
+ * R3R (第 165 轮 probe, KI-253 §5.1): dump a pre-pass snapshot in the *same*
+ * format as R3RDumpChainGeometry(), so "respace-before" and "respace-after" can
+ * be diffed car by car (the old before-snapshot only had veh/x/y, i.e. no
+ * dist/nom/clen/artic/segid to compare against).
+ */
+static void R3RDumpChainGeometrySnapshot(const char *tag, const std::vector<R3RGeoPoint> &snap)
+{
+	if (!R3RDbgOn() || snap.empty()) return;
+
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg == nullptr) return;
+	for (size_t i = 0; i < snap.size(); i++) {
+		const Train *w = snap[i].veh;
+		if (w == nullptr) continue;
+		const R3RGeoPoint *nx = (i + 1 < snap.size()) ? &snap[i + 1] : nullptr;
+		const int dist = (nx == nullptr) ? -1 : std::max(std::abs(snap[i].x - nx->x), std::abs(snap[i].y - nx->y));
+		const int nom = (nx == nullptr) ? -1 : w->CalcNextVehicleOffset();
+		fprintf(dbg, "GEO %s n=%d veh=%d tile=%d,%d x=%d y=%d dir=%d db=%d artic=%d starF=%d starB=%d segid=%d clen=%d dist=%d nom=%d\n",
+				tag, (int)i, (int)w->index.base(), snap[i].tx, snap[i].ty,
+				snap[i].x, snap[i].y, (int)w->direction,
+				w->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0,
+				w->IsArticulatedPart() ? 1 : 0,
+				w->IsSegmentFront() ? 1 : 0, w->IsSegmentBack() ? 1 : 0,
+				(int)w->r3r_segment_id, (int)w->gcache.cached_veh_length, dist, nom);
+	}
+	fprintf(dbg, "GEO-END %s head=%d n=%d capped=%d\n",
+			tag, (int)snap[0].veh->index.base(), (int)snap.size(), 0);
+	fclose(dbg);
 }
 
 /**
@@ -5695,67 +7341,174 @@ static int R3RRespaceChainAfterEdit(Train *head, const char *tag)
 	 * otherwise the walk crosses the same seam back and forth forever. */
 	R3RNormaliseMixedChainDrivingBackwards(head, tag);
 
-	int moved = 0;
-	int stretched = 0;
-	int visited = 0;
-	for (Train *a = head; a != nullptr && visited < R3R_CHAIN_WALK_LIMIT; a = a->GetMovingNext(), visited++) {
-		Train *b = a->GetMovingNext();
-		if (b == nullptr) break;
+	/* R3R (第 168 轮, KI-253 附记 4): the sweep has to start at the *moving*
+	 * front, not at the physical head. Every pair below is walked with
+	 * GetMovingNext() and each repair step (TrainController()) moves cars along
+	 * their movement direction, so the walk is only meaningful in movement
+	 * order. On a chain that drives backwards (DrivingBackwards set — a merged
+	 * consist whose leading end came from the tail, which is exactly what
+	 * R3RNormaliseMixedChainDrivingBackwards above leaves behind) the moving
+	 * front is Last(), while the call site hands us First(): the loop then
+	 * evaluates First()->GetMovingNext() == First()->Previous() == nullptr and
+	 * bails out immediately, i.e. respace was a silent no-op on every
+	 * backwards-driving chain. 2026-09-30 retest (build\R3R_debug1.log):
+	 * "RESPACE-AFTER-EDIT couple head=27 ... visited=0" twice (uniform db=1),
+	 * against "visited=20" for the identical geometry on forward chains. */
+	Train *const front = head->GetMovingFront();
 
-		/* Articulated parts legitimately share their parent's exact centre
-		 * (distance 0); that is not an overlap and must never be "fixed". The
-		 * same goes for pairs whose nominal offset is below one pixel: the
-		 * engine's rounding is meaningless there. */
-		if (a->IsArticulatedPart() || b->IsArticulatedPart()) continue;
-
-		const int nominal = a->CalcNextVehicleOffset();
-		if (nominal < 2) continue;
-
-		/* A splice error is a couple of pixels wide at most; bound the loop so a
-		 * pair that refuses to settle cannot spin here. */
-		for (int guard = 0; guard < 64; guard++) {
-			const int dist = std::max(std::abs((int)a->x_pos - (int)b->x_pos), std::abs((int)a->y_pos - (int)b->y_pos));
-			if (dist == nominal) break;
-
-			if (dist > nominal) {
-				/* Too far apart: pull the tail of this pair forward. Only move
-				 * when a one pixel step of b actually closes this pair: b may
-				 * face the other way (artic parts, or a part that is still being
-				 * turned around), in which case moving it would stretch the chain
-				 * further instead. */
-				const GetNewVehiclePosResult np = GetNewVehiclePos(b);
-				const int next_dist = std::max(std::abs((int)a->x_pos - np.x), std::abs((int)a->y_pos - np.y));
-				if (next_dist >= dist) break;
-
-				if (!TrainController(b, nullptr, false)) break;
-				moved++;
-			} else {
-				/* Too close: the two boxes overlap by (nominal - dist) pixels.
-				 * TrainController() can only step forward, so b cannot be pushed
-				 * back -- but the half *ahead* of the pair can be pulled further
-				 * ahead instead. TrainController(head, b) walks from the head to
-				 * b and stops there, so a (and everything in front of it) advances
-				 * one pixel while b and its tail stay put: exactly the inverse of
-				 * the tightening step above. */
-				if (stretched >= R3R_RESPACE_MAX_STRETCH) break;
-
-				const GetNewVehiclePosResult np = GetNewVehiclePos(a);
-				const int next_dist = std::max(std::abs(np.x - (int)b->x_pos), std::abs(np.y - (int)b->y_pos));
-				if (next_dist <= dist) break;
-
-				if (!TrainController(head, b, false)) break;
-				stretched++;
-			}
+	/* R3R (KI-253 probe, read-only): remember where every car sits before
+	 * tightening, so the report below can show which cars moved at all.
+	 * R3R (第 165 轮, §5.1): the snapshot keeps the vehicle *pointer* plus its
+	 * tile/x/y — a respace only moves pixels, so every other field (dist/nom/
+	 * clen/artic/segid) can be read from the live vehicle when the dump is
+	 * written, and "before" and "after" come out in one identical format. */
+	std::vector<R3RGeoPoint> geo_before;
+	if (R3RDbgOn()) {
+		int k = 0;
+		for (const Train *w = head; w != nullptr && k < R3R_CHAIN_WALK_LIMIT; w = w->Next(), k++) {
+			geo_before.push_back({ w, (int)TileX(w->tile), (int)TileY(w->tile), (int)w->x_pos, (int)w->y_pos });
 		}
 	}
 
-	if (moved != 0 || stretched != 0 || visited >= R3R_CHAIN_WALK_LIMIT) {
+	int moved = 0;
+	int stretched = 0;
+	int unfixed = 0;
+	/* R3R (第 170 轮, R170-A): pairs left alone because they are structurally off
+	 * rather than off by a splice error, plus how far the *moving front* itself
+	 * travelled in this call (the number the player perceives as "the train was
+	 * moved"), so the log can prove position invariance of a logical flip. */
+	int skipped = 0;
+	const int front_x0 = (int)front->x_pos;
+	const int front_y0 = (int)front->y_pos;
+	int passes = 0;
+	int visited = 0;
+	bool walk_capped = false;
+	/* R3R (第 167 轮, KI-253): see R3R_RESPACE_MAX_PASSES for why a single sweep
+	 * is not enough. Every pass re-walks from the moving front (第 168 轮, KI-253
+	 * 附记 4) and repairs whatever the previous pass left behind; a pass that
+	 * moves nothing means the chain has settled, and the unfixed count of that
+	 * pass describes the final state. */
+	for (passes = 1; passes <= R3R_RESPACE_MAX_PASSES; passes++) {
+		const int done_before = moved + stretched;
+		visited = 0;
+		unfixed = 0;
+		for (Train *a = front; a != nullptr && visited < R3R_CHAIN_WALK_LIMIT; a = a->GetMovingNext(), visited++) {
+			Train *b = a->GetMovingNext();
+			if (b == nullptr) break;
+
+			/* KI-253: parts are not exempt (the engine wants nominal spacing
+			 * between them too, see CheckTrainsLengths). Depot parking, where the
+			 * engine itself allows cars to share one tile, is skipped instead. */
+			if (a->track == TRACK_BIT_DEPOT || b->track == TRACK_BIT_DEPOT) continue;
+
+			const int nominal = a->CalcNextVehicleOffset();
+			if (nominal < 2) continue;
+
+			/* R3R (第 170 轮, R170-A): repair splice errors only. A pair whose
+			 * spacing is off by a whole car length or more is structurally wrong
+			 * (see R3R_RESPACE_MAX_ERROR) and is left exactly where it is, so the
+			 * pass can never end up dragging the whole train along the track. */
+			{
+				const int dist_in = std::max(std::abs((int)a->x_pos - (int)b->x_pos), std::abs((int)a->y_pos - (int)b->y_pos));
+				if (std::abs(dist_in - nominal) > R3R_RESPACE_MAX_ERROR) {
+					skipped++;
+					continue;
+				}
+			}
+
+			/* R3R (第 166 轮, KI-253): the widening budget is per pair. A chain
+			 * whose tail units each lost a few pixels needs more than
+			 * R3R_RESPACE_MAX_STRETCH pixels in total, and because the sweep walks
+			 * head-first a shared budget left the last pairs stacked forever (see
+			 * the constant's comment). */
+			int pair_stretched = 0;
+
+			/* A splice error is a couple of pixels wide at most; bound the loop so
+			 * a pair that refuses to settle cannot spin here. */
+			for (int guard = 0; guard < 64; guard++) {
+				const int dist = std::max(std::abs((int)a->x_pos - (int)b->x_pos), std::abs((int)a->y_pos - (int)b->y_pos));
+				if (dist == nominal) break;
+
+				if (dist > nominal) {
+					/* Too far apart: pull the tail of this pair forward. Only move
+					 * when a one pixel step of b actually closes this pair: b may
+					 * face the other way (artic parts, or a part that is still being
+					 * turned around), in which case moving it would stretch the chain
+					 * further instead. */
+					const GetNewVehiclePosResult np = GetNewVehiclePos(b);
+					const int next_dist = std::max(std::abs((int)a->x_pos - np.x), std::abs((int)a->y_pos - np.y));
+					if (next_dist >= dist) break;
+
+					if (!TrainController(b, nullptr, false)) break;
+					moved++;
+				} else {
+					/* Too close: the two boxes overlap by (nominal - dist) pixels.
+					 * TrainController() can only step forward, so b cannot be pushed
+					 * back -- but the half *ahead* of the pair can be pulled further
+					 * ahead instead. TrainController(front, b) walks from the moving
+					 * front to b and stops there, so a (and everything in front of it)
+					 * advances one pixel while b and its tail stay put: exactly the
+					 * inverse of the tightening step above. A blocked prefix move that
+					 * only gets part of the way is exactly what the next pass repairs. */
+					if (pair_stretched >= R3R_RESPACE_MAX_STRETCH) break;
+
+					const GetNewVehiclePosResult np = GetNewVehiclePos(a);
+					const int next_dist = std::max(std::abs(np.x - (int)b->x_pos), std::abs(np.y - (int)b->y_pos));
+					if (next_dist <= dist) break;
+
+					if (!TrainController(front, b, false)) break;
+					stretched++;
+					pair_stretched++;
+				}
+			}
+
+			/* R3R (第 166 轮 probe): a pair that is still off its nominal spacing
+			 * once its own guard loop is done hit a hard limit (blocked controller,
+			 * end of line, or a part facing the wrong way). Counting it lets the log
+			 * tell "all pairs are nominal" apart from "some pair is beyond repair",
+			 * which the previous summary could not express. */
+			{
+				const int dist = std::max(std::abs((int)a->x_pos - (int)b->x_pos), std::abs((int)a->y_pos - (int)b->y_pos));
+				if (dist != nominal) unfixed++;
+			}
+		}
+		if (visited >= R3R_CHAIN_WALK_LIMIT) {
+			walk_capped = true;
+			break;
+		}
+		/* R3R (第 167 轮): nothing moved anywhere in this whole pass, so the chain
+		 * has settled and repeating the sweep cannot change anything. */
+		if (moved + stretched == done_before) break;
+	}
+
+	if (moved != 0 || stretched != 0 || unfixed != 0 || walk_capped || skipped != 0) {
+		/* R3R (KI-253 probe): the pre-tightening snapshot and the current state,
+		 * so the log reader can see exactly which cars were stacked or split.
+		 * R3R (第 165 轮, §5.1): both ends carry the same fields now, so the two
+		 * dumps can be diffed car by car instead of only by pixel. */
+		R3RDumpChainGeometrySnapshot("respace-before", geo_before);
+		R3RDumpChainGeometry("respace-after", head);
+	}
+	/* R3R (第 165 轮, §5.1): the summary is printed on *every* commit, even when
+	 * nothing moved — otherwise "no RESPACE-AFTER-EDIT in the log" cannot be told
+	 * apart from "the pass never ran" (KI-253 retest kept asking that). */
+	{
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
-			fprintf(dbg, "[R3R] RESPACE-AFTER-EDIT %s head=%d px=%d stretch=%d visited=%d capped=%d\n",
-					tag, (int)head->index.base(), moved, stretched, visited, (visited >= R3R_CHAIN_WALK_LIMIT) ? 1 : 0);
+			const int front_shift = std::max(std::abs((int)front->x_pos - front_x0), std::abs((int)front->y_pos - front_y0));
+			fprintf(dbg, "[R3R] RESPACE-AFTER-EDIT %s head=%d px=%d stretch=%d unfixed=%d skip=%d front=%d passes=%d visited=%d capped=%d\n",
+					tag, (int)head->index.base(), moved, stretched, unfixed, skipped, front_shift, passes, visited, walk_capped ? 1 : 0);
 			fclose(dbg);
 		}
+	}
+	/* R3R (第 173 轮, KI-265 探针): unfixed>0 是"结构性坏链"的签名 —— 这一遍扫完
+	 * 仍有接缝满足不了"实际间距 == 名义间距"，而且 respace 主动跳过了它（超界被
+	 * skip，见 R170-A），也就是工具自己承认修不动。2026-09-30 现场 3747 行
+	 * `RESPACE-AFTER-EDIT couple head=48 ... unfixed=1` 就紧跟在那次穿模提交之后。
+	 * 单独打一行是为了便于 grep / 计数，不必在 summary 的其它计数里翻。只读。 */
+	if (unfixed != 0) {
+		R3RDbgWrite("RESPACE-BADCHAIN %s head=%d unfixed=%d skip=%d stretch=%d px=%d visited=%d capped=%d\n",
+				tag, (int)head->index.base(), unfixed, skipped, stretched, moved, visited, walk_capped ? 1 : 0);
 	}
 	return moved + stretched;
 }
@@ -5806,22 +7559,11 @@ static uint R3RSkipUnfireableDecoupleOrder(Train *v)
 	if (v->GetNumOrders() == 0) return 0;
 	uint stepped = 0;
 
-	/* 1. The arrival order we are standing on and the DECOUPLE behind it. */
-	const Order *cur = v->GetOrder(v->cur_real_order_index);
-	if (cur != nullptr && (cur->IsType(OT_GOTO_STATION) || cur->IsType(OT_GOTO_DEPOT))) {
-		const bool arrived = cur->IsType(OT_GOTO_STATION)
-				? (IsTileType(v->tile, TileType::Station) && cur->GetDestination().ToStationID() == GetStationIndex(v->tile))
-				: (IsRailDepotTile(v->tile) && cur->GetDestination().ToDepotID() == GetDepotIndex(v->tile));
-		if (arrived) {
-			VehicleOrderID next_real = v->cur_real_order_index + 1;
-			if (next_real >= v->GetNumOrders()) next_real = 0;
-			const Order *next = v->GetOrder(next_real);
-			if (next != nullptr && next->IsType(OT_DECOUPLE)) {
-				v->IncrementRealOrderIndex();
-				stepped++;
-			}
-		}
-	}
+	/* R3R (2026-10-01, 拍板 3 A「不跨」): 原来的第 1 步 ——「跨过『站在其终点的
+	 * 到站命令』+『紧随其后的解挂』这一对」—— 已整体退场。新形态下闸门只认
+	 * "当前 real 就是解挂"，不再存在"索引停在到站命令上、解挂挂在它后面"的
+	 * 状态，所以没有"一对"要跨；KI-281（耦合落点顺手吃掉后面那条解挂）也随之
+	 * 消失。这里只剩"落点自己就是解挂、且已经无物可解"这一种情形。 */
 
 	/* 2. Never come to rest on a DECOUPLE order that cannot fire any more. */
 	for (uint i = 0; i < v->GetNumOrders(); ++i) {
@@ -5904,6 +7646,12 @@ static void R3RAdvanceAfterDecouple(Train *half, OrderList *driving_orders, Vehi
 	InvalidateVehicleOrder(half, 0);
 }
 
+/* R3R (第 201 轮 / KI-305): R3RApplyDecoupleOrdersStrategy() 已随「前半/后半」UI 接线一并
+ * 删除。那个策略解析器读的是 DECOUPLE 订单上的 decouple_first_orders / decouple_second_orders
+ * 字段（唯一写入口是已删的 MOF_DECOUPLE_ORDERS 命令），字段恒为 ODOF_KEEP_ORDERS ⇒ 解析器
+ * 恒走 "keep" 默认分支、从无副作用。删除后解挂行为与删除前逐字段等价。
+ * 字段本身与它的序列化（NSL + XSLFI_DECOUPLE_ORDERS）刻意保留，见 order_type.h 的说明。 */
+
 /* R3R (KI-205): defined next to Couple(); used by DecoupleTrain() as well. */
 static uint R3RReleaseChainReservations(const Train *head, const char *why);
 
@@ -5960,7 +7708,17 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			 * （第 148 轮的站台复测日志里只有 UNIT-PARK 没有 UNIT-RESTORE，就是这个原因：
 			 * 修复挂在了 NormaliseTrainHead 上，却被这里的"先领新号"抢了先。） */
 			R3RRestoreUnitNumber(u);
-			if (u->unitnumber == 0) {
+			/* R3R (第 198 轮 / KI-300): 只有**真没有备份**时才领新号。
+			 *
+			 * R3RRestoreUnitNumber() 在"自己的号正被借用态链头穿着"时会故意保留备份、暂不
+			 * 取回（见其注释）。若这里不问备份就领新号，就会把那个还没归位的号盖掉：现场
+			 * 车 0 的号 1 被解挂前的链头 27 穿着，备份被保留后本可等 settle 归还，却被这里
+			 * 抢先发了新号 7（玩家报的"凭空冒出列车 7"），号 1 随后被归还方 ReleaseID 丢回池。
+			 *
+			 * 有备份时留 unitnumber == 0 的窗口，让紧随的 settle
+			 * （R3RBorrowControlTraitsLive 的 ctrl==chain 号块）或末尾的 NormaliseTrainHead(u)
+			 * 去取回；万一两条路都没取到，NormaliseTrainHead() 的兜底仍会发一个合法新号。 */
+			if (u->unitnumber == 0 && u->unitnumber_backup == 0) {
 				u->unitnumber = Company::Get(u->owner)->freeunits[VehicleType::Train].NextID();
 				if (u->unitnumber != UINT16_MAX) Company::Get(u->owner)->freeunits[VehicleType::Train].UseID(u->unitnumber);
 			}
@@ -5996,6 +7754,8 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * decoupled part resumes waiting at the NEXT WAIT_COUPLE (the one for the
 		 * station it is physically sitting at), not the first one in the list.
 		 * (KI-215c 修正了这个"记住的索引"到底是哪一条 —— 见下。) */
+		/* R3R (KI-215c, 2026-09-26)：以下的"此刻仍指向刚跑完的那条"【已被第 186 轮
+		 * 的闸门改形态作废】，保留原文只为记录那次的推理；当前口径见本注释末尾。 */
 		/* R3R (KI-215c, 2026-09-26)：cur_real_order_index 此刻仍指向【刚跑完的那条】
 		 * (列车停在它终点的 GOTO_STATION，正是这个位置让下一条 DECOUPLE 触发)，触发
 		 * 解挂的 DECOUPLE 是它的【后继】。旧代码把"前一条"存进 decouple_idx，而下面
@@ -6004,12 +7764,36 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * 看上去从"到站行"一次跨两行落到等待点，玩家读成"解挂时列车多跳了一个命令"。
 		 * 这里直接存 DECOUPLE 自身的索引，使循环起点 = D + 1。**落点不变**(两种读法都
 		 * 得"D 之后第一个 WAIT_COUPLE"，因为 D+1 在两读法里都不是 WAIT_COUPLE)，只是
-		 * 口径/命名与注释一致，后续任何以 decouple_idx 为"D 的索引"的用法不再差一。 */
+		 * 口径/命名与注释一致，后续任何以 decouple_idx 为"D 的索引"的用法不再差一。
+		 *
+		 * R3R (第 186 轮，2026-10-01)：上面的 "+1" 是旧闸门口径的残留。闸门已改成
+		 * 「当前 real 就压在 OT_DECOUPLE 上」（见 TrainLocoHandler 里同一轮的
+		 * `cur_real->IsType(OT_DECOUPLE)`），此时 cur_real_order_index 就是 DECOUPLE
+		 * 自己的索引，再 +1 等于把 D 记成 D+1 —— 下游三处全部差一：
+		 *  ①R3RAdvanceAfterDecouple() 从 D+2 重启（注释写的是 decouple_idx + 1），
+		 *    正好【跨过紧随解挂的 WAIT_COUPLE】，解出的那一半不等待、直接落到再下
+		 *    一条命令上开走。现场：build\R3R_debug.log 707/717 行解挂在 idx 3，
+		 *    754 行 DECOUPLE-JUMP dec_idx=4 / JUMP-ORD 4 type=17(等待挂接) /
+		 *    759 行 DECOUPLE-ADV u_real=5 ⇒ 车底被投到 idx 5 的 GOTO_STATION 上，
+		 *    829 行 DEPOT-ARR veh=0 real=5(1) destTx=58 destTy=19 —— 玩家报的
+		 *    「等待挂接被莫名跳过」+「车底自己蠕动（开始驶离）」都是这一格差。
+		 *  ②DECOUPLE-ODOF 从 D+1 读订单策略，读到的是等待点而不是 DECOUPLE，
+		 *    玩家写的 first/second 排程策略被静默忽略（现场 first=0 second=0）。
+		 *  ③DECOUPLE-JUMP 的 JUMP-ORD dump 起点也跟着差一格，日志自证被带偏。
+		 * 修法：以订单类型自证，而不是假定口径 —— 只有当前 real 确实不是解挂时才
+		 * 往后挪一格（兼作"闸门被改回旧口径"的兼容，不再差一）。 */
 		const VehicleOrderID fire_real = v->cur_real_order_index;
 		VehicleOrderID decouple_idx = fire_real;
 		{
 			const VehicleOrderID n_fire = v->GetNumOrders();
-			if (n_fire > 0) decouple_idx = (decouple_idx + 1) % n_fire;
+			if (n_fire > 0) {
+				decouple_idx = (fire_real < n_fire) ? fire_real : (fire_real % n_fire);
+				const Order *const at_fire = v->GetOrder(decouple_idx);
+				if (at_fire == nullptr || !at_fire->IsType(OT_DECOUPLE)) {
+					/* 索引停在"到站命令"上（旧口径）⇒ 解挂是它的后继。 */
+					decouple_idx = (decouple_idx + 1) % n_fire;
+				}
+			}
 		}
 
 		/* R3R (KI-180,口径经玩家 2026-09-23 拍板确认): 解挂出来的两半【绝不共用
@@ -6056,6 +7840,11 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * (T8701 #1 inherit). */
 		R3RRenumberPriorities(v);
 		R3RRenumberPriorities(u);
+		/* R3R (第 196 轮 / 缺口 A): 两半各自按"真正拿着排程的那一段"重发号码牌。
+		 * 必须排在 R3RSyncDrivingOrders() 之前 —— 后者读 owner 决定归还还是继续借用，
+		 * 而重选正是改 owner 的那一步（见 R3RReelectControlSegment()）。 */
+		R3RReelectControlSegment(v, "decouple-v");
+		R3RReelectControlSegment(u, "decouple-u");
 		R3RSyncDrivingOrders(v, false);
 		R3RSyncDrivingOrders(u, false);
 		InvalidateVehicleOrder(v, 0);
@@ -6175,6 +7964,10 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * 接手者恰恰是从它那里继承进度的（见 R3RPushProgressToOwner）。 */
 		R3RPushProgressToOwner(v);
 		R3RPushProgressToOwner(u);
+		/* R3R (第 152 轮 / P1=甲): 解挂提交点末尾，两半各 settle 一次 ——
+		 * 解挂是"谁继承哪张排程"的另一个主现场。 */
+		R3RSettleChainSegments(v, "decouple-v");
+		R3RSettleChainSegments(u, "decouple-u");
 		R3RCheckTtSync(u, "decouple-u");
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads the WAIT_COUPLE
@@ -6213,6 +8006,9 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 				 * R3RAdvanceAfterDecouple() 落位，直接看 v_real / u_real。 */
 				fprintf(dbg, "DECOUPLE-ADV dec_idx=%d v_real=%d u_real=%d\n",
 					(int)decouple_idx, (int)v->cur_real_order_index, (int)u->cur_real_order_index);
+				/* R3R (第 201 轮 / KI-305): the "DECOUPLE-ODOF" probe was removed
+				 * together with the strategy parser it reported on
+				 * (R3RApplyDecoupleOrdersStrategy, see above). */
 				fprintf(dbg, "DECOUPLE-DONE u=%d co=%d real=%d tx=%d ty=%d x=%d y=%d\n",
 					(int)u->index.base(), (int)R3RIsCarOnlyFormation(u),
 					(int)u->cur_real_order_index, (int)TileX(u->tile), (int)TileY(u->tile), (int)u->x_pos, (int)u->y_pos);
@@ -6227,7 +8023,26 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		}
 		/* Restore the unit numbers: the decoupled part keeps its own number (the
 		 * locomotive currently holds it), the locomotive gets its own back. */
-		if (v->unitnumber_backup != 0) {
+		/* R3R (第 195 轮 / KI-299b): 归还块的门禁必须用**同步之后**的借用态。
+		 *
+		 * 本函数外层的 `if (v->r3r_orders_borrowed)`（7530）读的是**耦合期**留下的
+		 * 标志，位置在 R3RRenumberPriorities()/R3RSyncDrivingOrders()（7636-7639）与
+		 * settle（7767）**之前**；而这两步会把借用关系重新判定一遍（KI-239 孤儿表归还
+		 * 后可能重新起借，或 owner == chain 时当场归还）。真正决定"链头此刻是否还穿着
+		 * 控制段那套身份"的是**重新判定之后**的值 —— 它也正是
+		 * R3RBorrowControlTraitsLive() 的"穿上"判据（5808）与
+		 * R3RSyncChainAfterDepotEdit() 取回自己号的判据（5902）。
+		 *
+		 * 现场（2026-10-02 01:18 日志，T8701 第二次解挂）：1651
+		 * `DEPOT-XFER-ID decouple-v head=27 ctrl=0 unit=1 own_bk=4`（settle 把控制段 0
+		 * 那套穿上）、1653/1664-1666 `ctrl=0 borrowed=1` 且判据③成立（链头 live u=1
+		 * 国内段 == 控制段 bk u=1 国内段）—— 紧接其后的本块却凭"有没有 *_backup"把链头
+		 * 换回自己那套（1726 `NAME-RESTORE veh=27 side=head`，号静默回 4）⇒ 活字段与
+		 * `r3r_orders_borrowed`/`ctrl`/段表/探针互相矛盾，判据③当场变假。同一件事
+		 * "穿上"用借用标志、"脱下"用备份是否存在，两套凭证不同源，谁后跑谁赢。
+		 * 借用态下链头的活字段**就是** (c) 的产物，这里一个字段都不能写。 */
+		const bool head_borrows_now = v->r3r_orders_borrowed;
+		if (!head_borrows_now && v->unitnumber_backup != 0) {
 			/* R3R (KI-147): the car-only formation above just took a FRESH unit
 			 * number out of the pool (u->unitnumber == 0 after Couple took the
 			 * consist's number away). That fresh number is thrown away here by
@@ -6241,10 +8056,77 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			/* u now holds that number itself; the copy parked by Couple (used by
 			 * the depot-split path) is stale and must not stay behind as a second
 			 * reference to the same pool entry. */
-			u->unitnumber_backup = 0;
+			/* R3R (第 192 轮 / KI-297): 只有"确实是与即将写入的号同一个池条目的
+			 * 陈旧副本"才清零。当 u 本身是**借用态链头**（= 解出来的多段车底，它
+			 * 的控制段另有其人）时，解挂提交点的 settle 刚刚把它**自己的**号重新停
+			 * 进 u->unitnumber_backup、活字段穿上控制段的号；旧代码无条件清零会把
+			 * 那个号一并抹掉（既不 ReleaseID 也不保留）⇒ 号池少一个可用号，且下次
+			 * Couple 时 u->unitnumber_backup 为 0，就把当前**借来的**号当成自己的
+			 * 号停进去 ⇒ 段身份被邻居的号顶掉（现场：段 1 的 bk/row 由 u=1 变
+			 * u=2，与段 2 重合）。 */
+			if (u->unitnumber_backup == v->unitnumber) u->unitnumber_backup = 0;
 			v->unitnumber = v->unitnumber_backup;
 			v->unitnumber_backup = 0;
+		} else if (!head_borrows_now && u->unitnumber != 0 && v->unitnumber == u->unitnumber) {
+			/* R3R (第 182 轮 / KI-277 号侧对称补完)：「链头本来就没有号」的借用与名称侧
+			 * 完全同构 —— 当时无值可停，Couple() 里的 `v->unitnumber_backup == 0` 分支把
+			 * 停放的 0 原样留下（GVSF_VIRTUAL 的假引擎链头正常就没有号，NormaliseTrainHead
+			 * 明确不给虚车发号），归还块整支被跳过。可是 u 已经在上面用
+			 * R3RRestoreUnitNumber() 把 Couple 时被拿走的号取了回来，于是同一个池条目被
+			 * v 与 u 的活字段同时引用 —— 重号，且任一方被删时 ReleaseID 会把仍在使用中的号
+			 * 放回号池。判据与名称侧同构：活字段仍等于等待方自己的号就是这次借用的凭据，
+			 * 把号留给对方、自己清回"没有号"（可逆、号池登记不动）。 */
+			v->unitnumber = 0;
+			v->unitnumber_backup = 0;
+			R3RDbgWrite("UNIT-RESTORE veh=%d side=head-cleared id=%u\n",
+					(int)v->index.base(), (unsigned)u->unitnumber);
+		} else if (head_borrows_now) {
+			/* R3R (第 195 轮 / KI-299b): 借用态 ⇒ 号不归还（理由见本块开头）。
+			 * 解出的那半的号不归这里管：它由 settle 里 R3RBorrowControlTraitsLive()
+			 * 的 ctrl == chain 分支（CTRL-UNBORROW）取回自己的号，照旧执行。 */
+			R3RDbgWrite("UNIT-RESTORE-SKIP-BORROW veh=%d u=%d borrowed=1 unit=%u own_bk=%u\n",
+					(int)v->index.base(), (int)u->index.base(),
+					(unsigned)v->unitnumber, (unsigned)v->unitnumber_backup);
 		}
+		/* R3R (第 160 轮 / KI-261): 车名的归还，与上面车号的归还同构。
+		 *
+		 * 耦合时链头穿上了被挂车组链头 u 的名字（v->name = u->name），并把自己
+		 * 原本的名字停进 v->name_backup；u 也把自己那一份停在 u->name_backup。
+		 * 解挂后两半各自重新成为独立链头，名字也要各自还回去 —— 否则"解挂之后
+		 * 机车永远叫车组的名字、车组自己也拿不回原名"（与号侧的对称性破缺）。
+		 * u 侧用 R3RRestoreTrainName()（只在活名字为空时取回，幂等），
+		 * v 侧是重写活字段，必须无条件覆盖它身上那件借来的名字。 */
+		/* R3R (第 181 轮 / KI-277): u 侧先取回，必须早于下面 v 侧的判据 ——
+		 * "链头本来没有自己的名字"那一支要靠 u 自己的名字来对照。 */
+		if (u->name.empty()) R3RRestoreTrainName(u);
+		if (head_borrows_now) {
+			/* R3R (第 195 轮 / KI-299b): 名侧与号侧同一门禁（见上面 head_borrows_now
+			 * 的说明）—— 借用态下链头的活名就是控制段那一套，凭 name_backup 非空
+			 * 再"还"一次等于用另一套凭证推翻 settle 刚做完的 (c)。现场签名就是
+			 * `NAME-RESTORE veh=27 side=head`（1726）。u 侧的名取回在上一行，照旧。 */
+			R3RDbgWrite("NAME-RESTORE-SKIP-BORROW veh=%d u=%d borrowed=1 hasname=%d own_name=%d\n",
+					(int)v->index.base(), (int)u->index.base(),
+					v->name.empty() ? 0 : 1, v->name_backup.empty() ? 0 : 1);
+		} else if (!v->name_backup.empty()) {
+			v->name = v->name_backup;
+			v->name_backup.clear();
+			R3RDbgWrite("NAME-RESTORE veh=%d side=head\n", (int)v->index.base());
+		} else if (!u->name.empty() && std::string_view(v->name) == std::string_view(u->name)) {
+			/* R3R (第 181 轮 / KI-277)：「链头本来就没有名字」的借用没法靠停放副本
+			 * 认出来 —— 当时无值可停，name_backup 空着，归还块整支被跳过，链头
+			 * 于是永久顶着别家车底的名字（玩家报的"这个场景根本没有 48 号车"）。
+			 * Couple() 现在不再清空 u->name，因此"活字段仍等于等待方自己的名字"
+			 * 就是这次借用的凭据，把借来的显示名清回"没有名字"（可逆、不丢数据）。 */
+			v->name.clear();
+			R3RDbgWrite("NAME-RESTORE veh=%d side=head-cleared\n", (int)v->index.base());
+		}
+	} else if (!v->name.empty() && !u->name.empty() && std::string_view(v->name) == std::string_view(u->name)) {
+		/* R3R (第 185 轮 / KI-280)：「没有借用排程」的解挂会把上面整支归还块跳过。
+		 * 若链头此刻的活名字正好等于等待方的名字，说明名侧的借用与
+		 * r3r_orders_borrowed 脱了钩，归还端因此从不执行（现场日志里连续两次解挂都
+		 * 不见 NAME-RESTORE 的另一种解释）。本条只留痕、不改任何行为。 */
+		R3RDbgWrite("NAME-RESTORE-SKIP veh=%d u=%d borrowed=0 head_name_matches_u=1\n",
+				(int)v->index.base(), (int)u->index.base());
 	}
 	/* R3R（2026-09-22）：解出的两半各自把自己链上的「列车分组」与「挂接分组」收敛到
 	 * 实际控制段的分组，见 R3RNormaliseChainGroups()。num_vehicle 以「前端列」为单位
@@ -6284,7 +8166,20 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * GetSegmentHeadFromRear() skips a marker sitting on the chain head, so a
 	 * stand-alone segment is never mistaken for one of its own coupled-on
 	 * segments. */
-	if (R3RIsCarOnlyFormation(u)) u->SetSegmentFront();
+	if (R3RIsCarOnlyFormation(u)) {
+		/* R3R（2026-09-30 玩家拍板「双管齐下」之二，源头）: a released part which
+		 * still holds a genuine articulated part must not be handed a ★ either.
+		 * This is the third place which turns a loose chain into a segment, and the
+		 * only one the player could hit without ever running the depot "upgrade to
+		 * segment" command: couple it once, decouple it once, and the released
+		 * bottom keeps the segment identity -- welded, ★ and all. */
+		if (R3RChainHasRealArticPart(u)) {
+			R3RDbgWrite("DECOUPLE-SEG-SKIP-REAL-ARTIC veh=%d -> ★ withheld (genuine articulated part)\n",
+					(int)u->index.base());
+		} else {
+			u->SetSegmentFront();
+		}
+	}
 
 	/* R3R (KI-205): the split is committed, so neither half will ever drive the
 	 * route the merged chain had booked before it arrived here -- part of that
@@ -6450,13 +8345,34 @@ static int R3RCheckChainFold(Train *head, const char *tag)
  * as soon as the train moves. In a healthy chain every vehicle sits on the
  * tail side of its predecessor, so the dot product of the successor offset
  * with the predecessor's facing must be negative. */
-static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
+static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag,
+		const Train **out_a = nullptr, const Train **out_b = nullptr)
 {
-	static const int dir_dx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 }; // DIR_N, DIR_NE, DIR_E, DIR_SE, DIR_S, DIR_SW, DIR_W, DIR_NW
-	static const int dir_dy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
+	/* R3R (第 187 轮, KI-287): 这里**曾经**挂着两张手写表
+	 *   dir_dx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 }
+	 *   dir_dy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 }
+	 * 那其实是"屏幕坐标 + y 向下"的罗盘表,而 `x_pos`/`y_pos` 是**世界(等轴测)坐标轴**
+	 * 上的像素(见 intro_gui.cpp:82 `RemapCoords(v->x_pos, v->y_pos, v->z_pos)`),
+	 * 两套轴之间差着一个 45° 的等轴测映射:
+	 *   世界 +x = 屏幕左下(SW)   世界 +y = 屏幕右下(SE)
+	 *   世界 -x = 屏幕右上(NE)   世界 -y = 屏幕左上(NW)
+	 * 于是引擎权威表 `_tileoffs_by_dir`(map.cpp:263) 是
+	 *   DIR_N=(-1,-1) DIR_NE=(-1,0) DIR_E=(-1,1) DIR_SE=(0,1)
+	 *   DIR_S=( 1, 1) DIR_SW=( 1,0) DIR_W=( 1,-1) DIR_NW=(0,-1)
+	 * 与手写表在 DIR_NE/SW 的 dx、DIR_E/W 的 dy 上**符号相反 / 归零**。
+	 * 后果:沿 y 轴排列的链(现场 58,63 / 60,90,方向恒 DIR_SE=3 / DIR_NW=7)两表恰好同号,
+	 * 从没暴露;而沿 x 轴排列的链(现场 24,9,A idx=26 dir=5 x=386 ↔ B idx=23 x=394)
+	 * 手写表给 dot = 8 * (-1) = -8 ⇒ 读成"健康",真折叠被放行 —— build\R3R_debug.log:9193-9194
+	 * (`FOLDCHK COUPLE ... A idx=26 dir=5 ... B idx=23 dir=1 ... dist=8` 之后
+	 * `COUPLE-PREFLIGHT ... dirfold=0`)即 KI-287 现场。
+	 * 现在统一改用引擎表(同文件 14341 行 `TileIndexDiffCByDir(moving_front->GetMovingDirection())`
+	 * 已是这个写法),不再自备偏移表。 */
 	const Train *wa = nullptr;
 	const Train *wb = nullptr;
 	int worst_dot = 0;
+	/* R3R (第 172 轮, KI-265): 出参先清空 —— 调用方只在返回 true 时读它。 */
+	if (out_a != nullptr) *out_a = nullptr;
+	if (out_b != nullptr) *out_b = nullptr;
 	for (const Train *a = head; a != nullptr; a = a->Next()) {
 		const Train *b = a->Next();
 		if (b == nullptr) break;
@@ -6527,7 +8443,28 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
 		 *    链序相对 direction 是反的,相对实际移动方向 ReverseDir(direction) 才是
 		 *    正常的;裸 direction 会把这条健康链逐对读成 +4(gap 检查看不出)。 */
 		const Direction a_dir = a->IsDrivingBackwards() ? ReverseDir(a->direction) : a->direction;
-		int dot = (b->x_pos - a->x_pos) * dir_dx[(int)a_dir & 7] + (b->y_pos - a->y_pos) * dir_dy[(int)a_dir & 7];
+		/* R3R (第 187 轮, KI-287): 偏移量必须取引擎权威表(世界轴),
+		 * 不能用手写的屏幕轴表 —— 理由见本函数开头。ReverseDir 后的方向在世界轴上正好是
+		 * 取反,故"倒车链"仍然自洽。 */
+		const TileIndexDiffC a_step = TileIndexDiffCByDir(a_dir);
+		int dot = (b->x_pos - a->x_pos) * a_step.x + (b->y_pos - a->y_pos) * a_step.y;
+		/* R3R (第 174 轮, KI-265 复测 dot==0 盲区): 拼接对**同格同位**也必须判折叠。
+		 *
+		 * 第 173 轮复测(build\R3R_debug.log 21:54)最后一次提交前的那一 tick:
+		 *   FOLDCHK COUPLE n=21 worst_gap=2
+		 *     A idx=50 x=936 y=1013 tile=58,63 dir=7  B idx=6 x=936 y=1013 tile=58,63 dir=3 dist=0
+		 * 被重试循环顶了 9px 的拼接对 (50,6) 已经**完全共位** ⇒ Δ=(0,0) ⇒ dot=0。
+		 * 判据只认 dot>0,于是提交前闸门在这里返回 false(PREFLIGHT fold=0 dirfold=0)、
+		 * OVERRIDE 前提同样不成立 ⇒ 一条"链序倒退"的折叠链被提交,紧随其后的 SEAM-FLIP
+		 * 再把两段方向掰成一致 ⇒ POSTFOLD 也报 folded=0;整条链上只剩 yapf 的 CRT-FOLD
+		 * 事后发现(玩家看到的仍是"机车压在车厢上")。这与 7816 行记的 veh=35 现场是同一个
+		 * 病,只是那次 dot=+9 被抓住、这次 dot 恰好落进 0。
+		 *
+		 * 相邻两节**非 artic** 车各自都带车长(cached_veh_length >= 2),几何上不可能共位;
+		 * 而 artic 成员已在上面按 IsArticGroupMember 跳过,所以共位必是坏链,无需再问方向。
+		 * 为不改变既有日志字段,共位按 dot=+1 记账(日志里 dot=1 且 A/B 同坐标即是此情形)。 */
+		const bool pair_co_located = (pair_dist <= 0);
+		if (pair_co_located) dot = std::max(dot, 0) + 1;
 		if (dot > worst_dot) {
 			worst_dot = dot;
 			wa = a;
@@ -6535,6 +8472,10 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag)
 		}
 	}
 	if (worst_dot > 0) {
+		/* R3R (第 172 轮, KI-265): 回传"被判折叠的那一对"(dot 最大者 a,b),
+		 * 供提交前闸门与 OVERRIDE 前提判断折叠落在哪个接缝上。 */
+		if (out_a != nullptr) *out_a = wa;
+		if (out_b != nullptr) *out_b = wb;
 		/* KI-14 (1): edge-triggered -- same per-tick retry loop as FOLDCHK. */
 		const uint64_t dir_key = ((uint64_t)head->index.base() << 32) ^ R3RDbgTagHash(tag);
 		if (R3RDbgEdge(R3REDGE_FOLDCHK_DIR, dir_key, ((uint64_t)worst_dot << 1) | (wa != nullptr ? 1 : 0))) {
@@ -6732,6 +8673,20 @@ static void R3RMoveSegmentOwner(Train *from, Train *to)
 	/* "链头借用中"标志与段优先级都属于段身份,跟着段头走。 */
 	std::swap(to->r3r_orders_borrowed, from->r3r_orders_borrowed);
 	std::swap(to->r3r_priority, from->r3r_priority);
+
+	/* R3R (第 156 轮): 段特质(这一节段自己的列车名与列车分组)的**暂存副本**也是段
+	 * 身份的一部分,必须和排程一起跟着段头走。旧代码只搬排程,于是折叠修正把某段的
+	 * ★ 从 A 迁到 B 之后,停放在 A 上的 name_backup / group_id_backup 滞留在 A(A 随后
+	 * 被 NormaliseSubtypes 降成段内普通车,再没人去读),新段头 B 两手空空 ⇒ 段行被写成
+	 * "无名字 + 默认分组"(现场: 2026-09-29 日志 3907 行 SEGTRAIT-SYNC-SEC seg=3 unit=0),
+	 * 玩家看到的就是"拖一下就丢了名字/分组"。
+	 * 与上面排程一样用 swap:回滚路径(R3RUndoLogicalFlip 会对同一对车反向再调一次)
+	 * 即精确还原,且"段内两车都带备份"的异常态不会丢一边。
+	 * unitnumber_backup 刻意不在这里动:它的搬运牵着号池登记(ReleaseID/UseID),
+	 * 链头段仍由 R3RRelocateFrontIdentity() 统一处理;非链头段可能滞留在旧段头上的
+	 * 那一份,由 R3RRecoverSegmentTraits() 在提交点兜底找回。 */
+	std::swap(to->name_backup, from->name_backup);
+	std::swap(to->group_id_backup, from->group_id_backup);
 
 	if (from_carries && R3RDbgEdge(R3REDGE_OWNERMOVE, from->index.base(), owner_payload)) {
 		R3RDbgWrite("OWNER-MOVE from=%d to=%d orders=%d prio=%u borrowed=%d\n",
@@ -7053,6 +9008,17 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 {
 	assert(chain != nullptr && chain->First() == chain);
 
+	/* R3R (2026-09-30, R170-A 双管齐下之二): 含真 artic part 的链一律不翻 —— 与
+	 * TryTrainCouple 折叠修正入口的同一门禁。本函数按"铰接块 = 段内原子块"迁移 ★
+	 * 与打散组角色位,该假设只对打散组(每节独立车)成立;真 artic part 由父车的
+	 * GRF 回调拥有,翻它会让段边界/包围盒与父车脱钩。返回原链头 = "翻转未发生",
+	 * 调用方在门外已否决整块折叠修正,故此处只可能被将来新增的调用方命中。 */
+	if (R3RChainHasRealArticPart(chain)) {
+		R3RDbgWrite("FLIP-REFUSE-REAL-ARTIC head=%d whole=%d -> chain left untouched\n",
+				(int)chain->index.base(), whole_chain_invert ? 1 : 0);
+		return chain;
+	}
+
 	/* 本次翻转的身份迁移记录从干净状态开始:同一份 R3RSegBoundaries 会被
 	 * "翻转 → 回滚 → 再翻转"复用(候选 1 折叠失败回滚后落候选 3,两次都用
 	 * u_old_bounds),不清空就会把同一对(旧段头,新段头)记录两次,回滚时反向搬两次
@@ -7228,6 +9194,10 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) { fprintf(dbg, "FLIP-DONE head=%d nseg=%d whole=%d\n", (int)new_head->index.base(), (int)segs.size(), whole_chain_invert ? 1 : 0); fclose(dbg); }
 	}
+	/* R3R (KI-253 probe): the flip only rewrites direction / chain order / ★ and
+	 * never touches positions, so dump where every car sits on the way out -- this
+	 * is the state a following RESPACE dump has to be compared against. */
+	R3RDumpChainGeometry("flip-done", new_head);
 	return new_head;
 }
 
@@ -7294,14 +9264,33 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by
 	 * 自己的列车名覆盖掉；先快照、拷完还原，于是合并链对外显示的是控制段的名字，
 	 * 机车自己的名字留在 from 上（from 随后由 R3RParkTrainName() 停进备份）。 */
 	const TinyString kept_to_name = to->name;
+	/* R3R (第 199 轮 / KI-301): 但"还原 to 自己的名字"只对**直接拼接**路径成立。身份迁移
+	 * 路径(owner_moved_by_flip)下 to 是刚从链内升上来的车厢/引擎,它自己本来就没有名字
+	 * (名字属于旧链头 from),还原一个空快照等于把上面拷贝刚写进来的名字当场抹掉,而名字
+	 * 随后又被 R3RParkTrainName(from) 停进已经降级为链内车的 from 的备份里,再没有人去取
+	 * —— 2026-10-02 现场:D19Er-XXXX(号 6 的三节去铰接组 48/49/50)在 A3 翻 v
+	 * (OWNER-MOVE from=48 to=50)之后链头 50 变无名(NAME-XFER head=50 ... head_own=0),
+	 * 挂/解一轮后号仍是 6、名被清空 ⇒ 界面显示默认名"列车 6"。
+	 * 口径与号侧(活号 to->unitnumber 由上面的拷贝带入、无条件随身份走)一致:to 自己无名
+	 * 而 from 有名时,名字留在 to 上;同时不再把同一件名字停进 from 的备份(否则同一件名字
+	 * 会同时活在链头与链内车上,from 将来重新成为链头时会冒出一个陈旧副本;借用态同理,
+	 * 借来的名随链头身份继续被 to 穿着)。 */
+	const bool name_follows_identity = owner_moved_by_flip && kept_to_name.empty() && !from->name.empty();
+
+	/* R3R (第 185 轮 / KI-280): from 此刻身上的名字是不是借来的，必须在这里（下面借用
+	 * 标志被 swap 到 to 身上之前）采样 —— 末尾对 from 的 R3RParkTrainName() 不能把借名
+	 * 当成 from 自己的原名停进 name_backup。 */
+	const bool from_name_borrowed = R3RNameIsBorrowed(from);
 
 	/* 车号 / current_order / dest_tile / profit / 服役间隔 / timetable 标志:
 	 * 复用官方"新车头取代旧头"的复制逻辑(顺带把 from 的车号清零)。
 	 * 订单号位置的顺序约束见上面的 kept_* 快照:拷贝会覆盖订单位置,必须在拷完还原。 */
 	to->CopyVehicleConfigAndStatistics(from);
 
-	/* R3R (需求贰): 还原 to（控制段段头）自己的名字，见上面的快照说明。 */
-	to->name = kept_to_name;
+	/* R3R (需求贰): 还原 to（控制段段头）自己的名字，见上面的快照说明。
+	 * R3R (第 199 轮 / KI-301): 身份迁移路径且 to 本来无名时例外 —— 让名字随身份留在 to
+	 * 上（拷贝已写入），见 name_follows_identity 的说明。 */
+	if (!name_follows_identity) to->name = kept_to_name;
 
 	/* R3R (KI-147 rev.3): unitnumber_backup 是"挂车时借出并暂存的车号",属于列车身份,
 	 * 必须随身份一起搬到新链头。不搬的话它会滞留在 from 上,而 from 随后被清掉 front
@@ -7367,8 +9356,17 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by
 	/* 非链头引擎不再持有的列车级数据。 */
 	from->dispatch_records.clear();
 	/* R3R (第 144 轮 / 需求贰): 名字不再直接丢弃 —— 停进 name_backup，等 from 重新
-	 * 成为链头时由 R3RRestoreTrainName() 取回（与 DEPOT-PARK 同款）。 */
-	R3RParkTrainName(from);
+	 * 成为链头时由 R3RRestoreTrainName() 取回（与 DEPOT-PARK 同款）。
+	 * R3R (第 185 轮 / KI-280): 传函数入口采样到的"借名"标志。
+	 * R3R (第 199 轮 / KI-301): 若名字已随身份留在新链头 to 上(name_follows_identity),
+	 * 就不能再把它当成"from 自己的名字"停一份备份 —— 同一件名字同时活在链头与链内车上,
+	 * from 将来重新成为链头时 R3RRestoreTrainName() 会冒出一个陈旧副本。此处直接清空
+	 * from 的活名(拷贝已把名字给了 to,from 侧留下的只是同一件的第二份)。 */
+	if (name_follows_identity) {
+		from->name.clear();
+	} else {
+		R3RParkTrainName(from, from_name_borrowed);
+	}
 
 	/* R3R (第 144 轮): 保证"停放排程"与借用标志成对 —— 身份迁移把 from 的
 	 * orders_backup 搬到 to 之后，标志必须跟着，否则 to 会带着"有停放排程但标志为假"
@@ -7404,6 +9402,29 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	if (v == nullptr || u == nullptr) return false;
 	if (v->First() != v || u->First() != u) return false;
 	if (v->First() == u->First()) return false; // Never couple a chain onto itself.
+
+	/* R3R（2026-09-30 玩家拍板「双管齐下」之一，耦合侧）: 任一参与方含**真** artic
+	 * part 就整块拒绝，绝不让它被焊成一段。
+	 *
+	 * 这是"谁把列车焊死"的源头堵口：★ 的三个授予点里，Couple() 的提交点
+	 * （下方 `merged_first->SetSegmentFront()`）与车库拖动的 merged-on 标记都不做
+	 * 打散前置 —— 只有 R3R 自己的「升段」命令 CmdMakeSegment 才会先跑
+	 * DearticulateChainWithSnapshot()。也就是说一条**从未走过升段命令**的真铰接
+	 * 列车（玩家直接买/克隆出来的铰接车底、或那份存档里 v_real/u_real 报 1 的车底）
+	 * 只要被挂上一次，就带着真 artic part 拿到了 ★，从那一刻起被当作"段"参与
+	 * 后续所有段语义 —— 玩家看到的就是"整节列车被焊死了"。
+	 *
+	 * 拒绝放在本函数入口而不是折叠修正入口（那里已有 FOLDCHK-REFUSE-REAL-ARTIC），
+	 * 因为折叠修正只在几何折叠时才会走到；几何不折叠时旧代码会一路提交成功并打 ★。
+	 * 这里是与几何无关的硬否决：本 tick 不挂车，状态未被改动（尚未 ArrangeTrains），
+	 * 直接 return false 即可，不需要回滚。机车侧(v)同样拒绝：R3R 的段机制无法安全
+	 * 处理真 artic part 的位置/包围盒（见 R170-A），铰接机车本就不该做 R3R 挂车。 */
+	if (R3RChainHasRealArticPart(v) || R3RChainHasRealArticPart(u)) {
+		R3RDbgWrite("CPL-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d -> coupling refused (genuine articulated part present)\n",
+				(int)v->index.base(), (int)u->index.base(),
+				R3RChainHasRealArticPart(v) ? 1 : 0, R3RChainHasRealArticPart(u) ? 1 : 0);
+		return false;
+	}
 
 	TrainList original_src;
 	TrainList original_dst;
@@ -7442,10 +9463,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	 * but note the two tests are no longer short-circuited: the old
 	 * `gap > 8 || dir` form hid every FOLDCHK-DIR line behind a large residual
 	 * gap. Only the direction verdict rejects a chain now. */
-	auto ChainFolded = [](Train *head, const char *tag, int *out_gap = nullptr, bool *out_dir = nullptr) -> bool {
+	auto ChainFolded = [](Train *head, const char *tag, int *out_gap = nullptr, bool *out_dir = nullptr,
+			const Train **out_a = nullptr, const Train **out_b = nullptr) -> bool {
 		const int worst_gap = R3RCheckChainFold(head, tag);
 		if (out_gap != nullptr) *out_gap = worst_gap;
-		const bool dir_fold = R3RCheckChainFoldedDirection(head, tag);
+		const bool dir_fold = R3RCheckChainFoldedDirection(head, tag, out_a, out_b);
 		if (out_dir != nullptr) *out_dir = dir_fold;
 		if (dir_fold) return true;
 		if (worst_gap > 8) {
@@ -7531,7 +9553,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	Train *head = v;
 	int direct_gap = -1;
 	bool direct_dir_fold = false;
-	bool direct_folded = ChainFolded(v, "COUPLE", &direct_gap, &direct_dir_fold);
+	/* R3R (第 172 轮, KI-265): the pair the direction verdict actually flagged.
+	 * 提交前闸门与 OVERRIDE 前提都要用它判断"折叠落在哪个接缝上"。 */
+	const Train *direct_fold_a = nullptr;
+	const Train *direct_fold_b = nullptr;
+	bool direct_folded = ChainFolded(v, "COUPLE", &direct_gap, &direct_dir_fold, &direct_fold_a, &direct_fold_b);
 	const bool direct_splice = SpliceFolded(v_last, "COUPLE");
 
 	/* R3R (KI-174): 几何复核 —— 用位置证据驳回方向判据的误判。
@@ -7549,10 +9575,46 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	 *
 	 * 因此:紧贴的直接拼接直接采纳,跳过方向判据。阈值取得很紧(2px),只有
 	 * "物理上已经完全对位"才会触发;test4.sav 那种真正需要翻转的场景(接缝
-	 * 在 19px 级别)不受影响。 */
-	if (direct_folded && direct_dir_fold && !direct_splice && direct_gap >= 0 && direct_gap <= 2) {
+	 * 在 19px 级别)不受影响。
+	 *
+	 * R3R (第 172 轮, KI-265, 2026-09-30): OVERRIDE 的前提被证伪,追加两条前提。
+	 * 反例(现场 COUPLE-OK loco=48 @3749 行): 全链紧贴到 worst_gap=2 时方向判据
+	 * 依然判出 dot=4 的折叠对 —— 判据的豁免是"|dist-exp|<=8 且方向相同",
+	 * 而 worst_gap<=2 意味着每一对的距离残差都 <=2<=8,豁免只剩"方向相同"这一项,
+	 * 于是还能被 flag 的对必然方向相反;而"相邻 + 处在名义间距 + 方向相反"在一条
+	 * 合并链里就是真交错折叠。即此时 direct_dir_fold 恰恰只得为真,OVERRIDE 把唯一
+	 * 的真折叠结论丢掉,提交出一条"方向一致但位置倒退"的病链(机车 48/49 与车底
+	 * 6/7 相叠 = 穿模,紧随 CRT-FOLD dot=4 与 TTB-PROBE fold-geom 刷屏)。
+	 * 它本想保护的"1px 紧贴健康链"走不到这里:紧贴且同向的对已被上面那条豁免吃掉,
+	 * 判据根本不会 flag。
+	 *
+	 * 前提 (a):被 flag 的对不得是本次拼接对 (v_last, u_head) —— 合并只可能在这一对
+	 *           上制造折叠,OVERRIDE 在此生效等于取消唯一的保护。
+	 * 前提 (b):被 flag 的对必须方向一致(即豁免成立的另一半条件)。两条合起来把
+	 *           OVERRIDE 限制在"链内部 + 方向一致 + 残差极小"的窄格里,那种形状
+	 *           不可能是一条 U 形折叠链。 */
+	const bool fold_pair_on_splice = (direct_fold_a != nullptr && direct_fold_a == v_last);
+	const bool fold_pair_dir_mixed = (direct_fold_a != nullptr && direct_fold_b != nullptr &&
+			direct_fold_a->direction != direct_fold_b->direction);
+	const bool override_candidate = (direct_folded && direct_dir_fold && !direct_splice &&
+			direct_gap >= 0 && direct_gap <= 2);
+	if (override_candidate && !fold_pair_on_splice && !fold_pair_dir_mixed) {
 		R3RDbgWrite("FOLDCHK-DIR-OVERRIDE worst_gap=%d tight direct splice, fold verdict ignored\n", direct_gap);
 		direct_folded = false;
+	} else if (override_candidate && direct_fold_a != nullptr && direct_fold_b != nullptr) {
+		/* KI-265 复测判据:折叠结论被保留 ⇒ 继续走折叠修正分支(含真 artic
+		 * 拒绝门禁),不再提交病链。节流:同一对折叠车只写一次。 */
+		const uint64_t ovr_key = ((uint64_t)direct_fold_a->index.base() << 32) ^
+				(uint64_t)direct_fold_b->index.base();
+		const uint64_t ovr_payload = ((uint64_t)direct_gap << 2) |
+				((uint64_t)(fold_pair_on_splice ? 1 : 0) << 1) |
+				(uint64_t)(fold_pair_dir_mixed ? 1 : 0);
+		if (R3RDbgEdge(R3REDGE_FOLDOVR, ovr_key, ovr_payload)) {
+			R3RDbgWrite("FOLDCHK-DIR-OVERRIDE-SKIP worst_gap=%d on_splice=%d dir_mixed=%d dirA=%d dirB=%d A=%d B=%d -> fold verdict kept\n",
+					direct_gap, fold_pair_on_splice ? 1 : 0, fold_pair_dir_mixed ? 1 : 0,
+					(int)direct_fold_a->direction, (int)direct_fold_b->direction,
+					(int)direct_fold_a->index.base(), (int)direct_fold_b->index.base());
+		}
 	}
 
 	if (direct_folded || direct_splice) {
@@ -7603,6 +9665,66 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		 * group roles). */
 		R3RDumpCoupleIdentity(v, "FOLD-V");
 		R3RDumpCoupleIdentity(u, "FOLD-U");
+
+		/* R3R (2026-09-30, R170-A 双管齐下之二): 禁止对含真 artic 的链做逻辑翻。
+		 *
+		 * 逻辑翻(R3RFlipChainBySegments)按"铰接块 = 段内原子块"整理段边界、迁移 ★
+		 * 与打散组角色位,它的名次/边界假设只有"组内每节都是独立车"时才成立;真
+		 * artic part 由父车的 GRF 回调拥有,翻它会让段边界、包围盒与父车脱钩 ——
+		 * 玩家现场报的"反向挂车翻转后位置被搬到站台另一端"(R170-A)正是这一类
+		 * 现场,而日志里被判为真 artic 的链又多来自复制路径(见 CloneVehicle 的
+		 * 打散组镜像修复)。
+		 *
+		 * 因此:任一参与方含真 artic part 就整块放弃折叠修正 —— 不赌一次翻转,
+		 * 本 tick 不挂车。状态已在上面被 RestoreTrainBackup 还原,放弃无需额外
+		 * 回滚,但缓存/链统计必须刷新后再交还给世界。 */
+		if (R3RChainHasRealArticPart(v) || R3RChainHasRealArticPart(u)) {
+			const bool v_real = R3RChainHasRealArticPart(v);
+			const bool u_real = R3RChainHasRealArticPart(u);
+			R3RRefreshChainCaches(v);
+			R3RRefreshChainCaches(u);
+			v->ConsistChanged(CCF_ARRANGE);
+			u->ConsistChanged(CCF_ARRANGE);
+			/* R3R (第 173 轮, KI-265「治前因」取证): 这一行现在同时给出"几何 + 机车速度"。
+			 * 现场 6 次重试里机车每失败一次就北推 1px(worst_gap 7→2),即"拒绝挂车"
+			 * 并没有让机车停下来 —— 复测要看的正是这里的 spd 是否为 0:只要 spd>0 且
+			 * gap 逐次变小,就说明重试循环还在把几何顶向 OVERRIDE 的触发条件,下一轮
+			 * 才好在拒绝分支里下刹车(本轮只取证,不动运动/位置)。
+			 * —— 第 174 轮复测已确认 spd=21~23 且 gap 单调变小,据此在下方下刹车。 */
+			R3RDbgWrite("FOLDCHK-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d gap=%d pair=(%d,%d) spd=%d db=%d -> rolled back, no logical flip this tick\n",
+					(int)v->index.base(), (int)u->index.base(), v_real ? 1 : 0, u_real ? 1 : 0,
+					direct_gap,
+					(direct_fold_a != nullptr) ? (int)direct_fold_a->index.base() : -1,
+					(direct_fold_b != nullptr) ? (int)direct_fold_b->index.base() : -1,
+					(int)v->cur_speed, (int)(v->IsDrivingBackwards() ? 1 : 0));
+
+			/* R3R (第 174 轮, KI-265「治前因」): 拒绝挂车必须同时让机车真正停下来。
+			 *
+			 * 第 173 轮复测(build\R3R_debug.log 21:54)取证结论:同一场景里本分支被连
+			 * 续触发 10 次,spd 全程 21~23(从未为 0),而 worst_gap 7→6→5→4→4→3→2→
+			 * 1→0→1 单调变小、机车 48 的 y 从 1015 一路北推 9px 到 1006 —— 即"拒绝"
+			 * 只是本 tick 不挂车,机车照旧每 tick 顶上来 1px,直到把拼接对 (50,6) 顶成
+			 * 同格同位(Δ=0)。那一刻方向判据的 dot 恰好为 0(判据只认 dot>0),闸门与
+			 * OVERRIDE 前提同时失明,于是提交出一条链序倒退的折叠链,再被 SEAM-FLIP
+			 * 把两段方向掰一致 ⇒ PREFLIGHT/POSTFOLD 都报 folded=0,只有 yapf 的
+			 * CRT-FOLD 事后发现(玩家看到的仍是"机车压在车厢上")。
+			 *
+			 * 所以拒绝分支不能再把"车还在动"留给下一 tick:含真 artic 的链本来就翻不
+			 * 了(本分支存在的理由),机车继续前进只会把几何顶穿。这里按本文件既有的
+			 * 停车惯用写法(cur_speed/sub speed/progress 清零,见 depot GOTO_COUPLE 一段)
+			 * 把机车停在当前命中点。拒绝点必定来自"已经碰上"的判定(现场每次 CPL-HIT 都
+			 * 带 overlap=1),所以刹车不会把机车停在够不着的地方 —— 它本来就已够着。
+			 * 注意 cur_speed 只对前部机车主控有效,故刹车对象取 v->First()。 */
+			Train *const v_front = v->First();
+			const int v_spd_before = (int)v_front->cur_speed;
+			v_front->cur_speed = 0;
+			v_front->subspeed = 0;
+			v_front->progress = 0;
+			R3RDbgWrite("FOLDCHK-REFUSE-BRAKE v=%d front=%d spd_before=%d spd_after=%d db=%d\n",
+					(int)v->index.base(), (int)v_front->index.base(), v_spd_before,
+					(int)v_front->cur_speed, (int)(v_front->IsDrivingBackwards() ? 1 : 0));
+			return false;
+		}
 
 		/* R3R (用户方案 2026-09-05:"谁反就翻谁"追平;2026-09-07 修订:v 一律
 		 * 逻辑翻、不物理 SWAP): A1 直接拼接折叠后不再按僵化的"翻 u → 双翻"
@@ -7790,6 +9912,74 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					R3RDbgWrite("SPLICE-GAP-LAST-RESORT COUPLE-FLIP-BOTH accepted anyway (no candidate has an adjacent splice)\n");
 				}
 			}
+		}
+	}
+
+	/* R3R (第 172 轮, KI-265): 提交前最后一道闸门 —— "合并链的拼接缝不得是方向
+	 * 折叠"。上面四类候选(直拼 / 翻 u / 翻 v / 双翻)各自已把方向判据当硬否决,
+	 * 这条闸门是独立复核:不论本次走的是哪条候选、有没有经过 OVERRIDE,只要最终链
+	 * 上"本次拼接对 (v_last, v_last->Next())"仍是方向折叠(两车 direction 相反且
+	 * 按 a 的朝向落在鼻子侧),就拒绝提交并完整回滚。
+	 *
+	 * 它是"绝不提交折叠链"这条不变式的断言,而不是某条路径的补丁:将来任何新增
+	 * 候选、新增前提或新增跳过条件,都必须先过这一关才可能重新制造 KI-265 的病链
+	 * (2026-09-30 现场: 折叠对 50/6 方向相反、被 OVERRIDE 放行后提交,机车 48/49
+	 * 与车底 6/7 相叠 = 穿模)。拒绝后本 tick 不挂车,回到"下 tick 重试"的既有
+	 * 语义(与 REFUSE-REAL-ARTIC / CheckTrainAttachment 失败同一条出路)。 */
+	{
+		const Train *gate_a = nullptr;
+		const Train *gate_b = nullptr;
+		const bool gate_folded = R3RCheckChainFoldedDirection(head, "COUPLE-PREFLIGHT", &gate_a, &gate_b);
+
+		/* R3R (第 173 轮, KI-265 探针): 到达提交点时无条件留一行几何摘要。
+		 * 折叠判据只在"判为折叠"时才打 FOLDCHK-DIR，而它受 R3RDbgEdge 的 128 帧
+		 * 窗口节流 ⇒ "日志里没有 FOLDCHK-DIR"既可能是没折叠、也可能是被节流，
+		 * 复测时无法区分。这一行按 (v,u,gap,dirA,dirB) 几何签名节流（每个不同的
+		 * 几何只写一行），于是每次重试都留下一条可核对的现场：拼接对是谁、两车
+		 * 朝向如何、判据是否成立、机车当时的速度。只读，不参与任何判据。 */
+		{
+			const Train *const sp_a = v_last;
+			const Train *const sp_b = (sp_a != nullptr) ? sp_a->Next() : nullptr;
+			const uint32_t pf_gap = (direct_gap < 0) ? 0xFFu : (uint32_t)direct_gap;
+			const uint32_t pf_dira = (gate_a != nullptr) ? (uint32_t)gate_a->direction : 0xFu;
+			const uint32_t pf_dirb = (gate_b != nullptr) ? (uint32_t)gate_b->direction : 0xFu;
+			const bool pf_mixed = (gate_a != nullptr && gate_b != nullptr &&
+					gate_a->direction != gate_b->direction);
+			const uint64_t pf_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
+			const uint64_t pf_payload = ((uint64_t)pf_gap << 40) | ((uint64_t)pf_dira << 36) |
+					((uint64_t)pf_dirb << 32) | ((uint64_t)(gate_folded ? 1u : 0u) << 1) |
+					(uint64_t)(pf_mixed ? 1u : 0u);
+			if (R3RDbgEdge(R3REDGE_CPLSUM, pf_key, pf_payload)) {
+				R3RDbgWrite("COUPLE-PREFLIGHT head=%d last=%d fold=%d dirfold=%d gap=%d pair=(%d dir=%d, %d dir=%d) mixed=%d onsplice=%d splice=(%d dir=%d, %d dir=%d) spd=%d db=%d\n",
+						(int)head->index.base(),
+						(sp_a != nullptr) ? (int)sp_a->index.base() : -1,
+						(int)(gate_folded ? 1 : 0), (int)(direct_dir_fold ? 1 : 0), direct_gap,
+						(gate_a != nullptr) ? (int)gate_a->index.base() : -1, (int)pf_dira,
+						(gate_b != nullptr) ? (int)gate_b->index.base() : -1, (int)pf_dirb,
+						(int)(pf_mixed ? 1 : 0),
+						(gate_a != nullptr && gate_a == v_last) ? 1 : 0,
+						(sp_a != nullptr) ? (int)sp_a->index.base() : -1,
+						(sp_a != nullptr) ? (int)sp_a->direction : -1,
+						(sp_b != nullptr) ? (int)sp_b->index.base() : -1,
+						(sp_b != nullptr) ? (int)sp_b->direction : -1,
+						(int)v->cur_speed, (int)(v->IsDrivingBackwards() ? 1 : 0));
+			}
+		}
+
+		if (gate_folded && gate_a != nullptr && gate_b != nullptr && gate_a == v_last &&
+				gate_a->direction != gate_b->direction) {
+			RestoreTrainBackup(original_src);
+			RestoreTrainBackup(original_dst);
+			if (v_flipped) R3RUndoLogicalFlip(v, v_old_bounds, v_old_roles);
+			if (u_flipped) R3RUndoLogicalFlip(u, u_old_bounds, u_old_roles);
+			R3RRefreshChainCaches(v);
+			R3RRefreshChainCaches(u);
+			v->ConsistChanged(CCF_ARRANGE);
+			u->ConsistChanged(CCF_ARRANGE);
+			R3RDbgWrite("COUPLE-REFUSE-STILL-FOLDED head=%d a=%d dirA=%d b=%d dirB=%d -> rolled back, no merge this tick\n",
+					(int)head->index.base(), (int)gate_a->index.base(), (int)gate_a->direction,
+					(int)gate_b->index.base(), (int)gate_b->direction);
+			return false;
 		}
 	}
 
@@ -8451,6 +10641,10 @@ static void Couple(Train *v, Train *u)
 
 	R3RMergePriorities(passive_segs_now, active_segs_now);
 	R3RRenumberPriorities(v);
+	/* R3R (第 196 轮 / 缺口 A): 耦合是第一次发牌（被动方在前），正常情况下重选是
+	 * 幂等的（被动段头自己就持有排程）；只有被动侧段头手上没有排程时才会把号码牌
+	 * 交给真正持表的那一段，随后的 couple_owner 与借用移交都按新号码牌走。 */
+	R3RReelectControlSegment(v, "couple");
 	Train *couple_owner = R3RGetLowestPriority(passive_segs_now);
 	if (couple_owner == nullptr || couple_owner->orders == nullptr) couple_owner = merged_first;
 	if (couple_owner == nullptr || couple_owner->orders == nullptr) couple_owner = u;
@@ -8494,6 +10688,11 @@ static void Couple(Train *v, Train *u)
 		 * 表，自己那张继续留在 orders_backup 里等解挂。
 		 * R3R: preserve the locomotive's own order position so a later decouple
 		 * can restore them. */
+		/* R3R (第 181 轮 / KI-277): 采样"本次耦合之前是否已经在借用"。
+		 * 下面的车号块要用它区分两种停放副本：借用中 ⇒ backup 是链头自己的号
+		 * （必须原样留着，解挂时归还）；借用已结束 ⇒ backup 是过期副本（照 KI-147
+		 * 还给号池）。v->r3r_orders_borrowed 在 :10180 会被置真，那时就分不清了。 */
+		const bool was_borrowing = v->r3r_orders_borrowed;
 		if (!v->r3r_orders_borrowed) {
 			v->orders_backup = v->orders;
 			v->orders_backup_real_index = v->cur_real_order_index;
@@ -8520,19 +10719,72 @@ static void Couple(Train *v, Train *u)
 		 * again once the backup is overwritten below -- release it, otherwise
 		 * every re-couple leaks one more unit id (same leak that makes train
 		 * numbers creep upwards). */
-		if (v->unitnumber_backup != 0 && v->unitnumber_backup != v->unitnumber &&
-				!v->R3RUnitNumberOwnedByOther()) {
-			Company::Get(v->owner)->freeunits[VehicleType::Train].ReleaseID(v->unitnumber_backup);
+		/* R3R (第 181 轮 / KI-277): 借用中时停放副本 = 链头自己的号，live = 上一位
+		 * lender 的号。旧代码在这里把停放副本"还给号池"再用借来的号覆盖它，于是
+		 * 链头自己的号被销毁、借来的号被当成本车身份停起来（现场 48 顶着 6 的号，
+		 * 界面里再也找不到 48）；解挂时归还的也是借来的号。借用中必须原样保留。 */
+		if (!was_borrowing) {
+			if (v->unitnumber_backup != 0 && v->unitnumber_backup != v->unitnumber &&
+					!v->R3RUnitNumberOwnedByOther()) {
+				Company::Get(v->owner)->freeunits[VehicleType::Train].ReleaseID(v->unitnumber_backup);
+			}
+			v->unitnumber_backup = 0;
 		}
-		v->unitnumber_backup = 0;
 		if (u->unitnumber != 0) {
 			/* R3R: the consist which lends its number keeps a copy of it, so a
 			 * depot drag which splits it off again can take that number back
 			 * instead of being handed a new one from the pool. */
 			if (u->unitnumber_backup == 0) u->unitnumber_backup = u->unitnumber;
-			v->unitnumber_backup = v->unitnumber;
+			/* 只在没有停放副本时停放（借用中已停着链头自己的号，不能被借来的号顶掉）。 */
+			if (v->unitnumber_backup == 0) v->unitnumber_backup = v->unitnumber;
 			v->unitnumber = u->unitnumber;
 			u->unitnumber = 0;
+		}
+		/* R3R (第 160 轮 / KI-261): 车名与车号**同源、同构**地借用。
+		 *
+		 * 现场（build\R3R_debug.log 2026-09-29 19:5x，head=48/50、owner=21、u=6）：
+		 * 玩家复测第 159 轮的控制段显现，看到"号跟了被挂车组、名字还跟着链头"。
+		 * 根因就是这里：车号早在 KI-147/route A 时代就换成了被挂车组链头 u 的号
+		 * （链头从此对外报的是车组的编号），而**名字**从未做过同一件事 ——
+		 * v->name 一直是链头（机车）自己的活字段，于是车辆列表主行、列车窗口
+		 * 标题显示的名字恒为链头车名（玩家原话"名称还是跟链头"）。
+		 *
+		 * 与号块完全对称：被挂车组链头 u 把自己的名字留一份副本后交出去
+		 * （u->name_backup），链头 v 把自己原本的名字停进 name_backup，
+		 * 然后穿上车组的名字。解挂 / 车库拆分时由 R3RRestoreTrainName() 取回
+		 * （等价于号在 DecoupleTrain() 里的互换）。
+		 *
+		 * 只在 u 真的有名字时借（与号块 `if (u->unitnumber != 0)` 同一条判据），
+		 * 于是"车组没名字"的常见场景下链头名一字不动，不会凭空丢名字。
+		 * 原生 non_leading_engines_keep_name（非链头引擎保留名字）开启时整块跳过，
+		 * 与 R3RParkTrainName() 的门禁一致。
+		 *
+		 * 注意：name_backup 目前是 NOSAVE（vehicle_base.h:380），耦合状态直接存档
+		 * ⇒ 读档后链头自己的名字取不回来（这是本条留下的已知残留，见 KI-261 备注）。 */
+		if (!_settings_game.vehicle.non_leading_engines_keep_name && !u->name.empty()) {
+			/* R3R (第 185 轮 / KI-280): 名字侧与号侧同一条规则 —— 借用中（was_borrowing，
+			 * 即 v 身上这件名字就是上一次耦合借来的）时【不再寄存】。旧写法只看
+			 * name_backup 是否为空，于是在"链头本来没有名字"的场景里把上一次借来的
+			 * 名字当成它自己的原名停进备份，解挂归还时就把别人的名字还了回来（玩家
+			 * 报的"名字乱传播"）。与下面 10216 的号侧 `if (!was_borrowing)` 完全对称，
+			 * 也与 KI-215"排程只在第一次借用时寄存"同规则。 */
+			const bool head_had_own = !v->name.empty() && !was_borrowing;
+			if (!R3RNameIsBorrowed(u) && u->name_backup.empty()) u->name_backup = u->name;
+			if (head_had_own && v->name_backup.empty()) v->name_backup = v->name;
+			v->name = u->name;
+			/* R3R (第 181 轮 / KI-277): 不再 u->name.clear()。
+			 * 链头本来没有名字时 v->name_backup 是空的，"这件名字是借来的"在解挂
+			 * 时就没了凭据，链头从此永久顶替等待方的身份（玩家报的 48 号消失）；
+			 * 留着 u 自己的活名字，归还端就能凭 v->name == u->name 认出这次借用
+			 * 并清回原状（DecoupleTrain 的 NAME-RESTORE side=head-cleared）。
+			 * u 此时不是链头，它的活名字不会对外显示，语义上只是"原件仍在 lender 手里"。 */
+			/* R3R (第 185 轮 / KI-280): borrowed=采样到的"耦合前 v 就在借用中"，
+			 * own=停放后 v 是否真有一件"自己的名字"（0 且 borrowed=1 表示这次正确地
+			 * 没有把借名停成原名；旧 exe 在这种情况下会错停成 1）。 */
+			R3RDbgWrite("NAME-XFER head=%d u=%d head_own=%d got_u=%d keep_u=%d borrowed=%d own=%d\n",
+					(int)v->index.base(), (int)u->index.base(),
+					(int)head_had_own, (int)!v->name.empty(), (int)!u->name.empty(),
+					(int)was_borrowing, (int)!v->name_backup.empty());
 		}
 		/* Inherit the consist's schedule position from the vehicle that was
 		 * waiting to be coupled. The WAIT_COUPLE order currently being fulfilled
@@ -8584,6 +10836,28 @@ static void Couple(Train *v, Train *u)
 		if (v->GetNumOrders() > 0 && v->GetOrder(v->cur_real_order_index)->IsType(OT_WAIT_COUPLE)) {
 			v->IncrementRealOrderIndex();
 			v->UpdateRealOrderIndex();
+		}
+		/* R3R (2026-10-01, 拍板 3 A「不跨」): 落点若是一条 DECOUPLE，默认【不再跨
+		 * 过它】—— 新形态下"停在解挂上"是一个合法的等待态：闸门认"当前 real 就是
+		 * 解挂"，列车停稳在站台 / 车库即触发，不再需要把它当僵尸跳掉（KI-281 的
+		 * "耦合落点顺手吃掉后面那条解挂"就此消失）。
+		 *
+		 * 只有一种情形仍需兜底：列车此刻并不在合法位置（既不在站台也不在车库，即
+		 * 停在路点上）。那时闸门永远不会触发，留着这条解挂会让列车僵死，所以仍按
+		 * 老办法跨过——见 §十一 B 与 KI-278 的原始现场（head=27 real=20 停在未执行
+		 * 的 DECOUPLE，链头被判 NOCAB、寻路 PFD-REJ-GROUP rej=768 刷屏）。 */
+		const Order *const r3r_land = v->GetNumOrders() > 0 ? v->GetOrder(v->cur_real_order_index) : nullptr;
+		const bool r3r_landed_on_decouple = (r3r_land != nullptr && r3r_land->IsType(OT_DECOUPLE));
+		const Train *const r3r_land_plat = v->GetStationLoadingVehicle();
+		const bool r3r_at_legal_spot = IsRailDepotTile(v->tile) ||
+				(r3r_land_plat != nullptr && IsTileType(r3r_land_plat->tile, TileType::Station));
+		const uint decouple_skip = (r3r_landed_on_decouple && !r3r_at_legal_spot)
+				? R3RSkipUnfireableDecoupleOrder(v) : 0;
+		if (decouple_skip > 0) {
+			const Order *const skipped_to = v->GetNumOrders() > 0 ? v->GetOrder(v->cur_real_order_index) : nullptr;
+			R3RDbgWrite("COUPLE-SKIP-DECOUPLE head=%d stepped=%u real=%d type=%d\n",
+					(int)v->index.base(), decouple_skip, (int)v->cur_real_order_index,
+					skipped_to != nullptr ? (int)skipped_to->GetType() : -1);
 		}
 		R3RCheckTtSync(v, "couple-waitcouple");
 		/* Keep the timetable index in sync (IncrementRealOrderIndex does not
@@ -8642,6 +10916,29 @@ static void Couple(Train *v, Train *u)
 				fclose(dbg);
 			}
 		}
+	}
+
+	/* R3R (第 173 轮, KI-265 探针, 只读): 提交之后的"事后校验"。
+	 * 提交前闸门只看【这一次的拼接对】，这里在【最终整链】上再跑一次方向判据：
+	 * 若为真，说明"绝不提交折叠链"这条不变式还有一条没被闸门覆盖的侧门，必须
+	 * 拿日志来定位。刻意只写日志、**不撤销提交** —— 提交之后回滚要连排程交接、
+	 * 索引继承、窗口失效一起还原，风险远大于收益；真正的拦截在 try 阶段完成。
+	 * 每次成功挂车写一行（不是每 tick），不会被 128 帧窗口抑制。 */
+	{
+		const Train *po_a = nullptr;
+		const Train *po_b = nullptr;
+		const Train *const post_head = v->First();
+		const bool post_folded = R3RCheckChainFoldedDirection(post_head, "COUPLE-POSTFOLD", &po_a, &po_b);
+		R3RDbgWrite("COUPLE-POSTFOLD head=%d folded=%d a=(%d dir=%d y=%d) b=(%d dir=%d y=%d) mixed=%d%s\n",
+				(int)post_head->index.base(), (int)(post_folded ? 1 : 0),
+				(po_a != nullptr) ? (int)po_a->index.base() : -1,
+				(po_a != nullptr) ? (int)po_a->direction : -1,
+				(po_a != nullptr) ? (int)po_a->y_pos : -1,
+				(po_b != nullptr) ? (int)po_b->index.base() : -1,
+				(po_b != nullptr) ? (int)po_b->direction : -1,
+				(po_b != nullptr) ? (int)po_b->y_pos : -1,
+				(int)((po_a != nullptr && po_b != nullptr && po_a->direction != po_b->direction) ? 1 : 0),
+				post_folded ? " INVARIANT-BROKEN-report-this" : "");
 	}
 
 	/* R3R (KI-128 probe): snapshot the order list right after the hand-over so a
@@ -8811,7 +11108,7 @@ static void Couple(Train *v, Train *u)
 	 * 它只是"前去挂接"命令执行期间借来的身份，真正的合并已经完成、命令也已推进掉
 	 * （IncrementImplicitOrderIndex/ProcessOrders 在上方），所以这里打点日志供现场
 	 * 核对：临时分组不进入合并后的链，整链的挂接分组由上一步 R3RNormaliseChainGroups()
-	 * 统一到控制段的真分组。 */
+	 * 按**全链段头掩码的并集**广播下去（第 159 轮 / q-2=肆，不再是覆盖控制段）。 */
 	if (coupler_used_fake_group != INVALID_COUPLE_GROUP) {
 		const char *fake_name = R3RGetCoupleGroupName(coupler_used_fake_group);
 		R3RDbgWrite("CGRP-FAKE-DESTROY head=%d loco=%d group=%d name=%s mask=0x%llx\n",
@@ -8897,6 +11194,32 @@ static void Couple(Train *v, Train *u)
 		FillTrainReservationLookAhead(v);
 	}
 
+	/* R3R (第 152 轮 / P1=甲): 耦合提交点末尾。
+	 * 这里正是"甲口径可能被破坏"的主现场 —— 现行 route A 让链头借用
+	 * couple_owner 那一行的排程，于是 head != owner；甲要求两者必须是同一个段。
+	 * 段 ID 与三特质在提交点末尾一次性settle。 */
+	R3RSettleChainSegments(v, "couple");
+
+	/* R3R (KI-253 probe): the CHAIN-ATTRS block near the start of this commit
+	 * point runs *before* the flags are cleared and before ConsistChanged()
+	 * rebuilds the caches, so its pow/wt/len can read as zero on a chain whose
+	 * gcache has not been filled in yet -- which is exactly what the round-158
+	 * log showed (len=0 pow=0 wt=0). Report the same aggregate once more here, at
+	 * the very end of the commit point, so "probe ran too early" and "the caches
+	 * really are empty" can be told apart. Read-only. */
+	{
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "CHAIN-ATTRS2 couple head=%d len=%d pow=%lld wt=%lld spd=%d nocab=%d db=%d\n",
+					(int)v->index.base(), (int)v->gcache.cached_total_length,
+					(long long)v->gcache.cached_power, (long long)v->gcache.cached_weight,
+					(int)v->GetDisplayMaxSpeed(),
+					(int)((v->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0),
+					v->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0);
+			fclose(dbg);
+		}
+	}
+
 	/* R3R: force an immediate visual refresh of the whole merged chain, so the
 	 * consist (which just became ordinary wagons again) repaints right away
 	 * instead of keeping its old consist-front look until the next redraw. */
@@ -8915,8 +11238,11 @@ static void Couple(Train *v, Train *u)
  * The rule itself is enforced inside R3RCoupleAllowed() (couple_group.cpp), so
  * that the couple pathfinder's destination test, the back-walk safety test and
  * this gate all judge candidates identically. This local copy mirrors it and is
- * used for one thing only: choosing between the labels reject=dest-mismatch and
- * reject=group-mismatch in the probe line. Keep it in sync with that function.
+ * used for two things: choosing between the labels reject=dest-mismatch and
+ * reject=group-mismatch in the probe line, and -- since KI-319 (round 212) --
+ * pre-screening the candidates in the pair scan *before* the pair-lock report,
+ * so a candidate this rule refuses is never advertised as "locked by somebody
+ * else". Keep it in sync with that function.
  *
  * @param coupler The locomotive executing the GOTO_COUPLE order.
  * @param target  The candidate consist (its chain head).
@@ -8925,7 +11251,16 @@ static void Couple(Train *v, Train *u)
 static bool R3RCoupleTargetAtOrderStation(const Train *coupler, const Train *target)
 {
 	const Order &order = coupler->current_order;
-	if (!order.IsType(OT_GOTO_COUPLE) || order.GetCoupleIsDepot()) return true;
+	if (!order.IsType(OT_GOTO_COUPLE)) return true;
+	if (order.GetCoupleIsDepot()) {
+		/* R3R (KI-288, round 188): mirror of the depot branch of
+		 * R3RCoupleAllowedIgnoringPair() -- a station platform is never part of
+		 * the named depot, so a candidate parked at one is refused there too
+		 * (observed 2026-10-01: a loco ordered to couple at depot 1,11 coupled
+		 * onto a consist at station tile 4,11). */
+		if (IsRailStationTile(target->tile)) return false;
+		return !IsRailDepotTile(target->tile) || GetDepotIndex(target->tile) == order.GetDestination().ToDepotID();
+	}
 	if (!IsRailStationTile(target->tile)) return true;
 	return GetStationIndex(target->tile) == order.GetDestination().ToStationID();
 }
@@ -9104,6 +11439,16 @@ static void R3REnsureCouplePair(Train *v)
 		}
 		if (!R3RIsCoupleTarget(t)) continue;
 		if (t->vehstatus.Test(VehState::Stopped)) continue;
+		/* R3R (KI-319, round 212): the destination rule is applied *here*, before
+		 * the pair-lock report, and not only by R3RCoupleAllowedIgnoringPair()
+		 * further down. A candidate parked at another station -- or at a station
+		 * while the order names a depot -- is refused by that gate anyway, but the
+		 * refusal used to happen after this block, so "somebody else already locked
+		 * this consist" was printed for a candidate that could never be taken.
+		 * Round 210 read exactly that as contention (CPL-PAIR-STEAL every 8 ticks,
+		 * §八.2) while the truth was "there is nothing here to couple onto". The
+		 * accepted set is unchanged: this only stops the lie. */
+		if (!R3RCoupleTargetAtOrderStation(coupler, t)) continue;
 		/* Somebody else already locked this consist: first come, first served.
 		 * "First" is the tick the order was entered, not the tick this scan ran,
 		 * so a locomotive which is already on its way to a consist is only
@@ -9276,6 +11621,14 @@ static const uint32_t R3R_COUPLE_DEST_IDLE_LIMIT = 500; ///< ~15 s at normal gam
  *  the same index passes through this handler. */
 static btree::btree_map<VehicleID, uint32_t> _r3r_couple_dest_idle;
 
+/** R3R (KI-320, round 213): edge-triggered news throttle for "this GOTO_COUPLE
+ *  order names a depot, so the locomotive is driving straight to the depot
+ *  instead of running the couple pathfinder". Keyed by VehicleID, value = the
+ *  destination tile that was last reported; a different destination (or a fresh
+ *  order) reports again. Entries are dropped when the locomotive leaves the
+ *  GOTO_COUPLE order. */
+static btree::btree_map<VehicleID, TileIndex> _r3r_couple_depot_news;
+
 /** R3R (KI-193 fallback, round 114): per-locomotive episode of "a qualifying coupling
  *  candidate is standing right here, yet the merge never commits". Only used for a loco
  *  that has arrived at its GOTO_COUPLE destination, where a coupling attempt happens at
@@ -9295,6 +11648,33 @@ static btree::btree_map<VehicleID, R3RCoupleCommitFailEpisode> _r3r_couple_commi
  *  coupling is never abandoned, short enough to break a fold-correction deadlock or a
  *  persistently vetoed attach instead of retrying for ever. */
 static const uint32_t R3R_COUPLE_COMMIT_FAIL_LIMIT = 4;
+
+/** R3R (KI-289, round 188)：「自愈掉头」次数上限（玩家口径 2026-10-01：自愈两次再停止）。
+ *
+ * 场景（2026-10-01 现场 veh=26）：机车执行 GOTO_COUPLE→车库 1,11，而车库那边根本
+ * 没有等待车底（CPL-PATHFOUND found=0）。它既不在目的地格上（DEPOT-ARR tileEqDest=0），
+ * 又一个候选都找不到 ⇒ 每 tick 搜一遍、空手而归、无法预留 ⇒ 被标
+ * VehicleRailFlag::Stuck。引擎的 "Handle stuck trains" 块攒够 pf.wait_for_pbs_path 后
+ * 就会 ReverseTrainDirection()（现场 10164/10284 的 `REVERSEDIR ... rev=0 stuck=1`，
+ * 玩家没碰过）。那次掉头把车尾送到 8px 外刚解下来的车底 23 面前，于是挂错了车
+ * —— 它正是 KI-288 的扳机。
+ *
+ * 这种 Stuck 的含义是「在等一个还不存在的车底」，不是「撞上堵点」，所以掉头毫无
+ * 意义（掉头也不会让车底出现），只会把列车摆成能挂错车的姿态。允许引擎自愈
+ * R3R_COUPLE_WAIT_HEAL_LIMIT 次（保留引擎两次机会：车底可能就在身后），之后停止
+ * 掉头、原地等待 —— 等价于 KI-193 的「原地等待」，只是把"目的地格上"这一种扩展为
+ * "只要是在等候选"都适用。 */
+static const uint32_t R3R_COUPLE_WAIT_HEAL_LIMIT = 2;
+
+/** R3R (KI-289)：本 tick 处于「停车 + 正在执行 GOTO_COUPLE + 一个候选都没有」的机车
+ *  集合，由 TrainCoupleHandler() 每 tick 维护（键=正在执行订单的那台机车，与
+ *  TrainLocoHandler 里的 consist 是同一个对象）。 */
+static btree::btree_map<VehicleID, uint8_t> _r3r_couple_no_target;
+
+/** R3R (KI-289)：上面那类机车**已经**自愈掉头的次数。达到
+ *  R3R_COUPLE_WAIT_HEAL_LIMIT 后置为 LIMIT+1 —— 这个 +1 同时充当「抑制日志已打过」
+ *  的一次性标记（见 "Handle stuck trains" 块）。该机车离开等待态时清掉。 */
+static btree::btree_map<VehicleID, uint32_t> _r3r_couple_wait_heals;
 
 /**
  * R3R (KI-193): is this locomotive standing on the destination of its running
@@ -9338,6 +11718,16 @@ static bool TrainCoupleHandler(Train *v)
 		/* R3R (KI-193 fallback): likewise for the "a candidate is there but the merge
 		 * never commits" episode. */
 		_r3r_couple_commit_fail.erase(v->index);
+		/* R3R (KI-289): the "waiting for a coupling target that does not exist"
+		 * state ends with the order. Wipe the marker and the self-heal budget, so
+		 * a later rendezvous (or a later order) starts with two fresh heals. */
+		_r3r_couple_no_target.erase(v->index);
+		_r3r_couple_wait_heals.erase(v->index);
+		/* R3R (KI-316, round 212): likewise for the "no candidate anywhere, driving
+		 * to the order destination instead" report in ChooseTrainTrack(). */
+		/* R3R (KI-320, round 213): likewise for the "order names a depot, drive
+		 * straight to the depot" report in ChooseTrainTrack(). */
+		_r3r_couple_depot_news.erase(v->index);
 		return false;
 	}
 	/* R3R (KI-106 fix 1): the exact-geometry path must also run while the loco is
@@ -9453,6 +11843,17 @@ static bool TrainCoupleHandler(Train *v)
 			 * not worth the edge-probe hash either. */
 			return false;
 		}
+		/* R3R (KI-289, round 188): a STANDSTILL coupler with nothing to couple onto
+		 * -- neither an exact-position partner (GetCouplePosition) nor a consist
+		 * inside the 9-tile touch scan -- is "waiting for a target that does not
+		 * exist yet". Mark it so the stuck handler limits the engine's self-heal
+		 * reversal (R3R_COUPLE_WAIT_HEAL_LIMIT) instead of spinning the loco end for
+		 * end. This holds both on and off the order destination: the 2026-10-01
+		 * scene had the loco parked on a STATION tile with its GOTO_COUPLE bound for
+		 * a depot (R3RCoupleOrderDestinationReached() false), and the reversal still
+		 * swung its rear onto the freshly decoupled consist 8 px away. Cleared as
+		 * soon as a candidate shows up or the order changes. */
+		_r3r_couple_no_target[v->index] = 1;
 		/* KI-14 (2): edge-triggered. This branch is reached on every tick (and on
 		 * every movement step, see the loop at the end of TrainLocoHandler) while
 		 * a GOTO_COUPLE loco has no reachable target, so the two raw
@@ -9508,6 +11909,13 @@ static bool TrainCoupleHandler(Train *v)
 		}
 		return false;
 	}
+
+	/* R3R (KI-289): a candidate is on hand, so this loco is NOT "waiting for a
+	 * target that does not exist" -- drop the marker and leave the engine's
+	 * self-heal reversal exactly as it is. If the merge still cannot commit (fold
+	 * correction veto, refused attach), the KI-193 fallback in the commit-fail
+	 * counter below is the one that breaks the deadlock. */
+	_r3r_couple_no_target.erase(v->index);
 
 	/* R6: only couple onto a consist that reaches the minimum programmable score.
 	 * TEMPORARILY DISABLED (2026-08-12): the built-in ruleset gives a consist
@@ -9596,6 +12004,8 @@ static bool TrainCoupleHandler(Train *v)
 			}
 
 			if (r3r_next != INVALID_VEH_ORDER_ID) {
+				/* R3R (第 206 轮探针, 只读): 这是本文件里另一条"自动跳命令"路径。 */
+				R3RWatchOrderIndex(v, "commitfail-skip-in");
 				/* Same bookkeeping as CmdSkipToOrder(): leave any loading/waiting state,
 				 * reset the beyond-platform-end marks, select the next order and discard
 				 * the stale current order so the ordinary ProcessOrders() of the next
@@ -9612,6 +12022,7 @@ static bool TrainCoupleHandler(Train *v)
 				v->ResetDepotUnbunching();
 				InvalidateVehicleOrder(v, 0);
 				v->StopSeparation();
+				R3RWatchOrderIndex(v, "commitfail-skip-out");
 			}
 			return false;
 		}
@@ -9735,6 +12146,11 @@ static void CheckNextTrainTile(Train *moving_front)
  */
 static bool CheckTrainStayInDepot(Train *v)
 {
+	/* R3R (第 206 轮探针, 只读): 库内列车本 tick 的入口基线。若 54 号链在
+	 * TrainLocoHandler 里被 Stopped 早退挡住，本函数根本不会跑 ⇒ "这里没有
+	 * 行"本身就说明该链走的不是这条路径。 */
+	R3RWatchOrderIndex(v, "depotstay-in");
+
 	/* R3R: a GOTO_COUPLE locomotive stays inside its target depot ONLY when it
 	 * has actually reached that depot (GOTO_COUPLE has no arrival handling so
 	 * without this it would drive right back out). A locomotive that is merely
@@ -10966,7 +13382,42 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	 * (CYapfDestinationTrainRailT) only accepts a consist whose current order is
 	 * WAIT_COUPLE and which satisfies the GOTO_COUPLE order requirements, so the
 	 * locomotive does not wander to an arbitrary consist. */
-	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+	/* R3R (KI-320, round 213): a GOTO_COUPLE order may name a depot instead of a
+	 * station. The couple pathfinder (CYapfDestinationTrainRailT) only accepts a
+	 * waiting consist that stands on a tile carrying a track reservation, and a
+	 * consist parked inside a depot carries none -- a depot tile is also a
+	 * topological dead end for the couple search (the safe-position back-walk
+	 * refuses every depot tile, cf. FSCP fail=depot, and the search may not
+	 * extend out of one). The station path patches this by scanning the whole
+	 * platform for a consist, but there is no depot equivalent, so a depot-type
+	 * couple order could never reach its target: CPL returned INVALID_TRACK,
+	 * no candidate was ever found and the locomotive was parked "stuck" in front
+	 * of the depot for ever.
+	 *
+	 * Fix (player decision): when the order names a depot, do not run the couple
+	 * pathfinder at all. Drive to the depot with the ordinary pathfinder --
+	 * exactly like an OT_GOTO_DEPOT order, whose destination functor resolves the
+	 * same v->dest_tile (UpdateOrderDest() sets it to Depot::Get(id)->xy for a
+	 * depot-type couple order). Once the locomotive stands inside the depot the
+	 * existing in-depot coupling block (TrainCoupleHandler) scans the depot for a
+	 * matching consist. Station-type couple orders are untouched. */
+	const bool r3r_couple_depot = consist->current_order.IsType(OT_GOTO_COUPLE) && consist->current_order.GetCoupleIsDepot();
+	if (r3r_couple_depot) {
+		TileIndex &r3r_cd_seen = _r3r_couple_depot_news[consist->index];
+		if (r3r_cd_seen != consist->dest_tile) {
+			r3r_cd_seen = consist->dest_tile;
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "COUPLE-DEPOT-DIRECT veh=%d tile=%d,%d dest=%d,%d\n",
+						(int)consist->index.base(),
+						(int)TileX(consist->tile), (int)TileY(consist->tile),
+						(int)TileX(consist->dest_tile), (int)TileY(consist->dest_tile));
+				fclose(dbg);
+			}
+		}
+	}
+
+	if (consist->current_order.IsType(OT_GOTO_COUPLE) && !r3r_couple_depot) {
 		/* R3R: always reserve the couple path - the loco needs a reservation
 		 * to move, and it must extend right up to the consist. Without this the
 		 * loco only reserves on force_res ticks and then moves without one. */
@@ -10980,15 +13431,36 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			best_track = path_found;
 		}
 		if (path_found == INVALID_TRACK) {
-			if (mark_stuck) MarkTrainAsStuck(consist);
-			FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
+			/* R3R (KI-316, round 214): the round-212 fallback to the ordinary
+			 * pathfinder ("no couplable consist anywhere -> drive to the
+			 * destination of the GOTO_COUPLE order instead") has been removed on
+			 * the player's ruling of 2026-10-03: a locomotive that finds nothing to
+			 * couple onto must NOT set off towards the order destination, it must
+			 * keep waiting where it stands -- on the loco siding -- until a consist
+			 * turns up.
+			 *
+			 * The couple pathfinder only ever aims at a couplable consist
+			 * (R3RIsCoupleTarget() plus the station/depot named by the
+			 * GOTO_COUPLE order). When no such consist exists at all it returns
+			 * INVALID_TRACK, and the correct reaction is the pre-212 one: drop the
+			 * reservation, mark the locomotive stuck and stay put. The pathfinder is
+			 * re-run on every retry (TrainCoupleHandler), so the rendezvous happens
+			 * by itself as soon as a legal target appears; the KI-193 / KI-289
+			 * parked-wait bookkeeping and the periodic COUPLE-DEST-EMPTY heartbeat
+			 * keep reporting the wait, with the order retained.
+			 *
+			 * A rendezvous which is merely not reachable yet (a waiting consist
+			 * blocking the route, a signal held) ends up here as well, which is
+			 * exactly what is wanted. */
 			if (changed_signal != INVALID_TRACKDIR) MarkSingleSignalDirty(tile, changed_signal);
+			FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
+			if (mark_stuck) MarkTrainAsStuck(consist);
 			return { FindFirstTrack(tracks), result_flags };
 		}
 		result_flags |= CTTRF_RESERVATION_MADE;
 	}
 
-	if (res_dest.tile != INVALID_TILE && !res_dest.okay && !consist->current_order.IsType(OT_GOTO_COUPLE)) {
+	if (res_dest.tile != INVALID_TILE && !res_dest.okay && (!consist->current_order.IsType(OT_GOTO_COUPLE) || r3r_couple_depot)) {
 		/* Pathfinders are able to tell that route was only 'guessed'.
 		 * R3R: a GOTO_COUPLE locomotive's route is chosen and reserved by the
 		 * couple pathfinder (CPL) above. The normal pathfinder treats the
@@ -11014,7 +13486,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		 * already-reserved consist platform (res_dest.okay == false), and
 		 * freeing the reservation here would wipe the couple reservation,
 		 * leaving the loco without one. Keep it and return. */
-		if (consist->current_order.IsType(OT_GOTO_COUPLE)) return { best_track, result_flags };
+		if (consist->current_order.IsType(OT_GOTO_COUPLE) && !r3r_couple_depot) return { best_track, result_flags };
 		if (mark_stuck) MarkTrainAsStuck(consist);
 		FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 		return { best_track, result_flags };
@@ -14106,6 +16578,116 @@ Money Train::CalculateCurrentOverallValue() const
 }
 
 /**
+ * R3R（2026-09-30 玩家拍板「双管齐下」之一，订单一层）: is this one of the three
+ * commands R3R's coupling machinery drives?
+ *
+ * GOTO_COUPLE / WAIT_COUPLE / DECOUPLE are the whole surface of the R3R couple
+ * hand-over: a travelling locomotive aims at a waiting consist with GOTO_COUPLE,
+ * the waiting consist parks on WAIT_COUPLE, and DECOUPLE cuts a segment off the
+ * back. Any chain which must not take part in that hand-over therefore has to
+ * skip exactly these order types.
+ */
+static bool R3RIsCoupleCommand(const Order *o)
+{
+	return o != nullptr && (o->IsType(OT_GOTO_COUPLE) || o->IsType(OT_WAIT_COUPLE) || o->IsType(OT_DECOUPLE));
+}
+
+/**
+ * R3R（2026-09-30 玩家拍板「双管齐下」之一，订单一层硬闸门）: a chain holding a
+ * *genuine* articulated part must not execute any R3R couple command; jump to the
+ * first normal order behind it instead.
+ *
+ * Rationale (player report): a consist that is really several genuine
+ * articulated parts looks -- to every other subsystem -- like a single welded
+ * vehicle, and R3R's segment machinery (logical flip, decouple, bounding-box
+ * bookkeeping) is built on the assumption that the chain can be re-ordered
+ * vehicle by vehicle. R3R's own "upgrade to segment" command normalises that
+ * shape by de-articulating it first, but a consist which never went through
+ * that command (bought/cloned as an articulated train, or the `u_real=1` bottom
+ * in the field log) would still be coupled onto and marked ★. This gate is the
+ * first line of defence, in front of the pathfinder: with the couple command
+ * skipped, the locomotive never even books a route to a waiting consist.
+ *
+ * Behaviour (player wording: "先检查自身是否存在真铰接式，如果存在，就跳到该条
+ * 命令后面的第一条非 R3R 命令"):
+ *  - Only acts when the order about to run (the real order at
+ *    cur_real_order_index, or the currently loaded current_order) IS one of the
+ *    three R3R commands.
+ *  - Walks forward over the run of R3R orders and lands on the first normal
+ *    order. The index is assigned directly, never through
+ *    IncrementRealOrderIndex(): that path is a deliberate no-op for a loaded
+ *    GOTO_COUPLE (see SkipToNextRealOrderIndex), which is exactly the state we
+ *    are leaving.
+ *  - The loaded current_order is freed so the ordinary ProcessOrders() of this
+ *    very tick loads the normal order again (a leftover GOTO_COUPLE would
+ *    otherwise keep driving the couple pathfinder).
+ *  - Only R3R orders in the whole schedule: nothing to jump to, so the current
+ *    R3R command is merely dropped and the train parks (it can never couple
+ *    anyway).
+ *
+ * @param consist Front engine being handled (only chain heads get ticked).
+ * @return True when an R3R command was skipped or dropped.
+ */
+static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)
+{
+	if (consist == nullptr || consist->orders == nullptr) return false;
+
+	/* R3R (第 206 轮探针, 只读): 无条件打一行 —— 连"链上根本没有真铰接、闸门
+	 * 直接放行"的情形也要留证。否则现场"日志里没有 ARTIC-SKIP-R3R"就无法区分
+	 * "从没进过闸门"和"进了闸门但因不是真铰接而早退"。 */
+	R3RWatchOrderIndex(consist, "skipgate-in");
+
+	if (!R3RChainHasRealArticPart(consist)) return false;
+
+	const uint n = consist->GetNumOrders();
+	if (n == 0) return false;
+
+	VehicleOrderID idx = consist->cur_real_order_index;
+	if ((uint)idx >= n) idx = 0;
+
+	const bool idx_is_couple = R3RIsCoupleCommand(consist->GetOrder(idx));
+	const bool cur_is_couple = R3RIsCoupleCommand(&consist->current_order);
+	if (!idx_is_couple && !cur_is_couple) return false;
+
+	VehicleOrderID target = idx;
+	if (idx_is_couple) {
+		uint stepped = 0;
+		while (stepped < n) {
+			target = (VehicleOrderID)(((uint)target + 1) % n);
+			stepped++;
+			if (!R3RIsCoupleCommand(consist->GetOrder(target))) break;
+		}
+		if (stepped >= n) {
+			/* Nothing but R3R orders in the schedule. Drop the command we were
+			 * about to run and leave the index where it is: the train parks and
+			 * will be skipped again on the next tick, which is the intended end
+			 * state for a chain that can never couple. */
+			consist->current_order.Free();
+			consist->SetDestTile(INVALID_TILE);
+			R3RDbgWrite("ARTIC-SKIP-R3R veh=%d tile=%d,%d from=%d all-r3r=1 type=%d -> no normal order to jump to\n",
+					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+					(int)idx, (int)consist->current_order.GetType());
+			return true;
+		}
+	}
+
+	const VehicleOrderID from = consist->cur_real_order_index;
+	consist->cur_real_order_index = target;
+	consist->cur_implicit_order_index = target;
+	if (consist->cur_timetable_order_index != INVALID_VEH_ORDER_ID) consist->cur_timetable_order_index = target;
+	consist->current_order.Free();
+	consist->SetDestTile(INVALID_TILE);
+
+	R3RDbgWrite("ARTIC-SKIP-R3R veh=%d tile=%d,%d from=%d to=%d type_from=%d type_to=%d idx_r3r=%d cur_r3r=%d\n",
+			(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+			(int)from, (int)target,
+			(int)(consist->GetOrder(from) != nullptr ? consist->GetOrder(from)->GetType() : -1),
+			(int)(consist->GetOrder(target) != nullptr ? consist->GetOrder(target)->GetType() : -1),
+			idx_is_couple ? 1 : 0, cur_is_couple ? 1 : 0);
+	return true;
+}
+
+/**
  * Per-tick handler of each front engine.
  * @param consist The front engine we are working with.
  * @param mode Set to \c True if we want the train to keep existing, \c False if we want to consider deleting it (it has been crashed).
@@ -14241,6 +16823,12 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			IsRailDepotTile(consist->tile) &&
 			r3r_pend->GetDestination().ToDepotID() == GetDepotIndex(consist->tile);
 
+	/* R3R 探针（item 3）：本条链进入本 tick 时的订单索引基线。放在闸门之前，
+	 * 所以"已进入 handler 但被下面任一道闸门挡回"的链也会留下基线；若本行
+	 * 已是 0->1，说明改动发生在进入 handler 之前（读档残余 / 车库拖动 / 上
+	 * 一 tick 的 ProcessOrders），不必再看本 tick 的后续站点。 */
+	R3RWatchOrderIndex(consist, "loco-entry");
+
 	/* exit if train is stopped (a stopped locomotive should not keep trying to
 	 * couple: the player stopped it, so give control back for stop/skip/return
 	 * commands instead of parking it in the GOTO_COUPLE state forever). */
@@ -14274,6 +16862,17 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		}
 		return true;
 	}
+
+	/* R3R（2026-09-30 玩家拍板「订单一层硬闸门」）: a chain holding a genuine
+	 * articulated part never runs a couple command. Done before the couple target
+	 * lock below, so a chain that just lost its R3R command never even becomes a
+	 * candidate for R3REnsureCouplePair(), and before the order processing further
+	 * down, so the pathfinder never books a route for it. */
+	R3RSkipCoupleOrdersForRealArtic(consist);
+	/* R3R 探针（item 3）：真铰接硬闸门之后的快照。本行出现 0->1 就是闸门自己
+	 * 跳了命令（既有 ARTIC-SKIP-R3R 只记"跳了什么"，本行连同上一站的基线
+	 * 一起给出"跳掉的到底是哪一条"）。 */
+	R3RWatchOrderIndex(consist, "post-skipgate");
 
 	/* R3R (KI-182): from the moment the "go to and couple" order starts running
 	 * the locomotive locks onto exactly one waiting consist, and both sides mark
@@ -14360,6 +16959,10 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			NormalizeTrainVehInDepot(consist, true);
 		}
 	}
+	/* R3R 探针（item 3）：车库挂车块之后的快照（含 TryTrainCouple 提交、
+	 * 身份迁移、r3r_parked 清除、NormalizeTrainVehInDepot）。这一段是"跳命令"
+	 * 的头号嫌疑区：提交失败/skip 分支会推进索引。 */
+	R3RWatchOrderIndex(consist, "post-depotblk");
 
 	/* R3R: DECOUPLE triggers when the train is stopped AND has genuinely arrived
 	 * at the destination of its CURRENT travel order (a station or a depot) and
@@ -14372,7 +16975,15 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * order (e.g. "go to depot") and the coupling station/depot tile does not
 	 * match that order — the train must first travel to the decouple
 	 * destination before it decouples there. */
-	if (consist->cur_speed == 0) {
+	/* R3R (2026-10-01, 拍板 1「同 tick 闭环」): 解挂闸门改成一个 lambda，在下方
+	 * HandleLoading() 【之后】调用（原来它内联在这里、跑在 ProcessOrders 与
+	 * HandleLoading 之前）。原因：站台的索引推进发生在 HandleLoading() 里
+	 * （vehicle.cpp:3895，语义是"装卸结束即推进"），闸门若仍在它之前求值，装卸
+	 * 完成那一 tick 闸门已经跑过去了；等下一 tick 闸门再跑，列车已起步
+	 * （cur_speed != 0），"停稳"判据失效 —— 解挂被静默丢弃。放到 HandleLoading()
+	 * 之后，推进与解挂就落在同一 tick 内。 */
+	auto r3r_try_decouple_arrival = [&]() {
+		if (consist->cur_speed != 0) return;
 		R3RScopeTimer r3r_dec_timer(&r3r_dec_ns, &r3r_dec_calls);
 		/* R3R: DECOUPLE triggers only when the train is genuinely parked at the
 		 * destination of its CURRENT REAL travel order. Read the real order by
@@ -14456,62 +17067,25 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		}
 		const Order *cur_real = consist->GetOrder(consist->cur_real_order_index);
 		bool at_order_dest = false;
-		if (cur_real != nullptr && cur_real->IsType(OT_GOTO_STATION)) {
-			/* R3R: must be parked at THIS order's station, not merely on some
-			 * station tile. When a locomotive couples onto a consist that is
-			 * waiting at a station (WAIT_COUPLE), the merged train inherits the
-			 * consist's order list and skips that WAIT_COUPLE (see Couple()),
-			 * so its first travel order is the delivery order that FOLLOWS the
-			 * waiting point. If that order says "go to station B" while the
-			 * consist is parked at station A, a bare IsTileType() test counted
-			 * A's platform as the destination, the DECOUPLE right after it fired
-			 * on the next tick and undid the couple at the very same tile
-			 * (observed 2026-09-22: COUPLE-OK loco=7 real=4 at 60,51 = station 0,
-			 * immediately followed by DECOUPLE-FIRE consist=7 real=4 whose order
-			 * was GOTO_STATION -> station 2; the consist was then stranded at
-			 * station 0 and every later couple was undone the same way). Compare
-			 * station indices, mirroring the GOTO_DEPOT branch below. */
-			at_order_dest = IsTileType(consist->tile, TileType::Station) &&
-				cur_real->GetDestination().ToStationID() == GetStationIndex(consist->tile);
-		} else if (cur_real != nullptr && cur_real->IsType(OT_GOTO_DEPOT)) {
-			/* R3R: must be parked at THIS order's target depot. A train that just
-			 * finished the previous GOTO_DEPOT (e.g. 42,28) has already advanced
-			 * its real order to the next GOTO_DEPOT (e.g. 38,27) while still
-			 * sitting inside the old depot, not yet rolled out; a bare
-			 * IsRailDepotTile() check would then count the old depot tile as
-			 * "arrived at the new order" and decouple at the wrong place
-			 * (observed 2026-09-04: DECOUPLE-FIRE fired at 42,28 although the
-			 * real order was GOTO_DEPOT -> 38,27). Compare depot indices
-			 * instead. */
-			at_order_dest = IsRailDepotTile(consist->tile) &&
-				cur_real->GetDestination().ToDepotID() == GetDepotIndex(consist->tile);
-		} else if (cur_real != nullptr && cur_real->IsType(OT_DECOUPLE)) {
-			/* R3R: entering a depot advances the real order from GOTO_DEPOT to
-			 * DECOUPLE (log evidence: real=5(15) with tileDepot=1 at tx=6 ty=30).
-			 * When the train is already on the depot tile under a DECOUPLE order,
-			 * treat that as "at destination" too — otherwise the gate stays false
-			 * and the depot decouple never fires. Station decouples keep
-			 * GOTO_STATION during dwell, so they already hit the first branch. */
-			at_order_dest = IsRailDepotTile(consist->tile);
+		/* R3R (2026-10-01, 拍板 3 A「不跨」+ 拍板 1「同 tick 闭环」): 解挂现在是
+		 * 一条"自带完成事件的命令" —— 只有当当前 real 索引就压在解挂上、且列车
+		 * 停稳在合法位置时才求值。旧的"(站在到站命令上) ∧ (下一条是解挂)"三合一
+		 * 形态连同它对 next_real 的依赖一并退场，因此不再跨越、不会顺手吃掉后面
+		 * 那条解挂（KI-281 的成因消失）。
+		 *
+		 * 位置合法性（§十 R-1）：判据不能只看链头那一格 —— 车长 > 站台时链头已
+		 * 越过站台末端并被打上 VehicleRailFlag::BeyondPlatformEnd
+		 * (train_cmd.cpp:616-639)，只看 consist->tile 会恒假、解挂永不触发。站台
+		 * 一侧改为"列车与该站的对应关系"：取链中第一辆真正在站台上的车
+		 * (Train::GetStationLoadingVehicle(), train.h:414-419) 判定。 */
+		if (cur_real != nullptr && cur_real->IsType(OT_DECOUPLE)) {
+			const bool in_depot = IsRailDepotTile(consist->tile);
+			const Train *plat = consist->GetStationLoadingVehicle();
+			const bool on_platform = plat != nullptr && IsTileType(plat->tile, TileType::Station);
+			at_order_dest = in_depot || on_platform;
 		}
 		if (at_order_dest) {
-			/* R3R: locate the NEXT REAL order by real index (wrapped), not by
-			 * cur_implicit_order_index+1. The implicit index drifts away from the
-			 * real index once a travel order expands into implicit sub-steps
-			 * (e.g. entering/occupying a depot), so implicit+1 no longer points
-			 * at the real DECOUPLE order when that order sits at the end of the
-			 * list. Reading by real index keeps arrival and "next order" aligned. */
-			bool should_decouple = false;
-			if (cur_real != nullptr && cur_real->IsType(OT_DECOUPLE)) {
-				/* Arrived in depot and the real order already advanced to
-				 * DECOUPLE — decouple directly, no "next order" check needed. */
-				should_decouple = true;
-			} else {
-				VehicleOrderID next_real = consist->cur_real_order_index + 1;
-				if (consist->GetNumOrders() > 0 && next_real >= consist->GetNumOrders()) next_real = 0;
-				const Order *next_order = consist->GetOrder(next_real);
-				should_decouple = (next_order != nullptr && next_order->IsType(OT_DECOUPLE));
-			}
+			const bool should_decouple = (cur_real != nullptr && cur_real->IsType(OT_DECOUPLE));
 			if (should_decouple) {
 				/* R3R (2026-09-23): a DECOUPLE order releases a part that is
 				 * coupled on. A chain that carries no coupled-on segment (no ★
@@ -14575,25 +17149,66 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						if (t->IsSegmentFront()) segs++;
 					}
 					const Train *eff = GetDecoupleVehicle(consist);
+					/* R3R (§十 R-1 现场复测, 2026-10-01): 站台内的车数与越界
+					 * （BeyondPlatformEnd）车数。车长 > 站台时链头并不在站台 tile
+					 * 上，这个计数是"位置合法性判据是否按预期命中"的唯一现场证据：
+					 * plat_in=0 而 plat_beyond>0 就说明命中的是超长列车那一支。 */
+					uint plat_in = 0, plat_beyond = 0;
+					for (const Train *t = consist; t != nullptr; t = t->Next()) {
+						if (t->flags.Test(VehicleRailFlag::BeyondPlatformEnd)) {
+							plat_beyond++;
+						} else if (IsTileType(t->tile, TileType::Station)) {
+							plat_in++;
+						}
+					}
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
-						fprintf(dbg, "DECOUPLE-FIRE consist=%d tx=%d ty=%d real=%d mode=%d num=%u segs=%u eff=%d\n",
+						fprintf(dbg, "DECOUPLE-FIRE consist=%d tx=%d ty=%d real=%d mode=%d num=%u segs=%u eff=%d plat=%u/%u\n",
 							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
 							(int)consist->cur_real_order_index,
 							dc_valid ? (int)dc_order->GetDecoupleBoundaryMode() : -1,
 							dc_valid ? (uint)dc_order->GetNumDecouple() : 0,
 							segs,
-							(eff != nullptr) ? (int)eff->index.base() : -1);
+							(eff != nullptr) ? (int)eff->index.base() : -1,
+							plat_in, plat_beyond);
 						fclose(dbg);
 					}
 				}
+				/* R3R (§十 R-2, 2026-10-01, 第 186 轮补)：快照必须【拆前】拍。
+				 * 拆链之后 consist->Next() 只覆盖仍连着它的那一半，被摘出去的另一半
+				 * 已经是一条独立的链 —— 而平台标志是按整车存的，两半都可能带
+				 * AdvanceInPlatform。只清一半的话，恰好是"解出的车底继续跑"的场景
+				 * （订单表里解挂后面没有 WAIT_COUPLE）残留限速，玩家看到的就是
+				 * "车底自己蠕动"。 */
+				std::vector<Train *> r3r_pre_split_chain;
+				for (Train *r3r_w = consist; r3r_w != nullptr; r3r_w = r3r_w->Next()) {
+					r3r_pre_split_chain.push_back(r3r_w);
+				}
 				DecoupleTrain(consist, true);
+
+				/* R3R (§十 R-2, 2026-10-01): 拆链改变了列车长度，平台对齐标志
+				 * （AdvanceInPlatform / BeyondPlatformEnd / NotYetInPlatform）从此
+				 * 描述的是【旧】列车。残留的 AdvanceInPlatform 会让下一次停站立刻
+				 * 进入 OT_LOADING_ADVANCE 并被限速 —— 即"耦合完成的列车蠕行出站"
+				 * （KI-128）。耦合路径早已显式清理（见 train_cmd.cpp 中 Couple 侧
+				 * "the platform-alignment flags ... describe the old consist" 一段），
+				 * 解挂路径此前漏了。这里对【拆前的整链】（两半都算）清掉
+				 * AdvanceInPlatform：它是唯一不会被下一次停站自动重算的标志
+				 * （BeyondPlatformEnd / NotYetInPlatform 由停站定位重新推导）。 */
+				for (Train *r3r_w : r3r_pre_split_chain) {
+					r3r_w->flags.Reset(VehicleRailFlag::AdvanceInPlatform);
+				}
 				{
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
-						fprintf(dbg, "LOCO-AFTER-DECOUPLE veh=%d curType=%d real=%d tile=%d,%d\n",
+						/* R3R (§十一 E): 落点索引与其订单类型 —— 拍板 3 A 之后，
+						 * "解挂执行完索引前进一格"必须能在这条日志上直接读出来。 */
+						const Order *const r3r_after = consist->GetNumOrders() > 0 ? consist->GetOrder(consist->cur_real_order_index) : nullptr;
+						fprintf(dbg, "LOCO-AFTER-DECOUPLE veh=%d curType=%d real=%d idxnext=%d tile=%d,%d\n",
 							(int)consist->index.base(), (int)consist->current_order.GetType(),
-							(int)consist->cur_real_order_index, (int)TileX(consist->tile), (int)TileY(consist->tile));
+							(int)consist->cur_real_order_index,
+							(r3r_after != nullptr) ? (int)r3r_after->GetType() : -1,
+							(int)TileX(consist->tile), (int)TileY(consist->tile));
 						if (consist->orders != nullptr) {
 							for (VehicleOrderID i = 0; i < consist->GetNumOrders(); ++i) {
 								const Order *o = consist->GetOrder(i);
@@ -14610,7 +17225,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				}
 			}
 		}
-	}
+	};
 
 	bool valid_order = !consist->current_order.IsType(OT_NOTHING) && consist->current_order.GetType() != OT_CONDITIONAL && !consist->current_order.IsSlotCounterOrder() && !consist->current_order.IsType(OT_LABEL);
 	/* R3R: ProcessOrders() calls UpdateVehicleTimetable() as soon as the train
@@ -14623,6 +17238,11 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	bool r3r_may_reverse;
 	{
 		R3RScopeTimer r3r_ord_timer(&r3r_ord_ns, &r3r_ord_calls);
+
+		/* R3R (第 206 轮探针, 只读): ProcessOrders 之前的基线，与下面的
+		 * post-processorders 配对，把"引擎订单处理"这一段单独框出来。 */
+		R3RWatchOrderIndex(consist, "pre-processorders");
+
 		/* R3R (KI-149): a decouple leaves the released part standing seam to
 		 * seam behind us, inside the same signal block. Turning around here
 		 * would drive us straight into it, so treat that direction as blocked
@@ -14631,6 +17251,11 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		r3r_may_reverse = ProcessOrders(consist) && CheckReverseTrain(consist) &&
 				R3RWaitingCoupleSeam(consist) != R3RSeamEnd::Back;
 	}
+	/* R3R 探针（item 3）：ProcessOrders 之后的快照。本行若出现 0->1，说明是
+	 * 引擎侧的订单处理（ProcessOrders / AdvanceOrdersFromVehiclePosition /
+	 * HandleLoading 内的推进）改了索引，而不是 R3R 的提交点。 */
+	R3RWatchOrderIndex(consist, "post-processorders");
+
 	if (r3r_may_reverse) {
 		consist->wait_counter = 0;
 		consist->cur_speed = 0;
@@ -14666,6 +17291,12 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	}
 
 	if (consist->current_order.IsType(OT_LOADING)) return true;
+
+	/* R3R (2026-10-01, 拍板 1「同 tick 闭环」): 闸门在这里求值 —— 站台的索引
+	 * 推进（HandleLoading → LeaveStation → IncrementImplicitOrderIndex，
+	 * vehicle.cpp:3895）刚在本 tick 上方发生，因此"索引落到解挂"与"执行解挂"
+	 * 落在同一 tick 内，列车不会带着"索引已在解挂"的状态起步。 */
+	r3r_try_decouple_arrival();
 
 	/* R3R: a WAIT_COUPLE order parks the train in place ANYWHERE (station platform
 	 * as well as depot). The CheckTrainStayInDepot-based check only covers depots;
@@ -14787,14 +17418,51 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		R3RScopeTimer r3r_stk_timer(&r3r_stk_ns, &r3r_stk_calls);
 		++consist->wait_counter;
 
+		/* R3R (KI-289, round 188)：先看清这台车为什么 Stuck。若它只是"在等一个还
+		 * 不存在的车底"（见 R3R_COUPLE_WAIT_HEAL_LIMIT 的注释），则把引擎的自愈
+		 * 掉头限制在 2 次以内；非等待态一字不动，引擎原行为完全保留。 */
+		const bool r3r_wait_no_target = _r3r_couple_no_target.count(consist->index) != 0;
+		uint32_t *r3r_heals = nullptr;
+		if (r3r_wait_no_target) {
+			r3r_heals = &_r3r_couple_wait_heals[consist->index];
+		} else {
+			_r3r_couple_wait_heals.erase(consist->index);
+		}
+		const bool r3r_heal_exhausted = r3r_heals != nullptr && *r3r_heals >= R3R_COUPLE_WAIT_HEAL_LIMIT;
+
 		/* Should we try reversing this tick if still stuck? */
 		bool turn_around = consist->wait_counter % (_settings_game.pf.wait_for_pbs_path * DAY_TICKS) == 0 && _settings_game.pf.reverse_at_signals;
+		if (r3r_heal_exhausted) turn_around = false;
 
 		if (!turn_around && consist->wait_counter % _settings_game.pf.path_backoff_interval != 0 && consist->force_proceed == TFP_NONE) return true;
 		TryPathReserveResultFlags path_result = TryPathReserveWithResultFlags(consist);
 		if ((path_result & TPRRF_RESERVATION_OK) == 0) {
 			/* Still stuck. */
-			if (turn_around || (path_result & TPRRF_REVERSE_AT_SIGNAL)) ReverseTrainDirection(consist);
+			const bool r3r_rev_wanted = turn_around || (path_result & TPRRF_REVERSE_AT_SIGNAL);
+			if (r3r_rev_wanted) {
+				if (r3r_heal_exhausted) {
+					/* R3R (KI-289)：自愈额度用完 —— 不再掉头，就站在原地等（车底一
+					 * 出现就会挂上；KI-193 的 4 次提交失败窗口仍是另一条兜底出口）。
+					 * 只在第一次抑制时打一行，免得刷屏。 */
+					if (*r3r_heals == R3R_COUPLE_WAIT_HEAL_LIMIT) {
+						++*r3r_heals;
+						R3RDbgWrite("COUPLE-WAIT-NOHEAL veh=%d tile=%d,%d real=%d wc=%u heals=%u turn_around=%d sig=%d (self-heal exhausted, waiting in place)\n",
+								(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+								(int)consist->cur_real_order_index, (unsigned)consist->wait_counter,
+								(unsigned)*r3r_heals, (int)turn_around, (int)(r3r_rev_wanted && !turn_around));
+					}
+				} else {
+					if (r3r_heals != nullptr) {
+						++*r3r_heals;
+						R3RDbgWrite("COUPLE-WAIT-HEAL veh=%d tile=%d,%d real=%d n=%u limit=%u turn_around=%d sig=%d (engine self-heal, waiting for a coupling target)\n",
+								(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+								(int)consist->cur_real_order_index, (unsigned)*r3r_heals,
+								(unsigned)R3R_COUPLE_WAIT_HEAL_LIMIT, (int)turn_around,
+								(int)(r3r_rev_wanted && !turn_around));
+					}
+					ReverseTrainDirection(consist);
+				}
+			}
 
 			if (consist->flags.Test(VehicleRailFlag::Stuck) && consist->wait_counter > 2 * _settings_game.pf.wait_for_pbs_path * DAY_TICKS) {
 				/* Show message to player. */
@@ -14991,6 +17659,13 @@ bool Train::Tick()
 
 		this->current_order_time++;
 
+		/* R3R (第 206 轮探针, 只读): tick 边界基线。Train::Tick() 只被链头
+		 * 调用（Vehicle::Tick 里走 front->Train::Tick()），所以这一对就是
+		 * "每个链头每 tick" 的边界。判定口径：上一 tick 的 tick-out 与本次
+		 * tick-in 之间的差 = 在 tick 之外（命令队列 / 读档末 / 其它子系统）
+		 * 被写出来的，与任何 handler 内的站点无关。 */
+		R3RWatchOrderIndex(this, "tick-in");
+
 		if (!TrainLocoHandler(this, false)) return false;
 
 		/* R3R: TryTrainCouple 的换端重排(head != v → R3RRelocateFrontIdentity)
@@ -15000,9 +17675,16 @@ bool Train::Tick()
 		 * 次 handler,会在 UpdateSpeed → GetAcceleration 里对 cached_weight == 0
 		 * 除零崩溃(C0000094)。跳过本次 tick,由下一 tick(缓存已重建)的新链头
 		 * 接管。 */
-		if (!this->IsFrontEngine()) return true;
+		if (!this->IsFrontEngine()) {
+			R3RWatchOrderIndex(this, "tick-out-leftchain");
+			return true;
+		}
 
-		return TrainLocoHandler(this, true);
+		/* R3R (第 206 轮探针, 只读): 本 tick 收尾的索引。第二次 handler 可能删车，
+		 * 故只在链头仍存活时打点（返回值语义与原来逐字相同）。 */
+		const bool r3r_tick_alive = TrainLocoHandler(this, true);
+		if (r3r_tick_alive) R3RWatchOrderIndex(this, "tick-out");
+		return r3r_tick_alive;
 	} else if (this->IsFreeWagon() && this->vehstatus.Test(VehState::Crashed)) {
 		/* Delete flooded standalone wagon chain */
 		if (++this->crash_anim_pos >= 4400) {
@@ -15022,6 +17704,9 @@ static void CheckIfTrainNeedsService(Train *v)
 {
 	if (Company::Get(v->owner)->settings.vehicle.servint_trains == 0 || !v->NeedsAutomaticServicing()) return;
 	if (v->IsChainInDepot()) {
+		/* R3R (第 206 轮探针, 只读): 库内列车走这条自动检修分支。它本身不改订单
+		 * 索引，加点是把它变成"库里链头在 tick 之外被 OnPeriodic 触及过"的基线。 */
+		R3RWatchOrderIndex(v, "svc-in-depot");
 		VehicleServiceInDepot(v);
 		return;
 	}

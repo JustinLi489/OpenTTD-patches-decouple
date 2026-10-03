@@ -256,6 +256,9 @@ static void Load_ORDR()
 		while ((index = SlIterateArray()) != -1) {
 			OrderPoolItem *item = OrderPoolItem::CreateAtIndex(OrderID(index));
 			SlObjectLoadFiltered(&item->order, slt);
+			/* R3R (KI-302): savegames written before the order type encoding fix
+			 * stored OT_GOTO_COUPLE/OT_WAIT_COUPLE in bit 4. Migrate those bytes. */
+			item->order.R3RMigrateOldTypeEncoding(SlXvIsFeatureMissing(XSLFI_R3R_ORDER_TYPE_ENC));
 			item->next_ref = _order_item_ref;
 		}
 	}

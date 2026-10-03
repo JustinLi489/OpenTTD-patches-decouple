@@ -3269,7 +3269,8 @@ public:
 				VehicleOrderID sel = this->OrderGetSel();
 				const Order *order = this->vehicle->GetOrder(sel);
 				if (order == nullptr || !order->IsType(OT_GOTO_COUPLE)) return {};
-				return GetString(STR_ORDER_COUPLE_SIDE_SEL, GetString(order->GetCoupleSide() == OCS_REAR ? STR_ORDER_COUPLE_SIDE_REAR : STR_ORDER_COUPLE_SIDE_FRONT));
+				/* R3R (KI-262): {STRING} wants the StringID, not the rendered text. */
+				return GetString(STR_ORDER_COUPLE_SIDE_SEL, order->GetCoupleSide() == OCS_REAR ? STR_ORDER_COUPLE_SIDE_REAR : STR_ORDER_COUPLE_SIDE_FRONT);
 			}
 
 			case WID_O_COUPLE_TEMP_GROUP: { // R3R (KI-170): couple group joined while the order runs
@@ -4834,8 +4835,13 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 				 * order that targets a station; plane 3 = the same plus the couple
 				 * side, which is only offered for coupling orders that target a depot
 				 * (KI-170 / KI-172). Plane 4 = couple group offered by a waiting order
-				 * (WAIT_COUPLE, KI-225). All planes are 60px wide in total, so
-				 * switching between them never changes the smallest window size. */
+				 * (WAIT_COUPLE, KI-225).
+				 *
+				 * R3R (KI-262, 第 162 轮): every plane of this selection MUST stay
+				 * within 60px, because the whole top row is an #NWidContainerFlag::
+				 * EqualSize container: its width is (widest child * number of
+				 * children), so ONE wide plane inflates all slots and with them the
+				 * minimum width of the window. */
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_YARD),
 					NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(60, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
 					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_R3R_YARD), SetMinimalSize(60, 12), SetFill(1, 0),

@@ -369,7 +369,7 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 	fprintf(dbg, "MAKESEG %s head=%d\n", tag, (int)head->index.base());
 	int i = 0;
 	for (const Train *w = head; w != nullptr; w = w->Next()) {
-		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d) eng=%d\n",
+		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d SB=%d) eng=%d\n",
 			tag,
 			(int)w->index.base(),
 			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
@@ -382,12 +382,163 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 			HasBit(w->subtype, GVSF_ARTICULATED_PART) ? 1 : 0,
 			w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
 			w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
-			w->flags.Test(VehicleRailFlag::SegmentFront) ? 1 : 0,
+			w->IsSegmentFront() ? 1 : 0,
+			w->IsSegmentBack() ? 1 : 0,
 			(int)w->engine_type.base());
 		if (++i > 60) break;
 	}
 	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
 	fclose(dbg);
+}
+
+/**
+ * R3R (第 179 轮, KI-270 补): one-line evidence that a clone reproduced *every*
+ * segment boundary marker of its source.
+ *
+ * R3RDumpUpgradeDbg() above only prints when the clone went through the
+ * de-articulation path (r3r_identity_rebuilt), i.e. when the source carried a
+ * de-articulated group. The hole this round closes is exactly the one that path
+ * does not cover: a multi-section chain whose section heads are plain real
+ * locomotives. Without this probe the widening would be unverifiable in game, so
+ * a clone whose source carries more than the trivial single ★ on its head (or
+ * whose marker counts do not match) always leaves one line behind.
+ *
+ * Read-only; the walk is bounded so a broken chain cannot turn it into a hang.
+ */
+static void R3RDbgCloneMarkers(const Train *src, const Train *dst)
+{
+	if (src == nullptr || dst == nullptr || !R3RDbgOn()) return;
+
+	uint n_src_front = 0, n_dst_front = 0;
+	uint n_src_back = 0, n_dst_back = 0;
+	uint diff = 0, n = 0;
+	const Train *s = src;
+	const Train *d = dst;
+	for (; s != nullptr && d != nullptr && n < 512; s = s->Next(), d = d->Next(), n++) {
+		const bool s_front = s->IsSegmentFront();
+		const bool d_front = d->IsSegmentFront();
+		const bool s_back = s->IsSegmentBack();
+		const bool d_back = d->IsSegmentBack();
+		if (s_front) n_src_front++;
+		if (d_front) n_dst_front++;
+		if (s_back) n_src_back++;
+		if (d_back) n_dst_back++;
+		if (s_front != d_front || s_back != d_back) diff++;
+	}
+
+	/* The uninteresting case is the plain single-section train: exactly one ★ on
+	 * the head and no ⊗ anywhere. Everything else is logged, so "the log has no
+	 * CLONE-MARKERS" keeps meaning "there was nothing multi-section to copy". */
+	if (n_src_front <= 1 && n_src_back == 0 && n_src_front == n_dst_front &&
+			n_src_back == n_dst_back && diff == 0) {
+		return;
+	}
+
+	R3RDbgWrite("CLONE-MARKERS src=%d dst=%d cars=%u srcSF=%u dstSF=%u srcSB=%u dstSB=%u diff=%u%s\n",
+			(int)src->index.base(), (int)dst->index.base(), n,
+			n_src_front, n_dst_front, n_src_back, n_dst_back, diff,
+			diff == 0 ? "" : " REPORT-THIS-MISMATCH");
+}
+
+/**
+ * R3R: split ONE real articulated group -- the parent @p v plus the contiguous
+ * articulated parts right after it -- into independent vehicles, with the baked
+ * per-vehicle statistics and the explicit group roles (ArticGroupHead on the
+ * former parent, ArticGroupMember on the former parts). This is the single-group
+ * form of #DearticulateChainWithSnapshot and behaves exactly like it: statistics
+ * are snapshotted while the chain is still articulated and distributed evenly
+ * across the group (the integer remainder rides on the head), and each member
+ * gains a plain engine/wagon identity from its record before its role flag is
+ * raised.
+ *
+ * It is used in two places: by #DearticulateChainWithSnapshot for every group of
+ * a chain, and by CloneVehicle() so that a copied group does not come back as a
+ * genuine articulated group (see the clone loop).
+ * @pre @p v is followed by at least one *real* articulated part.
+ * @param v Group parent (the former articulated head).
+ * @return First vehicle after the group (nullptr if the group is at the tail).
+ */
+static Train *R3RDearticulateOneGroup(Train *v)
+{
+	/* Snapshot the group statistics while the chain is still articulated. */
+	const uint16_t total_weight = v->GetWeightWithoutCargo();
+	const uint16_t total_power = v->GetPowerSnapshot();
+	const uint16_t max_speed = GetVehicleProperty(v, PROP_TRAIN_SPEED, RailVehInfo(v->engine_type)->max_speed);
+	const bool wagon_type = RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
+
+	/* Count the contiguous parts and remember the vehicle after the group. */
+	Train *part = v->GetNextArticulatedPart();
+	Train *nxt = part;
+	uint n_total = 1;
+	for (; nxt != nullptr && nxt->IsArticulatedPart(); nxt = nxt->Next()) n_total++;
+
+	const uint16_t w_q = total_weight / n_total;
+	const uint16_t w_r = total_weight % n_total;
+	const uint16_t p_q = total_power / n_total;
+	const uint16_t p_r = total_power % n_total;
+
+	/* The former parent keeps its real-vehicle identity; it gains the group
+	 * role and its baked share (the integer remainder rides on the head). */
+	v->SetArticGroupHead();
+	v->weight_override = w_q + w_r;
+	v->power_override = p_q + p_r;
+	v->max_speed_override = max_speed;
+
+	/* Split every part into a real vehicle with a baked share. */
+	for (Train *p = part; p != nxt; p = p->Next()) {
+		p->ClearArticulatedPart();
+		if (wagon_type) {
+			p->SetWagon();
+		} else {
+			p->SetEngine();
+		}
+		p->SetArticGroupMember();
+		p->weight_override = w_q;
+		p->power_override = p_q;
+		p->max_speed_override = max_speed;
+	}
+
+	return nxt;
+}
+
+/**
+ * R3R (KI-270, 2026-10-01): mirror the R3R segment-boundary markers of one
+ * vehicle onto another.
+ *
+ * BuildVehicle() only ever produces a plain vehicle, so nothing the R3R segment
+ * layer granted to the source survives the copy on its own. The two boundary
+ * markers are ★ (VehicleRailFlag::SegmentFront, the segment's left boundary /
+ * chain-head side) and ⊗ (VehicleRailFlag::SegmentBack, its right boundary).
+ * Without them the copy is not a segment any more: both the couple gate and the
+ * demote gate test IsSegmentFront() on the chain head, so a cloned segment
+ * could be neither demoted nor coupled onto.
+ *
+ * KI-223 added such a mirror, but only inside the "car-only formation" branch
+ * (a fake engine built out of a wagon), so it only ever ran when the segment
+ * head was a pseudo engine. Copying a segment whose head is a *real* locomotive
+ * -- in particular the head of a de-articulated group -- silently dropped ★:
+ * the debug log showed "CLONE-SRC veh=24 ... SF=1" against "CLONE-DST veh=69
+ * ... SF=0" for the very same 3-car locomotive segment.
+ *
+ * Both bits are mirrored in both directions (set *and* clear) so that the clone
+ * is an exact reproduction; a freshly built vehicle never carries either bit,
+ * so the clearing half is a no-op in the common case.
+ * @param src Source vehicle.
+ * @param dst Its clone.
+ */
+static void R3RMirrorSegmentMarkers(const Train *src, Train *dst)
+{
+	if (src == nullptr || dst == nullptr) return;
+	if (src->IsSegmentFront()) {
+		dst->SetSegmentFront();
+	} else {
+		dst->ClearSegmentFront();
+	}
+	if (src->IsSegmentBack()) {
+		dst->SetSegmentBack();
+	} else {
+		dst->ClearSegmentBack();
+	}
 }
 
 /**
@@ -413,7 +564,14 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
  * its role flag is raised.
  * @param head Chain head of the (whole, independent) chain being upgraded.
  */
-static void DearticulateChainWithSnapshot(Train *head)
+/* R3R (第 180 轮 / 选项 C): no longer file-local. train_cmd.cpp calls it once
+ * per consist at load time to migrate a legacy chain that carries both the
+ * segment markers (★/⊗) and genuine articulated parts -- a state the round-176
+ * gates no longer allow to be produced, but which old savegames still contain
+ * (see R3RDearticulateLegacyArticSegment in train_cmd.cpp). It is declared
+ * there by hand rather than in vehicle_cmd.h, so that this change stays
+ * .cpp-only and the KI-183 build guard does not drop every object file. */
+void DearticulateChainWithSnapshot(Train *head)
 {
 	for (Train *v = head; v != nullptr;) {
 		/* Only *real* articulated groups (derived from the subtype bit) are split;
@@ -426,45 +584,7 @@ static void DearticulateChainWithSnapshot(Train *head)
 			continue;
 		}
 
-		/* Snapshot the group statistics while the chain is still articulated. */
-		const uint16_t total_weight = v->GetWeightWithoutCargo();
-		const uint16_t total_power = v->GetPowerSnapshot();
-		const uint16_t max_speed = GetVehicleProperty(v, PROP_TRAIN_SPEED, RailVehInfo(v->engine_type)->max_speed);
-		const bool wagon_type = RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
-
-		/* Count the contiguous parts and remember the vehicle after the group. */
-		Train *part = v->GetNextArticulatedPart();
-		Train *nxt = part;
-		uint n_total = 1;
-		for (; nxt != nullptr && nxt->IsArticulatedPart(); nxt = nxt->Next()) n_total++;
-
-		const uint16_t w_q = total_weight / n_total;
-		const uint16_t w_r = total_weight % n_total;
-		const uint16_t p_q = total_power / n_total;
-		const uint16_t p_r = total_power % n_total;
-
-		/* The former parent keeps its real-vehicle identity; it gains the group
-		 * role and its baked share (the integer remainder rides on the head). */
-		v->SetArticGroupHead();
-		v->weight_override = w_q + w_r;
-		v->power_override = p_q + p_r;
-		v->max_speed_override = max_speed;
-
-		/* Split every part into a real vehicle with a baked share. */
-		for (Train *p = part; p != nxt; p = p->Next()) {
-			p->ClearArticulatedPart();
-			if (wagon_type) {
-				p->SetWagon();
-			} else {
-				p->SetEngine();
-			}
-			p->SetArticGroupMember();
-			p->weight_override = w_q;
-			p->power_override = p_q;
-			p->max_speed_override = max_speed;
-		}
-
-		v = nxt;
+		v = R3RDearticulateOneGroup(v);
 	}
 }
 
@@ -1421,9 +1541,27 @@ bool IsUniqueVehicleName(std::string_view name)
  */
 static void CloneVehicleName(const Vehicle *src, Vehicle *dst)
 {
-	std::string new_name = src->name.c_str();
+	/* R3R (第 179 轮, KI-245 同类点): src->name is a TinyString, whose c_str()
+	 * is a *nullptr* while the name is empty, and constructing a std::string from
+	 * that nullptr dereferences address 0 inside strlen with no assertion. The
+	 * only call site below is guarded by "!v_front->name.empty()", so this is a
+	 * latent hazard rather than a live crash, but there is no reason to keep it:
+	 * going through the implicit string_view conversion (the same idiom used by
+	 * R3RSyncSegmentTraits and R3RSyncHiddenSegmentTraits) is total, never
+	 * touches a null pointer, and retires the hazard class for good. */
+	std::string new_name(static_cast<std::string_view>(src->name));
 
-	if (!std::isdigit(*new_name.rbegin())) {
+	/* R3R (KI-269, 2026-10-01): std::isdigit() is only defined for values in
+	 * the range of unsigned char or EOF. Passing a plain (signed) char is
+	 * undefined behaviour and trips the MSVC debug-CRT assertion inside
+	 * _chvalidator as soon as the value is negative -- which is exactly what a
+	 * UTF-8 name ending in a non-ASCII byte looks like (a Chinese vehicle name
+	 * ends in a byte >= 0x80, i.e. negative as a signed char). Cloning a
+	 * vehicle that carries such a custom name crashed the game right here
+	 * (crash log stack: CmdCloneVehicle -> CloneVehicleName -> isdigit ->
+	 * _chvalidator, exception 80000003). Cast to unsigned char, and guard the
+	 * empty string (back() on an empty string is undefined). */
+	if (new_name.empty() || !std::isdigit(static_cast<unsigned char>(new_name.back()))) {
 		// No digit at the end, so start at number 1 (this will get incremented to 2)
 		new_name += " 1";
 	}
@@ -1436,7 +1574,7 @@ static void CloneVehicleName(const Vehicle *src, Vehicle *dst)
 			new_name[pos] = '0';
 		}
 
-		if (pos != std::string::npos && std::isdigit(new_name[pos])) {
+		if (pos != std::string::npos && std::isdigit(static_cast<unsigned char>(new_name[pos]))) {
 			++new_name[pos];
 		} else {
 			new_name[++pos] = '1';
@@ -2077,9 +2215,13 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				 * SegmentBack) and are not copied by BuildVehicle(), so without this
 				 * the copy of a segment is not a segment any more: it is neither a
 				 * legal demote target nor a legal couple target, because both gates
-				 * test IsSegmentFront() on the chain head. */
-				if (src->IsSegmentFront()) dst->SetSegmentFront();
-				if (src->IsSegmentBack()) dst->SetSegmentBack();
+				 * test IsSegmentFront() on the chain head.
+				 * KI-270 / 第 179 轮: the mirror itself lives in
+				 * R3RMirrorSegmentMarkers(), which the post-build lock-step walk
+				 * applies to *every* car of the clone. This branch is the one place
+				 * that still has to do it during the build, because the
+				 * MoveRailVehicle() further below needs the engine bit set first. */
+				R3RMirrorSegmentMarkers(src, dst);
 				/* R3R (KI-223, 2026-09-27): a pseudo engine that becomes a chain
 				 * head has to be marked as stopped in the depot.
 				 * IsStoppedInDepot() (vehicle_base.h) demands VehState::Stopped from
@@ -2108,10 +2250,157 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 	} while (v->type == VehicleType::Train && (v = v->GetNextVehicle()) != nullptr);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
+		/* R3R (2026-09-30, R170-A 根因): a de-articulated group must not come back
+		 * as a genuine articulated group on the clone.
+		 *
+		 * The source consist may have been split into independent vehicles
+		 * (DearticulateChainWithSnapshot(): explicit ArticGroupHead /
+		 * ArticGroupMember roles plus baked per-vehicle statistics), while
+		 * BuildVehicle() builds the parts of the engine record as *genuine*
+		 * articulated parts -- both CmdBuildRailVehicle() and CmdBuildRailWagon()
+		 * call AddArticulatedParts(). The build loop above never saw the source
+		 * members as separate vehicles, because GetNextVehicle() /
+		 * HasArticulatedPart() speak the semantic group layer and therefore step
+		 * over the source members *and* over the clone's genuine parts alike.
+		 *
+		 * The copy was therefore read as a genuine articulated group ("the copied
+		 * train is read as real artic"): the baked overrides and the whole
+		 * group-role layer were lost, and every consumer that tests the group
+		 * roles (NewGRF position-in-consist, the segment/flip machinery, moving
+		 * blocks) saw a completely different train than the original -- the root
+		 * cause of the R170-A report.
+		 *
+		 * Walk source and clone in lock-step at "unit" level (GetNextVehicle()
+		 * steps over group members and genuine parts on either side, so the pairs
+		 * stay aligned) and split the clone wherever the *source* group carries
+		 * the explicit head role. A genuine articulated group on the source stays
+		 * genuine on the clone -- only de-articulated groups are split. */
+		if (w_front != nullptr && w_front->type == VehicleType::Train &&
+				v_front != nullptr && v_front->type == VehicleType::Train) {
+			Train *src_walk = Train::From(v_front);
+			Train *dst_walk = Train::From(w_front);
+			bool group_mismatch = false;
+
+			while (src_walk != nullptr && dst_walk != nullptr) {
+				/* R3R (第 179 轮, KI-270 补): mirror the segment boundary markers
+				 * here, on *every* unit the walk visits -- not just on the two
+				 * special cases below.
+				 *
+				 * The previous round mirrored ★/⊗ in three separate places: the
+				 * KI-223 branch inside the build loop (only for a "car-only
+				 * formation", i.e. a pseudo engine built out of a wagon), the head
+				 * of a de-articulated group, and finally the clone's chain head as
+				 * a safety net. A car that is none of those -- in particular the
+				 * head of a *real locomotive* segment in the middle of a
+				 * multi-section chain (double heading, or simply any segment whose
+				 * head is a genuine locomotive instead of a pseudo engine) -- was
+				 * covered by neither branch, so the copy of that segment silently
+				 * lost ★ and was no longer a segment. Consolidating the mirror into
+				 * the single walk that already visits every car closes that hole:
+				 * whatever the source carries, the copy carries too.
+				 *
+				 * GetNextVehicle() steps over group members and genuine articulated
+				 * parts on both sides, so the pairs stay aligned; the members are
+				 * handled by the member loop further below (they are the only cars
+				 * this walk does not visit). */
+				R3RMirrorSegmentMarkers(src_walk, dst_walk);
+
+				if (src_walk->flags.Test(VehicleRailFlag::ArticGroupHead)) {
+					/* Count the source members and the clone's genuine parts. The
+					 * copy is faithful only when both counts agree: the clone's
+					 * parts come from the engine record, which generates exactly
+					 * the group's parts, so a mismatch means the source group is
+					 * not a pure de-articulated group and cannot be reproduced by
+					 * splitting. */
+					uint n_src = 0;
+					for (const Train *p = src_walk->Next(); p != nullptr && p->flags.Test(VehicleRailFlag::ArticGroupMember); p = p->Next()) n_src++;
+
+					const bool dst_has_parts = dst_walk->Next() != nullptr && dst_walk->Next()->IsArticulatedPart();
+					uint n_dst = 0;
+					if (dst_has_parts) {
+						for (const Train *p = dst_walk->Next(); p != nullptr && p->IsArticulatedPart(); p = p->Next()) n_dst++;
+					}
+
+					if (n_src != n_dst) {
+						R3RDbgWrite("R3R-CLONE-GROUP-MISMATCH src=%d dst=%d n_src=%u n_dst=%u -> sell clone\n",
+								(int)src_walk->index.base(), (int)dst_walk->index.base(), n_src, n_dst);
+						group_mismatch = true;
+						break;
+					}
+
+					if (n_dst > 0) {
+						/* Same split as on the source: real vehicles again, with the
+						 * baked shares and the explicit group roles. The head's own
+						 * boundary markers were already mirrored at the top of this
+						 * loop iteration. */
+						R3RDearticulateOneGroup(dst_walk);
+
+						/* Then mirror the per-vehicle identity of every member. The
+						 * plain engine/wagon bit already came from the split (it
+						 * follows the group's engine record), but an identity the
+						 * R3R segment layer granted to an individual member is not
+						 * derivable from the record: a segment tail is a "fake
+						 * engine" wagon (SetSegmentTailFakeEngine()) and an inner
+						 * member can carry the segment boundary markers. Copy the
+						 * source's bits so the copy is an exact reproduction. */
+						for (Train *sm = src_walk->Next(), *dm = dst_walk->Next();
+								sm != nullptr && dm != nullptr &&
+								sm->flags.Test(VehicleRailFlag::ArticGroupMember) && dm->flags.Test(VehicleRailFlag::ArticGroupMember);
+								sm = sm->Next(), dm = dm->Next()) {
+							if (sm->IsEngine()) {
+								dm->SetEngine();
+								dm->ClearWagon();
+								dm->ClearFreeWagon();
+								if (sm->IsFrontEngine()) dm->SetFrontEngine();
+								if (sm->vehstatus.Test(VehState::Stopped)) dm->vehstatus.Set(VehState::Stopped);
+							}
+							R3RMirrorSegmentMarkers(sm, dm);
+						}
+
+						r3r_identity_rebuilt = true;
+					}
+				}
+
+				src_walk = src_walk->GetNextVehicle();
+				dst_walk = dst_walk->GetNextVehicle();
+			}
+
+			if (group_mismatch) {
+				/* Not a faithful copy: rather than hand the player a train that
+				 * reads as genuine artic (and then gets moved/flipped as one), roll
+				 * the whole clone back -- buy nothing instead of buying something
+				 * broken. */
+				Command<Commands::SellVehicle>::Do(flags, w_front->tile, w_front->index, SellVehicleFlags::SellChain, INVALID_CLIENT_ID);
+				return CommandCost(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST);
+			}
+
+			/* R3R (第 179 轮): evidence for the multi-section case, which no other
+			 * probe covers. One line per clone that had something to copy. */
+			R3RDbgCloneMarkers(Train::From(v_front), Train::From(w_front));
+		}
+
+		/* R3R (第 179 轮): the "clone's chain head as a safety net" block that
+		 * used to live here is gone. The lock-step walk above now mirrors ★/⊗
+		 * on every car it visits, and its guard is the same
+		 * "both heads exist and are trains" condition this block used, so the
+		 * head is covered by the walk exactly whenever it was covered here --
+		 * keeping a second copy of the same rule is what let the middle-car hole
+		 * of KI-270 open in the first place. */
+
 		/* R3R (KI-129): refresh the clone after pseudo-engine identities were
 		 * restored on cars that are not the head (see above). ConsistChanged()
 		 * may only be called on a chain head, hence it is deferred to here. */
 		if (r3r_identity_rebuilt && w_front != nullptr && w_front->type == VehicleType::Train) {
+			/* R3R debug: make the result of the de-articulation checkable from
+			 * the log. CLONE-SRC / CLONE-DST dump every vehicle's subtype bits
+			 * and R3R rail flags (artic / AH / AM / SF), so a "the copy came
+			 * back as genuine artic" regression is visible by comparing the two
+			 * blocks: the clone must show the same de-articulated pattern as the
+			 * source (artic=0, head with AH=1, every part with AM=1). The dumps
+			 * are only written when the source actually carried de-articulated
+			 * groups -- a genuine articulated source produces no log line. */
+			R3RDumpUpgradeDbg(Train::From(v_front), "CLONE-SRC");
+			R3RDumpUpgradeDbg(Train::From(w_front), "CLONE-DST");
 			Train::From(w_front)->ConsistChanged(CCF_ARRANGE);
 		}
 
@@ -2337,6 +2626,11 @@ CommandCost CmdRenameVehicle(DoCommandFlags flags, VehicleID veh_id, const std::
 		} else {
 			v->name = text;
 		}
+		/* R3R (第 155 轮 / 落地清单 ③): the name is a trait of the segment, so the row of
+		 * the control segment is kept in step right here and not only at the next commit
+		 * point (R3RSettleChainSegments). A single segment chain has no row and this is a
+		 * no-op there, exactly like for the other vehicle types. */
+		R3RSegmentStoreTraits(v);
 		InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type), 1);
 		InvalidateWindowClassesData(WindowClass::DepartureBoard);
 		MarkWholeScreenDirty();

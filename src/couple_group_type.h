@@ -57,4 +57,27 @@ inline CoupleGroupMask R3RCoupleGroupBit(CoupleGroupID group)
 	return (group.base() < R3R_COUPLE_GROUP_MASK_BITS) ? (CoupleGroupMask(1) << group.base()) : COUPLE_GROUP_MASK_NONE;
 }
 
+/**
+ * R3R (第 152 轮): the segment identity a car carries while it has none.
+ *
+ * Every car stores the ID of the segment it belongs to in
+ * #Vehicle::r3r_segment_id, so a segment keeps its identity -- its schedule,
+ * its unit number, its name and its train group -- when the physical front
+ * marker (#VehicleRailFlag::SegmentFront) moves, when cars are spliced in or
+ * out, or when the vehicle pool is shuffled by unrelated deletions. The
+ * identity data itself lives in the segment table (see #R3RSegmentRecord),
+ * which is what makes moving the marker free: only the marker moves, never the
+ * data.
+ *
+ * 0 is never a valid segment ID. A chain which consists of a single segment has
+ * no second identity to keep apart -- the chain head's own fields are the only
+ * authority -- so its cars keep this value and nothing about a plain train is
+ * ever written to the savegame or looked up in the table. IDs are handed out
+ * the moment a chain really holds two or more segments, see R3RSegmentAlloc().
+ */
+static constexpr uint16_t R3R_SEGMENT_NONE = 0;
+
+/** R3R (第 152 轮): the highest segment ID the identity table can hand out. */
+static constexpr uint16_t R3R_SEGMENT_ID_MAX = 0xFFFE;
+
 #endif /* COUPLE_GROUP_TYPE_H */

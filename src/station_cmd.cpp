@@ -2083,7 +2083,10 @@ void R3REnumeratePlatforms(const Station *st, std::vector<TileIndex> &out)
 	const TileArea &ta = st->train_station;
 	if (ta.tile == INVALID_TILE) return;
 
-	for (TileIndex t = ta.tile; t < ta.tile + ta.w * ta.h; t++) {
+	/* 必须用 TileArea 的二维迭代器：车站的 train_station 是矩形（w × h），
+	 * 线性递增 t 只在 h == 1 时才是矩形遍历，否则只会扫到第一行、漏掉其余站台
+	 * （玩家报的「一次性建设的站台都算作一个站台」）。 */
+	for (TileIndex t : ta) {
 		if (!st->TileBelongsToRailStation(t)) continue; // 跳过空洞 / 属于别的车站的 tile
 		if (!R3RIsPlatformNorthEnd(t)) continue;        // 每个平台只取北端一次
 		out.push_back(t);

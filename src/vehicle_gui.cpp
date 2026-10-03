@@ -22,6 +22,7 @@
 #include "train_cmd.h"
 #include "aircraft.h"
 #include "depot_map.h"
+#include "group.h"
 #include "group_cmd.h"
 #include "group_gui.h"
 #include "couple_group.h"
@@ -344,6 +345,9 @@ void BaseVehicleListWindow::CountOwnVehicles()
 {
 	this->own_vehicles = 0;
 	for (const GUIVehicleGroup &vg : this->vehgroups) {
+		/* R3R (第 155 轮 / 落地清单 ⑤): a segment sub-row shares its chain, so counting it
+		 * would count one train twice. */
+		if (vg.R3RIsSegmentSubRow()) continue;
 		if ((*(vg.vehicles_begin))->owner == _local_company) this->own_vehicles++;
 	}
 	this->own_company = _local_company;
@@ -370,9 +374,33 @@ void BaseVehicleListWindow::BuildVehicleList()
 	if (this->grouping == GB_NONE) {
 		uint max_unitnumber = 0;
 		for (auto it = this->vehicles.begin(); it != this->vehicles.end(); ++it) {
+			const Vehicle *const v = *it;
 			this->vehgroups.emplace_back(it, it + 1);
 
-			max_unitnumber = std::max<uint>(max_unitnumber, (*it)->unitnumber);
+			max_unitnumber = std::max<uint>(max_unitnumber, v->unitnumber);
+
+			/* R3R (第 155 轮 / 落地清单 ⑤): the segments of a coupled consist which are not
+			 * the control segment would otherwise be invisible -- the list enumerates chains
+			 * only. Give each of them a sub-row directly below the chain's row, sharing that
+			 * row's iterators (so every chain-wide figure stays the chain's) and carrying its
+			 * own segment in r3r_hidden_section (so its identity is read from the segment
+			 * table, P3). R3RReorderSegmentSubRows() keeps the sub-rows next to their chain
+			 * once the list has been sorted. */
+			if (v->type != VehicleType::Train) continue;
+			/* R3R (第 156 轮 / 落地清单 ⑤ 残留): in a group's vehicle list only the segments
+			 * which really are in that group get a sub-row. This list includes a chain when
+			 * the group is the one of its control segment -- or of any of its hidden segments
+			 * (vehiclelist.cpp), so without this filter a segment of a neighbouring group
+			 * would show up as a sub-row of this group's train. */
+			const bool filter_by_group = (this->vli.type == VL_GROUP_LIST && this->vli.index != ALL_GROUP);
+			const GroupID list_group = filter_by_group ? this->vli.ToGroupID() : GroupID::Invalid();
+			for (const Vehicle *const seg : R3RSegmentHiddenHeads(v)) {
+				if (filter_by_group && !GroupIsInGroup(R3RSegmentSectionGroupID(seg), list_group)) continue;
+				this->vehgroups.emplace_back(it, it + 1, seg);
+				/* R3R (第 170 轮 / R170-C): the sub-row is drawn with the section accessors,
+				 * so the column width has to be reserved for those numbers as well. */
+				max_unitnumber = std::max<uint>(max_unitnumber, R3RSegmentSectionUnitNumber(seg));
+			}
 		}
 		this->unitnumber_digits = CountDigitsForAllocatingSpace(max_unitnumber);
 	} else {
@@ -676,9 +704,71 @@ static const Vehicle *_last_vehicle[2] = { nullptr, nullptr };
 
 static btree::btree_map<VehicleID, int> _vehicle_max_speed_loaded;
 
+/**
+ * R3R (第 155 轮 / 落地清单 ⑤): move every segment sub-row right below the chain it
+ * belongs to.
+ *
+ * A sub-row is only known through the chain it shares its iterators with, which is
+ * also what the sorter compares it by (GUIVehicleGroup::r3r_hidden_section is
+ * deliberately not part of any sort key). std::sort is not stable, so it is free to
+ * put a sub-row before its chain or to leave the sub-rows of one chain apart from
+ * each other; the segments of a train are easier to read when they follow their
+ * chain in chain order, so the order is rebuilt here after every sort.
+ *
+ * Sub-rows are appended after their chain, which keeps this a partition of the same
+ * element set: nothing is dropped or duplicated.
+ */
+void BaseVehicleListWindow::R3RReorderSegmentSubRows()
+{
+	/* Without a sub-row there is nothing to reorder, and the common case (no coupled
+	 * consist in the list at all) pays only this scan. */
+	bool have_sub_row = false;
+	for (const GUIVehicleGroup &vg : this->vehgroups) {
+		if (vg.R3RIsSegmentSubRow()) {
+			have_sub_row = true;
+			break;
+		}
+	}
+	if (!have_sub_row) return;
+
+	/* Group the sub-rows by the chain they belong to (their shared front car), so that
+	 * one pass over the list can emit every chain followed by its own segments. */
+	std::unordered_map<const Vehicle *, std::vector<GUIVehicleGroup>> sub_rows;
+	for (const GUIVehicleGroup &vg : this->vehgroups) {
+		if (!vg.R3RIsSegmentSubRow()) continue;
+		sub_rows[vg.vehicles_begin[0]].push_back(vg);
+	}
+
+	/* The sorter may have shuffled the sub-rows of one chain among each other as well;
+	 * put them back into chain order. */
+	for (auto &entry : sub_rows) {
+		std::stable_sort(entry.second.begin(), entry.second.end(), [](const GUIVehicleGroup &a, const GUIVehicleGroup &b) {
+			uint a_pos = 0, b_pos = 0;
+			R3RGetSegmentPosition(Train::From(a.r3r_hidden_section), &a_pos, nullptr);
+			R3RGetSegmentPosition(Train::From(b.r3r_hidden_section), &b_pos, nullptr);
+			return a_pos < b_pos;
+		});
+	}
+
+	std::vector<GUIVehicleGroup> reordered;
+	reordered.reserve(this->vehgroups.size());
+	for (const GUIVehicleGroup &vg : this->vehgroups) {
+		if (vg.R3RIsSegmentSubRow()) continue;   // Sub-rows are emitted together with their chain.
+
+		reordered.push_back(vg);
+		const auto entry = sub_rows.find(vg.vehicles_begin[0]);
+		if (entry != sub_rows.end()) reordered.insert(reordered.end(), entry->second.begin(), entry->second.end());
+	}
+
+	if (reordered.size() == this->vehgroups.size()) this->vehgroups.assign(reordered.begin(), reordered.end());
+}
+
 void BaseVehicleListWindow::SortVehicleList()
 {
-	if (this->vehgroups.Sort()) return;
+	if (this->vehgroups.Sort()) {
+		if (this->grouping == GB_NONE) this->R3RReorderSegmentSubRows();
+		return;
+	}
 
 	/* invalidate cached values for name sorter - vehicle names could change */
 	_last_vehicle[0] = _last_vehicle[1] = nullptr;
@@ -2085,6 +2175,50 @@ static std::string GetVehicleTimetableGroupString(const Vehicle *v)
 }
 
 /**
+ * R3R (第 155 轮 / 落地清单 ⑤): the slice of the row's image area in which a segment
+ * sub-row draws its own segment.
+ *
+ * A normal row draws the whole chain (that is how a consist is previewed in the list),
+ * but a sub-row stands for one segment of a chain, and the cars behind that segment
+ * belong to the following segments -- which have sub-rows of their own. Only the
+ * front car of the segment is drawn, so the row shows where the segment starts
+ * instead of repeating the train.
+ *
+ * @param ir          The row's rectangle (used for its top and bottom edges).
+ * @param image_left  Left edge of the image area of this row.
+ * @param image_right Right edge of the image area of this row.
+ * @param front       Front car of the segment the sub-row stands for.
+ * @param rtl         Whether the current text direction is right-to-left.
+ */
+static Rect R3RSegmentSubRowImageRect(const Rect &ir, int image_left, int image_right, const Vehicle *front, bool rtl)
+{
+	const int width = std::min<int>(GetSingleVehicleWidth(front, EIT_IN_LIST), image_right - image_left);
+	return rtl ? ir.WithX(image_right - width, image_right) : ir.WithX(image_left, image_left + width);
+}
+
+/**
+ * R3R (第 156 轮 / 落地清单 ⑤ 残留): the ID a row compares against to show up as selected.
+ *
+ * Selection in the list is per chain: clicking a sub-row commands the whole train
+ * (P2b) and stores the chain head in vehicle_sel, but DrawVehicleImage() only knows
+ * the single ID it is handed -- and a sub-row draws its own segment's front car, so
+ * without this translation a sub-row could never light up. "The chain is selected"
+ * is turned into "this row is selected" for the sub-rows of that chain, so the player
+ * can see which segments the selected train is made of. Every other row keeps the
+ * list's own selection unchanged.
+ *
+ * @param vehgroup         The row being drawn.
+ * @param shown            Car the row draws (a sub-row draws its segment's front car).
+ * @param selected_vehicle Selection of the list (VehicleID::Invalid() for none).
+ */
+static VehicleID R3RListLineSelection(const GUIVehicleGroup &vehgroup, const Vehicle *shown, VehicleID selected_vehicle)
+{
+	if (selected_vehicle == VehicleID::Invalid()) return selected_vehicle;
+	if (!vehgroup.R3RIsSegmentSubRow() || shown == nullptr) return selected_vehicle;
+	return (shown->First()->index == selected_vehicle) ? shown->index : selected_vehicle;
+}
+
+/**
  * Draw all the vehicle list items.
  * @param selected_vehicle The vehicle that is to be highlighted.
  * @param line_height      Height of a single item line.
@@ -2231,8 +2365,19 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 				}
 			}
 
-			DrawVehicleImage(v, {image_left, ir.top, image_right, ir.bottom}, selected_vehicle, EIT_IN_LIST, 0);
-			DrawString(tr.left, tr.right, ir.top + line_height - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom - 1, GetStringWithArgs(str, params), TextColour::Black);
+			/* R3R (第 155 轮 / 落地清单 ⑤): a sub-row carries its segment's identity and its
+			 * segment's front car only. The values drawn on this line (profit, age, cargoes,
+			 * timetable, ...) belong to the whole chain and are already shown by the row the
+			 * sub-row hangs below, so the sub-row leaves that line empty instead of repeating
+			 * them once per segment. */
+			const bool sub_row = vehgroup.R3RIsSegmentSubRow();
+			const Vehicle *const shown = sub_row ? vehgroup.r3r_hidden_section : v;
+			const VehicleID line_sel = R3RListLineSelection(vehgroup, shown, selected_vehicle);
+
+			DrawVehicleImage(shown, sub_row ? R3RSegmentSubRowImageRect(ir, image_left, image_right, shown, rtl) : ir.WithX(image_left, image_right), line_sel, EIT_IN_LIST, 0);
+			if (!sub_row) {
+				DrawString(tr.left, tr.right, ir.top + line_height - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom - 1, GetStringWithArgs(str, params), TextColour::Black);
+			}
 
 			/* company colour stripe along vehicle description row (R3R: control section) */
 			if (_settings_client.gui.show_vehicle_list_company_colour && vc->owner != this->vli.company) {
@@ -2286,11 +2431,45 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 				 * section's (the section with the lowest coupling ordinal). */
 				const Vehicle *vc = R3RControlSectionVehicle(v);
 
+				/* R3R (第 155 轮 / 落地清单 ⑤): a sub-row stands for one of the chain's hidden
+				 * segments (P2a), so it draws that segment's front car and shows that segment's
+				 * own traits -- name, unit number and group belong to the segment and are read
+				 * from the segment table (P3), which is also what {VEHICLE} answers for a
+				 * segment in every other window. Everything else on the row stays the chain's
+				 * (it shares the chain's iterators), and every action the row offers is mapped
+				 * onto the chain head by the click handler (P2b), so a sub-row only ever
+				 * selects or commands the whole train. */
+				const bool sub_row = vehgroup.R3RIsSegmentSubRow();
+				const Vehicle *const shown = sub_row ? vehgroup.r3r_hidden_section : vc;
+				const VehicleID line_sel = R3RListLineSelection(vehgroup, shown, selected_vehicle);
+				/* R3R (第 170 轮 / R170-C): a sub-row stands for its own segment, whose traits
+				 * live in that segment's row -- so it is read with the section accessors. The
+				 * carrier accessors would answer with the control segment's traits whenever the
+				 * section being drawn is the chain head's own segment (the head wears those),
+				 * which is exactly the case R170-C added (a depot drag re-orders the chain so
+				 * that the head's segment is no longer the control segment). */
+				const std::string shown_name = sub_row ? R3RSegmentSectionName(shown) : R3RSegmentName(shown);
+				/* A sub-row whose segment sits in the same group as the chain's control segment
+				 * would only repeat the row above it, so that one is shown without a group. */
+				const GroupID seg_group = sub_row ? R3RSegmentSectionGroupID(shown) : R3RSegmentGroupID(shown);
+				const GroupID shown_group = (sub_row && seg_group == R3RSegmentGroupID(vc)) ? DEFAULT_GROUP : seg_group;
+
+				/* Indent the sub-row's text and mark it with its position in the chain, so it
+				 * reads as one of the parts of the row above (the legend names the marker). */
+				Rect tr_row = tr.Indent(ScaleGUITrad(8), rtl);
+				if (sub_row) {
+					uint self_index = 0, self_total = 0;
+					R3RGetSegmentPosition(Train::From(shown), &self_index, &self_total);
+					const std::string marker = GetString(STR_VEHICLE_LIST_SEGMENT_SUBROW, self_index, self_total);
+					DrawString(tr_row.left, tr_row.right, ir.top, marker, TextColour::Grey, SA_LEFT, false, FontSize::Small);
+					tr_row = tr_row.Indent(GetStringBoundingBox(marker, FontSize::Small).width + WidgetDimensions::scaled.hsep_normal, rtl);
+				}
+
 				if (v->vehicle_flags.Test(VehicleFlag::PathfinderLost)) {
 					DrawSprite(SPR_WARNING_SIGN, PAL_NONE, vehicle_button_x, ir.top + GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal + profit.height);
 				}
 
-				DrawVehicleImage(v, ir.WithX(image_left, image_right), selected_vehicle, EIT_IN_LIST, 0);
+				DrawVehicleImage(shown, sub_row ? R3RSegmentSubRowImageRect(ir, image_left, image_right, shown, rtl) : ir.WithX(image_left, image_right), line_sel, EIT_IN_LIST, 0);
 
 				if (_settings_client.gui.show_cargo_in_vehicle_lists) {
 					/* Get the cargoes the vehicle can carry */
@@ -2302,26 +2481,43 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 						vehicle_cargoes.Set(u->cargo_type);
 					}
 
-					if (!vc->name.empty()) {
-						/* The vehicle got a name so we will print it and the cargoes */
-						DrawString(tr.left, tr.right, ir.top,
-								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_VEHICLE_NAME, vc->index, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
-								TextColour::Black, SA_LEFT, false, FontSize::Small);
-					} else if (vc->group_id != DEFAULT_GROUP) {
+					if (!shown_name.empty()) {
+						/* The vehicle got a name so we will print it and the cargoes.
+						 * R3R (第 170 轮 / R170-C): a sub-row must not name itself through
+						 * {VEHICLE} -- that resolves the name from the vehicle index, i.e. through
+						 * the carrier, which answers with the control segment's identity whenever
+						 * the sub-row's segment is the chain head's own. The name read above is the
+						 * one to print; STR_VEHICLE_LIST_NAME_AND_CARGO is "{STRING} {STRING}" in
+						 * both shipped languages, so the line is assembled the same way here. */
+						if (sub_row) {
+							DrawString(tr_row.left, tr_row.right, ir.top,
+									shown_name + " " + GetString(STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
+									TextColour::Black, SA_LEFT, false, FontSize::Small);
+						} else {
+							DrawString(tr_row.left, tr_row.right, ir.top,
+									GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_VEHICLE_NAME, shown->index, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
+									TextColour::Black, SA_LEFT, false, FontSize::Small);
+						}
+					} else if (shown_group != DEFAULT_GROUP) {
 						/* The vehicle has no name, but is member of a group, so print group name and the cargoes */
-						DrawString(tr.left, tr.right, ir.top,
-								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_GROUP_NAME, vc->group_id.base() | GROUP_NAME_HIERARCHY, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
+						DrawString(tr_row.left, tr_row.right, ir.top,
+								GetString(STR_VEHICLE_LIST_NAME_AND_CARGO, STR_GROUP_NAME, shown_group.base() | GROUP_NAME_HIERARCHY, STR_VEHICLE_LIST_CARGO, vehicle_cargoes),
 								TextColour::Black, SA_LEFT, false, FontSize::Small);
 					} else {
 						/* The vehicle has no name, and is not a member of a group, so just print the cargoes */
-						DrawString(tr.left, tr.right, ir.top, GetString(STR_VEHICLE_LIST_CARGO, vehicle_cargoes), TextColour::Black, SA_LEFT, false, FontSize::Small);
+						DrawString(tr_row.left, tr_row.right, ir.top, GetString(STR_VEHICLE_LIST_CARGO, vehicle_cargoes), TextColour::Black, SA_LEFT, false, FontSize::Small);
 					}
-				} else if (!vc->name.empty()) {
-					/* The vehicle got a name so we will print it */
-					DrawString(tr.left, tr.right, ir.top, GetString(STR_VEHICLE_NAME, vc->index), TextColour::Black, SA_LEFT, false, FontSize::Small);
-				} else if (vc->group_id != DEFAULT_GROUP) {
+				} else if (!shown_name.empty()) {
+					/* The vehicle got a name so we will print it.
+					 * R3R (第 170 轮 / R170-C): a sub-row prints the name read from its own
+					 * segment -- {VEHICLE} would resolve it from the index again, through the
+					 * carrier, which for the chain head is the control segment's name. */
+					DrawString(tr_row.left, tr_row.right, ir.top,
+							sub_row ? shown_name : GetString(STR_VEHICLE_NAME, shown->index),
+							TextColour::Black, SA_LEFT, false, FontSize::Small);
+				} else if (shown_group != DEFAULT_GROUP) {
 					/* The vehicle has no name, but is member of a group, so print group name */
-					DrawString(tr.left, tr.right, ir.top, GetString(STR_GROUP_NAME, vc->group_id.base() | GROUP_NAME_HIERARCHY), TextColour::Black, SA_LEFT, false, FontSize::Small);
+					DrawString(tr_row.left, tr_row.right, ir.top, GetString(STR_GROUP_NAME, shown_group.base() | GROUP_NAME_HIERARCHY), TextColour::Black, SA_LEFT, false, FontSize::Small);
 				}
 
 				/* R3R (KI-170): a chain which runs a "go to and couple" order holds a
@@ -2344,7 +2540,9 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 					tc = (v->age > v->max_age - DAYS_IN_LEAP_YEAR) ? TextColour::Red : TextColour::Black;
 				}
 
-				DrawString(ir.left, ir.right, ir.top + WidgetDimensions::scaled.framerect.top, GetString(STR_JUST_COMMA, v->unitnumber), tc);
+				/* R3R (第 170 轮 / R170-C): read the unit number with the same point of
+				 * view as the name above -- a sub-row shows its own segment's number. */
+				DrawString(ir.left, ir.right, ir.top + WidgetDimensions::scaled.framerect.top, GetString(STR_JUST_COMMA, sub_row ? R3RSegmentSectionUnitNumber(shown) : R3RSegmentUnitNumber(shown)), tc);
 				break;
 			}
 
