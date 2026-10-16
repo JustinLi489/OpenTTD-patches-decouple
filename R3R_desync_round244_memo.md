@@ -739,3 +739,30 @@ struct R3RResvLedgerRec {
 **回退方式**：`git checkout r3r-stable-2026-10-16 -- src`（**不用** `git reset --hard`）；或直接用离线快照目录覆盖 `src\` 与 `build\openttd.exe`。
 
 **刻意不入库**（沿用先例清单）：所有 `_tmp_*` / `diag_*` / `cleanup*` / `start_batch_*` 临时脚本、散装一次性 `*.ps1`、`ninja` 可执行、`*.log` / `*.sav` / `*.zip`、`INCREMENTAL`、`R3R_KNOWN_ISSUES.damaged_20260915.bak`、0 字节畸形名 ` R3R_release_build.cmd`。
+
+### 17.1 执行结果（2026-10-16，已完成）
+
+| 步骤 | 结果 |
+| --- | --- |
+| ① 源码 + 文档提交 | `fbbc12d1deb72aa843dbeac7dc0fd6d82e78ef56`（48 files changed, +13411 −336；24 个 `src\` + 24 个文档） |
+| ② 离线快照 | `build\r3r_stable_2026-10-16\`：`openttd.exe` 51 868 160 B（mtime 21:17:44，SHA256 `01EBA20A…450A8`）+ `src\` 下 **24 个**改动源码（`git archive` 自 ① 精确导出，保持仓库相对路径）+ `README.txt`（GBK） |
+| ③ 稳定点备忘提交 | `fe119ce14b07714836423ef12180134a0744611e`（+137 行，仅 `R3R_stable_20261016_memo.md`） |
+| ④ 附注标签 | `r3r-stable-2026-10-16` → 指向 ③；tag 消息 = `R3R stable checkpoint 2026-10-16 (source commit fbbc12d1de, memo fe119ce14b)` |
+| ⑤ push | **未推送**：`git ls-remote --tags origin` 报 `Recv failure: Connection was reset`（本机无网络）。上一稳定点 tag 同样只在本地。需要时自行 `git push origin r3r-stable-2026-10-16` |
+
+**快照内 24 个源文件**（与 `git show --stat fbbc12d1de` 的 `src/` 部分逐一对齐）：
+`autoreplace_cmd.cpp, bridge_map.h, couple_group.cpp, couple_group.h, depot_gui.cpp, economy.cpp, order_base.h, order_cmd.cpp, pbs.cpp, pbs.h, r3r_resv_probes.h, rail_map.h, road_map.h, station_cmd.cpp, station_map.h, train.h, train_cmd.cpp, tunnel_map.h, vehicle.cpp, vehicle_cmd.cpp, pathfinder/yapf/yapf_base.hpp, pathfinder/yapf/yapf_destrail.hpp, pathfinder/yapf/yapf_rail.cpp, sl/vehicle_sl.cpp`
+
+> 注：§十七 上文记的"26 个已改文件"是**工作区未提交态**的读数；实际入库/导出的 `src\` 文件为 **24 个**（差额来自 `git show --stat` 口径：只有内容真正变动的文件才计入）。以 24 为准。
+
+**README.txt 编码自证**：`R3R_fix_gbk.ps1` 报 `CONVERTED->GBK`；`Format-Hex` 首 16 字节 = `52 33 52 20 CE C8 B6 A8 BF C9 BB D8 CD CB B0 E6`（`R3R ` + GBK "稳定可回退版"）。
+（`Select-String` 直接搜该文件会 MISMATCH —— 它按 UTF-8 解码无 BOM 的 GBK 文件，属工具行为而非文件问题。）
+
+**有效性三点核验（无陈旧 obj）**：
+- `build\openttd.exe` 2026-10-16 21:17:44 **晚于** `src\pbs.cpp` 21:13:59、`src\pathfinder\yapf\yapf_rail.cpp` 21:01:33、`src\train_cmd.cpp` 18:22:01；
+- `pbs.cpp.obj` 21:16:16 > `pbs.cpp` 21:13:59；
+- `yapf_rail.cpp.obj` 21:01:56 > `yapf_rail.cpp` 21:01:33。
+
+**下一步**：稳定点已钉住，回到 §十六 的 I-3b（读档重建挂点）/ I-3c（块 ID 与是否连带 `_r3r_consist_resv`）/ I-4（实现 `R3RL` 入档；**只改 `.cpp`**，`Save_R3RL`/`Load_R3RL` 写在 `pbs.cpp`，`sl/couple_group_sl.cpp` 只加注册行 + 手写声明），随后 I-6 增量构建、I-7 双进程联机复测。
+
+> 说明：本 §17.1 是在 ④ 打 tag **之后**追加的 memo 补充，tag `r3r-stable-2026-10-16` 仍指向 ③ `fe119ce14b`（其树内不含本补充）。回退只依赖 ① 源码提交、③ 备忘与离线快照，不受此影响。
