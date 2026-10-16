@@ -48,6 +48,14 @@
 
 #include "table/strings.h"
 
+/**
+ * R3R (第 225 轮 / KI-332): settle a freshly cloned chain, i.e. mint its segment
+ * IDs and rows and re-derive their contents. Defined in train_cmd.cpp; declared
+ * by hand here because the commit-point machinery it wraps is file-static and
+ * this change stays .cpp-only.
+ */
+void R3RSettleClonedChain(Train *chain);
+
 #include "safeguards.h"
 
 /**
@@ -441,6 +449,40 @@ static void R3RDbgCloneMarkers(const Train *src, const Train *dst)
 }
 
 /**
+ * R3R (第 225 轮 / KI-332): the per-segment traits a clone inherited.
+ *
+ * One line per segment of the source chain, source value -> clone value, so the
+ * question "did the copy take the segment name / its couple groups / its
+ * priority" is decidable from the log alone. Written for every clone in probe
+ * builds: unlike R3RDbgCloneMarkers() above, the interesting single-section case
+ * (a named train which is in a couple group) has no ★/⊗ at all, so a marker-count
+ * gate would hide exactly the case this round is about.
+ *
+ * Read-only; the walk is bounded like the marker probe.
+ */
+static void R3RDbgCloneTraits(const Train *src, const Train *dst)
+{
+	if (src == nullptr || dst == nullptr || !R3RDbgOn()) return;
+
+	uint seg = 0, n = 0;
+	const Train *s = src;
+	const Train *d = dst;
+	for (; s != nullptr && d != nullptr && n < 512; s = s->GetNextVehicle(), d = d->GetNextVehicle(), n++) {
+		if (s != src && !s->IsSegmentFront()) continue;
+
+		const std::string sname = R3RSegmentSectionName(s);
+		const std::string dname = R3RSegmentSectionName(d);
+		R3RDbgWrite("CLONE-TRAIT seg=%u src=%d dst=%d prio=%u->%u grp=%u->%u cgrp=0x%llX->0x%llX name=\"%s\"->\"%s\"\n",
+				seg, (int)s->index.base(), (int)d->index.base(),
+				(unsigned)s->r3r_priority, (unsigned)d->r3r_priority,
+				(unsigned)R3RSegmentSectionGroupID(s).base(), (unsigned)R3RSegmentSectionGroupID(d).base(),
+				(unsigned long long)R3RGetCoupleGroupsOfSegment(s), (unsigned long long)R3RGetCoupleGroupsOfSegment(d),
+				sname.c_str(), dname.c_str());
+		seg++;
+	}
+}
+
+/**
  * R3R: split ONE real articulated group -- the parent @p v plus the contiguous
  * articulated parts right after it -- into independent vehicles, with the baked
  * per-vehicle statistics and the explicit group roles (ArticGroupHead on the
@@ -646,14 +688,22 @@ static void SetSegmentTailFakeEngine(Train *seg)
 	/* A single-vehicle chain has no distinct tail to promote; a tail that is
 	 * already an engine (e.g. a second real locomotive) is left untouched. */
 	if (last == seg || last->IsEngine()) return;
-	/* R3R: never promote the rear half of a dual-headed engine (IsMultiheaded()
-	 * with the engine bit deliberately cleared, i.e. IsRearDualheaded()). It
-	 * must stay a non-engine: giving it the engine bit would make *both* halves
-	 * of the dual head look like front engines, and NormaliseDualHeads() would
-	 * then move the two halves behind each other for ever -- an infinite loop
-	 * that freezes the game without writing a crash log. Such a rear half can
-	 * never lead a chain anyway. */
-	if (last->IsRearDualheaded()) return;
+	/* R3R (KI-343, "fake dual head"): a segment tail must be engine-capable. When
+	 * the tail is the rear half of a dual-headed engine (IsMultiheaded() with the
+	 * engine bit deliberately cleared) it used to be skipped entirely (KI-143),
+	 * which left the segment with a non-engine tail. A later logical flip
+	 * (R3RFlipChainBySegments) then promoted exactly this rear half to the chain
+	 * head, where NormaliseSubtypes() asserts IsEngine() and every flip guard
+	 * rejects it (KI-342: v_head_not_engine, retried each tick).
+	 *
+	 * Instead of bailing out we "split the dual head in place": grant the engine
+	 * bit *deliberately* and record that with FakeDualHead, so IsDualHeadRear()
+	 * still recognises the car as a rear half for every genuinely
+	 * dual-head-aware decision (unit grouping, engine counting, "cannot be sold
+	 * alone", depot pairing, ...). `NormaliseDualHeads()` already tolerates a
+	 * partner that carries the engine bit (it just skips rearranging), so this no
+	 * longer risks the infinite re-arranging loop KI-143 was guarding against. */
+	if (last->IsMultiheaded()) last->SetFakeDualHead();
 	last->SetEngine();
 	last->ClearWagon();
 	last->ClearFreeWagon();
@@ -670,6 +720,16 @@ static void ClearSegmentTailFakeEngine(Train *seg)
 	 * fake-engine identity that was granted by SetSegmentTailFakeEngine. */
 	last->ClearSegmentBack();
 	if (last == seg) return;
+	/* R3R (KI-343, "fake dual head"): undo the deliberately granted dual-head
+	 * engine bit first. SetSegmentTailFakeEngine() gave a dual head's rear half
+	 * the engine bit + FakeDualHead; clearing both restores the plain rear half
+	 * upstream expects. Its railveh_type is Multihead (not Wagon), so it must not
+	 * fall through to the wagon check below. */
+	if (last->IsFakeDualHead()) {
+		last->ClearFakeDualHead();
+		last->ClearEngine();
+		return;
+	}
 	/* Only the fake-engine identity (engine subtype grafted onto a wagon
 	 * engine_type) is undone; real engines at the tail are never demoted. */
 	if (!last->IsEngine() || RailVehInfo(last->engine_type)->railveh_type != RailVehicleType::Wagon) return;
@@ -1535,32 +1595,27 @@ bool IsUniqueVehicleName(std::string_view name)
 }
 
 /**
- * Clone the custom name of a vehicle, adding or incrementing a number.
- * @param src Source vehicle, with a custom name.
- * @param dst Destination vehicle.
+ * R3R (第 226 轮 / KI-333): the core of "clone a name" -- append a number when
+ * @p new_name does not already end in one, then increment the trailing number
+ * until @p is_unique() accepts the candidate. Returns an empty string when no
+ * free name was found within the iteration budget.
+ *
+ * This used to be the body of CloneVehicleName() itself. A multi-section train
+ * carries one name per segment, and the per-segment pass of a cloned chain needs
+ * exactly the same rule, so the two must not be allowed to drift apart.
+ *
+ * The empty-string / isdigit() guards are the KI-245 and KI-269 fixes: a
+ * TinyString name can be empty (back() on an empty string is undefined) and a
+ * UTF-8 name ends in a byte >= 0x80, which is negative as a signed char and
+ * trips the MSVC debug-CRT assertion inside isdigit() (_chvalidator).
+ *
+ * @param new_name Candidate name, without any uniqueness guarantee.
+ * @param is_unique Predicate telling whether a candidate may be used.
+ * @return The unique name, or an empty string if none was found.
  */
-static void CloneVehicleName(const Vehicle *src, Vehicle *dst)
+template <typename IsUnique>
+static std::string R3RIncrementedName(std::string new_name, IsUnique is_unique)
 {
-	/* R3R (第 179 轮, KI-245 同类点): src->name is a TinyString, whose c_str()
-	 * is a *nullptr* while the name is empty, and constructing a std::string from
-	 * that nullptr dereferences address 0 inside strlen with no assertion. The
-	 * only call site below is guarded by "!v_front->name.empty()", so this is a
-	 * latent hazard rather than a live crash, but there is no reason to keep it:
-	 * going through the implicit string_view conversion (the same idiom used by
-	 * R3RSyncSegmentTraits and R3RSyncHiddenSegmentTraits) is total, never
-	 * touches a null pointer, and retires the hazard class for good. */
-	std::string new_name(static_cast<std::string_view>(src->name));
-
-	/* R3R (KI-269, 2026-10-01): std::isdigit() is only defined for values in
-	 * the range of unsigned char or EOF. Passing a plain (signed) char is
-	 * undefined behaviour and trips the MSVC debug-CRT assertion inside
-	 * _chvalidator as soon as the value is negative -- which is exactly what a
-	 * UTF-8 name ending in a non-ASCII byte looks like (a Chinese vehicle name
-	 * ends in a byte >= 0x80, i.e. negative as a signed char). Cloning a
-	 * vehicle that carries such a custom name crashed the game right here
-	 * (crash log stack: CmdCloneVehicle -> CloneVehicleName -> isdigit ->
-	 * _chvalidator, exception 80000003). Cast to unsigned char, and guard the
-	 * empty string (back() on an empty string is undefined). */
 	if (new_name.empty() || !std::isdigit(static_cast<unsigned char>(new_name.back()))) {
 		// No digit at the end, so start at number 1 (this will get incremented to 2)
 		new_name += " 1";
@@ -1581,13 +1636,126 @@ static void CloneVehicleName(const Vehicle *src, Vehicle *dst)
 			new_name.push_back('0');
 		}
 		--max_iterations;
-	} while(max_iterations > 0 && !IsUniqueVehicleName(new_name));
+	} while (max_iterations > 0 && !is_unique(new_name));
 
-	if (max_iterations > 0) {
-		dst->name = new_name;
-	}
+	return (max_iterations > 0) ? new_name : std::string();
+}
+
+/**
+ * Clone the custom name of a vehicle, adding or incrementing a number.
+ * @param src Source vehicle, with a custom name.
+ * @param dst Destination vehicle.
+ */
+static void CloneVehicleName(const Vehicle *src, Vehicle *dst)
+{
+	/* R3R (第 179 轮, KI-245 同类点): src->name is a TinyString, whose c_str()
+	 * is a *nullptr* while the name is empty, and constructing a std::string from
+	 * that nullptr dereferences address 0 inside strlen with no assertion. The
+	 * only call site below is guarded by "!v_front->name.empty()", so this is a
+	 * latent hazard rather than a live crash, but there is no reason to keep it:
+	 * going through the implicit string_view conversion (the same idiom used by
+	 * R3RSyncSegmentTraits and R3RSyncHiddenSegmentTraits) is total, never
+	 * touches a null pointer, and retires the hazard class for good.
+	 *
+	 * R3R (KI-269, 2026-10-01): std::isdigit() is only defined for values in
+	 * the range of unsigned char or EOF. Passing a plain (signed) char is
+	 * undefined behaviour and trips the MSVC debug-CRT assertion inside
+	 * _chvalidator as soon as the value is negative -- which is exactly what a
+	 * UTF-8 name ending in a non-ASCII byte looks like (a Chinese vehicle name
+	 * ends in a byte >= 0x80, i.e. negative as a signed char). Cloning a
+	 * vehicle that carries such a custom name crashed the game right here
+	 * (crash log stack: CmdCloneVehicle -> CloneVehicleName -> isdigit ->
+	 * _chvalidator, exception 80000003). R3RIncrementedName() carries that cast
+	 * and the empty-string guard. */
+	const std::string new_name = R3RIncrementedName(std::string(static_cast<std::string_view>(src->name)),
+			[](const std::string &candidate) { return IsUniqueVehicleName(candidate); });
 
 	/* All done. If we didn't find a name, it'll just use its default. */
+	if (!new_name.empty()) dst->name = new_name;
+}
+
+/**
+ * R3R (第 226 轮 / KI-333): is a *segment* name already taken?
+ *
+ * A multi-section train carries one name per segment, and the player reads them
+ * from the sub-rows of the vehicle list, so a fresh name has to be free among
+ * segment names. Live vehicle names are checked as well, because the chain
+ * head's own name *is* the control segment's name. Rows are the formal home of
+ * every segment name; the parked copies are checked too, so a name that has not
+ * been mirrored into a row yet still counts as taken.
+ *
+ * @param name Candidate name.
+ * @return True when a live vehicle or a segment already wears it.
+ */
+static bool R3RSegmentNameInUse(const std::string &name)
+{
+	if (name.empty()) return false;
+
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (!v->name.empty() && v->name == name.c_str()) return true;
+		if (!v->name_backup.empty() && v->name_backup == name.c_str()) return true;
+	}
+
+	for (size_t i = 1; i <= R3RSegmentPoolSize(); i++) {
+		const R3RSegmentRecord *const row = R3RSegmentGet(static_cast<uint16_t>(i));
+		if (row != nullptr && row->name == name) return true;
+	}
+
+	return false;
+}
+
+/**
+ * R3R (第 226 轮 / KI-333): give every *hidden* segment of a freshly cloned
+ * chain a name of its own.
+ *
+ * CloneVehicleName() renames the chain head -- the car the player reads as "the"
+ * train -- by incrementing the trailing number of its name, but the other
+ * segments of a multi-section train carry names of their own which
+ * R3RCopyClonedSegmentTraits() copies verbatim. A two section train whose second
+ * section is called "纪州路快速01" therefore produced a clone with a second
+ * "纪州路快速01" right next to the original one. Every hidden segment gets the
+ * same treatment as the head here.
+ *
+ * Must run *after* CloneVehicleName(), so that the head's new name is part of the
+ * namespace which the candidates are checked against, and must run before the
+ * next commit point (the settle in CloneVehicle() does it right away) so that the
+ * rows are re-derived from the renamed copies.
+ *
+ * @param dst_chain First car of the cloned chain.
+ */
+static void R3RUniquifyClonedSegmentNames(const Vehicle *dst_chain)
+{
+	if (dst_chain == nullptr) return;
+
+	for (const Vehicle *const section : R3RSegmentHiddenHeads(dst_chain)) {
+		if (section == nullptr) continue;
+
+		/* The name this segment wears: a parked copy wins over the live field,
+		 * exactly like R3RSyncHiddenSegmentTraits() reads it. For the chain head
+		 * only the parked copy is its own -- its live name is the control
+		 * segment's, which CloneVehicleName() has just renamed. */
+		const bool parked = !section->name_backup.empty();
+		if (!parked && section == dst_chain) continue;
+
+		const std::string old_name(parked
+				? static_cast<std::string_view>(section->name_backup)
+				: static_cast<std::string_view>(section->name));
+		if (old_name.empty()) continue;
+
+		const std::string new_name = R3RIncrementedName(old_name,
+				[](const std::string &candidate) { return !R3RSegmentNameInUse(candidate); });
+		if (new_name.empty()) continue;
+
+		/* Write it back through the same field the source used, so that the
+		 * settled row (which prefers the parked copy) derives the new name. */
+		Vehicle *const car = Vehicle::Get(section->index);
+		if (car == nullptr) continue;
+		if (parked) {
+			car->name_backup = new_name;
+		} else {
+			car->name = new_name;
+		}
+	}
 }
 
 /**
@@ -2116,7 +2284,7 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 	v = v_front;
 
 	do {
-		if (v->type == VehicleType::Train && Train::From(v)->IsRearDualheaded()) {
+		if (v->type == VehicleType::Train && Train::From(v)->IsDualHeadRear()) {
 			/* we build the rear ends of multiheaded trains with the front ones */
 			continue;
 		}
@@ -2404,6 +2572,30 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			Train::From(w_front)->ConsistChanged(CCF_ARRANGE);
 		}
 
+		/* R3R (第 225 轮 / KI-332): the copy has the very same segments as its
+		 * source (the lock-step walk above mirrors ★/⊗), so it has to inherit what
+		 * the player sees *per segment*: the segment name, its couple groups and
+		 * its priority. Until now a clone came out with every segment unnamed,
+		 * every couple group gone and every priority at its default, and the
+		 * borrow layer then showed the wrong segment's traits on the head.
+		 *
+		 * Unit numbers are deliberately NOT inherited: a clone is a new train and
+		 * takes its numbers from the normal pool, exactly like a hand-built one.
+		 *
+		 * Settle first (the copy has no segment IDs yet, and without an ID a
+		 * segment has no row to write into), then copy the traits, then settle
+		 * again so the rows are derived from the copied state the same way a
+		 * commit point would derive them. */
+		if (w_front != nullptr && w_front->type == VehicleType::Train &&
+				v_front != nullptr && v_front->type == VehicleType::Train) {
+			Train *const w_head = Train::From(w_front);
+			Train *const v_head = Train::From(v_front);
+			R3RSettleClonedChain(w_head);
+			R3RCopyClonedSegmentTraits(v_head, w_head);
+			R3RSettleClonedChain(w_head);
+			R3RDbgCloneTraits(v_head, w_head);
+		}
+
 		/* for trains this needs to be the front engine due to the callback function */
 		total_cost.SetResultData(w_front->index);
 	}
@@ -2477,6 +2669,20 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 
 		/* Now clone the vehicle's name, if it has one. */
 		if (!v_front->name.empty()) CloneVehicleName(v_front, w_front);
+
+		/* R3R (第 226 轮 / KI-333): CloneVehicleName() has just renamed the chain
+		 * head; the other segments of a multi-section train still wear the
+		 * source's names (R3RCopyClonedSegmentTraits() copied them verbatim), so
+		 * the clone came out with a duplicate of every hidden section name. Give
+		 * them a number of their own, then settle once more so the rows pick up
+		 * the renamed parked copies. Note that this cannot live next to the
+		 * R3RCopyClonedSegmentTraits() call above: the head's new name has to be
+		 * part of the namespace the candidates are checked against. */
+		if (w_front != nullptr && w_front->type == VehicleType::Train &&
+				v_front != nullptr && v_front->type == VehicleType::Train) {
+			R3RUniquifyClonedSegmentNames(w_front);
+			R3RSettleClonedChain(Train::From(w_front));
+		}
 
 		/* Since we can't estimate the cost of cloning a vehicle accurately we must
 		 * check whether the company has enough money manually. */

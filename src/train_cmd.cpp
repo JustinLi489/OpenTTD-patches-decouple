@@ -127,6 +127,7 @@ static void CheckNextTrainTile(Train *moving_front);
 extern TileIndex VehiclePosTraceRestrictPreviousSignalCallback(const Train *v, const void *, TraceRestrictPBSEntrySignalAuxField mode);
 static void TrainEnterStation(Train *v, StationID station);
 static void UnreserveBridgeTunnelTile(TileIndex tile);
+Train *R3RReservationOwnerInDirection(TileIndex tile, Trackdir trackdir); // R3R (KI-349): defined in pbs.cpp, used by the red-signal probe.
 static bool CheckTrainStayInWormHolePathReserve(Train *consist, Train *moving_front, TileIndex tile);
 
 static constexpr uint16_t SPEED_ADAPTATION_MIN_SPEED = 50;
@@ -286,6 +287,36 @@ uint16_t GetTrainVehicleMaxSpeed(const Train *u, const RailVehicleInfo &rvi_u, c
 		speed = std::min<uint16_t>(speed, 30);
 	}
 	return speed;
+}
+
+/**
+ * R3R (round 220, KI-331): does the leading end of a backwards-driving chain
+ * really carry the driver?
+ *
+ * Train::CanLeadTrain() accepts a plain wagon whose engine subtype R3R grafted
+ * on -- the segment tail fake engine (SetSegmentTailFakeEngine()) and the
+ * car-only formation head (MakeConsist()) -- because its last-resort test is
+ * simply IsEngine(). A wagon stays a wagon though: it has no cab, so it must not
+ * mask the TCF_NO_DRIVING_CAB (32 km/h) limit when the train drives with that
+ * end in front. Upstream semantics for that flag are exactly
+ * "DrivingBackwards && !Last()->CanLeadTrain()" (see tracerestrict.cpp), so the
+ * fake engine was silently exempting every R3R segment from the limit.
+ *
+ * A NewGRF may declare a cab on a wagon (ExtraEngineFlag::HasCab); such a wagon
+ * genuinely leads and keeps the exemption.
+ *
+ * @param last The leading end while driving backwards (normally chain->Last()).
+ * @return True when that end can really carry the driver.
+ */
+static bool R3RLeadingEndHasDrivingCab(const Train *last)
+{
+	if (!last->CanLeadTrain()) return false;
+	/* R3R fake engine: engine subtype grafted onto a plain, cab-less wagon. */
+	if (last->IsEngine() && RailVehInfo(last->engine_type)->railveh_type == RailVehicleType::Wagon &&
+			!last->GetEngine()->info.extra_flags.Test(ExtraEngineFlag::HasCab)) {
+		return false;
+	}
+	return true;
 }
 
 /**
@@ -457,15 +488,16 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	this->tcache.cached_curve_speed_mod = min_curve_speed_mod;
 	this->tcache.cached_max_curve_speed = this->GetCurveSpeedLimit();
 
-	if (driving_backwards && !this->Last()->CanLeadTrain()) {
+	if (driving_backwards && !R3RLeadingEndHasDrivingCab(this->Last())) {
 		/* R3R DEBUG: capture the exact state that sets the 32 km/h no-cab limit. */
 		{
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
-				fprintf(dbg, "NOCAB-SET this=%d db=%d last=%d lastSub=0x%02X lastEng=%d lastLead=%d\n",
+				fprintf(dbg, "NOCAB-SET this=%d db=%d last=%d lastSub=0x%02X lastEng=%d lastLead=%d leadCab=%d\n",
 						(int)this->index.base(), (int)driving_backwards,
 						(int)this->Last()->index.base(), (int)this->Last()->subtype,
-						(int)this->Last()->IsEngine(), (int)this->Last()->CanLeadTrain());
+						(int)this->Last()->IsEngine(), (int)this->Last()->CanLeadTrain(),
+						(int)R3RLeadingEndHasDrivingCab(this->Last()));
 				fclose(dbg);
 			}
 		}
@@ -1982,6 +2014,13 @@ void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag)
  * the KI-183 build guard does not drop every object file. */
 void DearticulateChainWithSnapshot(Train *head);
 
+/* R3R (第 243 轮续四十七, REG-243-S): defined in pbs.cpp next to its sibling
+ * R3RReleaseReservationSafe(), and *only* reachable through pbs.h's forwarder --
+ * which throws away the "did we really release it" answer that
+ * ExtendTrainReservation() needs. Declared here by hand so this round stays a
+ * .cpp-only change (no header, no KI-183 full rebuild). */
+bool R3RReleaseReservationLedgerChecked(uint32_t key, TileIndex tile, Track track, const char *why);
+
 /**
  * R3R (第 180 轮 / 选项 C): one-shot load-time migration of a legacy consist
  * which carries BOTH an R3R segment marker (★ SegmentFront / ⊗ SegmentBack) and
@@ -2211,6 +2250,146 @@ static R3RSeamEnd R3RWaitingCoupleSeam(const Train *v)
 	if (R3RWaitingCoupleAtEnd(v, false)) return R3RSeamEnd::Back;
 	if (R3RWaitingCoupleAtEnd(v, true)) return R3RSeamEnd::Front;
 	return R3RSeamEnd::None;
+}
+
+/** R3R (KI-335): one fresh decouple seam the two halves must take turns leaving.
+ *  Keyed by the *follower* (the released rear half). */
+struct R3RDecompSeam {
+	VehicleID head;      ///< the leader half (keeps the original chain head), for logging
+	VehicleID seam_car;  ///< the leader's car sitting at the seam: it must clear the platform first
+	TileIndex seam_tile; ///< that car's tile right after the split
+	uint64_t  tick;      ///< _tick_counter at the split
+	bool      reported;  ///< the "wait" line has already been written for this seam
+};
+
+/**
+ * R3R (KI-335): decouple start-up interlock.
+ *
+ * Player report (round 223, issue 4): "两列动车组解耦之后几乎是同时启动的" -- the
+ * kept front half and the released rear half start rolling in the very same
+ * instant, which reads as one train splitting while in motion (and the rear half
+ * clips into the front one). The player's requirement is explicit: the front half
+ * must first clear the station / drive N tiles off, only then may the rear half
+ * start -- and the criterion has to be *geometry* ("驶离站台 / 驶离 N 格"), not the
+ * far weaker "I am no longer touching the seam" (a train is many tiles long, so
+ * "no longer touching" already fires while the two still block each other).
+ *
+ * Scope is deliberately narrow: only a recorded (leader, follower) pair is gated,
+ * so ordinary tailgating, two independent trains standing at the same station and
+ * every other consist are untouched. R3R always decouples the *tail* segments, so
+ * the released part u is the one behind and v (which keeps the chain head) leads.
+ *
+ * The gate is self-clearing -- an entry never outlives its relevance:
+ *  - the follower itself is parked by its own order (WAIT_COUPLE) or has no
+ *    traction at all => it is not going anywhere, drop the entry;
+ *  - the follower is no longer on a station platform => it already moved;
+ *  - the leader's seam car left the platform or got R3R_DECOMP_CLEAR_TILES away
+ *    from where the split happened => the front half cleared;
+ *  - the leader's seam car is gone (sold / re-identified) => nothing to wait for;
+ *  - R3R_DECOMP_WAIT_LIMIT ticks after the split => force release, so a leader
+ *    which never leaves can never block the follower for ever.
+ */
+static btree::btree_map<VehicleID, R3RDecompSeam> _r3r_decomp_seams;
+
+/** R3R (KI-335): "驶离 N 格" -- how far the leader's seam car must get. */
+static const uint R3R_DECOMP_CLEAR_TILES = 4;
+/** R3R (KI-335): safety cap on the interlock (30 s at normal speed). */
+static const uint32_t R3R_DECOMP_WAIT_LIMIT = 900;
+
+/**
+ * R3R (KI-335): remember that \a follower was just decoupled off \a kept on a
+ * station platform. Only recorded for a split that happens on a rail station
+ * tile -- a depot split already has its own, much stricter, scheduling, and a
+ * split in the open has no platform for either half to clear.
+ * @param kept     The half which keeps the original chain head (leaves first).
+ * @param follower The released half (behind the seam, waits).
+ */
+static void R3RRecordDecoupleSeam(const Train *kept, const Train *follower)
+{
+	if (kept == nullptr || follower == nullptr) return;
+	if (!IsRailStationTile(follower->tile)) return;
+	/* A car-only formation cannot roll by itself, so there is nothing to hold. */
+	if (R3RIsCarOnlyFormation(follower)) return;
+
+	const Train *const seam_car = kept->Last();
+	/* 剪枝：已经过了强制放行时限的条目，其后车一定是在等待期里被卖掉/被并走了
+	 * （再也不会有 tick 经 R3RDecoupleInterlockWait() 把它擦掉）。只删这些死条目，
+	 * 活着的 seam 年龄必然小于时限，绝不会被误删。放在这里是为了让 map 有界。 */
+	if (_r3r_decomp_seams.size() >= 64) {
+		std::vector<VehicleID> stale;
+		for (const auto &kv : _r3r_decomp_seams) {
+			if (_tick_counter - kv.second.tick >= R3R_DECOMP_WAIT_LIMIT) stale.push_back(kv.first);
+		}
+		for (const VehicleID id : stale) _r3r_decomp_seams.erase(id);
+	}
+	R3RDecompSeam &seam = _r3r_decomp_seams[follower->index];
+	seam.head = kept->index;
+	seam.seam_car = seam_car->index;
+	seam.seam_tile = seam_car->tile;
+	seam.tick = _tick_counter;
+	seam.reported = false;
+	R3RDbgWrite("DECOUPLE-INTERLOCK set head=%d follower=%d seam_car=%d tile=%d,%d\n",
+			(int)kept->index.base(), (int)follower->index.base(), (int)seam_car->index.base(),
+			TileX(seam_car->tile), TileY(seam_car->tile));
+}
+
+/**
+ * R3R (KI-335): must \a consist hold still because the other half of a fresh
+ * decouple has not cleared the station yet? Drops entries which have become
+ * irrelevant, so the map stays tiny. See R3RRecordDecoupleSeam for the exact
+ * clearing rules.
+ * @param consist Train front being ticked.
+ * @return \c true when this tick must not start rolling.
+ */
+static bool R3RDecoupleInterlockWait(const Train *consist)
+{
+	auto it = _r3r_decomp_seams.find(consist->index);
+	if (it == _r3r_decomp_seams.end()) return false;
+	R3RDecompSeam &seam = it->second;
+
+	/* Parked by its own order, or physically unable to move: not our business. */
+	if (consist->current_order.IsType(OT_WAIT_COUPLE) || R3RIsCarOnlyFormation(consist)) {
+		_r3r_decomp_seams.erase(it);
+		return false;
+	}
+	/* Already off the platform -- the interlock has done its job. */
+	if (!IsRailStationTile(consist->tile)) {
+		_r3r_decomp_seams.erase(it);
+		return false;
+	}
+
+	const Train *const seam_car = Train::GetIfValid(seam.seam_car);
+	uint dist = 0;
+	if (seam_car != nullptr) {
+		const uint tx = TileX(seam_car->tile), ty = TileY(seam_car->tile);
+		const uint sx = TileX(seam.seam_tile), sy = TileY(seam.seam_tile);
+		const uint dx = (tx > sx) ? tx - sx : sx - tx;
+		const uint dy = (ty > sy) ? ty - sy : sy - ty;
+		dist = (dx > dy) ? dx : dy;
+	}
+	if (seam_car == nullptr || !IsRailStationTile(seam_car->tile) || dist >= R3R_DECOMP_CLEAR_TILES) {
+		R3RDbgWrite("DECOUPLE-INTERLOCK clear head=%d follower=%d seam_car=%d dist=%u gone=%d\n",
+				(int)seam.head.base(), (int)consist->index.base(), (int)seam.seam_car.base(), dist,
+				seam_car == nullptr ? 1 : 0);
+		_r3r_decomp_seams.erase(it);
+		return false;
+	}
+
+	if (_tick_counter - seam.tick >= R3R_DECOMP_WAIT_LIMIT) {
+		R3RDbgWrite("DECOUPLE-INTERLOCK timeout head=%d follower=%d age=%u dist=%u\n",
+				(int)seam.head.base(), (int)consist->index.base(),
+				(unsigned)(_tick_counter - seam.tick), dist);
+		_r3r_decomp_seams.erase(it);
+		return false;
+	}
+
+	if (!seam.reported) {
+		seam.reported = true;
+		R3RDbgWrite("DECOUPLE-INTERLOCK wait head=%d follower=%d seam=%d,%d seam_car=%d dist=%u\n",
+				(int)seam.head.base(), (int)consist->index.base(),
+				TileX(seam.seam_tile), TileY(seam.seam_tile), (int)seam.seam_car.base(), dist);
+	}
+	return true;
 }
 
 static void AddRearEngineToMultiheadedTrain(Train *v)
@@ -2478,12 +2657,15 @@ static void NormaliseDualHeads(Train *t)
 
 		/* R3R: in a well-formed dual head exactly one half is an engine (the
 		 * front one) and the other is a plain rear car. If the partner also
-		 * carries the engine bit the consist is malformed (the rear half was
-		 * wrongly promoted to an engine, see SetSegmentTailFakeEngine()): both
-		 * halves then look like front engines and the re-arranging below would
-		 * move them behind each other for ever -- an infinite loop that freezes
-		 * the game (and, being a hang, writes no crash log). A missing partner
-		 * would be dereferenced below, so bail out on that too. */
+		 * carries the engine bit we skip the rearranging below. This is no
+		 * longer only a malformed-consist guard: SetSegmentTailFakeEngine()
+		 * *deliberately* grants a segment tail the engine bit + FakeDualHead
+		 * (KI-343), i.e. the partner legitimately carries the engine bit. Either
+		 * way both halves then look like front engines and the re-arranging
+		 * below would move them behind each other for ever -- an infinite loop
+		 * that freezes the game (and, being a hang, writes no crash log), so
+		 * skipping it is exactly the wanted behaviour. A missing partner would
+		 * be dereferenced below, so bail out on that too. */
 		if (t->other_multiheaded_part == nullptr || t->other_multiheaded_part->IsEngine()) continue;
 
 		/* R3R: inside a segment the two halves of a dual head must stay next to
@@ -2642,7 +2824,7 @@ static CommandCost CheckTrainAttachment(Train *t)
 		t->SetNext(nullptr);
 
 		/* Don't check callback for articulated or rear dual headed parts */
-		if (!t->IsArticulatedPart() && !t->IsRearDualheaded()) {
+		if (!t->IsArticulatedPart() && !t->IsDualHeadRear()) {
 			/* Back up and clear the first_engine data to avoid using wagon override group */
 			EngineID first_engine = t->gcache.first_engine;
 			t->gcache.first_engine = EngineID::Invalid();
@@ -3039,6 +3221,23 @@ CommandCost CmdMoveVirtualRailVehicle(DoCommandFlags flags, VehicleID src_veh, V
  * merged-on block which may act as a segment from a loose wagon chain. */
 static bool TrainHasEngine(const Train *v);
 
+/* R3R (KI-355): a command that can orphan a booked path -- selling a train, or
+ * rearranging one in the depot -- asks the read-only reservation audit to run
+ * sooner than its steady-state cadence, so the automatic reap gets a chance
+ * without the player having to type "r3r_resv_purge". The request is cleared
+ * when the audit runs, so a burst of depot edits does not turn into a burst of
+ * full map passes. */
+static bool _r3r_resv_audit_due = false;
+static void R3RMarkReservationAuditDue() { _r3r_resv_audit_due = true; }
+
+/* R3R (KI-364): true while the previous audit left a stray bit ageing towards its
+ * reap. Such a bit only leaves after R3R_RESV_REAP_AUDITS passes, so the steady
+ * 2048-tick cadence would keep a black preview (and a blocked tile) around for about
+ * 6144 ticks -- longer than the player waits. While something is still pending the
+ * audit therefore comes back every 256 ticks instead. Cleared by the audit itself
+ * once no stray is left, so a clean ledger costs nothing extra. */
+static bool _r3r_resv_audit_has_pending = false;
+
 /**
  * Move a rail vehicle around inside the depot.
  * @param flags type of operation
@@ -3112,13 +3311,13 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 		dst_head = nullptr;
 	}
 
-	if (src->IsRearDualheaded()) return CommandCost(STR_ERROR_REAR_ENGINE_FOLLOW_FRONT);
+	if (src->IsDualHeadRear()) return CommandCost(STR_ERROR_REAR_ENGINE_FOLLOW_FRONT);
 
 	/* When moving all wagons, we can't have the same src_head and dst_head */
 	if (move_chain && src_head == dst_head) return CommandCost();
 
 	/* When moving a multiheaded part to be place after itself, bail out. */
-	if (!move_chain && dst != nullptr && dst->IsRearDualheaded() && src == dst->other_multiheaded_part) return CommandCost();
+	if (!move_chain && dst != nullptr && dst->IsDualHeadRear() && src == dst->other_multiheaded_part) return CommandCost();
 
 	/* R3R (KI-212): a coupled-on segment is one operational unit and behaves like
 	 * an articulated block - nothing may be spliced into its interior. Inserting a
@@ -3197,6 +3396,7 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 
 	/* do it? */
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3RMarkReservationAuditDue(); // KI-355: a depot rearrange can orphan a booked path
 		/* Remove old heads from the statistics */
 		if (original_src_head_front_engine) GroupStatistics::CountVehicle(original_src_head, -1);
 		if (original_dst_head_front_engine) GroupStatistics::CountVehicle(original_dst_head, -1);
@@ -3469,7 +3669,7 @@ CommandCost CmdSellRailWagon(DoCommandFlags flags, Vehicle *t, bool sell_chain, 
 	Train *v = Train::From(t)->GetFirstEnginePart();
 	Train *first = v->First();
 
-	if (v->IsRearDualheaded()) return CommandCost(STR_ERROR_REAR_ENGINE_FOLLOW_FRONT);
+	if (v->IsDualHeadRear()) return CommandCost(STR_ERROR_REAR_ENGINE_FOLLOW_FRONT);
 
 	/* First make a backup of the order of the train. That way we can do
 	 * whatever we want with the order and later on easily revert. */
@@ -3502,6 +3702,7 @@ CommandCost CmdSellRailWagon(DoCommandFlags flags, Vehicle *t, bool sell_chain, 
 
 	/* do it? */
 	if (flags.Test(DoCommandFlag::Execute)) {
+		R3RMarkReservationAuditDue(); // KI-355: a sold train can orphan the path it had booked
 		/* First normalise the sub types of the chain. */
 		NormaliseSubtypes(new_head);
 
@@ -3771,6 +3972,13 @@ static void ReverseTrainSwapVeh(Train *v, int l, int r)
 }
 
 /**
+ * R3R (KI-334 probe): 定义在本文件后段(R3RDumpCoupleIdentity 之后)。物理翻
+ * (ReverseTrainSwapVehicles)与逻辑翻(R3RReverseChainDirections)两处出口都要调，
+ * 故在文件靠前处先声明。纯只读，R3R_PROBES=0 时 R3RDbgOn() 常量门直接折叠。
+ */
+static void R3RDumpDualHeadPairs(const Train *chain, const char *tag);
+
+/**
  * Swap vehicles in chain starting from \a v, and reverse their direction.
  * @param v First vehicle in chain to change.
  */
@@ -3787,6 +3995,10 @@ void ReverseTrainSwapVehicles(Train *v)
 	for (Train *u = v; u != nullptr; u = u->Next()) {
 		UpdateStatusAfterSwap(u);
 	}
+	/* R3R (KI-334 probe): ReverseTrainSwapVeh 只换数据不重链，故 v 仍是链头，
+	 * 可以走完整个链。双头两半在这里被各自换到对面，本行看它们是否仍相邻、
+	 * 朝向是否仍一致(KI-334「挂接后机车错位」的物理解释候选)。 */
+	R3RDumpDualHeadPairs(v, "swapv-post");
 }
 
 /**
@@ -5377,7 +5589,7 @@ static void R3RLogSegmentTraits(const Train *chain, const char *tag)
  * pass -- has to be the one which brings them back.
  *
  * @param chain Chain head of one resulting chain; may be nullptr.
- * @param tag Commit point name (couple / decouple-v / decouple-u / depot-edit).
+ * @param tag Commit point name (couple / decouple-v / decouple-u / depot-edit / clone).
  */
 static void R3RSettleChainSegments(Train *chain, const char *tag)
 {
@@ -5456,6 +5668,7 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 		const char *label = (t == "couple")     ? "settle-couple" :
 		                    (t == "decouple-v") ? "settle-decouple-v" :
 		                    (t == "decouple-u") ? "settle-decouple-u" :
+		                    (t == "clone")      ? "settle-clone" :
 		                    (t == "depot-edit") ? "settle-depot-edit" : "settle-other";
 		R3RDumpChainGeometry(label, chain);
 	}
@@ -5466,6 +5679,26 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 	 * 该次行为终值（上面的步骤全跑完），GEO 只对多段/长链打，本行对每次行为都给。 */
 	R3RLogSegmentTraits(chain, tag);
 	R3RWatchOrderIndex(chain, "settle-out", tag);
+}
+
+/**
+ * R3R (第 225 轮 / KI-332): settle a freshly cloned chain.
+ *
+ * CmdCloneVehicle() builds the copy car by car and mirrors the segment markers,
+ * so the clone has the same segments as the source -- but it has no segment IDs
+ * yet, and without those a segment has no row and cannot be given a name or a
+ * couple group. This is the thin, non-static entry point which lets the clone
+ * path (vehicle_cmd.cpp) reach the commit-point machinery before copying the
+ * per-segment traits, without the change having to touch a header.
+ *
+ * Called twice per clone: once to mint the IDs and rows, once after
+ * R3RCopyClonedSegmentTraits() to derive the rows from the copied state.
+ *
+ * @param chain Chain head of the clone; nullptr is a no-op.
+ */
+void R3RSettleClonedChain(Train *chain)
+{
+	R3RSettleChainSegments(chain, "clone");
 }
 
 /**
@@ -6425,6 +6658,16 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_DECOUPLETRY,  ///< KI-215: TryTrainDecouple outcome (a DECOUPLE that looks like it did nothing)
 	R3REDGE_FOLDOVR,      ///< KI-265: the tight-splice direction OVERRIDE was itself overruled (fold verdict kept)
 	R3REDGE_CPLSUM,       ///< KI-265: the geometry summary written at *every* couple commit point
+	R3REDGE_TPRBLK,       ///< KI-330 (U-1): FollowTrainReservation() reported the consist as blocked by another train
+	R3REDGE_CPLOFFDEST,   ///< KI-330 (U-2): a GOTO_COUPLE loco with no candidate is *off* its order destination
+	R3REDGE_TPRWALK,      ///< KI-330 (U-1b): the block test did not fire -- which exit of the reservation core is taken
+	R3REDGE_TPREXEMPT,    ///< KI-330: the block test was waived at a decouple seam (same tile, standstill)
+	R3REDGE_DUALHEAD,     ///< KI-334: a dual head pair's orientation/adjacency snapshot (flip/respace)
+	R3REDGE_DEPOTBLK,     ///< KI-336: the depot GOTO_COUPLE block's own verdict (the silent branch)
+	R3REDGE_CPLDEPOTSKIP, ///< KI-341: the depot touch-as-couple gate was skipped (moving chain not fully in depot)
+	R3REDGE_SPDDROP,      ///< KI-348: a train's cur_speed fell to zero (which commit point stopped it)
+	R3REDGE_LOCOMOVE,     ///< KI-348: a GOTO_COUPLE loco entered the *movement* branch (TrainController runs)
+	R3REDGE_REDSIG,       ///< KI-349: a train hit a red signal in TrainController (who owns the block behind it)
 	R3REDGE_COUNT,
 };
 
@@ -6906,7 +7149,7 @@ static Train *GetDecoupleVehicle(Train *v)
 	bool multihead_front = v->IsMultiheaded();
 	for (uint i = 1; i < num_decouple && ret != nullptr && ret->GetNextVehicle() != nullptr; i++) {
 		if (multihead_front) {
-			if (ret->IsRearDualheaded()) multihead_front = false;
+			if (ret->IsDualHeadRear()) multihead_front = false;
 		} else {
 			if (ret->IsMultiheaded()) multihead_front = true;
 		}
@@ -7510,6 +7753,10 @@ static int R3RRespaceChainAfterEdit(Train *head, const char *tag)
 		R3RDbgWrite("RESPACE-BADCHAIN %s head=%d unfixed=%d skip=%d stretch=%d px=%d visited=%d capped=%d\n",
 				tag, (int)head->index.base(), unfixed, skipped, stretched, moved, visited, walk_capped ? 1 : 0);
 	}
+	/* R3R (KI-334 probe): 提交点的最终几何 —— 双头两半是否仍相邻、朝向是否一致、
+	 * 中间有没有被 respace 的逐节平移插进别的车。R170-A 起 respace 有了 8px 误差
+	 * 上界并会 skip 超界的对，本探针正好能把「两半被分开」与「两半被拉长」区分开。 */
+	R3RDumpDualHeadPairs(head, "respace-post");
 	return moved + stretched;
 }
 
@@ -7680,6 +7927,16 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * payment 就挂在它身上；u 侧一并扫一遍是防御（正常不该有）。 */
 	R3RSettleLoadingBeforeChainEdit(v, "decouple-front");
 	R3RSettleLoadingBeforeChainEdit(u, "decouple-rear");
+
+	/* R3R (KI-359, memo §21.6): the chain has just been cut in two, before any
+	 * identity is rewritten -- so v still names the pre-cut chain head, which is
+	 * the ledger key. The bits the old chain had booked are now unreachable by the
+	 * engine (the couple path it was holding is not part of either half's `path`),
+	 * so drop them here instead of waiting for the audit. Both halves are named
+	 * because a cut can move which vehicle is the head; the u call is a no-op in
+	 * the normal case. */
+	R3RResvLedgerForget(v->index, "decouple");
+	R3RResvLedgerForget(u->index, "decouple");
 
 	if (u->IsEngine()) {
 		u->ClearFreeWagon();   // R3R: drop any stale free-wagon flag so the front stays a (fake) engine
@@ -8226,6 +8483,15 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	_r3r_couple_enter_tick.erase(v->index.base());
 	_r3r_couple_enter_tick.erase(u->index.base());
 
+	/* R3R (KI-335, 2026-10-10): 两半不许在同一瞬间一起起步。玩家口径：解耦之后
+	 * 前车必须先「完全离开站台 / 驶离 N 格」，后车才准启动。R3R 的解挂永远剥链尾，
+	 * 故 v（留着原链头）= 前车、u（解出的尾段）= 后车。记录一对 seam，由
+	 * TrainLocoHandler() 里的 R3RDecoupleInterlockWait() 消费；只登记"停在站台上"
+	 * 的解挂（车库有自己的排程、野外没有站台可让），且只在 u 自己会跑时才需要
+	 * （纯车底链恒被 P7 停驻门按住，不必再锁一层）。整个机制是窄判据：只有被登记
+	 * 的这一对 (前, 后) 受影响，正常跟车、两列车共用一个站台一律不受影响。 */
+	R3RRecordDecoupleSeam(v, u);
+
 	return u;
 }
 
@@ -8560,6 +8826,9 @@ static void R3RReverseChainDirections(Train *chain)
 		w->UpdateDeltaXY();
 		if (w->IsDrawn()) w->Vehicle::UpdateViewport(true);
 	}
+	/* R3R (KI-334 probe): 逐节取反之后，双头两半的 direction 是否仍一致、
+	 * 是否仍相邻 —— 这是本函数唯一"会破坏双头刚性"的地方。 */
+	R3RDumpDualHeadPairs(chain, "rev-dir-post");
 }
 
 /** R3R: 一条链上的段边界快照:★ 段首车与段右边界标记车(段尾)。 */
@@ -8894,7 +9163,7 @@ static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
 	if (head != nullptr) {
 		int i = 0;
 		for (const Train *w = head; w != nullptr; w = w->Next()) {
-			fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x(front=%d eng=%d wagon=%d freeW=%d artic=%d) AH=%d AM=%d SF=%d dir=%d flip=%d db=%d x=%d y=%d engType=%d\n",
+			fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x(front=%d eng=%d wagon=%d freeW=%d artic=%d) AH=%d AM=%d SF=%d dir=%d flip=%d db=%d x=%d y=%d engType=%d mh=%d rdh=%d omp=%d\n",
 				tag,
 				(int)w->index.base(),
 				w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
@@ -8911,12 +9180,103 @@ static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
 				(int)w->direction,
 				w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
 				w->IsDrivingBackwards() ? 1 : 0,
-				(int)w->x_pos, (int)w->y_pos, (int)w->engine_type.base());
+				(int)w->x_pos, (int)w->y_pos, (int)w->engine_type.base(),
+				/* R3R (KI-334 probe): the dual head relation itself. FOLD-V/FOLD-U
+				 * already print both halves' dir/flip/engType, but nothing in the
+				 * log used to say *which* cars form a rigid dual head pair. */
+				w->IsMultiheaded() ? 1 : 0,
+				w->IsDualHeadRear() ? 1 : 0,
+				w->other_multiheaded_part != nullptr ? (int)w->other_multiheaded_part->index.base() : -1);
 			if (++i > 60) break;
 		}
 	}
 	fprintf(dbg, "IDENT-END %s\n", tag);
 	fclose(dbg);
+}
+
+/**
+ * R3R (KI-334 probe, 只读): 把一条链上的每个「双头机车对」当成一对来 dump。
+ *
+ * KI-334 现场是「两列双头机车挂接时机车错位」。双头的两半是刚性焊死的
+ * (other_multiheaded_part)，任何时刻都必须**相邻**且**朝向一致**；但 R3R 的
+ * 逻辑翻 R3RReverseChainDirections(8581) 对每一节无差别地 direction/Flipped
+ * 取反，完全不看 IsMultiheaded()/IsDualHeadRear()/other_multiheaded_part，
+ * R3RRespaceChainAfterEdit 的逐对间距校正也只按 CalcNextVehicleOffset 算名义
+ * 长度、不认「两半是一个不可分单元」。既有探针里只有 FOLD-V/FOLD-U 的逐节
+ * dump(IDENT 行)和 KI-145 的 NDH-SEG-KEEP(只在升段路径打)，**没有**任何日志
+ * 说明「哪两节是一对、这一对我们各是第几节、中间是否插进了别的东西」。
+ *
+ * 本探针补上这一缺:对每一对打印两半各自的 direction/Flipped/倒车位/引擎位/
+ * 段头★、它们在本链上的位置、两半之间夹了几节(0=紧贴)、中间是否夹了 ★、
+ * 以及是否仍相邻。按 (tag, 前半, 后半) 边沿触发、pair 朝向做 payload，因此
+ * 稳定的一对每窗口只写一行，任何变化(方向/相邻关系/中间夹了 ★)都会单独成行。
+ * @param chain 链上任意一节(通常传链头)。
+ * @param tag   探针标签，"rev-dir-post"/"respace"…(参与边沿键，互不抑制)。
+ */
+static void R3RDumpDualHeadPairs(const Train *chain, const char *tag)
+{
+	if (!R3RDbgOn() || chain == nullptr) return;
+
+	int pos = 0;
+	for (const Train *w = chain; w != nullptr && pos < R3R_CHAIN_WALK_LIMIT; w = w->Next(), pos++) {
+		/* 每对只从「引擎那一半」打一行；正常双头恰好一个引擎半边。 */
+		if (!w->IsMultiheaded() || !w->IsEngine()) continue;
+		const Train *const other = w->other_multiheaded_part;
+		if (other == nullptr) {
+			const uint64_t okey = (R3RDbgTagHash(tag) << 32) ^ ((uint64_t)w->index.base() << 16);
+			if (R3RDbgEdge(R3REDGE_DUALHEAD, okey, 0xFFFFFFFFULL)) {
+				R3RDbgWrite("DUALHEAD %s front=%d orphan=1 (no other_multiheaded_part) pos=%d\n",
+						tag, (int)w->index.base(), pos);
+			}
+			continue;
+		}
+
+		/* 两半之间夹了几节(0=紧贴)，以及中间是否夹了段头 ★。 */
+		int sep = -1;           /* -1 = 伙伴不在此半前方的链序里(异常) */
+		bool star_between = false;
+		if (w->Next() == other) {
+			sep = 0;
+		} else if (w->Previous() == other) {
+			sep = 0;
+		} else {
+			int d = 0;
+			for (const Train *b = w->Next(); b != nullptr && d < 64; b = b->Next(), d++) {
+				if (b == other) { sep = d; break; }
+				if (b->IsSegmentFront()) star_between = true;
+			}
+			if (sep < 0) star_between = false;
+		}
+		const int opos = (sep < 0) ? -1
+				: (w->Next() == other) ? pos + 1
+				: (w->Previous() == other) ? pos - 1
+				: pos + 1 + sep;
+		const bool adjacent = (sep == 0);
+
+		const int dir_f = (int)w->direction;
+		const int dir_r = (int)other->direction;
+		const int flip_f = w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0;
+		const int flip_r = other->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0;
+		const int db_f = w->IsDrivingBackwards() ? 1 : 0;
+		const int db_r = other->IsDrivingBackwards() ? 1 : 0;
+		const int seg_f = w->IsSegmentFront() ? 1 : 0;
+		const int seg_r = other->IsSegmentFront() ? 1 : 0;
+
+		const uint64_t key = (R3RDbgTagHash(tag) << 32) ^
+				((uint64_t)w->index.base() << 16) ^ (uint64_t)other->index.base();
+		const uint64_t payload =
+				((uint64_t)(dir_f & 7) << 22) | ((uint64_t)flip_f << 21) | ((uint64_t)db_f << 20) | ((uint64_t)seg_f << 19) |
+				((uint64_t)(dir_r & 7) << 16) | ((uint64_t)flip_r << 15) | ((uint64_t)db_r << 14) | ((uint64_t)seg_r << 13) |
+				((uint64_t)(star_between ? 1 : 0) << 12) |
+				(uint64_t)((sep + 1) & 0xFF); /* sep=-1 -> 0, 0 -> 1, … */
+		if (R3RDbgEdge(R3REDGE_DUALHEAD, key, payload)) {
+			R3RDbgWrite("DUALHEAD %s front=%d pos=%d dir=%d flip=%d db=%d engType=%d segF=%d | rear=%d pos=%d dir=%d flip=%d db=%d engType=%d segF=%d | sep=%d adj=%d star=%d | px=%d,%d / %d,%d\n",
+					tag,
+					(int)w->index.base(), pos, dir_f, flip_f, db_f, (int)w->engine_type.base(), seg_f,
+					(int)other->index.base(), opos, dir_r, flip_r, db_r, (int)other->engine_type.base(), seg_r,
+					sep, adjacent ? 1 : 0, star_between ? 1 : 0,
+					(int)w->x_pos, (int)w->y_pos, (int)other->x_pos, (int)other->y_pos);
+		}
+	}
 }
 
 /** R3R: 以遍历为准重建链上所有车辆的 first/last 缓存。
@@ -9402,6 +9762,24 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	if (v == nullptr || u == nullptr) return false;
 	if (v->First() != v || u->First() != u) return false;
 	if (v->First() == u->First()) return false; // Never couple a chain onto itself.
+
+	/* R3R (KI-363 part C, 243 轮续五十): 账本版的"被吞链清账"。
+	 *
+	 * 合并之后 u 的账本行仍挂在 u 这个车号下（记账时的链头），而账本的**查行**
+	 * 与**释放闸门**两处都会把 caller 的 key 归一到 v->First()（pbs.cpp:442-450
+	 * 与 :367-382），所以合并之后**再也没有任何调用能释放 u 名下的行** —— 这正是
+	 * 下面 KI-205 那段注释里 "by then the damage is done for any bit whose
+	 * ownership broke in the merge" 的结构性原因（旧实现只能靠几何扫描去猜，猜
+	 * 不到的位就永久留着）。唯一有效的时机是 u 还是自己链头的时候，也就是这里，
+	 * 且在下面任何一次 ArrangeTrains() 之前。
+	 *
+	 * 只清 u：u 是挂接目标（R3RIsCoupleTarget 保证它停驻、不订路），它的出站路线
+	 * 本来就该由 KI-206/208 释放，重复释放是幂等的（无行即早退、不写日志）。
+	 * **刻意不清 v**：本函数在几何不满足时被反复重调，在入口释放主动机车的在用
+	 * 路径位等于每 tick 放一次（KI-362 同型抖动）。
+	 * mask 由 R3RResvLedgerForgetMask("couple") 定为 PATH-only，车下的 CONSIST
+	 * 位原样保留。 */
+	R3RResvLedgerForget(u->First()->index, "couple");
 
 	/* R3R（2026-09-30 玩家拍板「双管齐下」之一，耦合侧）: 任一参与方含**真** artic
 	 * part 就整块拒绝，绝不让它被焊成一段。
@@ -10479,6 +10857,11 @@ static void Couple(Train *v, Train *u)
 	 * to it is a leftover and safe to drop; the next pathfind books the route the
 	 * train will really take. */
 	R3RReleaseChainReservations(v, "couple");
+	/* R3R (KI-363 part C, 243 轮续五十): 同一件事的**账本版**，且是几何版的超集。
+	 * 几何版按 GetTrainForReservation() 反查"这一格归谁"，一旦归错人（典型：刚
+	 * 被并进来的等待车底那一格、或同格停着两列车）就永远扫不到；账本直接按
+	 * 合并链链头列出它名下所有位，不依赖反查。mask 同 "couple" = PATH-only。 */
+	R3RResvLedgerForget(v->First()->index, "couple");
 
 	/* R3R (裁决 2026-09-19 / R3R_couple_direction_rule_memo.md): 挂车「端面方向判据」。
 	 *
@@ -11906,6 +12289,34 @@ static bool TrainCoupleHandler(Train *v)
 			return false;
 		} else {
 			_r3r_couple_dest_idle.erase(v->index);
+			/* R3R (KI-330, U-2): read-only diagnosis. A GOTO_COUPLE loco with no
+			 * candidate anywhere reaches this branch on every tick while it is still
+			 * *off* its order destination, so the KI-193 parked-wait gate above never
+			 * engages: no heartbeat is written and the full map-wide candidate scan
+			 * runs every tick (the 2026-10-06 report had veh=57 frozen here). Log the
+			 * order destination once per (vehicle, tile) so an unreachable destination
+			 * can be told apart from a missing coupling target. */
+			const Order &r3r_co = v->current_order;
+			const uint64_t off_key = ((uint64_t)v->index.base() << 32) | (uint64_t)v->tile.base();
+			const uint64_t off_payload = (uint64_t)r3r_co.GetDestination().ToDepotID().base() |
+					((uint64_t)(r3r_co.GetCoupleIsDepot() ? 1 : 0) << 16) |
+					((uint64_t)v->dest_tile.base() << 24);
+			if (R3RDbgEdge(R3REDGE_CPLOFFDEST, off_key, off_payload)) {
+				const Train *r3r_mf = v->GetMovingFront();
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "COUPLE-WAIT-OFFDEST veh=%u tile=%u,%u mf=%u,%u real=%d isDepot=%d destDepot=%u destStn=%u destTile=%u onDepotTile=%d onStnTile=%d\n",
+							v->index.base(), (uint)TileX(v->tile), (uint)TileY(v->tile),
+							r3r_mf != nullptr ? (uint)TileX(r3r_mf->tile) : 65535u, r3r_mf != nullptr ? (uint)TileY(r3r_mf->tile) : 65535u,
+							(int)v->cur_real_order_index, r3r_co.GetCoupleIsDepot() ? 1 : 0,
+							r3r_co.GetCoupleIsDepot() ? (uint)r3r_co.GetDestination().ToDepotID().base() : 0u,
+							r3r_co.GetCoupleIsDepot() ? 0u : (uint)r3r_co.GetDestination().ToStationID().base(),
+							v->dest_tile.base(),
+							(r3r_mf != nullptr && IsRailDepotTile(r3r_mf->tile)) ? 1 : 0,
+							(r3r_mf != nullptr && HasStationTileRail(r3r_mf->tile)) ? 1 : 0);
+					fclose(dbg);
+				}
+			}
 		}
 		return false;
 	}
@@ -12140,6 +12551,33 @@ static void CheckNextTrainTile(Train *moving_front)
 }
 
 /**
+ * R3R (KI-339, 第 231 轮): has the whole consist physically entered a depot?
+ *
+ * A train's tile becomes the depot tile a few pixels BEFORE VehicleEnterTile_Rail()
+ * rewrites its track to TRACK_BIT_DEPOT (that rewrite only happens once the vehicle
+ * front reaches _fractcoords_enter[]). During that window IsRailDepotTile(v->tile) is
+ * already true while v->track still holds the plain-track bits the train arrived on.
+ *
+ * Both R3R gates below used to fire inside that window:
+ *  - the "stay in the target depot" gate (CheckTrainStayInDepot) made TrainLocoHandler()
+ *    return early, so the train never advanced the last few pixels, never entered the
+ *    depot and froze with track == TRACK_BIT_X (spd stuck at a non-zero value forever);
+ *  - the depot-internal couple scan set cur_speed = 0 half way in, which stops the
+ *    advance loop (j < adv_spd) and therefore left the tail of the train outside
+ *    the depot forever.
+ *
+ * Only the track bits are checked, not the tile, so multi-tile (drive-through) depots
+ * are accepted -- the same scope the original "IsRailDepotTile(v->tile)" gate had.
+ */
+static bool R3RChainFullyInDepot(const Train *v)
+{
+	for (const Train *u = v; u != nullptr; u = u->Next()) {
+		if (u->track != TRACK_BIT_DEPOT) return false;
+	}
+	return true;
+}
+
+/**
  * Will the train stay in the depot the next tick?
  * @param v %Train to check.
  * @return True if it stays in the depot, false otherwise.
@@ -12158,10 +12596,22 @@ static bool CheckTrainStayInDepot(Train *v)
 	 * depot must still leave and pathfind there.
 	 * IMPORTANT: only call GetDepotIndex(v->tile) when v->tile is actually a
 	 * depot tile — it asserts otherwise, which crashes when CheckTrainStayInDepot
-	 * is called for a consist that decoupled on a station platform. */
+	 * is called for a consist that decoupled on a station platform.
+	 * R3R (KI-339, 第 231 轮): the gate must ALSO require that the whole consist has
+	 * physically entered the depot (R3RChainFullyInDepot). "v->tile is the depot tile"
+	 * is NOT the same as "the train is in the depot": the tile changes a few pixels
+	 * before VehicleEnterTile_Rail() rewrites track to TRACK_BIT_DEPOT. Firing here
+	 * inside that window made TrainLocoHandler() return early, so the train never
+	 * advanced the last few pixels into the depot, track stayed TRACK_BIT_X, the
+	 * depot-internal couple scan (which needs TRACK_BIT_DEPOT) never ran, and the
+	 * locomotive sat frozen on the depot tile with a non-zero cur_speed forever —
+	 * KI-339 "库型 GOTO_COUPLE 到库后什么都不发生". While the consist is still rolling
+	 * in, this gate no longer matches; the "not all wagons in this depot" bail-out
+	 * below then returns false and the normal movement code finishes the entry. */
 	if (v->current_order.IsType(OT_GOTO_COUPLE) && v->current_order.GetCoupleIsDepot() &&
 			IsRailDepotTile(v->tile) &&
-			v->current_order.GetDestination().ToDepotID() == GetDepotIndex(v->tile)) return true;
+			v->current_order.GetDestination().ToDepotID() == GetDepotIndex(v->tile) &&
+			R3RChainFullyInDepot(v)) return true;
 
 	/* bail out if not all wagons are in the same depot or not in a depot at all */
 	for (const Train *u = v; u != nullptr; u = u->Next()) {
@@ -12453,6 +12903,16 @@ static void UnreserveBridgeTunnelTile(TileIndex tile)
  */
 static void ClearPathReservation(const Train *v, TileIndex tile, Trackdir track_dir, bool tunbridge_clear_unsignaled_other_end = false)
 {
+	/* R3R (第 243 轮, REG-243-M): entry tag for the second big release path -- the one
+	 * driven by the train itself (last vehicle leaving a tile, clearing under the
+	 * consist, crash). Printed before the map setters fire, so it pairs with their
+	 * CLEAR-RAIL line; only logged when the tile really carries a reservation. */
+	if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
+		R3RDbgWrite("CLEAR-PATH veh=%d tile=%d,%d td=%d phase=%s actor=%u\n",
+				(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)track_dir,
+				r3r_resv_phase, (uint)r3r_resv_actor.base());
+	}
+
 	/* R3R KI-108: GetVehicleTrackdir() can hand us INVALID_TRACKDIR (crashed vehicle,
 	 * or the direction/track mismatch state left behind by chain edits). Both
 	 * TrackdirToExitdir() and TrackdirToTrack() assert on that, so recover an
@@ -12519,6 +12979,15 @@ static void ClearPathReservation(const Train *v, TileIndex tile, Trackdir track_
 void FreeTrainTrackReservation(Train *consist, TileIndex origin, Trackdir orig_td)
 {
 	assert(consist->IsFrontEngine());
+
+	/* R3R (KI-359, memo §21.6): the ledger's bits booked by this chain go with the
+	 * path that is being rebuilt. A couple path laid down by the yapf `rp()` hook is
+	 * not part of `consist->path`, so nothing below would ever reach it -- that is
+	 * exactly how the veh23 bits of §19 survived a cancelled coupling. The ledger is
+	 * keyed on the chain head and `consist` IS the chain head (asserted above), so
+	 * one call covers the whole chain; when nothing was booked it is a single hash
+	 * lookup (memo §20.3). */
+	R3RResvLedgerForget(consist->index, "free-path");
 
 	if (origin == INVALID_TILE) consist->lookahead.reset();
 
@@ -12667,17 +13136,43 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 {
 	CFollowTrackRail ft(v);
 
+	/* R3R (第 243 轮, REG-243-O): name the first failure exit this trial extension
+	 * takes, so the back-out below can report *why* it could not extend. Log only:
+	 * no branch condition, no side effect. */
+	const char *r3r_backout_reason = "follow-fail";
+	/* R3R (第 243 轮, REG-243-S): who owns the reserved bit that stopped the trial
+	 * extension on a choice tile. Filled at the "choice-reserved" exit only, so the
+	 * EXTEND-BACKOUT line answers the open question "活车让路 / 有主但已死 / 孤儿位"
+	 * in one rerun. Read-only: no branch condition, no side effect. */
+	const Train *r3r_backout_owner = nullptr;
+	int r3r_backout_owner_track = -1;
+	bool r3r_backout_owner_whole = false;
+	/* R3R (第 243 轮续四十五, REG-243-S): the two masks the refused check actually
+	 * looked at (need= the tracks this step had to cross, resv= the tracks the tile
+	 * holds) plus the ledger's answer for the blamed track. The walk above names the
+	 * train standing at the far end of the reserved path, which is the coupling
+	 * target while a locomotive lays down a coupling path -- i.e. it can blame
+	 * somebody else for the locomotive's own bit (KI-359, pbs.cpp). The ledger
+	 * recorded who really wrote it, so `led=` is what separates "活车合法让路"
+	 * (led=<a live car that meant to hold it>) from "陈旧位/孤儿位" (led=-1: no row
+	 * at all -- came in with a savegame, from a whole-tile rebuild, or from a write
+	 * that ran with no R3R actor set). Read-only: no branch condition, no side
+	 * effect. */
+	uint r3r_backout_need_bits = 0;
+	uint r3r_backout_resv_bits = 0;
+	int r3r_backout_ledger = -1;
+
 	TileIndex tile = origin.tile;
 	Trackdir  cur_td = origin.trackdir;
 	while (ft.Follow(tile, cur_td)) {
 		if (KillFirstBit(ft.new_td_bits) == TRACKDIR_BIT_NONE) {
 			/* Possible signal tile. */
-			if (HasOnewaySignalBlockingTrackdir(ft.new_tile, FindFirstTrackdir(ft.new_td_bits))) break;
+			if (HasOnewaySignalBlockingTrackdir(ft.new_tile, FindFirstTrackdir(ft.new_td_bits))) { r3r_backout_reason = "oneway-signal"; break; }
 		}
 
 		if (ft.tiles_skipped == 0 && Rail90DegTurnDisallowedTilesFromTrackdir(ft.old_tile, ft.new_tile, ft.old_td, _settings_game.pf.forbid_90_deg)) {
 			ft.new_td_bits &= ~TrackdirCrossesTrackdirs(ft.old_td);
-			if (ft.new_td_bits == TRACKDIR_BIT_NONE) break;
+			if (ft.new_td_bits == TRACKDIR_BIT_NONE) { r3r_backout_reason = "90deg-turn"; break; }
 		}
 
 		/* Station, depot or waypoint are a possible target. */
@@ -12689,7 +13184,64 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			 * orders, so we might cause pathfinding to fail later on if we find a choice.
 			 * This failure would cause a bogus call to TryReserveSafePath which might reserve
 			 * a wrong path not leading to our next destination. */
-			if (HasReservedTracks(ft.new_tile, TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td)))) break;
+			if (HasReservedTracks(ft.new_tile, TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td)))) {
+				/* R3R (第 243 轮, REG-243-S): record WHO holds the bit. Whole-tile walk first
+				 * (the engine's own ownership walk, also valid on station/waypoint tiles),
+				 * then per reserved track. Log only: the branch condition is unchanged. */
+				r3r_backout_reason = "choice-reserved";
+				const TrackBits r3r_need_bits = TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td));
+				const TrackBits r3r_resv_bits = GetReservedTrackbits(ft.new_tile);
+				r3r_backout_need_bits = (uint)r3r_need_bits;
+				r3r_backout_resv_bits = (uint)r3r_resv_bits;
+				/* R3R (第 243 轮续四十五): blame the track this step actually had to
+				 * cross, not merely the first reserved track on the tile -- the old
+				 * report could name a track that had nothing to do with the refusal,
+				 * and it is the blamed track that `led=` is asked about below. */
+				Track r3r_blame_track = INVALID_TRACK;
+				for (Track r3r_t = TRACK_BEGIN; r3r_t < TRACK_END; r3r_t++) {
+					if (HasBit(r3r_resv_bits, r3r_t) && HasBit(r3r_need_bits, r3r_t)) { r3r_blame_track = r3r_t; break; }
+				}
+				Train *r3r_whole_owner = GetTrainForWholeTileReservation(ft.new_tile);
+				if (r3r_whole_owner != nullptr) {
+					r3r_backout_owner = r3r_whole_owner;
+					r3r_backout_owner_whole = true;
+				} else {
+					for (Track r3r_t = TRACK_BEGIN; r3r_t < TRACK_END; r3r_t++) {
+						if (!HasBit(r3r_resv_bits, r3r_t)) continue;
+						Train *r3r_t_owner = GetTrainForReservation(ft.new_tile, r3r_t);
+						if (r3r_t_owner != nullptr) { r3r_backout_owner = r3r_t_owner; r3r_backout_owner_track = (int)r3r_t; break; }
+					}
+				}
+				if (r3r_blame_track != INVALID_TRACK) {
+					r3r_backout_owner_track = (int)r3r_blame_track;
+					/* The authoritative answer: who booked this bit (KI-359). */
+					const uint32_t r3r_led = R3RResvLedgerOwner(ft.new_tile, r3r_blame_track);
+					r3r_backout_ledger = (r3r_led == R3R_RESV_NO_OWNER) ? -1 : (int)r3r_led;
+				}
+				/* R3R (第 243 轮续四十七, REG-243-S / REG-243-T): a chain can be stopped by a
+				 * bit of its own that its current path no longer uses. The booking was laid
+				 * down by an earlier path and left behind when the path was re-laid --
+				 * ExtendTrainReservation() only ever re-reserves the path it walks now, and
+				 * neither a chain edit nor a decouple walks the bits the chain abandons.
+				 * `led=` names that booker; `owner=` is only the walk's landing place and can
+				 * be another train entirely (REG-243-T = (i), KI-359). So when the blocking
+				 * bit is *ours*, drop it and retry the very same check once -- this is not a
+				 * "let the train through" rule. R3RReleaseReservationLedgerChecked() keeps a
+				 * bit that is still doing its job (a train stands on it, or the ledger handed
+				 * it to somebody else), so only a stale booking of this very chain can go. */
+				const uint32_t r3r_own_key = R3RResvActorID(v).base();
+				if (r3r_blame_track != INVALID_TRACK && r3r_backout_ledger == (int)r3r_own_key &&
+						R3RReleaseReservationLedgerChecked(r3r_own_key, ft.new_tile, r3r_blame_track, "stale-own-bit") &&
+						!HasReservedTracks(ft.new_tile, TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td)))) {
+					R3RDbgWrite("STALE-OWN-BIT veh=%u tile=%d,%d track=%d led=%d cleared=1\n",
+							(uint)r3r_own_key, (int)TileX(ft.new_tile), (int)TileY(ft.new_tile),
+							(int)r3r_blame_track, r3r_backout_ledger);
+					/* The bit is gone: the tile is free again, so treat it as an ordinary
+					 * choice and let the pathfinder lay down the rest of the path. */
+				} else {
+					break;
+				}
+			}
 
 			/* If we did skip some tiles, backtrack to the first skipped tile so the pathfinder
 			 * actually starts its search at the first unreserved tile. */
@@ -12708,7 +13260,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 		if (IsSafeWaitingPosition(v, tile, cur_td, true, _settings_game.pf.forbid_90_deg)) {
 			PBSWaitingPositionRestrictedSignalState restricted_signal_state;
 			bool wp_free = IsWaitingPositionFree(v, tile, cur_td, _settings_game.pf.forbid_90_deg, &restricted_signal_state);
-			if (!(wp_free && TryReserveRailTrackdir(v, tile, cur_td))) break;
+			if (!(wp_free && TryReserveRailTrackdir(v, tile, cur_td))) { r3r_backout_reason = wp_free ? "safe-reserve-fail" : "safe-not-free"; break; }
 			/* Safe position is all good, path valid and okay. */
 			restricted_signal_state.TraceRestrictExecuteResEndSlot(v);
 			return PBSTileInfo(tile, cur_td, true);
@@ -12739,12 +13291,13 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 				prog->Execute(v, input, out);
 				if (front_side && (out.flags & TRPRF_WAIT_AT_PBS)) {
 					/* Wait at PBS is set, take this as waiting at the start signal, handle as a reservation failure */
+					r3r_backout_reason = "wait-at-pbs";
 					break;
 				}
 			}
 		}
 
-		if (!TryReserveRailTrackdir(v, tile, cur_td)) break;
+		if (!TryReserveRailTrackdir(v, tile, cur_td)) { r3r_backout_reason = "reserve-fail"; break; }
 	}
 
 	if (ft.err == CFollowTrackRail::EC_OWNER || ft.err == CFollowTrackRail::EC_NO_WAY) {
@@ -12753,6 +13306,31 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 	}
 
 	/* Sorry, can't reserve path, back out. */
+	/* R3R (第 243 轮, REG-243-O): name this release path (ExtendTrainReservation's own
+	 * rollback of the trial extension) so the UNRES-RAIL lines read "extend-backout"
+	 * instead of inheriting the caller's phase. Not in R3RResvLedgerPurpose()'s
+	 * consist_phases[]: log only, no behaviour. */
+	R3RResvPhaseGuard r3r_phase_backout("extend-backout", R3RResvActorID(v));
+	/* R3R (第 243 轮, REG-243-O): why the trial extension stopped, and where.
+	 * stop= is the last tile the follower accepted (== the tile the back-out
+	 * loop stops at); next= is the tile it failed to step onto. */
+	/* R3R (第 243 轮, REG-243-S): owner=/whole=/track= answer "whose bit blocked the
+	 * choice tile" (owner=-1 means the audit walk found nobody although a reserved bit
+	 * matched, i.e. a candidate orphan). Appended at the end: the old fields, and their
+	 * order, are byte-for-byte unchanged.
+	 * R3R (第 243 轮续四十五): need=/resv= are the two masks that tripped the refusal
+	 * (need= what the step had to cross, resv= what the tile holds; the intersection
+	 * is the blamed track reported in track=), and led= is the ledger's owner of that
+	 * blamed track (-1 = no ledger row at all, i.e. nobody ever booked it through the
+	 * map setters -- a savegame/whole-tile-rebuild/actor-less write, see pbs.cpp).
+	 * owner= is the *walk* result and may be a different train than led= (KI-359). */
+	R3RDbgWrite("EXTEND-BACKOUT veh=%u origin=%d,%d/%d stop=%d,%d/%d next=%d,%d reason=%s err=%d owner=%d whole=%d track=%d need=0x%X resv=0x%X led=%d\n",
+			(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+			(int)TileX(ft.old_tile), (int)TileY(ft.old_tile), (int)ft.old_td,
+			(int)TileX(ft.new_tile), (int)TileY(ft.new_tile), r3r_backout_reason, (int)ft.err,
+			r3r_backout_owner != nullptr ? (int)r3r_backout_owner->index.base() : -1,
+			r3r_backout_owner_whole ? 1 : 0, r3r_backout_owner_track,
+			r3r_backout_need_bits, r3r_backout_resv_bits, r3r_backout_ledger);
 	tile = origin.tile;
 	cur_td = origin.trackdir;
 	TileIndex stopped = ft.old_tile;
@@ -13890,8 +14468,70 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	 * Exit here as doing any further reservations will probably just
 	 * make matters worse. */
 	if (other_train != nullptr && other_train->index != consist->index) {
-		if (mark_as_stuck) MarkTrainAsStuck(consist);
-		return TPRRF_NONE;
+		/* R3R (KI-330, U-1): read-only diagnosis. On the 2026-10-06 T8701/2 report the
+		 * locomotive's own reservation path ends on a tile it shares with the consist
+		 * it has just decoupled from; this branch then reports that consist as
+		 * "blocking" forever (the log shows no CRT/ChooseTrainTrack run for veh=48
+		 * after LOCO-AFTER-DECOUPLE). Log the exact origin / other-train geometry so
+		 * the fix can be scoped to the decouple seam without touching the genuine
+		 * "a train really is ahead on our path" case. */
+		const uint64_t tprblk_key = ((uint64_t)consist->index.base() << 32) | (uint64_t)other_train->index.base();
+		const uint64_t tprblk_payload = ((uint64_t)origin.tile.base() << 32) ^ (uint64_t)other_train->tile.base();
+		if (R3RDbgEdge(R3REDGE_TPRBLK, tprblk_key, tprblk_payload)) {
+			const Train *blk_mf = consist->GetMovingFront();
+			const Train *oth = Train::From(other_train);
+			const Train *oth_first = (oth != nullptr) ? oth->First() : nullptr;
+			const Train *oth_mf = (oth != nullptr) ? oth->GetMovingFront() : nullptr;
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "TPR-BLOCKED veh=%u tile=%u,%u spd=%d mf=%u,%u origin=%u,%u okay=%d td=%d other=%u otherTile=%u,%u otherMf=%u,%u otherSpd=%d otherOrder=%d otherFirst=%u caronly=%d\n",
+						consist->index.base(), (uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
+						blk_mf != nullptr ? (uint)TileX(blk_mf->tile) : 65535u, blk_mf != nullptr ? (uint)TileY(blk_mf->tile) : 65535u,
+						(uint)TileX(origin.tile), (uint)TileY(origin.tile), origin.okay ? 1 : 0, (int)origin.trackdir,
+						other_train->index.base(), (uint)TileX(other_train->tile), (uint)TileY(other_train->tile),
+						oth_mf != nullptr ? (uint)TileX(oth_mf->tile) : 65535u, oth_mf != nullptr ? (uint)TileY(oth_mf->tile) : 65535u,
+						other_train->cur_speed, (int)other_train->current_order.GetType(),
+						oth_first != nullptr ? oth_first->index.base() : 0u,
+						(oth_first != nullptr && R3RIsCarOnlyFormation(oth_first)) ? 1 : 0);
+				fclose(dbg);
+			}
+		}
+		/* R3R (KI-330, U-1 fix): decouple-seam exemption.
+		 *
+		 * On the 2026-10-06/07 T8701/2 runs all 8 TPR-BLOCKED hits satisfied
+		 * otherTile == moving_front->tile, i.e. the "blocking" train is the consist
+		 * this locomotive itself has just decoupled from, standing on the very same
+		 * tile -- while the locomotive's own reservation ends on a safe tile
+		 * (origin=100,65 okay=1). The branch below therefore treated the seam as a
+		 * permanent block and the locomotive never reached ChooseTrainTrack again.
+		 *
+		 * Waiving the veto gives the locomotive no privilege: it still has to walk
+		 * the ordinary ChooseTrainTrack/TryReserveRailTrack flow underneath, and
+		 * whether it may move at all is still decided by PBS reservation mutual
+		 * exclusion (the track the other train stands on is reserved by that train).
+		 * A genuine block looks different -- the other train stands on the *far end
+		 * of our reserved path*, i.e. otherTile == origin.tile with a different tile
+		 * than our own -- so it can never reach this exemption.
+		 */
+		if (other_train->tile == consist->tile && consist->cur_speed == 0) {
+			const uint64_t tprex_key = ((uint64_t)consist->index.base() << 32) | (uint64_t)other_train->index.base();
+			const uint64_t tprex_payload = ((uint64_t)origin.tile.base() << 32) ^ (uint64_t)other_train->index.base();
+			if (R3RDbgEdge(R3REDGE_TPREXEMPT, tprex_key, tprex_payload)) {
+				const Train *ex_first = Train::From(other_train)->First();
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "TPR-SEAM-EXEMPT veh=%u tile=%u,%u spd=%d other=%u origin=%u,%u okay=%d td=%d otherOrder=%d caronly=%d\n",
+							consist->index.base(), (uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
+							other_train->index.base(), (uint)TileX(origin.tile), (uint)TileY(origin.tile),
+							origin.okay ? 1 : 0, (int)origin.trackdir, (int)other_train->current_order.GetType(),
+							(ex_first != nullptr && R3RIsCarOnlyFormation(ex_first)) ? 1 : 0);
+					fclose(dbg);
+				}
+			}
+		} else {
+			if (mark_as_stuck) MarkTrainAsStuck(consist);
+			return TPRRF_NONE;
+		}
 	}
 	/* If we have a reserved path and the path ends at a safe tile, we are finished already. */
 	if (origin.okay && (moving_front->tile != origin.tile || first_tile_okay)) {
@@ -13923,6 +14563,32 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	TrackBits reachable = TrackdirBitsToTrackBits(GetTileTrackdirBits(new_tile, TRANSPORT_RAIL, 0) & DiagdirReachesTrackdirs(exitdir));
 
 	if (Rail90DegTurnDisallowedTilesFromDiagDir(origin.tile, new_tile, exitdir, _settings_game.pf.forbid_90_deg)) reachable &= ~TrackCrossesTracks(TrackdirToTrack(origin.trackdir));
+
+	/* R3R (KI-330, U-1b): read-only diagnosis, zero behaviour change. When the
+	 * "blocked by another train" test above did *not* fire, only two exits remain
+	 * and neither is otherwise observable: (a) `reachable == TRACK_BIT_NONE`, the
+	 * tile the reservation would continue on carries no track we may use -- this
+	 * logs nothing at all, and (b) ChooseTrainTrack() is reached but cannot book
+	 * the path. Log the walked origin and the first step taken so that a single
+	 * reproduction separates them (the U-1 question left open in the KI-330 memo:
+	 * the old build had no probe here and the log ends right after the decouple). */
+	{
+		const uint64_t tprwalk_payload = (uint64_t)(uint32_t)reachable | ((uint64_t)(uint32_t)exitdir << 16);
+		if (R3RDbgEdge(R3REDGE_TPRWALK, (uint64_t)consist->index.base(), tprwalk_payload)) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				const Train *walk_mf = consist->GetMovingFront();
+				fprintf(dbg, "TPR-WALK veh=%u mf=%u,%u origin=%u,%u td=%u okay=%d exit=%u new=%u,%u reach=%u spd=%d one=%d look=%d\n",
+						consist->index.base(),
+						walk_mf != nullptr ? (uint)TileX(walk_mf->tile) : 65535u,
+						walk_mf != nullptr ? (uint)TileY(walk_mf->tile) : 65535u,
+						(uint)TileX(origin.tile), (uint)TileY(origin.tile), (unsigned)origin.trackdir, origin.okay ? 1 : 0,
+						(unsigned)exitdir, (uint)TileX(new_tile), (uint)TileY(new_tile), (uint)reachable,
+						consist->cur_speed, consist->HasForceReserveOnce() ? 1 : 0, consist->lookahead != nullptr ? 1 : 0);
+				fclose(dbg);
+			}
+		}
+	}
 
 	TryPathReserveResultFlags result_flags = TPRRF_NONE;
 	if (reachable != TRACK_BIT_NONE) {
@@ -14274,59 +14940,58 @@ static bool R3RIsReservationHolder(const Train *consist)
 }
 
 /**
- * R3R (KI-203b): release one booked reservation without tripping over tiles that
- * changed type since it was booked (track lifted, tile rebuilt into a station,
- * depot, tunnel bridge or level crossing).
+ * R3R (KI-363 part B', 243 轮续五十): collect into @a out every tile that some
+ * train currently books on *its own* reservation. The keys are
+ * TileIndex::base(); the value is unused -- an unordered_map stands in for a set
+ * because this file does not pull in <unordered_set>.
  *
- * UnreserveTrack() is the low level plain-rail helper: it goes through
- * HasTrack() -> GetTrackBits(), which dbg_asserts IsPlainRailTile()
- * (rail_map.h:168). Calling it on a booked tile that has been rebuilt since is
- * what crashed the game -- the bookkeeping has to be defensive here, because it
- * by design looks at tiles the consist *left* long ago.
+ * This is the escape hatch the audit needs for the "no ledger row" case. That
+ * state is ambiguous: the ledger is NOSAVE (pbs.cpp:159), so right after a load
+ * *every* live reservation is row-less -- including the approach path a
+ * locomotive lays down towards the consist it is about to couple onto. That
+ * path's walk lands on the consist (its far end), and the path's tiles are not
+ * on the consist's own path either, so judging "row-less, therefore stray"
+ * through the landing train would hand a perfectly live approach path to the
+ * reaper. Judging by the union of every train's own path cannot: such a bit is
+ * on the *booker's* path.
  *
- * Anything we cannot prove to be a plain rail tile which still carries our bit
- * is left untouched and only dropped from the books.
+ * Deliberately tile-granular and track-blind -- coarser only makes the criterion
+ * more conservative (fewer strays), never less safe.
+ *
+ * @return False when some chain had to be skipped because it shares a tile with
+ *         another chain (the KI-211d guard inside R3RCollectReservedPathTiles):
+ *         that chain contributes no path at all, so the union has a hole -- and
+ *         the hole sits exactly on the "just coupled / just decoupled, two
+ *         trains on one tile" moment. The caller must then not use the result to
+ *         declare anything a stray.
  */
-static void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why)
+static bool R3RResvCollectAllPathTiles(std::unordered_map<uint32_t, uint8_t> &out)
 {
-	/* KI-207c: a station platform or a waypoint does not carry per-track
-	 * reservations but one whole-tile bit (station_map.h SetRailStationReservation),
-	 * and ReserveTrackUnderConsist() books those tiles too -- a consist parked on a
-	 * waypoint by the R3R platform waiter reserves exactly that tile. Until now the
-	 * release refused everything that is not plain rail (HasTrack() -> rail_map.h:168
-	 * asserts IsPlainRailTile), which made the bit permanent: no engine path ever
-	 * clears a *waypoint* tile either, because every platform release site
-	 * (SetRailStationPlatformReservation) is guarded by IsRailStationTile(), which
-	 * by definition excludes waypoints. That is the ghost the player reported --
-	 * only on the waypoint tile, one tile wide, gone once the waypoint is gone.
-	 *
-	 * The platform bit is shared between the tracks of that tile, so only release it
-	 * when no train stands on the tile and the engine cannot attribute the
-	 * reservation to anybody -- the same "nobody owns this path" criterion the audit
-	 * uses. */
-	if (IsValidTile(tile) && GetTileType(tile) == TileType::Station && HasStationRail(tile)) {
-		const bool ours = HasStationReservation(tile) &&
-				GetFirstVehicleOnTile(tile, VehicleType::Train) == nullptr &&
-				GetTrainForWholeTileReservation(tile) == nullptr;
-		if (ours) {
-			const TrackBits rail_bits = GetStationReservationTrackBits(tile);
-			if (rail_bits != TRACK_BIT_NONE) {
-				R3RResvPhaseGuard phase_guard("gc-stn");
-				UnreserveRailTrack(tile, FindFirstTrack(rail_bits));
+	out.clear();
+	bool complete = true;
+
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->type != VehicleType::Train || v->Previous() != nullptr) continue;
+		const Train *const chain_head = Train::From(v);
+
+		/* Mirror the KI-211d guard (pbs.cpp): a tile holding two chains makes the
+		 * bits leaving it unattributable, and then no path is collected for that
+		 * chain -- which is exactly the hole this return value reports. */
+		for (const Train *w = chain_head; w != nullptr; w = w->Next()) {
+			for (const Vehicle *vt = GetFirstVehicleOnTile(w->tile, VehicleType::Train); vt != nullptr; vt = vt->HashTileNext()) {
+				if (Train::From(vt)->First() != chain_head) { complete = false; break; }
 			}
+			if (!complete) break;
 		}
-		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s%s\n",
-				key, (int)TileX(tile), (int)TileY(tile), IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION",
-				why, ours ? "" : "-skip");
-		return;
+		/* A known hole is enough: stop walking, the caller will not use the set. */
+		if (!complete) break;
+
+		R3RCollectReservedPathTiles(chain_head, [](TileIndex tile, Trackdir, void *ctx) {
+			static_cast<std::unordered_map<uint32_t, uint8_t> *>(ctx)->emplace(tile.base(), 1);
+		}, &out);
 	}
 
-	const bool ours = IsValidTile(tile) && GetTileType(tile) == TileType::Railway &&
-			IsPlainRailTile(tile) && HasTrack(tile, track) &&
-			HasBit(GetRailReservationTrackBits(tile), track);
-	if (ours) UnreserveTrack(tile, track);
-	R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s%s\n",
-			key, (int)TileX(tile), (int)TileY(tile), (uint)track, why, ours ? "" : "-skip");
+	return complete;
 }
 
 /**
@@ -14389,6 +15054,23 @@ static void R3RReservationAudit(const char *tag)
 	uint reaped = 0;
 	std::vector<uint32_t> strays_now;
 
+	/* KI-363 part B' (243 轮续五十): the union of every train's own reserved path,
+	 * built lazily -- only a row-less bit ever needs it, and in a healthy session
+	 * there is no such bit at all. See R3RResvCollectAllPathTiles() for why the
+	 * union (and not the landing train's own path) is the safe discriminator. */
+	std::unordered_map<uint32_t, uint8_t> all_path_tiles;
+	bool all_path_tiles_built = false;
+	bool all_path_tiles_complete = false;
+	auto bit_on_some_path = [&](TileIndex t) -> bool {
+		if (!all_path_tiles_built) {
+			all_path_tiles_complete = R3RResvCollectAllPathTiles(all_path_tiles);
+			all_path_tiles_built = true;
+		}
+		/* An incomplete set has a hole, so "not in it" proves nothing. */
+		return !all_path_tiles_complete ||
+				(all_path_tiles.find(t.base()) != all_path_tiles.end());
+	};
+
 	for (TileIndex t(0); t < Map::Size(); t++) {
 		/* KI-207: the reap below only sees plain rail, the only place a single
 		 * track bit can be booked on its own. A watched tile may however be a
@@ -14429,13 +15111,23 @@ static void R3RReservationAudit(const char *tag)
 			reserved++;
 			Train *owner = GetTrainForWholeTileReservation(t);
 			const uint32_t wkey = bit_key(t, R3R_RESV_WHOLE_TILE_KEY);
-			if (owner == nullptr) {
+			/* KI-359 (memo §21.7): a bit can also be a stray because the train that
+			 * booked it is gone -- the walk keeps answering "owned" as long as
+			 * anybody stands at the far end of that path, so the far end is not the
+			 * booker (see pbs.cpp, the reservation ledger). Ask the ledger for the
+			 * booker and treat "booker no longer exists" as a stray as well; that is
+			 * the case the old criterion let through forever (KI-355 layer 2). */
+			const uint32_t lowner = R3RResvLedgerOwner(t, INVALID_TRACK);
+			const bool ledger_dead = (lowner != R3R_RESV_NO_OWNER) && (Train::GetIfValid((size_t)lowner) == nullptr);
+			if (owner == nullptr || ledger_dead) {
 				stray++;
 				strays_now.push_back(wkey);
 				const auto aged = _r3r_resv_stray_age.find(wkey);
-				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=stn kind=%s age=%u\n",
+				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=stn kind=%s age=%u lowner=%d why=%s\n",
 						tag, (int)TileX(t), (int)TileY(t), IsRailWaypointTile(t) ? "WAYPOINT" : "STATION",
-						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0));
+						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0),
+						(lowner == R3R_RESV_NO_OWNER) ? -1 : (int)lowner,
+						(owner == nullptr) ? "walk" : "dead");
 			} else {
 				owned++;
 				_r3r_resv_stray_age.erase(wkey);
@@ -14456,13 +15148,30 @@ static void R3RReservationAudit(const char *tag)
 			if (!HasBit(bits, track)) continue;
 			Train *owner = GetTrainForReservation(t, track);
 			const uint32_t bkey = bit_key(t, track);
-			if (owner == nullptr) {
+			/* KI-359 (memo §21.7): see the station branch above -- "the walk found
+			 * somebody" is not the same as "the booker still exists". */
+			const uint32_t lowner = R3RResvLedgerOwner(t, track);
+			const bool ledger_dead = (lowner != R3R_RESV_NO_OWNER) && (Train::GetIfValid((size_t)lowner) == nullptr);
+			/* KI-363 part B' (243 轮续五十): a bit that no ledger row covers AND that
+			 * is on nobody's own path is a stray as well. The old criterion only
+			 * caught "the walk found nobody" and "the booker is gone", so a bit whose
+			 * booker never got a row (a booking made outside an R3R phase, or a row
+			 * lost with the NOSAVE ledger) stayed on the map forever. See
+			 * R3RResvCollectAllPathTiles() for the safety argument. The *whole-tile*
+			 * branch above cannot use this escape: its reap re-asks
+			 * GetTrainForWholeTileReservation(), i.e. the very same question as
+			 * `owner`, so such a stray could never actually be released -- it would
+			 * only pin the audit to its 256-tick cadence from then on. */
+			const bool ledger_absent = (owner != nullptr) && (lowner == R3R_RESV_NO_OWNER) && !bit_on_some_path(t);
+			if (owner == nullptr || ledger_dead || ledger_absent) {
 				stray++;
 				strays_now.push_back(bkey);
 				const auto aged = _r3r_resv_stray_age.find(bkey);
-				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=%u bits=0x%X age=%u\n",
+				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=%u bits=0x%X age=%u lowner=%d why=%s\n",
 						tag, (int)TileX(t), (int)TileY(t), (uint)track, (uint)bits,
-						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0));
+						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0),
+						(lowner == R3R_RESV_NO_OWNER) ? -1 : (int)lowner,
+						(owner == nullptr) ? "walk" : (ledger_dead ? "dead" : "norow"));
 			} else {
 				owned++;
 				_r3r_resv_stray_age.erase(bkey);
@@ -14536,8 +15245,25 @@ static void R3RReservationAudit(const char *tag)
 		}
 	}
 
-	R3RDbgWrite("RESV-AUDIT-SUMMARY %s reservedTiles=%u owned=%u strayTiles=%u reaped=%u pendingStray=%u\n",
-			tag, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_age.size());
+	/* R3R (REG-243-A): print the tick the pass ran on, so a session that shows
+	 * fewer SUMMARY lines than the 2048-tick cadence predicts can be told apart
+	 * ("the game was paused, _tick_counter did not advance" vs. "the audit
+	 * stopped being scheduled"). */
+	R3RDbgWrite("RESV-AUDIT-SUMMARY %s tick=%u reservedTiles=%u owned=%u strayTiles=%u reaped=%u pendingStray=%u\n",
+			tag, (uint)_tick_counter, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_age.size());
+
+	/* R3R (KI-363, Mirror law): reconcile the ledger against the map once per sweep.
+	 * A writer that bypassed the setters (a station rebuilt over the tile, a platform
+	 * reservation cleared wholesale) shows up here as a row whose bit is gone, and
+	 * dropping it keeps the ledger a mirror of the map instead of drifting into
+	 * freeing the wrong bits later (REG-243-K). The reconcile rides the ownerless
+	 * R3RResvLedgerForget() entry point -- "nothing to forget" means "align with the
+	 * map" -- so pbs.h, and hence the incremental build, stays untouched. */
+	R3RResvLedgerForget(VehicleID::Invalid(), "resync");
+
+	/* R3R (KI-364): tell the scheduler whether the next pass has to come back early
+	 * to keep ageing the strays that are still here. */
+	_r3r_resv_audit_has_pending = !_r3r_resv_stray_age.empty();
 }
 
 /**
@@ -14789,6 +15515,26 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 				 * flag as every other path -- without a matching lock the
 				 * travelling locomotive is simply not headed for this consist. */
 				R3RCouplePairMatches(loco, v->First())) {
+			/* R3R (KI-341, 第 233 轮): the "touch while touching the depot" shortcut
+			 * used to fire as soon as the loco's *nose* reached a wagon standing
+			 * inside the depot, even while the loco (and its train) was still
+			 * outside. That produced the KI-340 mis-splice: the hit is measured
+			 * nose-to-body (a few px) but Couple() splices tail-to-head, so the
+			 * two ends are a whole locomotive length apart (dist=31). Wait until
+			 * the moving consist has physically entered the depot (every car's
+			 * track == TRACK_BIT_DEPOT, same criterion as KI-339's depot scan
+			 * block at 17395). The train then finishes entering under its own
+			 * movement code and couples from TrainCoupleHandler(), where the two
+			 * chains are aligned on the same depot track. */
+			if (!R3RChainFullyInDepot(loco)) {
+				if (R3RDbgEdge(R3REDGE_CPLDEPOTSKIP,
+						(uint64_t)loco->index.base(), (uint64_t)v->First()->index.base())) {
+					R3RDbgWrite("CPL-DEPOT-NOTIN veh=%d head=%d tile=%d,%d v=%d vtrack=%d\n",
+							(int)loco->index.base(), (int)v->First()->index.base(),
+							TileX(loco->tile), TileY(loco->tile), (int)v->index.base(), (int)v->track);
+				}
+				return 0;
+			}
 			int x_diff = v->x_pos - moving_front->x_pos;
 			int y_diff = v->y_pos - moving_front->y_pos;
 			int min_diff = (v->gcache.cached_veh_length + 1) / 2 + (moving_front->gcache.cached_veh_length + 1) / 2 - 1;
@@ -15579,6 +16325,81 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 						/* In front of a red signal */
 						Trackdir i = FindFirstTrackdir(trackdirbits);
 
+						if (R3RDbgOn()) {
+							/* R3R (KI-349): one-shot, read-only dump of the block behind the red
+							 * signal -- answers "who keeps it red?" (stray reservation vs. a real
+							 * neighbour) without touching any state. Edge-triggered, so one line
+							 * per (train, tile) unless the reservation picture changes. */
+							const DiagDirection beyond_dir = TrackdirToExitdir(i);
+							const TileIndex beyond = TileAddByDiagDir(gp.new_tile, beyond_dir);
+							const bool beyond_valid = IsValidTile(beyond);
+							const bool new_plain = IsPlainRailTile(gp.new_tile);
+							const bool beyond_plain = beyond_valid && IsPlainRailTile(beyond);
+							const TrackBits new_resv = new_plain ? GetReservedTrackbits(gp.new_tile) : TRACK_BIT_NONE;
+							const TrackBits beyond_resv = beyond_plain ? GetReservedTrackbits(beyond) : TRACK_BIT_NONE;
+							if (R3RDbgEdge(R3REDGE_REDSIG,
+									((uint64_t)first->index.base() << 32) ^ (uint64_t)gp.new_tile.base(),
+									((uint64_t)new_resv << 32) ^ (uint64_t)beyond_resv)) {
+								R3RDbgWrite("REDSIG veh=%d old=%d,%d new=%d,%d dir=%d chosen=0x%X i=%d prog=%d spd=%d wait=%d stuck=%d\n",
+										(int)first->index.base(), TileX(gp.old_tile), TileY(gp.old_tile),
+										TileX(gp.new_tile), TileY(gp.new_tile), (int)enterdir,
+										(int)chosen_track, (int)i, (int)first->progress,
+										(int)first->cur_speed, (int)first->wait_counter,
+										first->flags.Test(VehicleRailFlag::Stuck) ? 1 : 0);
+								R3RDbgWrite("REDSIG   tdbits=0x%X reach=0x%X sigs=0x%X red=0x%X bits=0x%X\n",
+										(int)trackdirbits, (int)reachable_trackdirs,
+										(int)ts.signals, (int)red_signals, (int)bits);
+								if (new_plain) {
+									R3RDbgWrite("REDSIG   new present=0x%X states=0x%X resv=0x%X veh=%d\n",
+											(int)GetPresentSignals(gp.new_tile), (int)GetSignalStates(gp.new_tile),
+											(int)new_resv,
+											HasVehicleOnTile<VehicleType::Train>(gp.new_tile, [](const Train *) { return true; }) ? 1 : 0);
+									/* R3R (round 243-b, REG-243-D): the old loop used k as both a 4-bit
+									 * signal slot (GetPresentSignals = GB(m3,4,4)) and a Track enum, so it
+									 * overran (k == 4,5 never match) and mislabelled the track. Walk only
+									 * the tracks this tile actually has, then test the signal on each. */
+									for (Track t = TRACK_BEGIN; t < TRACK_END; ++t) {
+										if (!HasBit(GetTrackBits(gp.new_tile), t)) continue;
+										if (!HasSignalOnTrack(gp.new_tile, t)) continue;
+										R3RDbgWrite("REDSIG     track=%d type=%d oneway=%d pbs=%d\n",
+												(int)t, (int)GetSignalType(gp.new_tile, t),
+												IsOnewaySignal(gp.new_tile, t) ? 1 : 0,
+												IsPbsSignal(GetSignalType(gp.new_tile, t)) ? 1 : 0);
+									}
+								}
+								R3RDbgWrite("REDSIG   beyond=%d,%d valid=%d plain=%d resv=0x%X veh=%d\n",
+										beyond_valid ? TileX(beyond) : -1, beyond_valid ? TileY(beyond) : -1,
+										beyond_valid ? 1 : 0, beyond_plain ? 1 : 0, (int)beyond_resv,
+										(beyond_plain && HasVehicleOnTile<VehicleType::Train>(beyond, [](const Train *) { return true; })) ? 1 : 0);
+								if (beyond_plain) {
+									for (uint k = 0; k < 6; k++) {
+										const Track t = (Track)k;
+										if (!HasBit(beyond_resv, t)) continue;
+										const Train *owner = GetTrainForReservation(beyond, t);
+										const Train *near = GetR3RReservationOwnerNearby(beyond, t);
+										R3RDbgWrite("REDSIG     beyond track=%d owner=%d near=%d\n",
+												(int)t, owner == nullptr ? -1 : (int)owner->index.base(),
+												near == nullptr ? -1 : (int)near->index.base());
+										/* R3R (KI-350): split the attribution above by direction.
+										 * near= is the *first* direction (TrackToTrackdir) that meets a
+										 * train, so on its own it cannot show that the other direction
+										 * also reaches one -- which is what decides "my own booking's
+										 * far end" (G-1: the block is held by the train asking) from "a
+										 * stale bit of the neighbour" (G-2: held by somebody else).
+										 * Same read-only walk the purge uses, one direction at a time. */
+										const Trackdir td_fwd = TrackToTrackdir(t);
+										const Trackdir td_rev = ReverseTrackdir(td_fwd);
+										const Train *hit_fwd = R3RReservationOwnerInDirection(beyond, td_fwd);
+										const Train *hit_rev = R3RReservationOwnerInDirection(beyond, td_rev);
+										R3RDbgWrite("REDSIG     beyond track=%d dir=%d hit=%d\n",
+												(int)t, (int)td_fwd, hit_fwd == nullptr ? -1 : (int)hit_fwd->index.base());
+										R3RDbgWrite("REDSIG     beyond track=%d dir=%d hit=%d\n",
+												(int)t, (int)td_rev, hit_rev == nullptr ? -1 : (int)hit_rev->index.base());
+									}
+								}
+							}
+						}
+
 						if (reverse_at_signal) {
 							v->flags.Reset(VehicleRailFlag::Stuck);
 							goto reverse_train_direction;
@@ -16280,6 +17101,10 @@ static void DeleteLastWagon(Train *v)
 	R3RTrackBitsProbe("crashed-del", trackbits, -1, tile);
 	Track track = TrackBitsToTrack(trackbits);
 	if (HasReservedTracks(tile, trackbits)) {
+		/* R3R (第 243 轮, REG-243-O): name this release path. 'v' is already deleted
+		 * here, so no actor is set. "crash-del" is not in
+		 * R3RResvLedgerPurpose()'s consist_phases[]: log only, no behaviour. */
+		R3RResvPhaseGuard r3r_phase_crash("crash-del");
 		UnreserveRailTrack(tile, track);
 
 		/* If there are still crashed vehicles on the tile, give the track reservation to them */
@@ -16696,18 +17521,89 @@ static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)
 static bool TrainLocoHandler(Train *consist, bool mode)
 {
 	R3RScopeTimer r3r_loco_timer(&r3r_loco_ns, &r3r_loco_calls);
-	/* R3R (KI-203c): read-only reservation audit, at most one full map pass every
-	 * R3R_RESV_AUDIT_TICKS. It lists reserved tiles whose nearest train is far
-	 * away -- the "black reservation preview nobody owns" the player keeps
-	 * reporting (60,16). Never modifies the map, so it cannot introduce new
-	 * failures. The first entry after a loadgame tells whether a given reserved
-	 * tile came in with the savegame or was created during this session. */
+	/* R3R (KI-348, round 242, read-only probe): log the tick on which a train
+	 * "fell from moving to standing". The live veh=23 case sits on plain track
+	 * with cur_speed == 0, Stuck == false and its order still GOTO_COUPLE: from
+	 * then on every tick only takes the j < adv_spd branch, so TrainController()
+	 * (the only place that reserves a path) never runs again and the consist can
+	 * never retry. Pairing this line with the preceding one pinpoints *which*
+	 * commit point stopped the train. Read-only: it only keeps a per-vehicle
+	 * speed snapshot inside this TU and never touches vehicle state. */
+	if (R3RDbgOn()) {
+		static std::unordered_map<uint32_t, uint16_t> r3r_spd_snapshot;
+		const uint32_t r3r_spd_key = consist->index.base();
+		const uint16_t r3r_spd_now = (uint16_t)std::min<int>(consist->cur_speed, 0xFFFF);
+		const auto r3r_spd_it = r3r_spd_snapshot.find(r3r_spd_key);
+		if (r3r_spd_now == 0) {
+			if (r3r_spd_it != r3r_spd_snapshot.end()) {
+				const uint16_t r3r_spd_prev = r3r_spd_it->second;
+				r3r_spd_snapshot.erase(r3r_spd_it);
+				if (r3r_spd_prev != 0) {
+					R3RDbgWrite("SPD-DROP veh=%d tile=%d,%d prev=%d order=%d real=%d stuck=%d fp=%d prog=%d wait=%d parked=%d stop=%d track=%02X dtile=%u\n",
+							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+							(int)r3r_spd_prev, (int)consist->current_order.GetType(),
+							(int)consist->cur_real_order_index, (int)consist->flags.Test(VehicleRailFlag::Stuck),
+							(int)consist->force_proceed, (int)consist->progress, (int)consist->wait_counter,
+							(int)consist->r3r_parked, (int)consist->vehstatus.Test(VehState::Stopped),
+							(unsigned)consist->track, (unsigned)consist->dest_tile.base());
+				}
+			}
+		} else {
+			r3r_spd_snapshot[r3r_spd_key] = r3r_spd_now;
+		}
+	}
+	/* R3R (KI-203c / KI-355): the "black reservation preview nobody owns" the
+	 * player keeps reporting is reaped by R3RReservationAudit(), which asks the
+	 * engine who owns each booked bit (GetTrainForReservation /
+	 * GetTrainForWholeTileReservation); the nearest-train distance heuristic this
+	 * comment used to describe is gone. Because the pass is a full map scan it
+	 * runs at a long steady-state cadence here, and a command that can orphan a
+	 * path (selling or rearranging a train) shortens the interval of the next
+	 * pass via R3RMarkReservationAuditDue() -- otherwise the ghosts would only
+	 * disappear when the player typed "r3r_resv_purge". The first entry after a
+	 * loadgame tells whether a given reserved tile came in with the savegame or
+	 * was created during this session. */
 	{
 		static uint32_t r3r_resv_audit_tick = 0;
+		static uint32_t r3r_resv_audit_wait_log = 0;
+		static bool r3r_resv_audit_armed = false;
 		static const uint32_t R3R_RESV_AUDIT_TICKS = 2048;
-		if (_tick_counter - r3r_resv_audit_tick >= R3R_RESV_AUDIT_TICKS) {
+		static const uint32_t R3R_RESV_AUDIT_TICKS_SOON = 256;
+		const bool audit_due = _r3r_resv_audit_due;
+		/* R3R (KI-364): three speeds. A command that can orphan a path pulls the pass
+		 * forward (KI-355), and a stray bit that is still ageing towards its reap does
+		 * the same, so the ghost disappears in a few hundred ticks instead of a few
+		 * thousand; only a clean ledger runs at the steady cadence. */
+		const bool audit_soon = audit_due || _r3r_resv_audit_has_pending;
+		const uint32_t interval = audit_soon ? R3R_RESV_AUDIT_TICKS_SOON : R3R_RESV_AUDIT_TICKS;
+		/* R3R (KI-366): "the audit family is empty" and "the audit scheduler is
+		 * broken" look identical in the log when a session is too short to ever
+		 * cross the cadence, and that ambiguity has now wasted a whole retest
+		 * round (see the round-243 memo). Two cheap marks remove it: one-shot
+		 * ARM proves the gate is reachable at all, and a throttled WAIT names
+		 * the remaining ticks to the next pass. Both stay well under one line
+		 * per interval, so a steady-state session sees no change. */
+		if (!r3r_resv_audit_armed) {
+			r3r_resv_audit_armed = true;
+			R3RDbgWrite("RESV-AUDIT-ARM tick=%u interval=%u due=%u pending=%u\n",
+					(uint)_tick_counter, (uint)interval, (uint)audit_due, (uint)_r3r_resv_audit_has_pending);
+		}
+		if (_tick_counter - r3r_resv_audit_tick >= interval) {
 			r3r_resv_audit_tick = _tick_counter;
+			_r3r_resv_audit_due = false;
+			/* R3R (KI-355): say so when this pass was pulled forward by a
+			 * sell/depot-rearrange command, so a RESV-REAP that follows can be
+			 * attributed to the command rather than to the plain cadence. */
+			if (audit_soon) R3RDbgWrite("RESV-AUDIT-DUE tick=%u interval=%u due=%u pending=%u\n",
+					(uint)_tick_counter, (uint)interval, (uint)audit_due, (uint)_r3r_resv_audit_has_pending);
 			R3RReservationAudit("tick");
+		} else if ((uint32_t)_tick_counter - r3r_resv_audit_tick >= interval / 2 &&
+				(uint32_t)_tick_counter - r3r_resv_audit_wait_log >= interval) {
+			r3r_resv_audit_wait_log = (uint32_t)_tick_counter;
+			const uint32_t waited = (uint32_t)_tick_counter - r3r_resv_audit_tick;
+			R3RDbgWrite("RESV-AUDIT-WAIT tick=%u waited=%u interval=%u due=%u pending=%u\n",
+					(uint)_tick_counter, (uint)waited, (uint)interval,
+					(uint)audit_due, (uint)_r3r_resv_audit_has_pending);
 		}
 	}
 	/* train has crashed? */
@@ -16880,10 +17776,48 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * that one consist. */
 	R3REnsureCouplePair(consist);
 
+	/* R3R 探针（第 230 轮 / KI-339，只读、零行为变更）：GOTO_COUPLE 机车"到了库却什么都不发生"
+	 * 的唯一静默分叉点就在下面的 depot 块 —— 当 couple_targets_this_depot 为假、
+	 * 而订单本身仍是 OT_GOTO_COUPLE 时，17421 的 else-if 明确排除该类型，于是整个
+	 * 块既不挂接也不做车底归一化，车原地停驻且不留任何日志（现场：veh=65 在
+	 * 964,133 上 CPL-PAIR dist=0 反复出现，却既无 COUPLE-* 也无 NOABSORB-SEG）。
+	 * 本行把该判据的四个子条件连同 track/IsEngine/Stopped 一起打出来，用于区分
+	 * 「不在库里 / 不是引擎 / 目的地不是本库（GetCoupleIsDepot 或 depot id 不匹配）
+	 * / 其实判据成立而是下游 TrainCoupleHandler 静默失败」。 */
+	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+		const bool r3r_on_depot_tile = IsRailDepotTile(consist->tile);
+		const bool r3r_couple_is_depot = consist->current_order.GetCoupleIsDepot();
+		const uint r3r_dest_raw = (uint)consist->current_order.GetDestination().base();
+		const uint r3r_depot_idx = r3r_on_depot_tile ? (uint)GetDepotIndex(consist->tile).base() : UINT_MAX;
+		const bool r3r_id_match = r3r_couple_is_depot && r3r_on_depot_tile && (r3r_dest_raw == r3r_depot_idx);
+		const uint64_t r3r_blk_pay = ((uint64_t)(unsigned)consist->track << 40) |
+				((uint64_t)(uint)consist->IsEngine() << 32) |
+				((uint64_t)(uint)r3r_couple_is_depot << 4) |
+				((uint64_t)(uint)r3r_on_depot_tile << 3) |
+				((uint64_t)(uint)r3r_id_match << 2) |
+				((uint64_t)(uint)r3r_pending_depot_couple << 1) |
+				(uint64_t)(uint)consist->vehstatus.Test(VehState::Stopped);
+		if (R3RDbgEdge(R3REDGE_DEPOTBLK, (uint64_t)consist->index.base(), r3r_blk_pay)) {
+			R3RDbgWrite("DEPOTBLK veh=%d tile=%d,%d track=%02X eng=%d isdepot=%d ontile=%d idmatch=%d pend=%d stopped=%d parked=%d spd=%d destRaw=%u depotIdx=%u\n",
+					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+					(unsigned)consist->track, (int)consist->IsEngine(), (int)r3r_couple_is_depot,
+					(int)r3r_on_depot_tile, (int)r3r_id_match, (int)r3r_pending_depot_couple,
+					(int)consist->vehstatus.Test(VehState::Stopped), (int)consist->r3r_parked,
+					(int)consist->cur_speed, r3r_dest_raw, r3r_depot_idx);
+		}
+	}
+
 	/* If a locomotive is about to leave the depot, automatically couple onto any
 	 * wagon chain (free wagon or independent consist) that waits inside the depot.
-	 * When executing a GOTO_COUPLE order, couple onto the depot's waiting consist directly. */
-	if (consist->track == TRACK_BIT_DEPOT && consist->IsEngine()) {
+	 * When executing a GOTO_COUPLE order, couple onto the depot's waiting consist directly.
+	 * R3R (KI-339, 第 231 轮): this block must also require R3RChainFullyInDepot. A train
+	 * enters a depot car by car, so for several ticks the head has track == TRACK_BIT_DEPOT
+	 * while the tail is still outside. Entering the block then (as it did before) zeroes
+	 * cur_speed below, and a zero cur_speed makes TrainLocoHandler() take the "stopped"
+	 * branch (j < adv_spd) -- the advance loop stops running and the tail can never follow
+	 * the head into the depot. Waiting until the whole consist is inside keeps the entry
+	 * under the engine's own movement code and only then runs the couple scan. */
+	if (consist->track == TRACK_BIT_DEPOT && consist->IsEngine() && R3RChainFullyInDepot(consist)) {
 		/* R3R: the depot GOTO_COUPLE block below must only apply when the couple
 		 * order's target IS this depot. A locomotive that merely sits in its HOME
 		 * depot (e.g. after a GOTO_DEPOT stop) while holding a GOTO_COUPLE order
@@ -17298,6 +18232,22 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * 落在同一 tick 内，列车不会带着"索引已在解挂"的状态起步。 */
 	r3r_try_decouple_arrival();
 
+	/* R3R (KI-335, 2026-10-10): 解挂启动互锁。刚解出的后车不许与前半同时起步
+	 * （玩家："两列动车组解耦之后几乎是同时启动的"），必须等前半「完全离开站台 /
+	 * 驶离 N 格」。全部判据与自清理规则见 R3RDecoupleInterlockWait()：只有被
+	 * DecoupleTrain() 登记过的那一对会命中，别的车（包括同一个站台上的另一列车、
+	 * 正常跟车的后车）走不到这里。命中时把速度清零并 return true —— 与下面
+	 * WAIT_COUPLE / 纯车底链的停驻门逐字同形，只是"停"的条件换成了前车的几何位置。
+	 *
+	 * 位置：必须在 HandleLoading() 之后（否则装卸结束那一 tick 会漏），且早于
+	 * WAIT_COUPLE 门 —— 这样"后车自己就是等待方"时由等待方门接管、互锁登记顺手
+	 * 撤销，互锁不会把一个本来就不动的等待车底锁住。 */
+	if (R3RDecoupleInterlockWait(consist)) {
+		consist->cur_speed = 0;
+		consist->subspeed = 0;
+		return true;
+	}
+
 	/* R3R: a WAIT_COUPLE order parks the train in place ANYWHERE (station platform
 	 * as well as depot). The CheckTrainStayInDepot-based check only covers depots;
 	 * without this a consist waiting on a platform would keep creeping along. */
@@ -17547,16 +18497,46 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				/* R3R DEBUG: reached the stopped-coupler check.
 				 * KI-14 (2): edge-triggered -- this runs for every stationary
 				 * GOTO_COUPLE loco on every tick, so the raw fopen here was a hot
-				 * syscall with no diagnostic value once the state was known. */
+				 * syscall with no diagnostic value once the state was known.
+				 * KI-348 (round 242): the payload now carries the very bits that
+				 * decide whether this standstill can end on its own (Stuck /
+				 * force_proceed / progress / wait_counter) plus the full state on
+				 * the printed line, so a standstill that never changes state is
+				 * visible at a glance. Still read-only. */
+				const uint64_t s0_pay = (uint64_t)consist->tile.base()
+						| ((uint64_t)(consist->flags.Test(VehicleRailFlag::Stuck) ? 1u : 0u) << 32)
+						| ((uint64_t)(consist->force_proceed != TFP_NONE ? 1u : 0u) << 33)
+						| ((uint64_t)std::min<uint>(consist->progress, 0x3FFu) << 34)
+						| ((uint64_t)std::min<uint>(consist->wait_counter, 0xFFu) << 44);
 				const uint64_t s0_key = R3RDbgTagHash("CPL-S0-CHK") | ((uint64_t)consist->index.base() << 32);
-				if (R3RDbgEdge(R3REDGE_CPLS0, s0_key, (uint64_t)consist->tile.base())) {
-					R3RDbgWrite("CPL-S0-CHK veh=%d tile=%d,%d\n",
-							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile));
+				if (R3RDbgEdge(R3REDGE_CPLS0, s0_key, s0_pay)) {
+					R3RDbgWrite("CPL-S0-CHK veh=%d tile=%d,%d real=%d order=%d stuck=%d fp=%d prog=%d wait=%d parked=%d stop=%d track=%02X dtile=%u\n",
+							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+							(int)consist->cur_real_order_index, (int)consist->current_order.GetType(),
+							(int)consist->flags.Test(VehicleRailFlag::Stuck), (int)consist->force_proceed,
+							(int)consist->progress, (int)consist->wait_counter, (int)consist->r3r_parked,
+							(int)consist->vehstatus.Test(VehState::Stopped), (unsigned)consist->track,
+							(unsigned)consist->dest_tile.base());
 				}
 				if (CheckTrainCollision(moving_front) || TrainCoupleHandler(consist)) return true;
 			}
 		}
 	} else {
+		/* R3R (KI-348, round 242, read-only probe): the *movement* branch is the
+		 * only place that ever calls TrainCheckIfLineEnds()/TrainController(),
+		 * i.e. the only place that can reserve a path. Logged for GOTO_COUPLE
+		 * locos only (one line per traversed tile), so that "LOCO-MOVE veh=23
+		 * never appears again after the standstill" is positive proof that the
+		 * consist left the movement branch for good. Never modifies state. */
+		if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
+			const uint64_t mv_key = R3RDbgTagHash("LOCO-MOVE") | ((uint64_t)consist->index.base() << 32);
+			if (R3RDbgEdge(R3REDGE_LOCOMOVE, mv_key, (uint64_t)consist->tile.base())) {
+				R3RDbgWrite("LOCO-MOVE veh=%d tile=%d,%d j=%d spd=%d track=%02X stuck=%d\n",
+						(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
+						j, (int)consist->cur_speed, (unsigned)consist->track,
+						(int)consist->flags.Test(VehicleRailFlag::Stuck));
+			}
+		}
 		TrainCheckIfLineEnds(moving_front);
 		moving_front = moving_front->GetMovingFront();
 		/* Loop until the train has finished moving. */
@@ -17933,6 +18913,10 @@ void DeleteVisibleTrain(Train *v)
 		} else {
 			R3RTrackBitsProbe("del-visible", trackbits, -1, tile);
 			Track track = TrackBitsToTrack(trackbits);
+			/* R3R (第 243 轮, REG-243-O): name this release path. 'u' is already deleted
+			 * here, so no actor is set. "del-visible" is not in
+			 * R3RResvLedgerPurpose()'s consist_phases[]: log only, no behaviour. */
+			R3RResvPhaseGuard r3r_phase_delvis("del-visible");
 			if (HasReservedTracks(tile, trackbits)) UnreserveRailTrack(tile, track);
 			if (IsLevelCrossingTile(tile)) UpdateLevelCrossing(tile);
 		}
@@ -18803,5 +19787,5 @@ bool Train::CanLeadTrain() const
 		return this->GetFirstEnginePart()->IsEngine();
 	}
 
-	return this->IsEngine() || this->IsRearDualheaded();
+	return this->IsEngine() || this->IsDualHeadRear();
 }

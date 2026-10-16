@@ -15,6 +15,8 @@
 #include "depot_map.h"
 #include "station_map.h"
 #include "group.h"
+#include "order_base.h"
+#include "tracerestrict.h"
 #include "r3r_perf.h"
 #include "core/pool_func.hpp"
 
@@ -118,19 +120,51 @@ static CoupleGroupMask R3RSanitiseCoupleGroupMask(CoupleGroupMask mask)
 	return result;
 }
 
+/* Defined below, next to its documentation. */
+static CoupleGroupMask R3RAddCoupleGroupAncestors(CoupleGroupMask groups);
+
+/**
+ * R3R (第 224 轮 / KI-336 选项 2): the groups through which \a a and \a b may meet.
+ *
+ * Both arguments are the *stored* (explicit) masks; the ancestors are added in
+ * here, exactly once per side, and on the other side only:
+ *
+ *     match(a,b) = (E(a) & A(b)) | (A(a) & E(b))
+ *
+ * with E = stored and A = stored + ancestors. A group therefore counts only when
+ * one side was really put into it and the other side is in it or in one of its
+ * sub groups. Sharing a mere ancestor is not enough: the sibling sub groups A1
+ * and A2 stay incompatible, and so do an uncle and his nephew -- their common
+ * ancestor never enters either side's E. See KI-336.
+ */
+static CoupleGroupMask R3RCoupleGroupMatchingSet(CoupleGroupMask a, CoupleGroupMask b)
+{
+	const CoupleGroupMask a_eff = R3RAddCoupleGroupAncestors(a);
+	const CoupleGroupMask b_eff = R3RAddCoupleGroupAncestors(b);
+	return (a & b_eff) | (a_eff & b);
+}
+
 bool R3RCoupleGroupMasksCompatible(CoupleGroupMask a, CoupleGroupMask b)
 {
-	/* Q2: every segment without an assigned group forms one single implicit
-	 * group, so unassigned segments may couple amongst themselves, while an
-	 * unassigned segment never couples with an explicitly assigned group. */
-	if (a == COUPLE_GROUP_MASK_NONE || b == COUPLE_GROUP_MASK_NONE) return a == b;
-	/* Q5: a segment in several groups couples with any partner sharing one. */
-	return (a & b) != COUPLE_GROUP_MASK_NONE;
+	/* Q2 + R3R (第 224 轮 / KI-336 拍板 ② 后半): every segment without an
+	 * assigned group forms one single implicit group, so two unassigned segments
+	 * may couple amongst themselves, while an unassigned segment never couples
+	 * with an explicitly assigned group. This is the *same company* rule; the
+	 * cross-company gate below never lets the implicit group through. */
+	if (a == COUPLE_GROUP_MASK_NONE && b == COUPLE_GROUP_MASK_NONE) return true;
+	/* Q5 + R3R (第 224 轮 / KI-336 选项 2): direct line only, see
+	 * R3RCoupleGroupMatchingSet(). */
+	return R3RCoupleGroupMatchingSet(a, b) != COUPLE_GROUP_MASK_NONE;
 }
 
 bool R3RCoupleGroupMasksAllowCrossCompany(CoupleGroupMask a, CoupleGroupMask b)
 {
-	const CoupleGroupMask shared = a & b;
+	/* R3R (第 224 轮 / KI-336 拍板 ②): across companies the two sides have to
+	 * match exactly like within one company (same direct-line rule), and on top of
+	 * that at least one of the matching groups has to be open for other companies.
+	 * Two unassigned segments have an empty matching set, so the implicit group can
+	 * never carry a company boundary -- which is what the player asked for. */
+	const CoupleGroupMask shared = R3RCoupleGroupMatchingSet(a, b);
 	if (shared == COUPLE_GROUP_MASK_NONE) return false;
 
 	for (uint i = 0; i < R3R_COUPLE_GROUP_MASK_BITS; i++) {
@@ -277,15 +311,16 @@ void R3RClearCoupleGroupsOfSegment(Train *v)
 }
 
 /**
- * R3R (KI-306, round 202): probe for the restored same-company group whitelist.
+ * R3R (KI-306 round 202; KI-336 round 224): probe for the couple group whitelist.
  *
- * The whitelist is only consulted when one of the two orders explicitly
- * declares a temporary couple group, so this is a rare path -- but it still
- * runs inside the couple pathfinder (three resolution levels), hence the
- * throttle: one line per (coupler,target) id pair, and only when the verdict
- * actually changes. Key = coupler<<16 | target; 64 pairs is plenty for the
- * handful of locomotives that can be trying to couple at any moment, and the
- * table is deliberately not saved (pure diagnostics).
+ * Since round 224 the whitelist is consulted for *every* same-company candidate
+ * (the stored group sets are compared unconditionally), so this sits on a hot path:
+ * the couple pathfinder asks it for every tile of every back-walk. Hence the
+ * throttle -- one line per (coupler,target) id pair and only when the verdict
+ * actually changes, a table capped at 64 pairs, and unknown pairs stay silent once
+ * it is full (the earlier version wrote unconditionally in that case, which would
+ * flood the log within seconds now). Key = coupler<<16 | target; the table is
+ * deliberately not saved (pure diagnostics).
  *
  * NOTE: do not name a parameter `cdecl` -- MSVC's windows headers
  * (`#define cdecl __cdecl`) turn it into the calling convention keyword and the
@@ -313,6 +348,10 @@ static void R3RCoupleGateProbe(const Train *coupler, const Train *target, bool c
 		keys[used] = key;
 		vals[used] = compatible;
 		used++;
+	} else {
+		/* R3R (第 224 轮 / KI-336): 表满即静默。闸门现在是热路径（每个候选、回溯的每一格
+		 * 都会问），原来的"表满后未知键每次都写一行"会在几秒内刷爆日志。 */
+		return;
 	}
 	R3RDbgWrite("CG-GATE compatible=%d coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X\n",
 			(int)compatible, (int)coupler->index.base(), (int)target->index.base(),
@@ -378,18 +417,22 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	 * 石头" —— 就是参与挂接的那个段的有效分组 = 它自己的真分组 ∪ 命令指定的那个
 	 * 真分组。因此它挂得上滚木组的车底，而分组无交集的照样被白名单拒绝：这不是
 	 * "万能放行"，只是临时多了一个真实身份。
-	 * （第 109 轮曾把这道白名单整体废除，于是本段所述机制变成死代码；第 202 轮
-	 * KI-306 已按"命令声明了临时分组才重新启用白名单"恢复，见下方闸门。）
+	 * （第 109 轮曾把这道白名单整体废除、第 202 轮 KI-306 又把它收窄成"命令声明了
+	 * 临时分组才启用"，两者均已被第 224 轮 KI-336 的拍板撤回，见下方闸门。）
 	 *
 	 * 这层身份完全由命令派生，不写进段的数据（段上仍然只有"石头"），命令一被推进掉
 	 * （挂接成功，见 train_cmd.cpp 的 Couple() / CGRP-FAKE-DESTROY）就随之消失。
 	 * 命令里的分组被删掉时按"不指定"处理（R3RIsValidCoupleGroup()），与没写属性等价。
 	 *
 	 * 跨公司那道独立闸门(D6-①)照常用合并后的分组集判定：临时并入一个开放的真分组
-	 * 时效果与真的属于该组一致，并入一个不对外的组则依旧跨不过公司边界。 */
-	/* R3R (第 146 轮 / 需求叁改): 用"有效集合"（含所有祖先组）判定：子组的车也属于父组。 */
-	CoupleGroupMask coupler_groups = R3RGetEffectiveCoupleGroupsOfSegment(coupler);
-	CoupleGroupMask target_groups = R3RGetEffectiveCoupleGroupsOfSegment(target);
+	 * 时效果与真的属于该组一致，并入一个不对外的组则依旧跨不过公司边界。
+	 *
+	 * R3R (第 224 轮 / KI-336 选项 2): 这里取**存储的（显式）**集合，不再预先并入祖先。
+	 * 祖先由 R3RCoupleGroupMasksCompatible() / R3RCoupleGroupMasksAllowCrossCompany()
+	 * 自己补，而且只算到对面那一侧（`match = (E(a) & A(b)) | (A(a) & E(b))`）——
+	 * 若在这里就各自展开成 `A`，兄弟子组 A1/A2 会因为共同的祖先 A 重新判成相容。 */
+	CoupleGroupMask coupler_groups = R3RGetCoupleGroupsOfSegment(coupler);
+	CoupleGroupMask target_groups = R3RGetCoupleGroupsOfSegment(target);
 	bool coupler_declared_temp = false;
 	bool target_declared_temp = false;
 	if (order.IsType(OT_GOTO_COUPLE)) {
@@ -417,72 +460,54 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 		}
 	}
 
-	/* R3R (第 109 轮, 2026-09-24): 常规分组（真挂接分组）的白名单闸门已废除。
+	/* R3R (第 224 轮 / KI-336 拍板 ②): 分组白名单**无条件**生效：无论同公司还是跨公司，
+	 * 都要"相同挂接分组"才允许挂接（玩家 2026-10-08 口径）。
 	 *
-	 * 玩家口径：「废除常规分组和路签对挂接的影响」。原先这里要求
-	 * R3RCoupleGroupMasksCompatible(机车段掩码, 车底段掩码) 为真，即两段的真分组
-	 * 必须有交集，否则候选直接被判成"这里没有等待的车底"。这条闸门现在只按「公司在
-	 * 不同公司时必须共用一个对外的分组」的公司边界（下面那段）保留，不再按同公司内
-	 * 的分组归属否决候选。
+	 * 历史（两条都已被本轮撤回，保留供追溯）：
+	 *   - 第 109 轮 (2026-09-24) 把常规分组的白名单整体废除（"废除常规分组和路签对挂接的
+	 *     影响"），理由是分组是玩家组织车队的账目，当成挂接许可会让"忘记把车底加进同一
+	 *     分组"表现成"机车到了站台找不到挂接目标"；真正该管住目标的是 KI-182 的一对一
+	 *     配对锁。
+	 *   - 第 202 轮 (KI-306) 把白名单收窄成"**命令显式声明了临时挂接分组**时才启用"，
+	 *     用来治"设了与没设完全一样"（机车被自己车库里的无分组车底吸住）。
+	 *   玩家 2026-10-08 明确要求回到"无论公司都要相同挂接分组"，故两条作废；KI-182 的配对锁
+	 *   照旧在最外层叠加（本函数只看分组与目的地）。
 	 *
-	 * 废除理由：分组本是玩家用来组织车队的账目，把它当成挂接许可，会让"忘记把车底
-	 * 加进同一分组"直接表现成机车到了站台却找不到挂接目标（候选择被剔出目的地集合
-	 * -> 无预留 -> 沿站台乱跑）；而真正该管住"只能挂上目标那一列"的机制是 KI-182 的
-	 * 一对一配对锁（R3RCoupleAllowed() 里的 r3r_couple_target/requester），它比分组
-	 * 白名单精确得多。
+	 * 判据 = R3RCoupleGroupMasksCompatible()（选项 2，只认直系：同组 / 父子 / 祖孙）：
+	 *   - 只放进 A1 的车 × 只放进 A2 的车（A1、A2 是 A 的子组）⇒ **拒**（只共享祖先 A）；
+	 *     "舅舅 × 外甥"、"舅公 × 旁系晚辈"同理拒（见 R3RCoupleGroupMatchingSet() 注释）；
+	 *   - 放进 A 的车 × 放进 A1 的车 ⇒ **可挂**；
+	 *   - 同公司两方都无分组 ⇒ **可挂**（同一个隐式组）；一边有分组一边没有 ⇒ **拒**；
+	 *   - 跨公司两方都无分组 ⇒ **拒**（隐式组不是任何人显式拥有的组，跨不过公司边界）。
 	 *
-	 * 连带影响（第 109 轮原文，已被第 202 轮 KI-306 部分撤回）：命令级的「临时挂接
-	 * 分组」(GetCoupleTempGroup) 当时对同公司挂接不再有任何作用（本来就是为了通过
-	 * 这道白名单）；它仍然有效的地方是公司边界——临时并入一个对外的真分组，就能跨
-	 * 公司挂上对方那一列。coupler_groups 的合并（上面几行）因此必须保留。真挂接
-	 * 分组本身、分组管理 UI、白名单比较函数 R3RCoupleGroupMasksCompatible() 都保留
-	 * 不动，只是不再**无条件**否决挂接。
+	 * 临时挂接分组 (GetCoupleTempGroup, KI-170 / KI-225) 语义不变：它只是给本方掩码多并进
+	 * 一个真实分组位（上面已合并），再走同一判据——不再是"启用开关"，也不再是万能放行。
+	 * 于是"声明滚木的机车能挂上滚木（或其子/父组）的车底"，而挂不上只有"滚木"以外分组的车底。
 	 *
-	 * R3R (第 202 轮, KI-306)：上面那条"不再有任何作用"正是玩家报的问题——设了与
-	 * 没设完全一样（`build\R3R_debug.log` 里 4 个空组 + `CPL-PAIR act=48/54 tgt=0`
-	 * 无限刷屏，机车被自己车库里的车底吸住）。修法不是恢复无条件白名单（那会退回
-	 * KI-195 想治的老毛病），而是**由命令显式声明临时分组时才启用**：声明 = 玩家主动
-	 * 表达"我要按分组挂"，此时分组必须相容；不声明 = 维持本轮的"一律放行"。
+	 * 被拒候选按既有语义上报为"这里没有等待的车底"，机车继续找别的候选；到点仍找不到就
+	 * 走 KI-193 的 COUPLE-DEST-EMPTY，即**原地无限等待、保留订单**（第 112 轮口径）。
+	 * `R3R_COUPLE_DEST_IDLE_LIMIT`=500 只是搜索节流与等待心跳的周期，**不跳命令**
+	 * （第 227 轮勘误：第 212 轮曾写"满 500 tick 后跳过命令"，该行为从未保留）。
 	 *
 	 * 注意：本函数是三个解析层级共用的唯一判据（yapf_destrail.hpp 的目的地测试、
 	 * yapf_rail.cpp 的 CheckSafePositionOnNode 回溯安全测试、train_cmd.cpp 的到点闸门），
 	 * 所以这一处改动对三者同时生效；train_cmd.cpp 里 R3RCanCoupleNow 的 reject 标签
-	 * (R3REDGE_COUPLEGATE) 也随之一并只反映目的地与公司边界。 */
+	 * (R3REDGE_COUPLEGATE) 现在也会报出分组否决。 */
 
 	/* R3R (D6-①): the company boundary is a second, independent gate. Two
-	 * segments of the same company couple exactly as before; two segments of
-	 * different companies additionally need a shared group which the owner
-	 * opened for other companies. A rejected candidate is reported upstream as
+	 * segments of different companies need a matching group (same direct-line rule
+	 * as within one company) *and* off that matching set at least one group has to
+	 * be opened for other companies. A rejected candidate is reported upstream as
 	 * "no waiting consist here", so a locomotive never couples across companies
 	 * by accident and simply keeps looking for another candidate. */
 	if (coupler->owner != target->owner) {
 		return R3RCoupleGroupMasksAllowCrossCompany(coupler_groups, target_groups);
 	}
 
-	/* R3R (第 202 轮, KI-306): 同公司路径上，只有**命令显式声明了临时挂接分组**时
-	 * 才重新启用分组白名单：
-	 *   - 机车侧的 GOTO_COUPLE 声明了分组（tooltip：「再额外拥有该分组，因此可以挂上
-	 *     属于它的车底」），或
-	 *   - 等待侧的 WAIT_COUPLE 声明了分组（KI-225 的对称语义「我在等人按这个分组来接我」）。
-	 * 二者都没有时返回 true，即 KI-195 的"同公司不设门槛"照旧——"忘记把车底加进分组"
-	 * 不会再次变成"到了站台找不到挂接目标"。
-	 *
-	 * 判据用的是合并后的**有效集合**（真分组 ∪ 临时分组，且含所有祖先组，见上面几行），
-	 * 所以：声明"滚木"的机车能挂上滚木组（或滚木的子/父组）的车底；而掩码为
-	 * COUPLE_GROUP_MASK_NONE 的车底（现场那条没分组的 27 节车库车底）会被
-	 * R3RCoupleGroupMasksCompatible() 的 `a==b` 分支判 false ⇒ 直接剔出候选集。
-	 * 被拒候选按既有语义上报为"这里没有等待的车底"，机车继续找别的候选，找不到就走
-	 * KI-193 的 COUPLE-DEST-EMPTY（等待 500 tick 后跳过命令），不会卡死。
-	 *
-	 * 这一处对三个解析层级同时生效（本函数是唯一判据，见上方 KI-165 注释），
-	 * train_cmd.cpp 的到点闸门 R3RCanCoupleNow() 因此也自动受约束。 */
-	if (coupler_declared_temp || target_declared_temp) {
-		const bool compatible = R3RCoupleGroupMasksCompatible(coupler_groups, target_groups);
-		R3RCoupleGateProbe(coupler, target, coupler_declared_temp, target_declared_temp,
-				coupler_groups, target_groups, compatible);
-		return compatible;
-	}
-	return true;
+	const bool compatible = R3RCoupleGroupMasksCompatible(coupler_groups, target_groups);
+	R3RCoupleGateProbe(coupler, target, coupler_declared_temp, target_declared_temp,
+			coupler_groups, target_groups, compatible);
+	return compatible;
 }
 
 /**
@@ -1203,6 +1228,125 @@ void R3RSegmentStoreTraits(const Vehicle *v)
 	} else {
 		row->group_id = head->group_id;
 	}
+}
+
+/**
+ * R3R (第 225 轮 / KI-332): copy the per-segment traits of a chain onto its clone.
+ *
+ * See the declaration in couple_group.h for the contract. The three traits live
+ * in three places and all of them are written:
+ *  - the \\*_backup fields of the segment heads (where a parked segment keeps its
+ *    own value, and what R3RBorrowControlTraits() reads at the commit points --
+ *    writing the row alone would be undone by the next R3RSettleChainSegments()),
+ *  - the live fields of the chain head (the control segment's traits while the
+ *    borrow layer is active) and of every hidden segment head (its own traits),
+ *  - the row of every segment which has one.
+ *
+ * The loop walks both chains with GetNextVehicle() and copies car by car; the
+ * segment markers were mirrored by the caller, so the two walks stay in step.
+ */
+void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
+{
+	if (src_chain == nullptr || dst_chain == nullptr) return;
+
+	const Train *s = src_chain;
+	Train *d = dst_chain;
+	uint n = 0;
+	while (s != nullptr && d != nullptr) {
+		/* Parked copies first: the commit points prefer those over the live
+		 * fields, so they are what makes the copy survive the next settle. */
+		if (!s->name_backup.empty()) d->name_backup = s->name_backup;
+		if (s->group_id_backup != GroupID::Invalid()) d->group_id_backup = s->group_id_backup;
+
+		/* A hidden segment head wears its own traits in the live fields. The chain
+		 * head does not: it wears the control segment's ones, and its name is set
+		 * by CloneVehicleName() further down the clone path. */
+		if (d != dst_chain && !s->name.empty()) d->name = s->name;
+		d->group_id = s->group_id;
+
+		if (d == dst_chain || d->IsSegmentFront()) {
+			/* Only a segment head carries the group mask and the priority. */
+			d->couple_groups = R3RGetCoupleGroupsOfSegment(s);
+			d->r3r_priority = s->r3r_priority;
+
+			/* R3R (第 227 轮 / KI-334): the segment's own schedule must travel
+			 * with the clone as well. The chain head's *live* orders are handled
+			 * by CmdCloneOrder() (CO_COPY / CO_SHARE, see order_cmd.cpp), but that
+			 * only covers the head -- and a chain head in the borrow layer drives
+			 * the control segment's schedule, not its own. The schedule a segment
+			 * head keeps for itself lives in the parked copy (orders_backup), which
+			 * is exactly how a hidden segment (depot drag / couple borrow) carries
+			 * its own orders. Without copying it, dragging that hidden segment out
+			 * of the clone yields an empty order list (the reported bug).
+			 *
+			 * Deep-copy the list: the clone must own its orders, sharing the
+			 * pointer would leave two independent trains on one OrderList and
+			 * reproduce the dangling-list crash (KI-93). */
+			const OrderList *src_own = nullptr;
+			VehicleOrderID src_real = INVALID_VEH_ORDER_ID;
+			VehicleOrderID src_impl = INVALID_VEH_ORDER_ID;
+			if (s->orders_backup != nullptr) {
+				src_own = s->orders_backup;
+				src_real = s->orders_backup_real_index;
+				src_impl = s->orders_backup_implicit_index;
+			} else if (d != dst_chain && s->orders != nullptr && !s->r3r_orders_borrowed) {
+				/* A hidden segment which still holds its own orders in the live
+				 * field (never parked). The chain head is deliberately excluded:
+				 * its live orders are taken care of by CmdCloneOrder(). */
+				src_own = s->orders;
+				src_real = s->cur_real_order_index;
+				src_impl = s->cur_implicit_order_index;
+			}
+			if (src_own != nullptr && src_own->GetNumOrders() > 0) {
+				std::vector<Order> orders;
+				orders.reserve(src_own->GetNumOrders());
+				for (const Order *order : src_own->Orders()) {
+					orders.emplace_back(*order);
+					TraceRestrictRemoveNonOwnedReferencesFromOrder(&orders.back(), d->owner);
+				}
+				/* A freshly cloned car never carries a parked schedule yet. */
+				assert(d->orders_backup == nullptr);
+				assert(OrderList::CanAllocateItem());
+				d->orders_backup = OrderList::Create(std::move(orders), d);
+				d->orders_backup->GetScheduledDispatchScheduleSet() = src_own->GetScheduledDispatchScheduleSet();
+				for (DispatchSchedule &ds : d->orders_backup->GetScheduledDispatchScheduleSet()) {
+					ds.ResetStateAfterClone();
+				}
+				d->orders_backup_real_index = src_real;
+				d->orders_backup_implicit_index = src_impl;
+				/* The clone's own schedule now sits in the parked copy, so the live
+				 * field is not its own -- the same state R3RReturnBorrowedOrders()
+				 * expects when the segment head becomes a chain head again. */
+				d->r3r_orders_borrowed = true;
+
+				/* Read-only probe: ORD-IDX-WATCH only watches the live orders, so a
+				 * hidden segment whose schedule sits in orders_backup would be
+				 * invisible there. One line per copied segment head makes the
+				 * round-227 fix verifiable (n must equal the source segment). */
+				R3RDbgWrite("CLONE-ORD dst=%d src=%d n=%u real=%d impl=%d borrowed=%d bk=%p\n",
+						(int)d->index.base(), (int)s->index.base(), (unsigned)src_own->GetNumOrders(),
+						(int)src_real, (int)src_impl, (int)s->r3r_orders_borrowed, (void *)d->orders_backup);
+			}
+
+			/* The row is the formal home of a hidden segment's traits; the control
+			 * segment's row is mirrored from the live fields by R3RSegmentStoreTraits(). */
+			const std::string name = R3RSegmentSectionName(s);
+			GroupID group = R3RSegmentSectionGroupID(s);
+			if (group == DEFAULT_GROUP) group = GroupID::Invalid();
+
+			R3RSegmentRecord *const row = R3RSegmentGet(d->r3r_segment_id);
+			if (row != nullptr) {
+				if (!name.empty()) row->name = name;
+				if (group != GroupID::Invalid()) row->group_id = group;
+			}
+		}
+
+		++n;
+		s = s->GetNextVehicle();
+		d = d->GetNextVehicle();
+	}
+
+	R3RDbgWrite("CLONE-TRAITS dst=%d n=%u\n", (int)dst_chain->index.base(), n);
 }
 
 /**

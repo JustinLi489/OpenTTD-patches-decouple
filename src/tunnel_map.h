@@ -88,9 +88,8 @@ inline bool HasTunnelReservation(TileIndex t)
 inline void SetTunnelReservation(TileIndex t, bool b)
 {
 	dbg_assert_tile(IsRailTunnelTile(t), t);
-#if R3R_PROBES
-	if (HasTunnelReservation(t) != b) R3RResvWatchLog(b ? "SET-TUNNEL" : "CLEAR-TUNNEL", t); // R3R (KI-207)
-#endif
+	/* R3R (KI-207, unconditional since KI-359): also feeds the reservation ledger. */
+	if (HasTunnelReservation(t) != b) R3RResvWatchLog(b ? "SET-TUNNEL" : "CLEAR-TUNNEL", t);
 	AssignBit(_m[t].m5, 4, b);
 }
 

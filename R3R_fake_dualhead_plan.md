@@ -140,10 +140,19 @@ IsDualHeadRear()  ==  IsMultiheaded() && (!IsEngine() || HasBit(FakeDualHead))
 
 ## 5. 状态
 
-- 未实现（本轮先把 KI-149 rev.2 收尾；本方案待开工）。
-- **开工前清点已完成**（2026-09-21），结论见第 3.0~3.3 节：20 个 `IsRearDualheaded()` 调用点
+- **已落地并编译通过（2026-10-10 第 234 轮，玩家拍板"按原案开工"）**，见 KI-343 与临时报告
+  `R3R_fake_dualhead_round234_memo.md`。全量 692 步 `[692/692] Linking`、`EXIT_CODE=0`、
+  `build\openttd.exe` @2026-10-10 21:03:46（51 738 112 B）；游戏内复测待做。
+- **开工前清点已完成**（2026-09-21），结论见第 3.0~3.3 节：`IsRearDualheaded()` 调用点
   语义一致可整体替换；`ConnectMultiheadedTrains()` 是唯一必需改的读档逻辑；`Train::flags`
   已存档故格式无变更；功率计算已核实不受影响。
+- **第 234 轮实测修正（两处，以本节为准）**：
+  1. 旗标位从"27 位之前的空位"改为 **bit 28**（23 保留占位，24~27 已被
+     `ArticGroupHead`/`ArticGroupMember`/`SegmentFlipped`/`ForceReserveOnce` 占用）。
+  2. 新判据**不能**放在 `ground_vehicle.hpp:445` 紧邻处（`GroundVehicle` 看不见
+     `VehicleRailFlag`），落在 **`Train`（`src\train.h`）**。
+  3. 调用点由 20 处更新为 **18 处**（新增 `train_cmd.cpp:2816` `AddWagonToConsist` 与
+     `train_cmd.cpp:7119` 解挂边界配对游走；定义 2 处 + 注释 2 处不计），行号已全部漂移。
 - 剩余未知：双头后半节被授引擎位后，NewGRF 双头变量（`u.rail.*` / `position in consist`）与
   depot GUI（`depot_gui.cpp:169` 的 `other_multiheaded_part == v->Next()` 视觉配对）的行为，
   需游戏内实看。

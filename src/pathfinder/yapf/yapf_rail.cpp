@@ -295,6 +295,11 @@ private:
 				}
 				return false;
 			}
+			/* R3R (第 243 轮, REG-243-O): name this release (the couple pathfinder's
+			 * own rollback of a half-reserved safe tile) so the UNRES-RAIL line says
+			 * "yapf-fscp" instead of inheriting the caller's phase. "yapf-fscp" is not
+			 * in R3RResvLedgerPurpose()'s consist_phases[]: log only, no behaviour. */
+			R3RResvPhaseGuard r3r_phase_fscp("yapf-fscp", R3RResvActorID(Yapf().GetVehicle()));
 			UnreserveRailTrack(tile, TrackdirToTrack(td));
 		}
 		return true;
@@ -438,8 +443,16 @@ public:
 	bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool unsafe_pos = false)
 	{
 		/* R3R (KI-207): every pathfinder-made reservation passes through here, so
-		 * record which train is booking (phase stays whatever the caller named). */
-		R3RResvPhaseGuard r3r_phase(nullptr, R3RResvActorID(Yapf().GetVehicle()));
+		 * record which train is booking.
+		 *
+		 * R3R (第 243 轮, REG-243-M): this used to pass nullptr and inherit the
+		 * caller's phase ("choose-track"), which made a release made *inside* YAPF
+		 * indistinguishable from one made by the caller *after* YAPF returned -- both
+		 * printed the same phase. It now names its own phase so the two separate.
+		 * "yapf-resv" is not listed in R3RResvLedgerPurpose()'s consist_phases[], so
+		 * the ledger still classifies these bits as *path* bits: no behaviour change,
+		 * only a new log tag. */
+		R3RResvPhaseGuard r3r_phase("yapf-resv", R3RResvActorID(Yapf().GetVehicle()));
 		this->res_fail_tile = INVALID_TILE;
 		this->origin_tile = origin;
 
@@ -794,6 +807,8 @@ public:
 		/* R3R (KI-207): this is the GOTO_COUPLE pathfinder -- it books the route the
 		 * loco drives to the waiting consist. Name it for the reservation trace. */
 		R3RResvPhaseGuard r3r_phase("yapf-couple", R3RResvActorID(v));
+		/* R3R (第 236 轮, KI-344): 清零本次扫描的 census，结束时由 CPL-SCAN 无条件回放。 */
+		R3RCoupleScanReset();
 		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
 		{
 			FILE *dbg = R3RFopenDbg("a");
@@ -816,6 +831,10 @@ public:
 				fclose(dbg);
 			}
 		}
+		/* R3R (第 236 轮, KI-344): 无条件清点回放 —— 这是回答"found=0 到底是等待链
+		 * 不在场还是被闸门拒掉"的唯一出口，与 CPL-PATHFOUND 同频（每次寻路一行）。 */
+		R3RCoupleScanDump((int)v->index.base(), path_found ? 1 : 0,
+				(uint)Yapf().nodes.ClosedCount(), (uint)Yapf().GetMaxSearchNodes());
 		if (!path_found) return INVALID_TRACKDIR;
 
 		/* Found a destination, set as reservation target. */
@@ -1018,6 +1037,19 @@ public:
 						const TrackBits bits = TrackdirBitsToTrackBits(GetTileTrackdirBits(t, ::TransportType::TRANSPORT_RAIL, 0));
 						if ((bits & TrackToTrackBits(trk)) != 0) TryReserveRailTrack(t, trk);
 					};
+					/* R3R: same guard, but for the tiles the loco drives through in a
+					 * known direction. Those must be booked at trackdir level: only
+					 * TryReserveRailTrackdir() also sets a facing PBS signal to green
+					 * (pbs.cpp:723-725), and that green is the right of way the loco
+					 * needs to actually drive over the tile it just had reserved.
+					 * Booking them at track level (as this lambda did before) left the
+					 * reservation without the green: the tile was booked, the next hop
+					 * itself faced a red PBS signal, and the loco stopped in front of it
+					 * while holding the reservation. See KI-349 / this file's rp(). */
+					auto reserve_dir_if_present = [&](TileIndex t, Trackdir td) {
+						const TrackBits bits = TrackdirBitsToTrackBits(GetTileTrackdirBits(t, ::TransportType::TRANSPORT_RAIL, 0));
+						if ((bits & TrackToTrackBits(TrackdirToTrack(td))) != 0) TryReserveRailTrackdir(v, t, td);
+					};
 					if (depth > 512) return false;
 					if (cur == tg) return true;
 					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) rp_last_tile = cur;
@@ -1032,7 +1064,7 @@ public:
 						const TileIndexDiff step = TileOffsByDiagDir(f3.exitdir);
 						const Track plat_track = AxisToTrack(axis);
 						if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-							TryReserveRailTrack(cur, TrackdirToTrack(cur_td));
+							reserve_dir_if_present(cur, cur_td);
 						}
 						/* R3R: also reserve the platform tiles between the loco and
 						 * the consist - the loco must drive over them to reach the
@@ -1052,39 +1084,52 @@ public:
 					TrackdirBits tdb3 = f3.new_td_bits;
 					if (tdb3 == TRACKDIR_BIT_NONE) return false;
 					if (KillFirstBit(tdb3) == TRACKDIR_BIT_NONE) {
-						if (rp(f3.new_tile, FindFirstTrackdir(tdb3), depth + 1)) {
+						const Trackdir nd = FindFirstTrackdir(tdb3);
+						if (rp(f3.new_tile, nd, depth + 1)) {
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								reserve_if_present(cur, TrackdirToTrack(cur_td));
+								reserve_dir_if_present(cur, cur_td);
 							}
 							/* R3R: also reserve the entry track of the next tile - the loco needs the
-							 * track it drives INTO, not just the one it leaves. Only reserve if the tile
-							 * actually has that track (avoids the pbs.cpp:144 assertion on platforms or
-							 * tiles where cur_td points along a different axis from the next tile). */
+							 * track it drives INTO, not just the one it leaves.
+							 * The track entered with is the track of the trackdir the follower really
+							 * continues with there (nd). Deriving it from ReverseTrackdir(cur_td) is
+							 * only correct while the next tile carries the same track as cur (the two
+							 * expressions are identical: ReverseTrackdir never changes the track), so
+							 * on a connection which switches slots - the next tile runs on a different
+							 * track than cur - that guess books a track the loco never touches. Such a
+							 * bit has no owner at all (the train releases only the tracks of its own
+							 * path), it is never freed, it blocks other trains on that track and it is
+							 * saved with the map (see KI-346, the 20 tile `track=4` corridor of KI-345).
+							 * reserve_dir_if_present() keeps the pbs.cpp:144 safety: it only books a track
+							 * the tile really has, which is always true for nd. */
 							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
-								Track entry_track = TrackdirToTrack(ReverseTrackdir(cur_td));
-								TrackBits tile_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(f3.new_tile, ::TransportType::TRANSPORT_RAIL, 0));
-								if (tile_tracks & TrackToTrackBits(entry_track)) {
-									TryReserveRailTrack(f3.new_tile, entry_track);
-								}
+								reserve_dir_if_present(f3.new_tile, nd);
 							}
 							return true;
 						}
 						return false;
 					}
 					for (TrackdirBits tb = tdb3; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
-						if (rp(f3.new_tile, (Trackdir)FindFirstBit(tb), depth + 1)) {
+						const Trackdir nd = (Trackdir)FindFirstBit(tb);
+						if (rp(f3.new_tile, nd, depth + 1)) {
 							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								reserve_if_present(cur, TrackdirToTrack(cur_td));
+								reserve_dir_if_present(cur, cur_td);
 							}
-							/* R3R: also reserve the entry track of the next tile, but only if
-							 * the tile actually has that track (avoids the pbs.cpp:144 assertion
-							 * on platforms/tiles where cur_td points along a different axis). */
+							/* R3R: also reserve the entry track of the next tile - the loco needs the
+							 * track it drives INTO, not just the one it leaves.
+							 * The track entered with is the track of the trackdir the follower really
+							 * continues with there (nd). Deriving it from ReverseTrackdir(cur_td) is
+							 * only correct while the next tile carries the same track as cur (the two
+							 * expressions are identical: ReverseTrackdir never changes the track), so
+							 * on a connection which switches slots - the next tile runs on a different
+							 * track than cur - that guess books a track the loco never touches. Such a
+							 * bit has no owner at all (the train releases only the tracks of its own
+							 * path), it is never freed, it blocks other trains on that track and it is
+							 * saved with the map (see KI-346, the 20 tile `track=4` corridor of KI-345).
+							 * reserve_dir_if_present() keeps the pbs.cpp:144 safety: it only books a track
+							 * the tile really has, which is always true for nd. */
 							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
-								Track entry_track = TrackdirToTrack(ReverseTrackdir(cur_td));
-								TrackBits tile_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(f3.new_tile, ::TransportType::TRANSPORT_RAIL, 0));
-								if (tile_tracks & TrackToTrackBits(entry_track)) {
-									TryReserveRailTrack(f3.new_tile, entry_track);
-								}
+								reserve_dir_if_present(f3.new_tile, nd);
 							}
 							return true;
 						}
@@ -1286,10 +1331,14 @@ public:
 
 		/* set origin and destination nodes */
 		PBSTileInfo origin;
-		if (v->current_order.IsType(OT_GOTO_COUPLE)) {
+		if (v->current_order.IsType(OT_GOTO_COUPLE) && !v->current_order.GetCoupleIsDepot()) {
 			/* R3R: when coupling, start the path from the loco itself.
 			 * FollowTrainReservation would walk the consist's platform reservation up
-			 * to its far end, and the path would then extend past the platform. */
+			 * to its far end, and the path would then extend past the platform.
+			 * Depot-type coupling (GetCoupleIsDepot()) must NOT take this shortcut:
+			 * it drives to a depot exactly like OT_GOTO_DEPOT, and pinning the origin
+			 * to the vehicle's own tile (which is the depot tile when parked inside)
+			 * makes the safe-position back-walk fail, so no reservation is ever made. */
 			origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
 		} else {
 			origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::OkayUnused);

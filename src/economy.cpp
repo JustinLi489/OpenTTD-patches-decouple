@@ -2017,11 +2017,11 @@ static void ReserveConsist(Station *st, Vehicle *u, CargoArray *consist_capleft,
 		 * "articulated chain". Also don't do the reservation if the vehicle is going to refit
 		 * to a different cargo and hasn't tried to do so, yet. */
 		if (!v->IsArticGroupMember() &&
-				(v->type != VehicleType::Train || !Train::From(v)->IsRearDualheaded()) &&
+				(v->type != VehicleType::Train || !Train::From(v)->IsDualHeadRear()) &&
 				(v->type != VehicleType::Aircraft || Aircraft::From(v)->IsNormalAircraft()) &&
 				(must_reserve || u->current_order.GetRefitCargo() == v->cargo_type)) {
 			IterateVehicleParts(v, ReserveCargoAction(st, next_station, cargo_type_loading ? u : nullptr, through_load), through_load);
-		} else if (through_load && v->type == VehicleType::Train && Train::From(v)->IsRearDualheaded()) {
+		} else if (through_load && v->type == VehicleType::Train && Train::From(v)->IsDualHeadRear()) {
 			ReserveCargoAction(st, next_station, cargo_type_loading ? u : nullptr, through_load)(v);
 		}
 		if (consist_capleft == nullptr || v->cargo_cap == 0) continue;

@@ -210,7 +210,7 @@ void VehicleServiceInDepot(Vehicle *v)
 	if (v->type == VehicleType::Train) {
 		Train *t = Train::From(v);
 		for (Train *u = t; u != nullptr; u = u->Next()) {
-			if (u->IsEngine() || u->IsRearDualheaded()) {
+			if (u->IsEngine() || u->IsDualHeadRear()) {
 				u->flags.Reset({VehicleRailFlag::NeedRepair, VehicleRailFlag::HasHitRoadVehicle, VehicleRailFlag::ConsistBreakdown});
 				u->critical_breakdown_count = 0;
 				const RailVehicleInfo &rvi = u->GetEngine()->VehInfo<RailVehicleInfo>();
@@ -1047,7 +1047,7 @@ bool Vehicle::IsEngineCountable() const
 		case VehicleType::Aircraft: return Aircraft::From(this)->IsNormalAircraft(); // don't count plane shadows and helicopter rotors
 		case VehicleType::Train:
 			return !this->IsArticGroupMember() && // tenders, articulated parts and de-articulated group members
-					!Train::From(this)->IsRearDualheaded(); // rear parts of multiheaded engines
+					!Train::From(this)->IsDualHeadRear(); // rear parts of multiheaded engines (incl. R3R fake dual heads)
 		case VehicleType::Road: return RoadVehicle::From(this)->IsFrontEngine();
 		case VehicleType::Ship: return Ship::From(this)->IsPrimaryVehicle();
 		default: return false; // Only count company buildable vehicles
@@ -1238,6 +1238,18 @@ void Vehicle::PreDestructor()
 	if (this->type == VehicleType::Train && Train::From(this)->flags.Test(VehicleRailFlag::PendingSpeedRestriction)) {
 		_pending_speed_restriction_change_map.erase(this->index);
 		Train::From(this)->flags.Reset(VehicleRailFlag::PendingSpeedRestriction);
+	}
+
+	/* R3R (KI-359, memo §21.6): the train that booked reservation bits is ceasing
+	 * to exist, so no later release path can honour those bits -- hand them back
+	 * now instead of leaving them for the audit's "the booker is dead" pass.
+	 * The ledger is keyed on the chain head, so being called once per car of a
+	 * chain that is sold car by car is harmless: the first call clears the chain
+	 * and the rest are a single hash lookup (Forget normalises to the head, and
+	 * First() finds it even while `this` is a mid-chain wagon). */
+	if (this->type == VehicleType::Train) {
+		const Train *r3r_chain_head = Train::From(this)->First();
+		R3RResvLedgerForget((r3r_chain_head != nullptr) ? r3r_chain_head->index : this->index, "destroy");
 	}
 
 	if (this->Previous() == nullptr) {

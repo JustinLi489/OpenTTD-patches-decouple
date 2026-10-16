@@ -28,8 +28,11 @@
  * the reservation audit (R3RReservationAudit) reports the current type of every
  * watched tile, so it is still visible.
  *
- * With R3R_PROBES == 0 nothing of this exists in the binary; the call sites below
- * are compiled out, and the no-op overload keeps the header self-consistent.
+ * R3R (KI-359, 2026-10-11): this hook is no longer probe-only. The reservation
+ * ledger (see pbs.h) books every bit under the chain head that laid it down, and it
+ * is fed from right here, so the call sites must run in every build. Only the
+ * watched-tile logging inside the function body stays behind R3R_PROBES; with the
+ * probes off the hook still runs, maintaining just the ledger.
  */
 
 #ifndef R3R_RESV_PROBES_H
@@ -39,10 +42,10 @@
 #include "tile_type.h"
 #include "track_type.h"
 
-#if R3R_PROBES
 /**
  * Log one reservation state change on a watched tile, tagged with the phase the
- * game is in and the acting train (see R3RResvPhaseGuard in pbs.h).
+ * game is in and the acting train (see R3RResvPhaseGuard in pbs.h). Feeds the
+ * reservation ledger for every change, watched or not (KI-359).
  *
  * @param kind  what changed, e.g. "SET-RAIL" / "CLEAR-STN" / "CHG-BRIDGE".
  * @param tile  the tile whose reservation field changed.
@@ -50,8 +53,5 @@
  *              only knows the whole-tile state (bool-valued setters).
  */
 void R3RResvWatchLog(const char *kind, TileIndex tile, Track track = INVALID_TRACK);
-#else
-inline void R3RResvWatchLog(const char *, TileIndex, Track = INVALID_TRACK) {}
-#endif
 
 #endif /* R3R_RESV_PROBES_H */

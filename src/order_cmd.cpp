@@ -3820,6 +3820,36 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
 			CancelLoadingDueToDeletedOrder(v);
 		}
 	}
+
+	/* R3R (couple priority, route A): a vehicle about to be destroyed may still be
+	 * the registered first_shared of a *live* order list which it no longer
+	 * references through orders/orders_backup. The borrow moves the pointer away
+	 * from it and never touches the registration, so every path above (and
+	 * OrderList::FreeChain()) is unreachable for that list: this vehicle looks like
+	 * it owns nothing, while the list itself stays alive because another vehicle of
+	 * the consist is running it. The registration would then keep naming this
+	 * vehicle after it has been returned to the pool, and the next reader dies on
+	 * the poison pointer (DeleteStaleLinks -> GetFirstSharedVehicle()->index,
+	 * crash-20260917T130637Z.log).
+	 *
+	 * Re-point those registrations here, now, while this vehicle is still valid:
+	 * with this vehicle detached (orders/orders_backup are null on that path),
+	 * FreeChain() hands the list over to a vehicle which still runs it, and only
+	 * destroys the list when nobody does. Collect first -- FreeChain() may delete
+	 * the list, which would invalidate the pool iterator.
+	 *
+	 * No CleaningPool() guard is needed: Vehicle::PreDestructor() bails out early
+	 * while a pool is being cleaned, so this function is never reached then. */
+	std::vector<OrderList *> r3r_dead_registered;
+	for (OrderList *ol : OrderList::Iterate()) {
+		if (ol->GetFirstSharedVehicle() != v) continue;
+		if (ol == v->orders || ol == v->orders_backup) continue; // handled above, or by PreDestructor()
+		r3r_dead_registered.push_back(ol);
+	}
+	for (OrderList *ol : r3r_dead_registered) {
+		if (R3RFindOrderListReferrer(ol, v) == nullptr) UpdateDeparturesWindowVehicleFilter(ol, true);
+		ol->FreeChain(false);
+	}
 }
 
 /**

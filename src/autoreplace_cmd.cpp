@@ -286,7 +286,7 @@ static CommandCost GetNewEngineType(const Vehicle *v, const Company *c, bool alw
 
 	e = EngineID::Invalid();
 
-	if (v->type == VehicleType::Train && Train::From(v)->IsRearDualheaded()) {
+	if (v->type == VehicleType::Train && Train::From(v)->IsDualHeadRear()) {
 		/* we build the rear ends of multiheaded trains with the front ones */
 		return CommandCost();
 	}
@@ -638,7 +638,7 @@ CommandCost CopyHeadSpecificThings(Vehicle *old_head, Vehicle *new_head, DoComma
 static CommandCost ReplaceFreeUnit(Vehicle **single_unit, DoCommandFlags flags, bool *nothing_to_do, bool same_type_only)
 {
 	Train *old_v = Train::From(*single_unit);
-	assert(!old_v->IsArticulatedPart() && !old_v->IsRearDualheaded());
+	assert(!old_v->IsArticulatedPart() && !old_v->IsDualHeadRear());
 
 	CommandCost cost = CommandCost(ExpensesType::NewVehicles, 0);
 
@@ -943,7 +943,7 @@ CommandCost CmdAutoreplaceVehicle(DoCommandFlags flags, VehicleID veh_id, bool s
 	bool free_wagon = false;
 	if (v->type == VehicleType::Train) {
 		Train *t = Train::From(v);
-		if (t->IsArticulatedPart() || t->IsRearDualheaded()) return CMD_ERROR;
+		if (t->IsArticulatedPart() || t->IsDualHeadRear()) return CMD_ERROR;
 		free_wagon = !t->IsFrontEngine();
 		if (free_wagon && t->First()->IsFrontEngine()) return CMD_ERROR;
 	} else {

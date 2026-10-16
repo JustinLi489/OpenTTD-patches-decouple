@@ -595,9 +595,8 @@ inline bool HasStationReservation(TileIndex t)
 inline void SetRailStationReservation(TileIndex t, bool b)
 {
 	dbg_assert_tile(HasStationRail(t), t);
-#if R3R_PROBES
-	if (HasStationReservation(t) != b) R3RResvWatchLog(b ? "SET-STN" : "CLEAR-STN", t); // R3R (KI-207)
-#endif
+	/* R3R (KI-207, unconditional since KI-359): also feeds the reservation ledger. */
+	if (HasStationReservation(t) != b) R3RResvWatchLog(b ? "SET-STN" : "CLEAR-STN", t);
 	AssignBit(_me[t].m6, 2, b);
 }
 

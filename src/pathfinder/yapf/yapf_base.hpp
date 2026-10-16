@@ -121,6 +121,10 @@ public:
 	/** default constructor */
 	inline CYapfBaseT() : max_search_nodes(PfGetSettings().max_search_nodes) {}
 
+	/** R3R (第 236 轮, KI-344): 只读访问节点预算，供挂接扫描 census 探针区分
+	 *  "搜索穷尽" 与 "被节点上限截断"（该成员是 protected，follow 类无法直接读）。 */
+	inline int GetMaxSearchNodes() const { return this->max_search_nodes; }
+
 	/** default destructor */
 	~CYapfBaseT() {}
 

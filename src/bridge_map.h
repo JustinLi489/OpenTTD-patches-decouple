@@ -411,15 +411,14 @@ inline void SetBridgeReservationTrackBits(TileIndex t, TrackBits b)
 {
 	assert_tile(IsRailBridgeHeadTile(t), t);
 	assert(!TracksOverlap(b));
-#if R3R_PROBES
-	/* R3R (KI-207): a bridge head is one tile of the whole bridge, so the same
-	 * reservation can be widened/reduced track by track; log every net change. */
+	/* R3R (KI-207, unconditional since KI-359): a bridge head is one tile of the
+	 * whole bridge, so the same reservation can be widened/reduced track by track;
+	 * every net change is logged (when watched) and fed to the reservation ledger. */
 	const TrackBits r3r_old = GetBridgeReservationTrackBits(t);
 	if (r3r_old != b) {
 		R3RResvWatchLog(b == TRACK_BIT_NONE ? "CLEAR-BRIDGE" : (r3r_old == TRACK_BIT_NONE ? "SET-BRIDGE" : "CHG-BRIDGE"),
 				t, FindFirstTrack(b != TRACK_BIT_NONE ? b : r3r_old));
 	}
-#endif
 	Track track = RemoveFirstTrack(&b);
 	SB(_m[t].m2, 0, 3, track == INVALID_TRACK ? 0 : track + 1);
 	SB(_m[t].m2, 3, 1, (uint8_t)(b != TRACK_BIT_NONE));

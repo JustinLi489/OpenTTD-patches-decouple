@@ -924,9 +924,11 @@ struct DepotWindow : Window {
 		/* Set the row and number of boxes in each row based on the number of boxes drawn in the matrix */
 		const NWidgetCore *wid = this->GetWidget<NWidgetCore>(WID_D_MATRIX);
 
-		/* Set up rect for each cell */
-		Rect ir = r.WithHeight(this->resize.step_height);
-		if (this->num_columns != 1) ir = ir.WithWidth(this->resize.step_width, rtl);
+		/* Set up rect for each cell. The cell size is the matrix widget's own resize step, not the
+		 * window resize step: the latter is the root container's step (0 for depot windows, see KI-329)
+		 * and would produce degenerate zero-width cells. */
+		Rect ir = r.WithHeight((int)wid->resize_y);
+		if (this->num_columns != 1) ir = ir.WithWidth((int)wid->resize_x, rtl);
 		ir = ir.Shrink(WidgetDimensions::scaled.framerect, RectPadding::zero);
 
 		/* Draw vertical separators at whole tiles.
@@ -954,20 +956,20 @@ struct DepotWindow : Window {
 
 		uint num = this->vscroll->GetPosition() * this->num_columns;
 		uint maxval = static_cast<uint>(std::min<size_t>(this->vehicle_list.size(), num + (rows_in_display * this->num_columns)));
-		for (; num < maxval; ir = ir.Translate(0, this->resize.step_height)) { // Draw the rows
+		for (; num < maxval; ir = ir.Translate(0, (int)wid->resize_y)) { // Draw the rows
 			Rect cell = ir; /* Keep track of horizontal cells */
 			for (uint i = 0; i < this->num_columns && num < maxval; i++, num++) {
 				/* Draw all vehicles in the current row */
 				const Vehicle *v = this->vehicle_list[num];
 				this->DrawVehicleInDepot(v, cell);
-				cell = cell.Translate(rtl ? -(int)this->resize.step_width : (int)this->resize.step_width, 0);
+				cell = cell.Translate(rtl ? -(int)wid->resize_x : (int)wid->resize_x, 0);
 			}
 		}
 
 		maxval = static_cast<uint>(std::min<size_t>(this->vehicle_list.size() + this->wagon_list.size(), (this->vscroll->GetPosition() * this->num_columns) + (rows_in_display * this->num_columns)));
 
 		/* Draw the train wagons without an engine in front. */
-		for (; num < maxval; num++, ir = ir.Translate(0, this->resize.step_height)) {
+		for (; num < maxval; num++, ir = ir.Translate(0, (int)wid->resize_y)) {
 			const Vehicle *v = this->wagon_list[num - this->vehicle_list.size()];
 			this->DrawVehicleInDepot(v, ir);
 		}
@@ -1006,6 +1008,9 @@ struct DepotWindow : Window {
 		this->RefreshVehicleList();
 
 		const NWidgetCore *matrix_widget = this->GetWidget<NWidgetCore>(WID_D_MATRIX);
+		/* The cell size is the matrix widget's own resize step. Guard against a zero step
+		 * (a degenerate layout) so that the divisions below can never divide by zero. */
+		if (matrix_widget->resize_x == 0 || matrix_widget->resize_y == 0) return {.action = DepotGUIAction::Error};
 		/* Make X relative to widget. Y is left alone for GetScrolledRowFromWidget(). */
 		x -= matrix_widget->pos_x;
 		/* In case of RTL the widgets are swapped as a whole */
@@ -1015,11 +1020,11 @@ struct DepotWindow : Window {
 		if (this->type == VehicleType::Train) {
 			xm = x;
 		} else {
-			xt = x / this->resize.step_width;
-			xm = x % this->resize.step_width;
+			xt = x / (int)matrix_widget->resize_x;
+			xm = x % (int)matrix_widget->resize_x;
 			if (xt >= this->num_columns) return {.action = DepotGUIAction::Error};
 		}
-		ym = (y - matrix_widget->pos_y) % this->resize.step_height;
+		ym = (y - matrix_widget->pos_y) % (int)matrix_widget->resize_y;
 
 		int32_t row = this->vscroll->GetScrolledRowFromWidget(y, this, WID_D_MATRIX);
 		uint pos = (row * this->num_columns) + xt;
@@ -1820,7 +1825,9 @@ struct DepotWindow : Window {
 		if (this->type == VehicleType::Train) {
 			this->hscroll->SetCapacity(nwi->current_x - this->tag_width - this->header_width - this->count_width);
 		} else {
-			this->num_columns = nwi->current_x / nwi->resize_x;
+			/* The matrix may be narrower than one cell; never let num_columns become 0 as it
+			 * is used as a divisor (CeilDiv in RefreshVehicleList) and as a modulo base. */
+			this->num_columns = std::max<uint>(1, nwi->resize_x != 0 ? nwi->current_x / nwi->resize_x : 1);
 		}
 	}
 

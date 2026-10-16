@@ -53,6 +53,7 @@ enum class VehicleRailFlag : uint8_t {
 	ArticGroupMember          = 25, ///< R3R: member (part) role of a de-articulated group; real artic parts derive this from subtype and never carry this bit.
 	SegmentFlipped            = 26, ///< R3R: the segment this vehicle belongs to was logically reversed (R3RFlipChainBySegments); in-segment / in-group position variables are mirrored so NewGRF keeps the pre-flip values.
 	ForceReserveOnce          = 27, ///< R3R (KI-179): one-shot "reserve independently of the signals" ability, granted to the merged train when a coupling completes. Consumed by the first successful path reservation (whether or not it needed the red-signal bypass), kept while every reservation attempt fails (the train then takes the ordinary "waiting for free track" punishment). Saved with the rest of the rail flags (Train::flags).
+	FakeDualHead              = 28, ///< R3R (KI-343): this is the rear half of a multiheaded engine whose engine bit was granted *deliberately* (so it can be a segment tail / a legal chain head) -- see Train::IsDualHeadRear(). Saved with the rest of the rail flags (Train::flags). NOTE: bit 23 (ForceFlipReverse) is a retired-but-reserved slot, so the next free bit is 28.
 };
 using VehicleRailFlags = EnumBitSet<VehicleRailFlag, uint32_t>;
 
@@ -174,6 +175,33 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void SetSegmentBack() { this->flags.Set(VehicleRailFlag::SegmentBack); }
 	/** Clear the segment-back marker. */
 	void ClearSegmentBack() { this->flags.Reset(VehicleRailFlag::SegmentBack); }
+
+	/**
+	 * R3R (KI-343): is this vehicle the rear half of a multiheaded engine?
+	 *
+	 * Upstream answers this by inspecting the engine bit alone
+	 * (GroundVehicle::IsRearDualheaded() == IsMultiheaded() && !IsEngine()), which makes
+	 * "is it a rear half" and "does it carry the engine bit" the same question: a rear half
+	 * can never be an engine. R3R must break that identity apart, because a segment tail has
+	 * to be an engine (or a fake engine), while a dual head's rear half must stay paired with
+	 * its front half.
+	 *
+	 * The fix is to grant the engine bit deliberately and record the fact with
+	 * VehicleRailFlag::FakeDualHead. This predicate is the single source of truth for
+	 * "this is a rear half": it accepts both the upstream form (no engine bit) and the R3R
+	 * form (engine bit + FakeDualHead). All former IsRearDualheaded() call sites use this one
+	 * instead; the upstream definition is kept untouched for comparison/template use.
+	 */
+	inline bool IsDualHeadRear() const
+	{
+		return this->IsMultiheaded() && (!this->IsEngine() || this->flags.Test(VehicleRailFlag::FakeDualHead));
+	}
+	/** Whether the engine bit of this dual-head rear half was granted deliberately by R3R. */
+	bool IsFakeDualHead() const { return this->flags.Test(VehicleRailFlag::FakeDualHead); }
+	/** Record that the engine bit of this dual-head rear half was granted deliberately by R3R. */
+	void SetFakeDualHead() { this->flags.Set(VehicleRailFlag::FakeDualHead); }
+	/** Drop the record (the engine bit itself must be handled by the caller). */
+	void ClearFakeDualHead() { this->flags.Reset(VehicleRailFlag::FakeDualHead); }
 
 	/**
 	 * R3R group-role view: is this vehicle an articulated-group *member* (part role)?
@@ -362,7 +390,7 @@ public:
 	inline Train *GetNextUnit() const
 	{
 		Train *v = this->GetNextVehicle();
-		if (v != nullptr && v->IsRearDualheaded()) v = v->GetNextVehicle();
+		if (v != nullptr && v->IsDualHeadRear()) v = v->GetNextVehicle();
 
 		return v;
 	}
@@ -374,7 +402,7 @@ public:
 	inline Train *GetPrevUnit()
 	{
 		Train *v = this->GetPrevVehicle();
-		if (v != nullptr && v->IsRearDualheaded()) v = v->GetPrevVehicle();
+		if (v != nullptr && v->IsDualHeadRear()) v = v->GetPrevVehicle();
 
 		return v;
 	}

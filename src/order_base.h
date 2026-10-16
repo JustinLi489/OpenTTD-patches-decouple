@@ -890,7 +890,10 @@ public:
 	 * The train executing this order is, for as long as this order is the one it
 	 * runs, treated as if the segment carrying the order also belonged to this
 	 * group -- on top of the groups that segment really has (see
-	 * R3RCoupleAllowed()) -- so it may couple onto a consist of that group.
+	 * R3RCoupleAllowed()) -- so it may couple onto a consist of that group, or of
+	 * one of its sub groups (第 224 轮 / KI-336: the whitelist matches the direct
+	 * line only, and this extra identity takes part in that comparison like any
+	 * stored one).
 	 * Nothing is written to the segment itself: the membership is derived from
 	 * the order, and it is gone as soon as the order stops being current (i.e.
 	 * after a successful coupling, see Couple() in train_cmd.cpp).

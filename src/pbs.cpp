@@ -23,10 +23,10 @@
 #include "table/strings.h"
 
 #include <vector>
+#include <unordered_map>
 
 #include "safeguards.h"
 
-#if R3R_PROBES
 /*
  * R3R (KI-207, 2026-09-25): reservation-origin tracing for ghost reservations.
  *
@@ -44,7 +44,10 @@
  *   - "r3r_resv_watch.txt" in the game working directory (next to R3R_debug.log)
  *     adds more tiles without a rebuild: one "x y" per line, '#' comments out.
  *
- * Nothing here runs in a build with the probes off (R3R_PROBES == 0).
+ * R3R (KI-359, 2026-10-11): as of this revision the phase/actor context and the
+ * hook itself are built unconditionally, because the *ledger* below is a real fix
+ * and not a probe -- it is fed from the same hook. Only the watched-tile logging
+ * stays behind R3R_PROBES.
  */
 const char *r3r_resv_phase = "misc";
 
@@ -55,6 +58,7 @@ const char *r3r_resv_phase = "misc";
  * that has already been deleted. */
 VehicleID r3r_resv_actor = VehicleID::Invalid();
 
+#if R3R_PROBES
 static const std::vector<TileIndex> &R3RWatchedResvTiles()
 {
 	static const std::vector<TileIndex> tiles = []() {
@@ -88,10 +92,455 @@ bool R3RIsWatchedResvTile(TileIndex tile)
 	}
 	return false;
 }
+#endif /* R3R_PROBES */
+
+/*
+ * R3R (KI-359, 2026-10-11): the reservation ledger -- "which train laid down which
+ * bit".
+ *
+ * Why the walk is not enough: GetTrainForReservation() answers "which train stands
+ * at the far end of this reserved path". While a locomotive couples to a waiting
+ * consist the far end is *always* the consist, so the bits the coupling path
+ * installs get attributed to the train being coupled to rather than to the one
+ * reserving -- the field log has SET-RAIL actor=23 on the very tile the audit
+ * reported as owner=veh22. The ledger instead books each bit under the chain head
+ * of whoever was acting at the instant the bit was written; that is a caller-side
+ * fact, and it is the same unit of ownership the rest of R3R uses.
+ *
+ * Two maps, keyed by a dense bit key (tile * 8 + track slot, slot 7 for whole-tile
+ * bits): bit -> owner, and owner -> its bits, so releasing an owner is a single
+ * lookup. Both are in-memory only and therefore empty after a load; the audit
+ * falls back to the walk for bits that were never booked.
+ *
+ * A bit re-booked by somebody else simply moves to the new owner (the old row is
+ * dropped first). For a multi-track tile only the first track is booked -- see
+ * the "CHG-*" note at R3RResvWatchLog -- which under-books rather than over-books:
+ * a missing row can only mean "released late", never "released somebody else's".
+ *
+ * R3R (KI-362/363/364 + REG-243-K, 2026-10-14): the ledger is an ownership table,
+ * not a one-way log book, and as such it has to obey two laws:
+ *
+ *  1. *Release law*: a release may only free the bits the caller is entitled to by
+ *     **purpose**. A bit that is still needed for another purpose must only have
+ *     that purpose taken off it. Before this, R3RResvLedgerForget() freed every
+ *     bit of the owner, including the tiles the train physically stands on that
+ *     ReserveTrackUnderConsist() keeps under it; those were immediately re-booked
+ *     by the next ReserveTrackUnderConsist(), once per tick, for every tile of the
+ *     consist (KI-362). And R3RReleaseReservationSafe() only looked at the map
+ *     ("is a bit set here?") without ever asking the ledger whose it is, so a
+ *     drifted ledger could free somebody else's bit (REG-243-K).
+ *  2. *Mirror law*: every row must match a bit that really is reserved on the map,
+ *     and a bit that is still reserved and still ours must not be abandoned. The
+ *     old release path dropped the row in both cases, so a platform bit it refused
+ *     to free (a train stands there) was left with no owner at all -- which is
+ *     exactly the ownerless stray the reap path then had to sweep up (KI-363/364).
+ *     R3RResvLedgerResync() re-checks the ledger against the map so that a writer
+ *     which bypasses the setters (MakeStation() rebuilding the tile,
+ *     SetRailStationPlatformReservation() clearing a whole platform) cannot cause
+ *     permanent drift.
+ *
+ * "Purpose" is read from the phase the caller named with R3RResvPhaseGuard(); see
+ * R3RResvLedgerPurpose(). The reason string handed to R3RResvLedgerForget() picks
+ * the mask of the release; see R3RResvLedgerForgetMask().
+ */
+struct R3RResvLedgerRec {
+	TileIndex tile;
+	Track track;
+	uint8_t purposes;  ///< bitmask of R3RResvPurpose, i.e. why the bit is held
+};
+
+/** Why a bit is held; see the two laws in the ledger comment above. */
+enum R3RResvPurpose : uint8_t {
+	R3R_RESV_PURPOSE_PATH    = 0x01,  ///< a path reservation (lookahead / coupling path)
+	R3R_RESV_PURPOSE_CONSIST = 0x02,  ///< the tiles the train physically stands on
+	R3R_RESV_PURPOSE_ALL     = 0x03,  ///< nothing holds the bit once the train is gone
+};
+
+static std::unordered_map<uint32_t, std::vector<R3RResvLedgerRec>> _r3r_resv_by_owner;
+static std::unordered_map<uint32_t, uint32_t> _r3r_resv_owner_of_bit;
+
+static inline uint32_t R3RResvBitKey(TileIndex tile, Track track)
+{
+	const uint32_t slot = (track == INVALID_TRACK) ? 7u : (uint32_t)track;
+	return (tile.base() << 3) | slot;
+}
+
+/** The acting train's chain head, i.e. the ledger's unit of ownership, or
+ *  R3R_RESV_NO_OWNER when no actor is set (a load-time or engine-internal write
+ *  that must not be booked: it has no R3R owner to release it later). */
+static uint32_t R3RResvLedgerActorHead()
+{
+	const Vehicle *v = Vehicle::GetIfValid(r3r_resv_actor);
+	if (v == nullptr) return R3R_RESV_NO_OWNER;
+	const Vehicle *h = v->First();
+	return (h != nullptr ? h->index.base() : v->index.base());
+}
+
+/** Drop one row from an owner's list (the bit key is dropped separately). */
+static void R3RResvLedgerDropRow(uint32_t owner, TileIndex tile, Track track)
+{
+	const auto own_it = _r3r_resv_by_owner.find(owner);
+	if (own_it == _r3r_resv_by_owner.end()) return;
+	auto &rows = own_it->second;
+	for (auto it = rows.begin(); it != rows.end(); ++it) {
+		if (it->tile == tile && it->track == track) { rows.erase(it); break; }
+	}
+	if (rows.empty()) _r3r_resv_by_owner.erase(own_it);
+}
+
+/** strcmp() == 0 without pulling in a header for it. */
+static inline bool R3RResvPhaseIs(const char *a, const char *b)
+{
+	if (a == nullptr || b == nullptr) return false;
+	while (*a != '\0' && *a == *b) { ++a; ++b; }
+	return *a == *b;
+}
+
+/**
+ * The purpose of the bit that is being written *right now*, taken from the phase
+ * the caller named with R3RResvPhaseGuard().
+ *
+ * The three phases below are the ones ReserveTrackUnderConsist(),
+ * ClearReservationUnderConsist() and the platform waiter (train_cmd.cpp
+ * "waiter-platform") run under, i.e. they own the tiles the train stands on.
+ * Everything else -- "choose-track", "controller", "yapf-couple", "release-ghost",
+ * "reap", "reap-stn", "gc-stn", and a nested guard that inherits a phase -- books a
+ * path bit.
+ *
+ * A new phase must be registered here if it books *consist* bits. Misclassification
+ * is safe in one direction only and that is the direction it fails in: a consist
+ * bit mistaken for a path bit gets freed by a "free-path" release, which is the old
+ * KI-362 behaviour, whereas a path bit mistaken for a consist bit would simply be
+ * freed a little later by the train leaving its tile. Nothing can be released that
+ * the *owner* does not hold, because R3RReleaseReservationLedgerChecked() and
+ * R3RResvLedgerForget() both check ownership first.
+ */
+static uint8_t R3RResvLedgerPurpose()
+{
+	static const char *const consist_phases[] = { "consist", "clear-consist", "waiter-platform" };
+	for (const char *phase : consist_phases) {
+		if (R3RResvPhaseIs(r3r_resv_phase, phase)) return R3R_RESV_PURPOSE_CONSIST;
+	}
+	return R3R_RESV_PURPOSE_PATH;
+}
+
+/**
+ * Which purposes a release with the given reason may take off the bits of an owner
+ * (Release law). The reason string is the one passed to R3RResvLedgerForget() by
+ * its callers in train_cmd.cpp / vehicle.cpp:
+ *
+ *  - "free-path": FreeTrainTrackReservation() is rebuilding the path, so it only
+ *    owns the path bits. Freeing the consist bits here is KI-362: the tiles under
+ *    the train were freed and immediately re-booked by ReserveTrackUnderConsist(),
+ *    once per tick, for every tile of the consist.
+ *  - the chain-edit commit points "couple" / "flip" / "depot-edit" (KI-363 part C):
+ *    the train is *still there* -- the edit changes which vehicle is the chain head,
+ *    so the rows booked under the old head are the dead ones. Same KI-362 argument
+ *    applies to the tiles under the consist, hence PATH-only as well.
+ *  - anything else ("decouple", "destroy"): the train is gone or is being split,
+ *    so both kinds really do end. An unknown reason keeps the old, conservative
+ *    behaviour (release everything the owner holds) rather than leaking bits.
+ */
+static uint8_t R3RResvLedgerForgetMask(const char *why)
+{
+	if (R3RResvPhaseIs(why, "free-path") || R3RResvPhaseIs(why, "couple") ||
+			R3RResvPhaseIs(why, "flip") || R3RResvPhaseIs(why, "depot-edit")) {
+		return (uint8_t)R3R_RESV_PURPOSE_PATH;
+	}
+	return (uint8_t)R3R_RESV_PURPOSE_ALL;
+}
+
+/** Drop the reverse entry of one bit as well, i.e. forget it completely. */
+static void R3RResvLedgerDropBit(TileIndex tile, Track track)
+{
+	const uint32_t bit_key = R3RResvBitKey(tile, track);
+	const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
+	if (bit_it == _r3r_resv_owner_of_bit.end()) return;
+	R3RResvLedgerDropRow(bit_it->second, tile, track);
+	_r3r_resv_owner_of_bit.erase(bit_it);
+}
+
+static void R3RResvLedgerResync();
+
+/** Number of ledger writes between two reconciliations against the map (Mirror
+ *  law). Bounded, so the sweep cannot become a per-tick cost, and rare enough
+ *  (thousands of *changes*, not ticks) that it is invisible in the profile. */
+static const uint32_t R3R_LEDGER_RESYNC_NOTES = 8192;
+static uint32_t _r3r_resv_ledger_notes = 0;
+
+void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track)
+{
+	/* Mirror law: every so often, check the whole ledger against the map, in case a
+	 * writer bypassed the setters (MakeStation() rebuilding a tile,
+	 * SetRailStationPlatformReservation() clearing a platform) or a row was left
+	 * behind by a release that did not settle. */
+	if (++_r3r_resv_ledger_notes >= R3R_LEDGER_RESYNC_NOTES) {
+		_r3r_resv_ledger_notes = 0;
+		R3RResvLedgerResync();
+	}
+
+	const uint32_t bit_key = R3RResvBitKey(tile, track);
+
+	/* "CLEAR-*" means the bit went away; every other kind we receive ("SET-*",
+	 * "CHG-*") adds or re-writes it. Matching on the prefix rather than passing a
+	 * flag keeps the six map setters untouched: they already spell it out in kind. */
+	if (kind[0] == 'C' && kind[1] == 'L') {
+		const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
+		if (bit_it == _r3r_resv_owner_of_bit.end()) return;
+		R3RResvLedgerDropRow(bit_it->second, tile, track);
+		_r3r_resv_owner_of_bit.erase(bit_it);
+		return;
+	}
+
+	const uint32_t owner = R3RResvLedgerActorHead();
+	if (owner == R3R_RESV_NO_OWNER) return;
+	const uint8_t purpose = R3RResvLedgerPurpose();
+
+	const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
+	if (bit_it != _r3r_resv_owner_of_bit.end()) {
+		if (bit_it->second == owner) {
+			/* Same owner, possibly a new purpose for the same bit: a train standing
+			 * on a platform books that whole-tile bit as CONSIST and can book the
+			 * entry track of the same tile as PATH. OR the purpose in instead of
+			 * returning -- returning is what made the ledger forget that the bit was
+			 * also a consist bit, and it would then be freed by a "free-path"
+			 * release (KI-362). */
+			const auto own_it = _r3r_resv_by_owner.find(owner);
+			if (own_it != _r3r_resv_by_owner.end()) {
+				for (R3RResvLedgerRec &row : own_it->second) {
+					if (row.tile == tile && row.track == track) {
+						row.purposes |= purpose;
+						return;
+					}
+				}
+			}
+			/* A reverse entry without a forward row cannot happen; repair it rather
+			 * than losing the bit. */
+			_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose});
+			return;
+		}
+		R3RResvLedgerDropRow(bit_it->second, tile, track);
+		bit_it->second = owner;
+	} else {
+		_r3r_resv_owner_of_bit.emplace(bit_key, owner);
+	}
+	_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose});
+}
+
+uint32_t R3RResvLedgerOwner(TileIndex tile, Track track)
+{
+	const auto it = _r3r_resv_owner_of_bit.find(R3RResvBitKey(tile, track));
+	return (it == _r3r_resv_owner_of_bit.end()) ? R3R_RESV_NO_OWNER : it->second;
+}
+
+/**
+ * R3R (KI-361, round 243-cont): the train the ledger books \a tile/\a track under,
+ * or nullptr when there is no row (a bit that came in with a savegame, or one
+ * written by an engine path that carries no R3R actor).
+ *
+ * Callers use this to answer the ownership question *before* the walk: the walk
+ * names the train standing at the far end of the reserved path, which is the
+ * coupling target while a locomotive lays down a coupling path -- i.e. it blames
+ * somebody else for the locomotive's own bits. The ledger recorded who wrote them.
+ */
+static Train *R3RTrainForLedgerBit(TileIndex tile, Track track)
+{
+	const uint32_t owner = R3RResvLedgerOwner(tile, track);
+	if (owner == R3R_RESV_NO_OWNER) return nullptr;
+	/* The owner is a chain head that was live when the bit was written; it may have
+	 * been sold since (R3RResvLedgerForget then drops the rows, so this is only a
+	 * belt-and-braces check). */
+	return Train::GetIfValid((size_t)owner);
+}
+
+/**
+ * Release one booked bit, asking the ledger who owns it first, and report whether
+ * the bit is now *settled* (Release law; REG-243-K).
+ *
+ * @return true when nothing of ours is left on the map: the bit was freed, or it
+ *     was already gone (the tile was rebuilt into something else, the platform
+ *     reservation was cleared wholesale). false when the bit is still reserved but
+ *     this call deliberately did not touch it -- because the ledger attributes it
+ *     to a different owner now (REG-243-K), or because a train stands on the tile
+ *     and the bit is still doing its job. The caller must then keep the row: that
+ *     is the mirror law, and dropping the row there is what used to leave the bit
+ *     ownerless for the reap path (KI-363/364).
+ */
+bool R3RReleaseReservationLedgerChecked(uint32_t key, TileIndex tile, Track track, const char *why)
+{
+	/* Never free a bit the ledger attributes to somebody else (REG-243-K). A
+	 * *missing* row (a bit that came in with a savegame, or one written without an
+	 * R3R actor) cannot answer the question, so it keeps the old behaviour -- the
+	 * audit's reap path and the older per-consist bookkeeping both rely on that. */
+	const uint32_t booker = R3RResvLedgerOwner(tile, track);
+	if (booker != R3R_RESV_NO_OWNER && booker != key) {
+		/* The ledger keys bookings by the *chain head*, while the older per-consist
+		 * table (R3RReconcileConsistReservation, ClearReservationUnderConsist) is
+		 * keyed by the vehicle that called in. A difference is therefore only
+		 * benign when both name the same chain. */
+		uint32_t own_head = R3R_RESV_NO_OWNER;
+		if (const Train *k = Train::GetIfValid((size_t)key); k != nullptr && k->First() != nullptr) {
+			own_head = k->First()->index.base();
+		}
+		if (booker != own_head) {
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s-notowner(veh=%u)\n",
+					key, (int)TileX(tile), (int)TileY(tile), (uint)track, why, booker);
+			return false;
+		}
+	}
+
+	if (IsValidTile(tile) && GetTileType(tile) == TileType::Station && HasStationRail(tile)) {
+		if (!HasStationReservation(tile)) {
+			/* The whole-tile bit is gone: nothing to free, and the row is stale. */
+			R3RResvLedgerDropBit(tile, track);
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s-gone\n",
+					key, (int)TileX(tile), (int)TileY(tile),
+					IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
+			return true;
+		}
+		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr ||
+				GetTrainForWholeTileReservation(tile) != nullptr) {
+			/* Still held by a train that stands there (or by a path whose far end is
+			 * somebody): the bit is doing its job, keep it booked. */
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s-hold\n",
+					key, (int)TileX(tile), (int)TileY(tile),
+					IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
+			return false;
+		}
+		const TrackBits rail_bits = GetStationReservationTrackBits(tile);
+		if (rail_bits != TRACK_BIT_NONE) {
+			R3RResvPhaseGuard phase_guard("gc-stn");
+			UnreserveRailTrack(tile, FindFirstTrack(rail_bits));
+		}
+		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s\n",
+				key, (int)TileX(tile), (int)TileY(tile),
+				IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
+		return true;
+	}
+
+	const bool ours = IsValidTile(tile) && GetTileType(tile) == TileType::Railway &&
+			IsPlainRailTile(tile) && HasTrack(tile, track) &&
+			HasBit(GetRailReservationTrackBits(tile), track);
+	if (ours) {
+		UnreserveTrack(tile, track);
+		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s\n",
+				key, (int)TileX(tile), (int)TileY(tile), (uint)track, why);
+		return true;
+	}
+	/* Not plain rail anymore, track lifted, or the bit is already gone: the bit
+	 * cannot exist here, so the row is stale either way. */
+	R3RResvLedgerDropBit(tile, track);
+	R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s-gone\n",
+			key, (int)TileX(tile), (int)TileY(tile), (uint)track, why);
+	return true;
+}
+
+void R3RResvLedgerForget(VehicleID owner, const char *why)
+{
+	if (owner == VehicleID::Invalid()) {
+		/* R3R (KI-363, Mirror law): an ownerless "forget" is the reconcile-now
+		 * request R3RReservationAudit() makes once per sweep -- there is nothing to
+		 * forget, so align the whole ledger with the map instead. Riding this
+		 * already-declared entry point keeps pbs.h (and therefore the incremental
+		 * build) untouched. */
+		R3RResvLedgerResync();
+		return;
+	}
+
+	/* Normalise to the chain head, the ledger's unit of ownership: the caller may
+	 * hold a mid-chain vehicle (a sold wagon, a decoupled half). */
+	uint32_t key = owner.base();
+	if (const Vehicle *v = Vehicle::GetIfValid(owner); v != nullptr) {
+		if (const Vehicle *h = v->First(); h != nullptr) key = h->index.base();
+	}
+
+	const auto own_it = _r3r_resv_by_owner.find(key);
+	if (own_it == _r3r_resv_by_owner.end()) return;
+	std::vector<R3RResvLedgerRec> rows = std::move(own_it->second);
+	_r3r_resv_by_owner.erase(own_it);
+
+	const uint8_t mask = R3RResvLedgerForgetMask(why);
+	unsigned released = 0;
+	unsigned kept = 0;
+
+	for (const R3RResvLedgerRec &row : rows) {
+		/* Take this purpose off the bit; only a bit nothing else needs may go. */
+		const uint8_t left = (uint8_t)(row.purposes & ~mask);
+		if (left != 0) {
+			_r3r_resv_by_owner[key].push_back(R3RResvLedgerRec{row.tile, row.track, left});
+			++kept;
+			continue;
+		}
+
+		/* Note the order: release *first*, drop the reverse entry afterwards.
+		 * R3RReleaseReservationLedgerChecked() needs the row still in place to
+		 * verify the bit is ours (REG-243-K); erasing first is what made that check
+		 * a no-op. */
+		if (!R3RReleaseReservationLedgerChecked(key, row.tile, row.track, why)) {
+			/* The bit is still doing its job on the map (a train stands on the
+			 * platform, the ledger handed it to somebody else): keep it booked, or
+			 * it becomes an ownerless stray (KI-364). */
+			_r3r_resv_by_owner[key].push_back(row);
+			++kept;
+			continue;
+		}
+
+		const uint32_t bit_key = R3RResvBitKey(row.tile, row.track);
+		const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
+		/* Only drop the reverse entry while it still points at us: a bit that was
+		 * re-booked by somebody else in the meantime must keep its new owner. */
+		if (bit_it != _r3r_resv_owner_of_bit.end() && bit_it->second == key) {
+			_r3r_resv_owner_of_bit.erase(bit_it);
+		}
+		++released;
+	}
+
+	R3RDbgWrite("RESV-LEDGER-FORGET veh=%u why=%s mask=0x%X released=%u kept=%u\n",
+			key, why, (unsigned)mask, released, kept);
+}
+
+/** Reconcile the whole ledger against the map (Mirror law). Rows whose bit is not
+ *  reserved on the map any more are dropped; a row that is still ours and still
+ *  reserved is left alone. Only logs when it actually found something. */
+static void R3RResvLedgerResync()
+{
+	unsigned rows = 0;
+	unsigned dropped = 0;
+	for (auto own_it = _r3r_resv_by_owner.begin(); own_it != _r3r_resv_by_owner.end(); ) {
+		auto &list = own_it->second;
+		for (auto row_it = list.begin(); row_it != list.end(); ) {
+			++rows;
+			const R3RResvLedgerRec &row = *row_it;
+			bool alive = false;
+			if (IsValidTile(row.tile)) {
+				const TrackBits bits = GetReservedTrackbits(row.tile);
+				alive = (row.track == INVALID_TRACK) ? (bits != TRACK_BIT_NONE)
+						: HasBit(bits, row.track);
+			}
+			if (alive) { ++row_it; continue; }
+
+			const uint32_t bit_key = R3RResvBitKey(row.tile, row.track);
+			const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
+			if (bit_it != _r3r_resv_owner_of_bit.end() && bit_it->second == own_it->first) {
+				_r3r_resv_owner_of_bit.erase(bit_it);
+			}
+			row_it = list.erase(row_it);
+			++dropped;
+		}
+		if (list.empty()) {
+			own_it = _r3r_resv_by_owner.erase(own_it);
+		} else {
+			++own_it;
+		}
+	}
+	if (dropped != 0) {
+		R3RDbgWrite("RESV-LEDGER-RESYNC rows=%u dropped=%u why=map-mismatch\n", rows, dropped);
+	}
+}
 
 /**
  * Log one reservation state change on a watched tile, tagged with the phase and the
- * acting train.
+ * acting train, and always feed the ledger (KI-359).
  *
  * "actor" is the vehicle the caller was working on (a locomotive booking its path,
  * a consist sitting on its platform, the release sweep, ...). "head" is that
@@ -100,11 +549,18 @@ bool R3RIsWatchedResvTile(TileIndex tile)
  * the identity between booking the bit and freeing it.
  *
  * Called from the six map-accessor setters (see r3r_resv_probes.h), i.e. from the
- * hottest path in the game; hence the switch check first, so a plain run never walks
- * the watch list.
+ * hottest path in the game: the ledger update runs unconditionally (a hash lookup
+ * or two per *change*, not per tile visited), while the watched-tile logging that
+ * follows is compiled out with the probes off and additionally checks the watch
+ * list only after the cheap debug switch. Note that the "CHG-*" kinds report just
+ * the first track of the new trackbits, so a multi-track tile books one bit; that
+ * direction of error is safe (see R3RResvLedgerNote).
  */
 void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
 {
+	R3RResvLedgerNote(kind, tile, track);
+
+#if R3R_PROBES
 	if (!R3RDbgOn()) return;
 	if (!R3RIsWatchedResvTile(tile)) return;
 	int actor = -1;
@@ -115,8 +571,36 @@ void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
 	}
 	R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
 			kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
+#endif
 }
-#endif /* R3R_PROBES */
+
+/**
+ * R3R (KI-203b, moved here from train_cmd.cpp by KI-359): release one booked
+ * reservation without tripping over tiles that changed type since it was booked
+ * (track lifted, tile rebuilt into a station, depot, tunnel bridge or crossing).
+ *
+ * UnreserveTrack() is the low level plain-rail helper: it goes through
+ * HasTrack() -> GetTrackBits(), which dbg_asserts IsPlainRailTile()
+ * (rail_map.h:168). Calling it on a booked tile that has been rebuilt since is
+ * what crashed the game -- the bookkeeping has to be defensive here, because it
+ * by design looks at tiles the consist *left* long ago.
+ *
+ * Anything we cannot prove to be a plain rail tile which still carries our bit
+ * is left untouched and only dropped from the books.
+ *
+ * It moved into pbs.cpp with the ledger because the ledger is shared by every
+ * reservation-releasing path now, and pbs.cpp is where the other map-level
+ * reservation helpers live; the three call sites in train_cmd.cpp did not change.
+ *
+ * R3R (KI-362/REG-243-K): this is now a thin forwarder. The real work lives in
+ * R3RReleaseReservationLedgerChecked(), which also asks the ledger whether the bit
+ * really is ours, and which reports whether the bit is settled -- the ledger needs
+ * that answer to keep a row it could not release (see the two laws above).
+ */
+void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why)
+{
+	R3RReleaseReservationLedgerChecked(key, tile, track, why);
+}
 
 /**
  * Get the reserved trackbits for any tile, regardless of type.
@@ -214,7 +698,36 @@ bool IsRailStationPlatformFree(const Train *v, TileIndex start, DiagDirection di
  */
 bool TryReserveRailTrackdir(const Train *v, TileIndex tile, Trackdir td, bool trigger_stations)
 {
-	bool success = TryReserveRailTrack(tile, TrackdirToTrack(td), trigger_stations);
+	const Track track = TrackdirToTrack(td);
+	bool success = TryReserveRailTrack(tile, track, trigger_stations);
+
+	/* R3R (KI-361, memo round243 §26): the couple pathfinder books a few tiles
+	 * Track-level only (its rp() lambda has no signal-setting capability and the
+	 * tiles are "not part of any node segment"), so a later Trackdir-level
+	 * reservation of the very same bit returns false here even though the bit is
+	 * still *ours*. Two consequences, both observed in the 1112,129 red-signal
+	 * scene: (a) the caller drops the tile from its path (never released again ->
+	 * orphan reservation), and (b) the PBS signal is never set green, so the train
+	 * is held forever behind a tile it reserved itself. Treat "already booked by
+	 * our own chain" as a successful reservation: the bit is ours either way, and
+	 * the green is what the signal is for. Only plain rail is special-cased; every
+	 * other tile type keeps its original semantics.
+	 *
+	 * R3R (KI-370, 2026-10-16): the tile-type test MUST be IsPlainRailTile() --
+	 * IsPlainRail() has "@pre IsTileType(t, TileType::Railway)" and asserts that
+	 * very precondition inside GetRailTileType() (rail_map.h:40). Since the
+	 * trackdir-level call sites (yapf_rail.cpp rp() since 修法甲) hand us station
+	 * waypoints, level crossings, tunnel/bridge tiles and depots as well, an
+	 * unguarded IsPlainRail(tile) tripped the assert the moment such a tile was
+	 * already reserved by our own chain. */
+	if (!success && v != nullptr && IsPlainRailTile(tile)) {
+		const Train *const booker = R3RTrainForLedgerBit(tile, track);
+		if (booker != nullptr && booker->index == v->First()->index &&
+				HasBit(GetRailReservationTrackBits(tile), track)) {
+			success = true;
+		}
+	}
+
 	if (success && HasPbsSignalOnTrackdir(tile, td)) {
 		SetSignalStateByTrackdir(tile, td, SignalState::Green);
 		MarkSingleSignalDirty(tile, td);
@@ -326,6 +839,9 @@ void UnreserveRailTrackdir(TileIndex tile, Trackdir td)
 		SetSignalStateByTrackdir(tile, td, SignalState::Red);
 		MarkSingleSignalDirty(tile, td);
 	}
+	/* R3R (第 243 轮, REG-243-O): deliberately no guard here. Each caller of this
+	 * function names its own phase, so the UNRES-RAIL line tells the two apart. A guard
+	 * placed here would overwrite the caller's name and hide that information. */
 	UnreserveRailTrack(tile, TrackdirToTrack(td));
 }
 
@@ -341,6 +857,18 @@ void UnreserveRailTrackdir(TileIndex tile, Trackdir td)
 void UnreserveRailTrack(TileIndex tile, Track t)
 {
 	assert_msg_tile(TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TRANSPORT_RAIL, 0)) & TrackToTrackBits(t), tile, "track: {:X}", t);
+
+	/* R3R (第 243 轮, REG-243-M): tag every release at the *entry* of this function,
+	 * where the phase the caller named is still current, so the map-setter's
+	 * CLEAR-RAIL line (r3r_resv_probes.h) can be attributed to a code path. Printed
+	 * just before the setter fires, so the two lines are adjacent in the log.
+	 * Only logged when the tile really carries a reservation, which keeps the volume
+	 * at "one line per real release". */
+	if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
+		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
+				(int)TileX(tile), (int)TileY(tile), (int)t,
+				r3r_resv_phase, (uint)r3r_resv_actor.base());
+	}
 
 	switch (GetTileType(tile)) {
 		case TileType::Railway:
@@ -1642,6 +2170,21 @@ static Train *R3RFollowReservationToNearbyTrain(TileIndex tile, Trackdir trackdi
 Train *GetTrainForReservation(TileIndex tile, Track track)
 {
 	assert_msg_tile(HasReservedTracks(tile, TrackToTrackBits(track)), tile, "track: {:X}", track);
+
+	/* R3R (KI-361, round 243-cont): ask the ledger first. The walk below answers
+	 * "which train stands at the far end of this reserved path", and while a
+	 * locomotive couples to a waiting consist that far end is always the *target*
+	 * -- so the bits the coupling path installs come back attributed to the
+	 * waiting consist, i.e. to somebody else. Field log 2026-10-11: SET-RAIL
+	 * actor=23 on 1112,128..131 while the walk answered veh22 for all four, which
+	 * turned the locomotive's own booking into a red signal in front of itself
+	 * (veh23 stood still on 1112,125 for the whole session). The ledger recorded
+	 * the writer, which is the question the callers actually ask.
+	 *
+	 * The walk stays as the fallback for bits without a row: those came in with a
+	 * savegame, or an engine-internal path wrote them without an R3R actor. */
+	if (Train *owner = R3RTrainForLedgerBit(tile, track)) return owner;
+
 	Trackdir  trackdir = TrackToTrackdir(track);
 
 	RailTypes rts = GetRailTypeInfo(GetTileRailTypeByTrack(tile, track))->indirect_compatible_railtypes;
@@ -1724,6 +2267,35 @@ Train *GetR3RReservationOwnerNearby(TileIndex tile, Track track)
 }
 
 /**
+ * R3R (KI-350): direction-split sibling of GetR3RReservationOwnerNearby() for the
+ * red-signal probe (KI-349) in train_cmd.cpp.
+ *
+ * GetR3RReservationOwnerNearby() walks the forward direction first and returns as
+ * soon as *one* of the two directions meets a train, so a "near=" answer alone
+ * cannot tell that the *other* direction also reaches a train. That datum is
+ * exactly what separates the two explanations of a red signal whose block bit is
+ * held: "the bit sits at the end of my own booking" (the block is held by the
+ * train asking, i.e. its own tail) from "the bit is a stale leftover of the
+ * neighbour" (held by somebody else). This entry point answers one direction at a
+ * time; the walk, its conservatism and its read-only nature are identical to the
+ * merged helper above.
+ *
+ * @param tile A tile whose reservation is stored as a plain rail track bit.
+ * @param trackdir The single direction to walk in.
+ * @return The first train met along that one direction, or nullptr if there is none.
+ */
+Train *R3RReservationOwnerInDirection(TileIndex tile, Trackdir trackdir)
+{
+	if (!IsValidTile(tile) || !IsPlainRailTile(tile)) return nullptr;
+
+	const Track track = TrackdirToTrack(trackdir);
+	if (!HasBit(GetReservedTrackbits(tile), track)) return nullptr;
+
+	const RailTypes rts = GetRailTypeInfo(GetTileRailTypeByTrack(tile, track))->indirect_compatible_railtypes;
+	return R3RFollowReservationToNearbyTrain(tile, trackdir, rts);
+}
+
+/**
  * R3R (KI-210): GetTrainForWholeTileReservation() with the *nearest* train as
  * the answer instead of the train at the far end of the path (station platform /
  * waypoint flavour, for the same caller and the same reason).
@@ -1778,6 +2350,11 @@ Train *GetR3RWholeTileReservationOwnerNearby(TileIndex tile)
  */
 uint R3RPurgeStrayReservations()
 {
+	/* R3R (第 243 轮, REG-243-O): name this release path so the UNRES-RAIL lines it
+	 * produces read "purge" instead of inheriting whatever phase ran last. "purge" is
+	 * not in R3RResvLedgerPurpose()'s consist_phases[]: log only, no behaviour. */
+	R3RResvPhaseGuard r3r_phase_purge("purge");
+
 	struct R3RResvBit { TileIndex tile; Track track; bool whole_tile; };
 	std::vector<R3RResvBit> doomed;
 

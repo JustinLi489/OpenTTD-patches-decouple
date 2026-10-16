@@ -490,9 +490,8 @@ inline bool HasCrossingReservation(TileIndex t)
 inline void SetCrossingReservation(TileIndex t, bool b)
 {
 	assert_tile(IsLevelCrossingTile(t), t);
-#if R3R_PROBES
-	if (HasCrossingReservation(t) != b) R3RResvWatchLog(b ? "SET-XING" : "CLEAR-XING", t); // R3R (KI-207)
-#endif
+	/* R3R (KI-207, unconditional since KI-359): also feeds the reservation ledger. */
+	if (HasCrossingReservation(t) != b) R3RResvWatchLog(b ? "SET-XING" : "CLEAR-XING", t);
 	AssignBit(_m[t].m5, 4, b);
 }
 

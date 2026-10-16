@@ -35,10 +35,17 @@ extern CoupleGroupPool _couplegroup_pool;
  * R3R: a couple group.
  *
  * Couple groups are the hard whitelist for coupling: two chains may only be
- * coupled when the segments which meet at the coupling point belong to the
- * same couple group. Segments without an assigned group form one single
- * implicit group (see #INVALID_COUPLE_GROUP), so a game which never assigns a
- * group keeps its previous, unrestricted behaviour.
+ * coupled when the segments which meet at the coupling point match each other
+ * (第 224 轮 / KI-336: the same group, or one of them one of the other's
+ * ancestors -- the sub group is a member of its parent, so "同一组/父子/祖孙"
+ * match while two sibling sub groups and any collateral relation do not; see
+ * R3RCoupleGroupMasksCompatible()). Two segments of different companies
+ * additionally need a matching group which the owner opened for them
+ * (R3RCoupleGroupMasksAllowCrossCompany()). Segments without an assigned group
+ * form one single implicit group (see #INVALID_COUPLE_GROUP), so a game which
+ * never assigns a group keeps its previous, unrestricted behaviour; an
+ * unassigned segment never matches an assigned one, and the implicit group never
+ * crosses a company boundary.
  *
  * A group is attached to a *segment*: the value is stored on the vehicle which
  * heads the segment (the one carrying the SegmentFront marker, or the chain
@@ -94,29 +101,42 @@ struct CoupleGroup : CoupleGroupPool::PoolItem<&_couplegroup_pool> {
 bool R3RIsValidCoupleGroup(CoupleGroupID group);
 
 /**
- * R3R: may the two group sets be coupled together?
- * An empty set counts as one single implicit group, therefore two unassigned
- * segments are compatible, while an unassigned segment is never compatible with
- * an explicitly assigned group. Otherwise a non-empty intersection of the two
- * sets is required (Q5: a segment in several groups matches a partner which
- * shares at least one of them).
- * @param a First group set.
- * @param b Second group set.
+ * R3R (第 224 轮 / KI-336 选项 2): may the two group sets be coupled together?
+ *
+ * Both arguments are the *stored* (explicit) masks, never the expanded ones: the
+ * ancestors are added in here, and on the other side only --
+ * `(a & ancestors(b)) | (ancestors(a) & b) != 0`. A group therefore counts only
+ * when one side was really put into it and the other side is in it or in one of
+ * its sub groups: the sub group A1 matches its parent A (and A1a below it), while
+ * the sibling sub groups A1 and A2 do *not* match -- they only share the ancestor
+ * A, which is in neither side's own set. The same rule keeps an uncle and his
+ * nephew incompatible however far up the tree their common ancestor sits.
+ *
+ * An empty set counts as one single implicit group: two unassigned segments are
+ * compatible (same company -- the cross-company gate below never lets the implicit
+ * group through), while an unassigned segment is never compatible with an
+ * explicitly assigned group.
+ * @param a First stored group set.
+ * @param b Second stored group set.
  * @return whether the two sets may meet at a coupling point.
  */
 bool R3RCoupleGroupMasksCompatible(CoupleGroupMask a, CoupleGroupMask b);
 
 /**
- * R3R (D6-①+D6-③): do \a a and \a b share a group which is open for other companies?
+ * R3R (D6-①+D6-③; 第 224 轮): do \a a and \a b share a group which is open for other companies?
  *
- * Crossing a company boundary is an explicit opt-in on the shared group
- * (#CoupleGroup::CGF_ALLOW_OTHERS), so the implicit group formed by two
- * unassigned segments never authorises it: without an assigned group there is
- * no group the opt-in could have been expressed on.
+ * The two sides first have to match exactly like within one company -- the same
+ * direct-line rule as R3RCoupleGroupMasksCompatible(), which is also why the
+ * *stored* masks are passed in here -- and off that matching set at least one group
+ * has to be open for other companies (#CoupleGroup::CGF_ALLOW_OTHERS).
  *
- * @param a First group set.
- * @param b Second group set.
- * @return whether at least one shared group is open for other companies.
+ * Crossing a company boundary is an explicit opt-in on the matching group, so the
+ * implicit group formed by two unassigned segments never authorises it: without an
+ * assigned group there is no group the opt-in could have been expressed on.
+ *
+ * @param a First stored group set.
+ * @param b Second stored group set.
+ * @return whether at least one matching group is open for other companies.
  */
 bool R3RCoupleGroupMasksAllowCrossCompany(CoupleGroupMask a, CoupleGroupMask b);
 
@@ -165,13 +185,19 @@ CoupleGroupMask R3RGetCoupleGroupsOfSegment(const Train *v);
  * The parent tree is a membership relation: a segment in the sub group "石头"
  * whose parent is "滚木" is a member of 滚木 as well, so every read which decides
  * "is this segment a member of that group" (management list, counts, the name
- * shown on the vehicle, the cross-company gate) must use this instead of
- * R3RGetCoupleGroupsOfSegment(). The stored mask is never expanded, so dragging a
- * group to another parent changes the membership of all its members at once.
+ * shown on the vehicle) must use this instead of R3RGetCoupleGroupsOfSegment().
+ * The stored mask is never expanded, so dragging a group to another parent changes
+ * the membership of all its members at once.
  *
  * Do NOT use this where a mask is written back (e.g. broadcasting the union of
  * the chain's segment masks onto every segment head after coupling, see
  * R3RNormaliseChainGroups()): that would bake the ancestors into the savegame.
+ *
+ * Do NOT use this for the coupling whitelist either (R3RCoupleGroupMasksCompatible()
+ * / R3RCoupleGroupMasksAllowCrossCompany(), 第 224 轮 / KI-336): those take the
+ * *stored* masks and expand the ancestors themselves, on the other side only, so
+ * that the sibling sub groups A1 and A2 cannot match through their common ancestor.
+ * Feeding them pre-expanded sets would reintroduce exactly that bug.
  *
  * @param v Any vehicle of the segment.
  * @return The segment's effective group set (own groups plus every ancestor's).
@@ -207,9 +233,11 @@ void R3RClearCoupleGroupsOfSegment(Train *v);
  *
  * This is the single gate every coupling path goes through, so it also owns the
  * company boundary (D6-①): a coupling which crosses companies additionally
- * requires a shared group which is open for other companies
- * (#CoupleGroup::CGF_ALLOW_OTHERS). The owner of the vehicles is never changed
- * by a coupling (D3).
+ * requires a matching group which is open for other companies
+ * (#CoupleGroup::CGF_ALLOW_OTHERS). The whitelist itself is unconditional since
+ * 第 224 轮 (KI-336) -- the same direct-line match as within one company applies
+ * to every candidate. The owner of the vehicles is never changed by a coupling
+ * (D3).
  *
  * @param coupler The moving chain which wants to couple.
  * @param target The chain which is being coupled onto.
@@ -638,6 +666,29 @@ GroupID R3RSegmentSectionGroupID(const Vehicle *section);
  *          are no-ops (such a chain has no row and reads the car itself).
  */
 void R3RSegmentStoreTraits(const Vehicle *v);
+
+/**
+ * R3R (第 225 轮 / KI-332): copy the per-segment traits of \a src_chain onto a
+ * freshly built clone \a dst_chain, segment by segment.
+ *
+ * The clone path (CmdCloneVehicle) rebuilds the cars and mirrors the segment
+ * markers (★/⊗), so the copy has the very same segments as the source, but
+ * nothing carried the three player-visible traits over: the clone came out with
+ * every segment unnamed, every couple group gone and every priority at its
+ * default. This restores them.
+ *
+ * Numbers are deliberately *not* copied (KI-332): a clone is a new train and
+ * takes its unit numbers from the normal pool, exactly like a hand-built one.
+ * Names, couple groups and priorities are properties of the segment, so they are.
+ *
+ * Both chains must have been settled first (R3RSettleClonedChain()), because a
+ * hidden segment's traits live in the row of its own segment ID and the copy
+ * writes them there from the source's row.
+ *
+ * @param src_chain First car of the source chain; nullptr is a no-op.
+ * @param dst_chain First car of the clone; nullptr is a no-op.
+ */
+void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain);
 
 /**
  * R3R (第 155 轮 / 落地清单 ⑤): every segment head of \a chain except the control

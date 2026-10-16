@@ -92,7 +92,12 @@ void ConnectMultiheadedTrains()
 							if (w->engine_type != eid || w->other_multiheaded_part != nullptr || !w->IsMultiheaded()) continue;
 
 							/* we found a car to partner with this engine. Now we will make sure it face the right way */
-							if (w->IsEngine()) {
+							/* R3R (KI-343): the engine bit may have been granted
+							 * *deliberately* to a rear half that serves as a segment
+							 * tail (FakeDualHead). Keep it and leave spritenum alone,
+							 * otherwise the flag/engine bit would be silently demoted
+							 * again on every savegame load. */
+							if (w->IsEngine() && !w->IsFakeDualHead()) {
 								w->ClearEngine();
 								w->spritenum++;
 							}
@@ -103,7 +108,10 @@ void ConnectMultiheadedTrains()
 						for (w = u->GetNextVehicle(); w != nullptr; w = w->GetNextVehicle()) {
 							if (w->engine_type != eid || w->other_multiheaded_part != nullptr || !w->IsMultiheaded()) continue;
 
-							if (w->IsEngine()) {
+							/* R3R (KI-343): a deliberately engine-flagged rear half
+							 * (FakeDualHead) counts as a closing bracket, not an
+							 * opening one. */
+							if (w->IsEngine() && !w->IsFakeDualHead()) {
 								stack_pos++;
 							} else {
 								if (stack_pos == 0) break;

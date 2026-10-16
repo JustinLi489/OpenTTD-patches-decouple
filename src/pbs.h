@@ -31,13 +31,23 @@
  * reservation bits (see r3r_resv_probes.h), so no call site can be forgotten. The
  * watch list defaults to the tiles reported as ghosts and can be extended without a
  * rebuild by dropping "r3r_resv_watch.txt" (one "x y" pair per line, '#' starts a
- * comment) next to R3R_debug.log in the game working directory. */
-#if R3R_PROBES
+ * comment) next to R3R_debug.log in the game working directory.
+ *
+ * R3R (KI-359, 2026-10-11): the phase/actor context below is compiled
+ * unconditionally, because the reservation *ledger* (see R3RResvLedgerNote) is a
+ * real fix rather than a probe: it books every reservation bit under the chain
+ * head that laid it down, and it is fed from the very same hook. Only the
+ * watched-tile logging stays behind R3R_PROBES. */
 extern const char *r3r_resv_phase;
 /** Acting train, as an ID rather than a pointer: the log is reached from deep
  *  inside the map setters, where a raw pointer could outlive the train it names. */
 extern VehicleID r3r_resv_actor;
+#if R3R_PROBES
 bool R3RIsWatchedResvTile(TileIndex tile);
+#else
+/** No-op counterpart for a build with the probes off, for the same reason as
+ *  R3RResvPhaseGuard below: the call sites must compile both ways. */
+inline bool R3RIsWatchedResvTile(TileIndex) { return false; }
 #endif
 
 /**
@@ -48,12 +58,11 @@ bool R3RIsWatchedResvTile(TileIndex tile);
  *
  * Passing \c nullptr for the phase (or VehicleID::Invalid() for the actor) leaves
  * that field alone -- that is how the generic pathfinder entry point adds "who"
- * without destroying the phase of the caller. A no-op object in a build without the
- * probes, which is why it is a real type and not a macro: call sites must compile
- * both ways.
+ * without destroying the phase of the caller. It is a real type and not a macro so
+ * that call sites compile identically with and without the probes, and since
+ * KI-359 it is always a working guard, because the ledger depends on the actor.
  */
 struct R3RResvPhaseGuard {
-#if R3R_PROBES
 	const char *prev_phase;
 	VehicleID prev_actor;
 	explicit R3RResvPhaseGuard(const char *phase, VehicleID actor = VehicleID::Invalid())
@@ -63,10 +72,40 @@ struct R3RResvPhaseGuard {
 		if (actor != VehicleID::Invalid()) r3r_resv_actor = actor;
 	}
 	~R3RResvPhaseGuard() { r3r_resv_phase = prev_phase; r3r_resv_actor = prev_actor; }
-#else
-	explicit R3RResvPhaseGuard(const char *, VehicleID = VehicleID::Invalid()) {}
-#endif
 };
+
+/**
+ * R3R (KI-359, 2026-10-11): the reservation ledger -- "which train laid down which
+ * reservation bit".
+ *
+ * The engine's own walk (GetTrainForReservation) answers "which train stands at the
+ * far end of this reserved path", which is a structurally wrong answer while a
+ * locomotive couples to a waiting consist: the far end is then always the target, so
+ * the bits a coupling path installs get attributed to the target (field log:
+ * SET-RAIL actor=23 on the very tile the audit reported as owner=veh22). The ledger
+ * instead books every bit written through the six map setters under the chain head
+ * of whoever was acting at that moment, which is the only caller-side fact that
+ * survives chain edits.
+ *
+ * The tables are in-memory and not saved: after loading they are empty and the
+ * ownership question falls back to the walk plus the audit (which reaps bits whose
+ * ledger owner no longer exists). Keys are VehicleID values, never Train pointers,
+ * because a train can be deleted between booking and releasing.
+ */
+inline constexpr uint32_t R3R_RESV_NO_OWNER = UINT32_MAX;
+/** Book ("SET-*"/"CHG-*") or unbook ("CLEAR-*") one reservation bit. Called from the
+ *  map setters via R3RResvWatchLog; a no-op while no actor is set. */
+void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track);
+/** Ledger owner of one bit, or R3R_RESV_NO_OWNER when it was never booked (e.g. it
+ *  came in with a savegame). */
+uint32_t R3RResvLedgerOwner(TileIndex tile, Track track);
+/** Release every bit booked under \a owner and drop its ledger rows. Used when the
+ *  owning train is sold, decoupled or gives up its path. */
+void R3RResvLedgerForget(VehicleID owner, const char *why);
+/** Release one reservation bit after re-verifying that the tile still holds it (see
+ *  pbs.cpp). Leaves the map alone when the check fails, so a stale ledger row can
+ *  never free somebody else's bit. */
+void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why);
 
 /**
  * VehicleID of \a v for R3RResvPhaseGuard, tolerating a null pointer (that leaves the

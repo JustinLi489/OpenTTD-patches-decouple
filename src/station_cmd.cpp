@@ -5055,9 +5055,39 @@ void RerouteCargoFromSource(Station *st, CargoType c, StationID source, StationI
 
 robin_hood::unordered_flat_set<VehicleID> _delete_stale_links_vehicle_cache;
 
+/* R3R/KI-368: OrderList::first_shared is a bare Vehicle pointer that R3R's own
+ * re-linking paths do not always re-point (the link is only maintained by the
+ * KI-93 fallbacks, which do not cover every destruction route -- e.g. a car that
+ * is not the explicitly deleted one only passes through ~Vehicle(), never
+ * PreDestructor(), and PreDestructor() itself returns early while the pool is
+ * being cleaned). When that happens first_shared keeps pointing at the freed
+ * block, and the code below dereferenced it (v->First()) and crashed with an
+ * access violation on the MSVC debug heap's 0xDD fill pattern.
+ *
+ * There is no O(1) way to tell a live Vehicle* from a dangling one -- the
+ * VehicleID needed by IsValidID()/Get() can only be obtained by dereferencing
+ * the very pointer in question -- so build the set of live vehicles once per
+ * station tick and drop anything that is not in it. DeleteStaleLinks() runs at
+ * most once per station per STATION_LINKGRAPH_TICKS, so this is amortised to
+ * almost nothing. */
+static robin_hood::unordered_flat_set<const Vehicle *> _r3r_live_vehicle_cache;
+static bool _r3r_live_vehicle_cache_valid = false;
+
+/** Is this pointer a vehicle that is still alive? Never dereferences @p v. */
+static bool R3RIsLiveVehicleCached(const Vehicle *v)
+{
+	if (!_r3r_live_vehicle_cache_valid) {
+		_r3r_live_vehicle_cache.clear();
+		for (const Vehicle *w : Vehicle::Iterate()) _r3r_live_vehicle_cache.insert(w);
+		_r3r_live_vehicle_cache_valid = true;
+	}
+	return _r3r_live_vehicle_cache.find(v) != _r3r_live_vehicle_cache.end();
+}
+
 void ClearDeleteStaleLinksVehicleCache()
 {
 	_delete_stale_links_vehicle_cache.clear();
+	_r3r_live_vehicle_cache_valid = false;
 }
 
 /**
@@ -5109,21 +5139,36 @@ void DeleteStaleLinks(Station *from)
 							}
 						}
 						if (!found_to || !found_from) continue;
-						vehicles.push_back(l->GetFirstSharedVehicle());
+						/* R3R/KI-368: first_shared may be dangling (see
+						 * R3RIsLiveVehicleCached above). Drop it here instead of
+						 * dereferencing it further down. */
+						Vehicle *const first_shared = l->GetFirstSharedVehicle();
+						if (first_shared == nullptr || !R3RIsLiveVehicleCached(first_shared)) {
+							R3RDbgWrite("SL-STALE-SKIP ol=%llx fs=%llx ctx=has-both-ends\n",
+									static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(l)),
+									static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(first_shared)));
+							continue;
+						}
+						vehicles.push_back(first_shared);
 					}
 
 					auto iter = vehicles.begin();
 					while (iter != vehicles.end()) {
 						Vehicle *v = *iter;
+						/* R3R/KI-367: OrderList::first_shared is not re-pointed when R3R re-links a
+						 * consist, so *iter need not be the front unit. IsStoppedInDepot() asserts
+						 * this == First() and LinkRefresher::Run() both expect the chain head, so work
+						 * on the physical chain head (identical to *iter in unmodified upstream). */
+						Vehicle *const chain_head = v->First();
 
-						auto res = _delete_stale_links_vehicle_cache.insert(v->index);
+						auto res = _delete_stale_links_vehicle_cache.insert(chain_head->index);
 						// Only run LinkRefresher if vehicle was not already in the cache
 						if (res.second) {
 							/* Do not refresh links of vehicles that have been stopped in depot for a long time. */
-							if (!v->IsStoppedInDepot() || (EconTime::CurDate() - v->date_of_last_service) <=
+							if (!chain_head->IsStoppedInDepot() || (EconTime::CurDate() - chain_head->date_of_last_service) <=
 									LinkGraph::STALE_LINK_DEPOT_TIMEOUT) {
 								edge_helper.RecordSize();
-								LinkRefresher::Run(v, false); // Don't allow merging. Otherwise lg might get deleted.
+								LinkRefresher::Run(chain_head, false); // Don't allow merging. Otherwise lg might get deleted.
 								if (edge_helper.RefreshIterationIfSizeChanged()) {
 									edge = edge_helper.GetEdge();
 								}
