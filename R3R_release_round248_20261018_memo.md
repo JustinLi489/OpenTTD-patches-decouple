@@ -39,11 +39,11 @@
 - [x] 取证（源码/两树 exe/tag/打包目录/探针口径）
 - [x] Release 全量重编（`R3R_release_fullbuild.cmd`，2026-10-18 01:34:13 启动 → 02:00:05 写 done）
 - [x] 校验 exe：`EXIT_CODE=0`、`[693/693] Linking`、23 140 864 B @ 2026-10-18 01:59:55（晚于最新源码 10-16 23:56:38）、SHA256 `B5FA0983A929CCFFD89566D277A5B082AB89992A32F71525B365F7C5244C7C20`
-- [ ] git 提交（仅源码 5 + 文档，**不 add** `_tmp_*` / `*.log` / `*.zip` / `ninja` / `INCREMENTAL`）
-- [ ] 打 tag `r3r-stable-2026-10-18`
-- [ ] 复制 `pkg_20261003` → `pkg_20261018`，替换 exe、改写 `README_R3R.txt`
-- [ ] 打包 `R3R-v1.0.3-win64-2026-10-18.zip`
-- [ ] 回填 exe 体积/SHA256 与构建自证到本文
+- [x] git 提交 `94bcd67019`（源码 5 + 文档 4，9 files / +1192 −98；未 add 任何 `_tmp_*` / `*.log` / `*.zip` / `ninja` / `INCREMENTAL` / `pkg_*`）
+- [x] tag `r3r-stable-2026-10-18`
+- [x] 复制 `pkg_20261003` → `pkg_20261018`（136 项 / 44.79 MB），替换 exe、改写 `README_R3R.txt`（4 185 B）
+- [x] 打包 `R3R-v1.0.3-win64-2026-10-18.zip`（16 015 286 B）
+- [x] 回填 exe 体积/SHA256 与构建自证到本文
 
 ## 五之二、构建自证（2026-10-18 实测）
 
@@ -57,6 +57,23 @@
 | 产物 | `build-release\openttd.exe` 23 140 864 B / 22.1 MB |
 | 探针 | 编译期删除；发布包不产日志、环境变量无效 |
 | 源码新鲜度 | 最新源码 `src\train_cmd.cpp` 2026-10-16 23:56:38 < exe 01:59:55 ⇒ 无陈旧 obj |
+
+## 六、发行产物（2026-10-18 02:05 生成）
+
+| 项 | 值 |
+|---|---|
+| 源码提交 | `94bcd67019`（`R3R: 2026-10-18 stable checkpoint (rounds 219-248)`，9 files / +1192 −98） |
+| 稳定 tag | `r3r-stable-2026-10-18`（annotated，指向含本 memo 回填的文档提交） |
+| 包目录 | `build-release\pkg_20261018\R3R-OpenTTD-0.73.1-win64\`（136 项 / 44 791 060 B 量级，与上版同结构） |
+| 包内 exe | 23 140 864 B @ 2026-10-18 01:59:55（与 `build-release\openttd.exe` 同字节） |
+| 包内说明 | `README_R3R.txt` 4 185 B（改写：新增「关于本构建（诊断版另发）」「存档兼容性」两节 + 第 219~248 轮变化 7 条） |
+| 压缩包 | `d:\sourcecode of JGRPP\R3R-v1.0.3-win64-2026-10-18.zip` 16 015 286 B（15.3 MB）@ 02:05:16 |
+| zip 内容校验 | 136 entries；顶层 `R3R-OpenTTD-0.73.1-win64\`；`openttd.exe` 23 140 864 / `README_R3R.txt` 4 185 |
+| zip SHA256 | `51FDF905E9E52B5B8181D3117B34DB204A851D7297AAF1D4EA7F48DA1C9BA566` |
+| 对比上版 | v1.0.2 zip 15 981 244 B ⇒ +34 042 B（exe 23 057 408 → 23 140 864，+83 456 B；压缩后增幅合理） |
+
+**给朋友的话（交底）**：发布包探针在编译期删除，出了 bug 交不出日志；要交日志得换 `build\openttd.exe`（Debug + 探针，2026-10-17 00:00:54 版，51 882 496 B）。包里 README 已写明这一点。
+**仍未做（等玩家发话）**：①`git push`；②GitHub Release 上传（附 zip + 说明）；③`PROBES=1` 的 Release 诊断包。
 
 
 ## 六、风险与注意事项
