@@ -973,8 +973,9 @@ void R3RNormaliseChainGroupsAfterLoad()
 /** R3R (第 152 轮): segment rows by ID. Slot #R3R_SEGMENT_NONE is never handed out, so the table is never empty. */
 static std::vector<R3RSegmentRecord> _r3r_segments(1);
 
-/** R3R (第 152 轮): IDs which were released and may be handed out again (LIFO). */
-static std::vector<uint16_t> _r3r_free_segment_ids;
+/* R3R (第 246 轮 / U-4): the LIFO free list that used to live here is gone. IDs
+ * are now handed out by scanning for the lowest free slot -- see R3RSegmentAlloc()
+ * for why the allocation order had to stop depending on the release order. */
 
 size_t R3RSegmentPoolSize()
 {
@@ -1003,15 +1004,29 @@ R3RSegmentRecord *R3RSegmentGetOrCreate(uint16_t id)
 
 uint16_t R3RSegmentAlloc()
 {
-	uint16_t id;
-	if (!_r3r_free_segment_ids.empty()) {
-		id = _r3r_free_segment_ids.back();
-		_r3r_free_segment_ids.pop_back();
-	} else {
-		if (_r3r_segments.size() > R3R_SEGMENT_ID_MAX) return R3R_SEGMENT_NONE;
-		id = static_cast<uint16_t>(_r3r_segments.size());
-		_r3r_segments.emplace_back();
+	/* R3R (第 246 轮 / U-4): hand out the *lowest* free slot instead of the top of
+	 * a LIFO free list. A full search of the GUI and list code finds no ordering
+	 * or comparison on segment IDs -- they are only ever compared for equality
+	 * and used to index this table -- so both schemes are semantically
+	 * equivalent. The difference only shows up under desync: a LIFO list makes
+	 * the ID a segment receives depend on the *order* in which earlier segments
+	 * happened to be released, so two machines that free the same set of
+	 * segments in a different order hand out different IDs, and every ID ends up
+	 * in the segment rows and in the savegame. With a lowest-free scan the ID is
+	 * a pure function of the set of live segments. The scan is bounded by the
+	 * pool size and this path only runs when a segment is created (couple,
+	 * decouple, depot edit, load), never per tick. */
+	for (size_t id = 1; id < _r3r_segments.size(); id++) {
+		if (_r3r_segments[id].in_use) continue;
+		R3RSegmentRecord &rec = _r3r_segments[id];
+		rec = R3RSegmentRecord{};
+		rec.in_use = true;
+		return static_cast<uint16_t>(id);
 	}
+
+	if (_r3r_segments.size() > R3R_SEGMENT_ID_MAX) return R3R_SEGMENT_NONE;
+	const uint16_t id = static_cast<uint16_t>(_r3r_segments.size());
+	_r3r_segments.emplace_back();
 
 	R3RSegmentRecord &rec = _r3r_segments[id];
 	rec = R3RSegmentRecord{};
@@ -1024,15 +1039,16 @@ void R3RSegmentFree(uint16_t id)
 	R3RSegmentRecord *rec = R3RSegmentGet(id);
 	if (rec == nullptr) return;
 
+	/* R3R (第 246 轮): clearing in_use is all that is needed now --
+	 * R3RSegmentAlloc() finds this slot again by itself, and the moment of
+	 * release no longer decides which ID the next segment gets. */
 	*rec = R3RSegmentRecord{};
-	_r3r_free_segment_ids.push_back(id);
 }
 
 void R3RSegmentTableReset()
 {
 	_r3r_segments.clear();
 	_r3r_segments.emplace_back();
-	_r3r_free_segment_ids.clear();
 }
 
 /**

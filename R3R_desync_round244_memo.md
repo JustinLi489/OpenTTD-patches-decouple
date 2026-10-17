@@ -766,3 +766,227 @@ struct R3RResvLedgerRec {
 **下一步**：稳定点已钉住，回到 §十六 的 I-3b（读档重建挂点）/ I-3c（块 ID 与是否连带 `_r3r_consist_resv`）/ I-4（实现 `R3RL` 入档；**只改 `.cpp`**，`Save_R3RL`/`Load_R3RL` 写在 `pbs.cpp`，`sl/couple_group_sl.cpp` 只加注册行 + 手写声明），随后 I-6 增量构建、I-7 双进程联机复测。
 
 > 说明：本 §17.1 是在 ④ 打 tag **之后**追加的 memo 补充，tag `r3r-stable-2026-10-16` 仍指向 ③ `fe119ce14b`（其树内不含本补充）。回退只依赖 ① 源码提交、③ 备忘与离线快照，不受此影响。
+
+---
+
+## 十八、第 245 轮：I-4 落地 —— 台账入档 `R3RL`（已实现 + 已编译）
+
+**轮次口径**：分析在 §四~§十六（第 244 轮，KI-371~KI-376），本实现单独记作**第 245 轮**，对应 KI 条目 **KI-371 状态由「未修」改为「已修（第 245 轮）」**。
+
+### 18.1 按 §16.6 清单的逐条落地情况
+
+| 编号 | 项目 | 结果 |
+| --- | --- | --- |
+| I-3b | 读档重建挂点 | **不需要**（由设计消解）——`Load_R3RL()` 自带 `_r3r_resv_owner_of_bit` 重建，`SlFixPointers`/`AfterLoadVehicles` 阶段不必再加钩子 |
+| I-3c | 块 ID 与是否连带 `_r3r_consist_resv` | 块 ID 定 **`R3RL`**；`_r3r_consist_resv` 本轮**不动**（它是"本进程记账 + 有 GC 兜底"的辅助表，不是跨端判据） |
+| I-4 | 实现 | **已完成**（见 18.2） |
+| I-5 | 改 `pbs.h:90-94` 的 "not saved" 声明 | **刻意未做**：§16.6 明确"pbs.h 一个字不动"（改 `.h` ⇒ KI-183 护栏判全量 692 步）。该注释**现已过时**，登记为残留（见 18.5） |
+| I-6 | 增量构建自证 | **已完成**（见 18.3） |
+| I-7 | 双进程联机复测 | **未做**（须玩家参与，见 18.4） |
+
+### 18.2 改动内容（只动两个 `.cpp`，未碰任何 `src/*.h`）
+
+**`src/pbs.cpp`**（4 处）：
+1. 新增 `#include "sl/saveload.h"`（放在 `#include "train.h"` 之后）——只为拿到 `NSL` / `NamedSaveLoad` / `SlTableHeader` / `SlObjectSaveFiltered` / `SlIterateArray`。
+2. 新增槽位常量，并让 `R3RResvBitKey()` 复用它（**一处定义**，避免" 整格=7 "这个魔法数散落）：
+   ```cpp
+   static constexpr uint8_t R3R_RESV_SLOT_WHOLE_TILE = 7;
+   static inline uint32_t R3RResvBitKey(TileIndex tile, Track track)
+   { const uint32_t slot = (track == INVALID_TRACK) ? R3R_RESV_SLOT_WHOLE_TILE : (uint32_t)track; return (tile.base() << 3) | slot; }
+   ```
+3. 新增 `struct R3RResvLedgerSaveRec { uint32_t owner; uint8_t purposes; };` + `static const NamedSaveLoad _r3r_resv_ledger_desc[]`（字段名 `owner` / `purposes`）。
+4. 新增 **非 static** `void Save_R3RL()` / `void Load_R3RL()`，位置紧接 `R3RReleaseReservationSafe()` 之后（保持台账代码块聚集）。
+
+**`src/sl/couple_group_sl.cpp`**（2 处）：
+1. `#include "../safeguards.h"` 之后加手写声明 `void Save_R3RL(); void Load_R3RL();`（**不加头文件**，故 `pbs.h` 不需长访问器）。
+2. chunk handler 表 `_couple_group_chunk_handlers[]` 在 `'R3SG'` 之后追加一行：
+   ```cpp
+   { 'R3RL', Save_R3RL, Load_R3RL, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R reservation ledger chunk
+   ```
+
+**设计要点（与 §16.6 逐条对齐）**：
+- 数组索引 **= bit key `(tile << 3 | slot)`**，唯一且安全整数范围（最大地图 ≈ 2^27，远低于 2^31）；`owner` 放行内字段而**不做索引**（同一 owner 多行不会互覆）。
+- `Load_R3RL()` 先 `clear()` 两张表再逐行重建 ⇒ **`_r3r_resv_owner_of_bit` 不入档**，它是正向表的纯派生（Mirror law 由读档一次归一保证）。
+- `owner == R3R_RESV_NO_OWNER` 行**丢弃**（无主位任何释放路径都不该碰）。
+- `purposes == 0` 归一为 `R3R_RESV_PURPOSE_ALL`——与 `R3RResvLedgerForgetMask()` 对"未知 reason"的保守读法一致（宁可少放，不可误放）。
+- `track` 由 `slot == 7 ? INVALID_TRACK : (Track)slot` 反解 ⇒ 与 `R3RResvBitKey()` 同一套编码，不存在"两套编码错位"。
+- `CH_SPARSE_TABLE` + named table header ⇒ **旧存档没有 `R3RL` 块，台账为空 = 今天的行为逐字不变**；`SLV` 不动、无需 `SlXvFeatureTest`、无需版本迁移。
+- 不校验车辆、不校验地图（蓝图 §16.6）：车辆校验会误删刚被卖/刚被买的车位，地图校验会把"地图与台账的正常中间态"当错误；两者都交给既有 `R3RResvLedgerResync()` 在下次使用时归一。
+
+### 18.3 构建自证（增量，复用既有 `_tmp_inc_build.cmd`，**未新建任何 `.cmd`**）
+
+- 构建前 `tasklist` 确认 `openttd.exe` **未在运行**（否则闸门写 `EXIT_CODE=97`）。
+- 护栏：`build\R3R_incbuild.guard.log` = **`GUARD: incremental is safe (no header/lang file is newer than the newest object)`** ⇒ 本轮纯 `.cpp` 改动判定**增量合法**（KI-183 未触发全量）。
+- `build\R3R_incbuild.done` = **`EXIT_CODE=0`**（2026-10-16 23:21:12）。
+- 日志：**`[6/6] Linking CXX executable openttd.exe`**（`findstr /C:"Linking CXX executable"` 命中 1 次），`error C` / `FAILED:` / `build stopped` **计数 0**。
+- 时间戳自证：
+  - `src\pbs.cpp` **23:18:42** → `build\CMakeFiles\openttd_lib.dir\src\pbs.cpp.obj` **23:19:44**；
+  - `src\sl\couple_group_sl.cpp` **23:18:53** → `...\couple_group_sl.cpp.obj` **23:19:41**；
+  - `build\openttd.exe` **2026-10-16 23:21:06**（51 868 160 B）**晚于**两个 obj。
+- `read_lints` 两个文件 **0 条**。
+- **产物自证（V-1）**：新块 ID 已在 exe 里 —— `findstr /M /C:"LR3R"` **命中**、`/C:"GS3R"`（既有 `R3SG`）**亦命中**，而正序 `"R3RL"` / `"R3SG"` **均不命中** ⇒ exe 存的是 4 字节常量的**小端形态**（`R3RL`=0x4C523352，内存字节 `52 33 52 4C`→ 反向读作 `LR3R`），与既有块行为一致，不是"没进二进制"。
+
+> 注：这解释了为什么**不能**在 exe 里直接搜 `"R3RL"` 来判断注册是否生效（与记忆中"exe 内语言串非明文"同族陷阱）。判据应看**反序形态**，或（更稳）看 `.done` / `Linking` / obj 时间戳三件套。
+
+### 18.4 未完成：I-7 双进程联机复测（须玩家参与）
+
+本轮**不得自行启动游戏**（既有硬性约束）。复测口径（沿用 KI-371 判据 3 条 + 本篇 §十五 场景）：
+1. **① 主机运行一段后客户端中途入局不产生 desync** —— 需双进程，判据＝客户端入局后 5 分钟内不弹 "desync detected"；
+2. **② `-d desync=3` 报错点不落在** `TryReserveRailTrackdir` / `R3RReleaseReservationLedgerChecked` / `R3RReservationAudit`；
+3. **③ 单机行为逐字不变** —— 不加载联机场景的单机局，预留/释放相关探针行（`RESV-*` / `RESERVECONSIST`）与上一版**逐字相同**（`R3RL` 只加存档块、不改任何运行时判据）；
+4. **④ 存档往返**：带台账的局存档 → 读档 → 台账问询答案不变（`RESV-AUDIT-SUMMARY` 的 `owned`/`stray` 读数为同一数量级，不再出现"读档后台账全空 ⇒ stray 暴涨"的旧形态）。
+
+### 18.5 残留与过时项（登记，不删除）
+
+- **R-1（残留·低）**：`pbs.h:90-94` 那段 "…not saved…" 注释**已过时**（台账现在入档了）。改写它要动 `.h` ⇒ KI-183 护栏判全量 692 步；本轮按蓝图刻意不动，留作下一轮"顺手改 `.h`"的搭车项。
+- **R-2（残留·中）**：`_r3r_consist_resv`（`train_cmd.cpp`，进程内记账 + 每 256 次调用 GC）**仍未入档**，与 KI-376 同族。它的失配面小于主台账（只是"多放了一点"，且有 GC 兜底），本轮未动。
+- **R-3（疑点·待验证）**：`R3RL` 是**稀疏块**，行数 = 全图被记账的位数。大场面（长编组 + 多站台整格位）下存档体积增量未实测。判据＝对同一存档"加块前/后"比字节数，并核对行数 ≈ `RESV-AUDIT-SUMMARY` 的 `reservedTiles`。若显著（>数十 KB）再议"只存脏行"。
+- **R-4（疑点·待验证）**：`purposes` 归一为 `ALL` 的行，读档后若该位实际只剩 `CONSIST`，会**多留一次**（`ALL` 是"还没放完"的保守读法）。判据＝复测中出现"该位被 `RESET` 而台账仍记"的探针行则说明需要更细的归一。当前判断为可接受（保守方向 = 不会误放别人的活位）。
+
+---
+
+## 二十、第 246 轮：第 2 / 3 / 4 / 6 项落地（批 1 收官 + 批 2 主体）
+
+> 承接 §十四 玩家拍板"先做第 1 项"（第 245 轮已完成 `R3RL` 入档）。本轮把**批 1 余下的第 2 项**与**批 2 的第 4 / 3 / 6 项**一起做完。
+> 四项同属一类根因：**判据依赖"本机历史"而不是"同步状态"**。改法一律把节拍/老化改成**由同步变量（`_tick_counter`、车号、地图状态）直接推导**，**零存档改动、零判据放宽**。
+
+### 20.1 本轮新发现（按用户 2026-10-11 规则登记：有疑点 / 猜测根因）
+
+- **REG-246-A（疑点 → 本轮已实证并修复·第 2 项真正的大头）**：§12.1 第 2 项只写了"老化计数 tick 化 + GC 时钟 tick 化"两条，但**审计的节拍门本身**也是本机历史 —— `train_cmd.cpp` 的 `static uint32_t r3r_resv_audit_tick = 0;`（第 17567 行一带）在**读档后归 0** ⇒ 客户端中途入局后**当场**跑一次审计（`_tick_counter - 0 >= interval` 恒真），而主机按自己的节拍跑 ⇒ **两侧审计落在不同 tick**，`RESV-REAP` 对地图的改动因此错位。**这是"第 1 项只修台账"之后仍然存在的审计侧 desync 路径**，必须与第 2 项一并修。
+  - 修法：改成 **`(uint32_t)_tick_counter % interval == 0`**（绝对节拍，不依赖任何本机历史）。`R3R_RESV_AUDIT_TICKS_SOON(256)` 整除 `R3R_RESV_AUDIT_TICKS(2048)`，故两档切换不会落在网格线之间。
+- **REG-246-B（疑点·待验证·第 2 项残留）**：`_r3r_resv_stray_age`（老化表）**本身未入档**。本轮把它从"数到第几次审计"改成 `stray_since = _tick_counter` 的**绝对时间戳**后，两侧在同一次会话内（同一起点）逐字一致；但**中途入局的客户端**该表为空 ⇒ 首次登记的 `stray_since` 晚于主机 ⇒ 收割时机仍可能错位。
+  - 第 245 轮已引入 `R3RL` 稀疏块，把这张表**并进同一个块**即可根治。本轮按 §12.2"第 2 项零存档改动"**未做**，登记为批 3 的搭车项（与第 5 项 `_r3r_decomp_seams` 同批；`_r3r_consist_resv` 同族，见 R-2）。
+- **U-4（第 3 项前置·本轮结清）**：`r3r_segment_id` **不进入任何排序/比较** —— 全库检索 `*gui.cpp` / `*list.cpp` **零命中**；`couple_group.cpp` / `train_cmd.cpp` 里只有 `==` / `!=` 与 `_r3r_segments[id]` 下标。⇒ 段 ID 是**纯不透明键**。因此 §12.1 第 3 项的"取最小空闲 ID"是**加固**（消除"释放顺序不同 ⇒ 同一段在不同机器拿到不同 ID"的面），**不是修 bug**；本轮照做。
+
+### 20.2 本轮改动清单（全部 `.cpp`，未碰任何 `src/*.h`）
+
+| 项 | 文件 | 锚点 | 改动 |
+|---|---|---|---|
+| 2a | `train_cmd.cpp` | `:17566-17608` 审计门 | 删 `r3r_resv_audit_tick` / `r3r_resv_audit_wait_log` 两个本机 static，门改为 `_tick_counter % interval == 0`（REG-246-A） |
+| 2b | `train_cmd.cpp` | `:15041` `:15045` `:15189-15233` | `R3R_RESV_REAP_AUDITS`(次数) → `R3R_RESV_REAP_TICKS = 3*2048`(tick)；老化表值 `uint8_t age` → `uint64_t stray_since`（绝对首次看到 tick） |
+| 2c | `train_cmd.cpp` | `:14932` `:15392` | 删 `_r3r_consist_resv_gc_clock`（本机调用计数），GC 改 `_tick_counter % R3R_CONSIST_RESV_GC_TICKS(256) == 0` |
+| 4 | `yapf_rail.cpp` | `:1746-1769` (`R3RCoupleScanHold/Result`) | 删 `uint hold`（本机调用计数），改记 `empty_tick`，重试窗口用 `_tick_counter - empty_tick < 8` 判 |
+| 6 | `train_cmd.cpp` | `:12001-12005` `:12140-12144` `:12100` `:12291` | 删 `_r3r_couple_dest_idle`（本机计数），节流改 `(_tick_counter + v->index.base()) % R3R_COUPLE_DEST_IDLE_LIMIT != 0 ⇒ return false` |
+| 3 | `couple_group.cpp` | `:976-977` `:1004-1036` | 删 LIFO 自由表 `_r3r_free_segment_ids`，`R3RSegmentAlloc()` 改为**扫描取最小空闲 ID**（U-4 已证 ID 仅作相等比较） |
+
+**统一口径（写进代码注释）**：凡是"本机计数器 / 本机时间戳"驱动的节流与老化，一律换成"同步量取模 / 同步量差值"。理由＝读档与中途入局都会让本机历史归零或与主机不同步，而 `_tick_counter`、`VehicleID`、地图状态三者都是同步量。
+
+### 20.3 为什么第 6 项与第 4 项用 `% limit` 而不是"绝对时间戳"
+
+第 4 项能保留 `_tick_counter - empty_tick < 8` 形态（它有"上次搜索结果"这个天然锚点，值为 `VehicleID → tick`，本身是同步量派生的）。第 6 项没有锚点 —— 它是"停在终点就别每 tick 全图搜"的纯速率节流，用 `(tick + 车辆号) % N == 0` 既保住了 1/N 的搜索速率，又让**每台机器挑中同一批 tick**（`_tick_counter` 与 `index` 都同步），且**不需要任何存档字段**。用"到达时刻 + N"的写法反而会引入本机历史（到达时刻是同步的，但需要额外存一个字段，等于把第 6 项升级成第 5 项那样要入档）。
+
+### 20.4 构建自证（增量，复用既有 `_tmp_inc_build.cmd`，**未新建任何 `.cmd`**）
+
+- 构建前 `tasklist /FI "IMAGENAME eq openttd.exe"` ⇒ `No tasks are running`（否则闸门写 `EXIT_CODE=97`）。
+- 护栏 `build\R3R_incbuild.guard.log`：`GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ 走增量，未触发全量。
+- 调度：`[2/6] couple_group.cpp.obj` → `[3/6] yapf_rail.cpp.obj` → `[4/6] pbs.cpp.obj` → `[5/6] train_cmd.cpp.obj` → `[6/6] Linking CXX executable openttd.exe`（Linking 恰 1 次）。日志尾部的 `-- Generating Doxyfile*` 是 ninja 每次都跑的配置边，不代表重编。
+- 判决 `build\R3R_incbuild.done` = `EXIT_CODE=0`；日志内 `error C*` / `fatal error` / `FAILED:` 计数 **0**。
+- 时间戳（源码 → obj → exe，逐条 obj 均晚于对应 `.cpp`）：
+  - `src\pathfinder\yapf\yapf_rail.cpp` 23:43:49 → `yapf_rail.cpp.obj` 23:45:50
+  - `src\couple_group.cpp` 23:43:54 → `couple_group.cpp.obj` 23:45:49
+  - `src\pbs.cpp` 23:45:12 → `pbs.cpp.obj` 23:45:55
+  - `src\train_cmd.cpp` 23:45:12 → `train_cmd.cpp.obj` 23:45:58
+  - `build\openttd.exe` **2026-10-16 23:47:55（51 882 496 B）** 晚于上列全部 obj
+- `read_lints`：三个改动文件 **0 条**。
+- 产物字面量自证（`findstr /M`，命中即打印 exe 路径）：`holdAge=`（第 4 项新探针字段，`build\openttd.exe` 命中）、`RESV-AUDIT-WAIT` / `RESV-AUDIT-DUE` / `RESV-AUDIT-SUMMARY`（第 2 项探针）**全部命中**。
+  - 注：`findstr` 必须直接调用、参数写成 `/C:"字面量"`；上一轮写成 `cmd /c "findstr /C:\"...\" ..."` 双层转义被 cmd 解析成了"打不开的文件名"，返回假 `MISSING`。
+- 本轮**未改任何 `src/*.h`**（含 `pbs.h:90-94` 的过时注释，见残留 R-1），故护栏判增量；将来若动 `pbs.h` 必须按 KI-183 走全量并先报玩家。
+
+---
+
+## 二十一、第 246 轮批 3（第 5 / 7 / 8 / 10 项）落地与核验（2026-10-16 ~ 10-17）
+
+**任务**：延续 §20 的批次表（§12.2），推进 **批 3（P2）** = 第 5 项（解挂互锁入档）、第 7 项（配对时间戳契约化）、第 8 项（等待者清扫去重待核），并搭车完成 **批 4** 的 **第 10 项**（读档迁移族幂等核验）。**只改 `.cpp`**，未碰任何 `src/*.h`（保持 KI-183 增量合规）。
+
+### 21.1 第 5 项 · 解挂互锁 + 孤儿预留戳入档（新稀疏块 `R3DS`；`R3RDecompSeam.kind=0` / `_r3r_resv_stray_since.kind=1`）
+
+**为什么要入档（D 组 + REG-246-B 合并成一个块）**：`_r3r_decomp_seams`（KI-335 互锁：解挂后前车驶离 N 格后车才起步）与 `_r3r_resv_stray_since`（第 246 轮第 2 项新引入的孤儿预留老化戳）都拿 `_tick_counter` 量"年龄"，`_tick_counter` 是同步量，**但"从哪一刻开始量"不是**——中途入局的客户端读档后两表为空：主机已量了几百 tick、客户端从 0 开始 ⇒ **前车放行 / 孤儿位收割比主机晚若干 tick** ⇒ 从那一 tick 起地图分叉。写入绝对起点后，两端由同一起点推出同一年龄。
+
+**改动（2 个 `.cpp`）**
+
+**`src/train_cmd.cpp`**
+1. `#include "sl/saveload.h"`（`NSL` / `NamedSaveLoad` / `SlTableHeader*` / `SlObjectSave*Filtered` 的来源）；
+2. `_r3r_resv_stray_since` 由 `R3RReservationAudit()` 的**函数内 static** 提升到**文件作用域**（`:15086`，`std::unordered_map<uint32_t, uint64_t>`），使下方的 `R3DS` 块能写到它；审计函数内只留注释指向；
+3. 新增 `struct R3RDesyncStateRec { uint8_t kind; uint32_t key; uint32_t a; uint32_t b; uint32_t tile; uint64_t tick; }`（`:15105`）+ `static const NamedSaveLoad _r3r_desync_state_desc[]`（`:15114`）；
+4. 新增**非 static** `void Save_R3DS()`（`:15123`）/ `void Load_R3DS()`（`:15149`）。
+
+**`src/sl/couple_group_sl.cpp`**
+5. 手写声明 `void Save_R3DS(); void Load_R3DS();`（同 `R3RL` 的理由：实现留在 `train_cmd.cpp`，**不开头文件**以免触发 KI-183 全量）；
+6. chunk handler 表在 `'R3RL'` 之后追加 `{ 'R3DS', Save_R3DS, Load_R3DS, nullptr, nullptr, CH_SPARSE_TABLE },`。
+
+**设计要点**
+
+- **一个块装两族**：`kind` 做判别（`0` = 解挂缝、`1` = 孤儿戳），未知 `kind` **读档时直接忽略**（`Load_R3DS` 的显式注释）⇒ 将来加第三种行不必再动版本号。
+- **`key` 一律是 VehicleID / bit key 的裸数值，`Ptrs` 传 `nullptr`**：块里**没有任何指针**，不需要 `SlObjectPtrOrNullFiltered`、不需要新引用类型、不需要指针修正阶段参与。`Load_R3DS` 只做 `VehicleID((uint16_t)rec.key)` 这样的**包装**，**绝不解引用**。
+- **`Load_R3DS` 先 `clear()` 两张表再逐行重建**：存档是唯一真相，上一局/上次读档的残留不得穿过。
+- **解挂缝的 `reported`（"wait 行是否已打过"）刻意不入档**，读档一律重置为 `false` ⇒ 读档后允许再打一次 `wait` 行（纯日志，不影响地图）。
+- **消费者加守卫**：`TrainLocoHandler` 里消费 `_r3r_decomp_seams` 的地方加 `Train::GetIfValid(seam.head) == nullptr ⇒ erase + return false`。理由有二：①**索引会被新车继承**（车辆池槽位复用，同第 7 项要防的悬垂同族）；②`R3DS` 块**可能早于车辆池加载完成**，此刻"缝的主人还不存在"是正常中间态，必须当成"无锁"而不是当成"解锁"。
+- **`CH_SPARSE_TABLE` + named header**：旧存档没有 `R3DS` 块 ⇒ 两表为空 = **今天的行为逐字不变**；`SLV` 不动、无版本迁移、无 `SlXvFeatureTest`。**REG-246-B 就此结清**（原计划并入 `R3RL`，实际并入新的 `R3DS`，理由：`R3RL` 是"预留台账"语义、`R3DS` 是"会话起点"语义，混块会让 R-3 的体积判定失真）。
+
+### 21.2 第 7 项 · 配对进入时间戳契约化（`const Train* owner` → `VehicleID owner`）
+
+**改动（仅 `src/train_cmd.cpp`，约 5 处）**
+
+- `struct R3RCoupleEnterStamp`（`:6787`）的 `owner` 由 `const Train *` 改为 `VehicleID`；
+- `R3RFindCoupleEnterStamp(const Train *)` → `R3RFindCoupleEnterStamp(VehicleID id)`（`:6811`），比较 `it->second.owner != id`；
+- 赋值点（`:11811`）改为 `R3RCoupleEnterStamp{ coupler->index, (uint64_t)_tick_counter }`；调用点（`:11810` / `:6832`）改为 `R3RFindCoupleEnterStamp(coupler->index)`。
+
+**关键事实**：旧形态**从未解引用**该指针，只做**值比较**——所以它不是"崩溃隐患"，而是"**契约含混**"：一旦被戳的车辆被删，记录的指针悬垂，比较读到的是**已释放对象的地址**。该值在两端**不可比**（地址是机器局部量），且"地址复用"会把旧 run 的极早时间戳**送给新车**。改成 `VehicleID` 后两点同时消失；`R3RFindCoupleEnterStamp` 保留"`owner != id` ⇒ 视为无戳"的守卫（`:6818`，注释已重写为"释放的索引会发给新车"）。
+
+**tie-break 判定（结论：不需要额外按 index 排序）**：§20/§12.1 第 7 项建议"同一 tick 并列时按 vehicle index 做 tie-break"。核查决策函数（`:6836-6841` 注释 + `R3RMayChallengeCoupleLock`）后确认：规则是"**challenger 严格更早**才能抢锁，**相等或任一侧无戳 ⇒ 锁保持给 holder**"。holder 由上一位竞逐者锁定，而所有 chain head 每 tick 经 `R3REnsureCouplePair()` 被调用**恰好一次**，调用顺序 = `Vehicle::Iterate()` = **车辆池 index 升序**——pool index 是**同步量**（车辆创建顺序同步、池布局同步）⇒ **遍历顺序两端一致 ⇒ 并列时的裁决天然确定**。故**不补 tie-break**，"相等保持 holder"即玩家口径的"否则看游戏心情排先后"，且该"心情"在联机下是可复现的。
+
+### 21.3 第 8 项 · 等待者清扫去重 `_r3r_waiter_purged` 幂等核验（结论：**幂等成立，保留集合，非 desync 源**）
+
+**代码（`src/train_cmd.cpp:17824-17871`）**：站台停放 waiter（`R3RIsCarOnlyFormation || (IsPrimaryVehicle && OT_WAIT_COUPLE)` 且 `cur_speed==0` 且在站台格）在**首次**进入该状态时，`if (_r3r_waiter_purged.insert(consist->index).second) { R3RReleaseChainReservations(consist, "waiter"); consist->lookahead.reset(); }`，随后 `ReserveTrackUnderConsist()` + 平台整格位；一旦不再是停放 waiter，`else` 分支 `erase` 两个集合（配 KI-208 的 `_r3r_waiter_nobook_logged`）。
+
+**幂等性论证**
+- `R3RReleaseChainReservations(consist, "waiter")` 对每一位**先自证归属**（站台/路点走 `GetTrainForWholeTileReservation` 且要求 owner 是本链头；plain rail 要求 `HasReservedTracks` 且位属本链）⇒ **第二次调用时那些位已不在** ⇒ 逐位 `continue` ⇒ **no-op**。第 127/126 轮 `RESV-GHOST` 的四道校验是同一套。
+- 等待期**不会有新路线**：KI-208 的 `RESV-NOBOOK` 门禁在此状态拒绝 `TryPathReserveWithResultFlags` ⇒ 没有"新订的位"需要第二次清。
+- `consist->lookahead.reset()` 是**纯本机寻路缓存**（不入档、不参与判据），reset 一次与两次结果相同。
+
+**结论**：去重集合只决定"purge 跑几次"，而 purge 幂等 ⇒ **两端即便集合状态不同（读档方多跑一次），地图结果仍逐字一致** ⇒ 不构成 desync 源。**保留集合**（与备忘 §E 组"确认幂等后去掉集合"的建议**有意分歧**）：去掉会让**每帧**执行 `R3RReleaseChainReservations` 的**地图扫描**（注释自陈 "the map-wide scan stays rare"），是性能退步而无正确性收益。**状态：已核验（静态），无需改码。**
+
+### 21.4 第 10 项 · 读档迁移族幂等性核验（三项，结论：**均幂等/确定，非 desync 源**）
+
+| 迁移动作 | 位置 | 幂等性论证 | 判定 |
+|---|---|---|---|
+| `LEGACY-ARTIC-DEARTIC`（旧档焊死铰接链自动打散） | `train_cmd.cpp` `R3RDearticulateLegacyArticSegment()`，由 `R3RRebuildCouplePriorities()` 调，而后者**只被 `sl/vehicle_sl.cpp` 的读档路径调用** | 判据 = 链上有 ★/⊗ **且** `R3RChainHasRealArticPart(chain)`。打散会清掉部件的 `GVSF_ARTICULATED_PART` ⇔ 该函数**随即为假** ⇒ 再次读档**早退**；★/⊗ 不打散（保留），所以判据不会"反复真" | ✔ 幂等 |
+| `R3RSettleChainSegments(chain, "load")`（重发段 ID） | `train_cmd.cpp` | 第 3 项已把 `R3RSegmentAlloc()` 由"自由表 LIFO"改成"**扫描取最小空闲 ID**" ⇒ 分配结果只依赖"已分配集合"。读档按固定顺序（`Vehicle::Iterate()`，同步量）依次 settle ⇒ **同一存档两次读入得到同一套 ID**，两端也一致 | ✔ 确定（依赖第 3 项，已落） |
+| `DEPOT-XFER-ID ... load`（KI-263 车号/名穿透） | `train_cmd.cpp` `R3RBorrowControlTraitsLive(chain, "load")` | 门禁含"**绝不改写已有 `*_backup`**"，只在目标为止空时填充 ⇒ 重复执行结果相同；输入是存档字段（同步） | ✔ 幂等 |
+
+**统一论证**：这三项都是"**读档那一刻跑一次**"，而读档是**同步过程**（所有客户端从同一份存档冷启动 ⇒ 同输入 ⇒ 同输出）。**唯一能破坏确定性的**是"输出依赖本机残留状态"——上面逐项证明三者都只看**同步量**（地图/车辆状态、已分配集合、存档字段），**不看**本机计数器/地址/哈希顺序。**状态：已核验（静态），无需改码。实测判据见 §21.6 第 4 条。**
+
+### 21.5 构建自证（增量，复用既有 `_tmp_inc_build.cmd`，**未新建任何 `.cmd`**）
+
+- 构建前 `tasklist /FI "IMAGENAME eq openttd.exe"` ⇒ 未运行（否则闸门写 `EXIT_CODE=97`；同轮首次尝试曾因此被拦下过，只看 `done` 文件存在与否会误判，必须看时间戳）。
+- 护栏 `build\R3R_incbuild.guard.log`：`GUARD: incremental is safe (no header/lang file is newer than the newest object)` ⇒ 走增量，**未触发全量**。
+- 调度：`[2/4] couple_group_sl.cpp.obj` → `[3/4] train_cmd.cpp.obj` → `[4/4] Linking CXX executable openttd.exe`（**Linking 恰 1 次**）。
+- 判决 `build\R3R_incbuild.done` = **`EXIT_CODE=0`**（2026-10-17 00:01:09）；日志内 `error C*` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 时间戳（源码 → obj → exe，逐条 obj 均晚于对应 `.cpp`）：
+  - `src\sl\couple_group_sl.cpp` 23:56:26 → `couple_group_sl.cpp.obj` 23:59:42（718 121 B）
+  - `src\train_cmd.cpp` 23:56:38 → `train_cmd.cpp.obj` 23:59:46（11 939 379 B）
+  - `build\openttd.exe` **2026-10-17 00:00:54（51 882 496 B）** 晚于上列全部 obj
+- `read_lints`：两个改动文件 **0 条**。
+- 产物字面量自证（`findstr /M /C:"字面量" "…\build\openttd.exe"`，命中即打印 exe 路径）：
+  - **`SD3R`**（= `'R3DS'` 4 字节块 ID 的**小端反序**形态）⇒ **命中**，注册确实进了二进制；
+  - **`LR3R`**（= `'R3RL'`，第 245 轮块）⇒ 命中，回归确认；**`DECOUPLE-INTERLOCK`** ⇒ 命中。
+  - **注意**：块 ID / 语言串在 exe 内**非明文**，判定"注册生效"必须搜**反序**且**不能**搜正序 `R3DS`（同族陷阱）。
+- **尺寸说明**：本版 exe 与 §20.4 的 exe **同为 51 882 496 B**（对齐填充巧合）。判定效力由 **mtime + obj 链 + `SD3R` 字面量**三者交叉确认，不以尺寸为准。
+- **本轮未改任何 `src/*.h`**（含 `pbs.h:90-94` 过时注释，见残留 R-1），故护栏判增量。
+
+### 21.6 复测判据（须玩家参与；AI 不得自行启动游戏）
+
+1. **解挂互锁存档往返**（第 5 项）：在**解挂那一刻**存档 → 读档 ⇒ 后车仍等前车驶离 N 格才起步（`DECOUPLE-INTERLOCK` 的 `set`/`wait`/`clear` 三行可跨读档续上；`wait` 行允许在读档后**重新打一次**，属预期）。
+2. **孤儿戳存档往返**（REG-246-B）：带孤儿位的局存档 → 读档 ⇒ `RESV-AUDIT-SUMMARY` 的 `stray` 不再因"读档后戳表为空"而从零重新计龄；`RESV-REAP` 的触发时机与主机同 tick 量级。
+3. **负判据**：无解挂缝 / 无孤儿位的普通局，`R3DS` 块**不产生行**（存档体积不增）、行为与上一版**逐字相同**。
+4. **读档迁移幂等**（第 10 项）：①旧档（含焊死铰接链）读入 ⇒ `LEGACY-ARTIC-DEARTIC` 恰打一次，**再读同一档不再打**；②同一档读两次，段 ID（`GEO settle-load` 的 `segid`）逐段一致；③`DEPOT-XFER-ID ... load` 第二次不产生二次覆盖。
+5. **契约化回归**（第 7 项）：多机车抢同一等待车底 ⇒ 仍"先进入订单者胜"，且**卖了 / 解挂了占位机车后，新车继承同一 index 不得继承旧戳**（不再出现"新车秒抢"）。
+
+### 21.7 残留 / 待办
+
+- **R-2（残留·中，未动）**：`_r3r_consist_resv`（进程内记账 + 256 分频 GC）**仍未入档**，与 KI-376 同族。失配面小于主台账（最坏只是"多留一点"，有 GC 兜底）。本轮第 5 项只搬了 `_r3r_decomp_seams` 与 `_r3r_resv_stray_since`，**未**顺带搬它。
+- **R-1（残留·低，未动）**：`pbs.h:90-94` 过时注释，仍需"搭车改 `.h`"轮次处理。
+- **R-3 / R-4**（第 245 轮登记，未实测）：`R3RL` 体积增量、`purposes` 归一偏保守 —— 本轮新增 `R3DS` 后建议**一并**在复测时测存档体积（判据：行数 ≈ 解挂缝数 + 孤儿位数）。
+- **I-7 双进程联机复测**（§十五 / §十八.4）：**必须玩家执行**。主机跑一段 → 客户端**中途入局**，看 `-d desync=3` 是否仍报错；这是"修好了没有"的唯一权威判据。
+- **git**：第 245 轮起的改动**仍未提交**（工作区为未提交状态）。
+- **本批的诚实边界**：第 8 / 10 项的结论是**静态核验**（读码 + 论证），**不是实测**；第 5 / 7 项虽有构建 + 字面量自证，也**未**实机联机验证。

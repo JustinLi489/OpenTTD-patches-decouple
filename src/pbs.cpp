@@ -19,6 +19,7 @@
 #include "bridge_signal_map.h"
 #include "r3r_perf.h"
 #include "train.h"
+#include "sl/saveload.h"
 
 #include "table/strings.h"
 
@@ -159,9 +160,15 @@ enum R3RResvPurpose : uint8_t {
 static std::unordered_map<uint32_t, std::vector<R3RResvLedgerRec>> _r3r_resv_by_owner;
 static std::unordered_map<uint32_t, uint32_t> _r3r_resv_owner_of_bit;
 
+/** R3R (第 245 轮, KI-369): the bit key's slot for whole-tile (station / waypoint)
+ *  reservations. train_cmd.cpp spells the same value out in its own audit key, but
+ *  it cannot be shared across translation units, so inside pbs.cpp it lives here --
+ *  the ledger and the R3RL savegame then decode the key from one definition. */
+static constexpr uint8_t R3R_RESV_SLOT_WHOLE_TILE = 7;
+
 static inline uint32_t R3RResvBitKey(TileIndex tile, Track track)
 {
-	const uint32_t slot = (track == INVALID_TRACK) ? 7u : (uint32_t)track;
+	const uint32_t slot = (track == INVALID_TRACK) ? R3R_RESV_SLOT_WHOLE_TILE : (uint32_t)track;
 	return (tile.base() << 3) | slot;
 }
 
@@ -600,6 +607,86 @@ void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
 void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why)
 {
 	R3RReleaseReservationLedgerChecked(key, tile, track, why);
+}
+
+/*
+ * R3R (第 245 轮, KI-371): the ledger goes into the savegame.
+ *
+ * Why: the ledger is the ownership answer every release path trusts now, so a
+ * client that loads a game with an empty ledger answers "no owner" for every bit
+ * on the map and falls back to the walk -- which is the wrong answer while a
+ * locomotive couples to a waiting consist. Two clients then reap different bits
+ * and desync (REG-243-K). Saving the ledger keeps both ends asking the same
+ * question from the same table.
+ *
+ * Only the forward table (_r3r_resv_by_owner) is written; the reverse index
+ * (_r3r_resv_owner_of_bit) is a pure derivation of it and is rebuilt on load.
+ *
+ * The array index carries the bit key (tile << 3 | slot), which is unique, so one
+ * row is one bit and tile/track are decoded back from the index; see
+ * R3RResvBitKey(). The index stays far below 2^31 even on the largest map.
+ *
+ * The block is a CH_SPARSE_TABLE with a named table header, so an old savegame
+ * simply has no R3RL chunk and the ledger starts empty -- exactly today's
+ * behaviour, no SLV bump. The chunk is registered from couple_group_sl.cpp, while
+ * these two functions live here, so the ledger stays private to pbs.cpp and no
+ * header has to grow an accessor.
+ */
+
+/** One saved bit: the owner and why it is held. The tile/track are the index. */
+struct R3RResvLedgerSaveRec {
+	uint32_t owner;
+	uint8_t purposes;
+};
+
+static const NamedSaveLoad _r3r_resv_ledger_desc[] = {
+	NSL("owner",    SLE_VAR(R3RResvLedgerSaveRec, owner, SLE_UINT32)),
+	NSL("purposes", SLE_VAR(R3RResvLedgerSaveRec, purposes, SLE_UINT8)),
+};
+
+void Save_R3RL()
+{
+	SaveLoadTableData slt = SlTableHeader(_r3r_resv_ledger_desc);
+
+	for (const auto &own_it : _r3r_resv_by_owner) {
+		for (const R3RResvLedgerRec &row : own_it.second) {
+			R3RResvLedgerSaveRec rec{own_it.first, row.purposes};
+			SlSetArrayIndex(R3RResvBitKey(row.tile, row.track));
+			SlObjectSaveFiltered(&rec, slt);
+		}
+	}
+}
+
+void Load_R3RL()
+{
+	SaveLoadTableData slt = SlTableHeaderOrRiff(_r3r_resv_ledger_desc);
+
+	/* Start from a clean ledger: the savegame is the whole truth, and the reverse
+	 * index is rebuilt from the forward table below. */
+	_r3r_resv_by_owner.clear();
+	_r3r_resv_owner_of_bit.clear();
+
+	int index;
+	while ((index = SlIterateArray()) != -1) {
+		R3RResvLedgerSaveRec rec{ R3R_RESV_NO_OWNER, 0 };
+		SlObjectLoadFiltered(&rec, slt);
+
+		/* An ownerless row cannot be released by anybody; drop it. A row with no
+		 * purpose would be dropped by the first release, so normalise it to
+		 * "everything is held" -- the same conservative reading
+		 * R3RResvLedgerForgetMask() uses for an unknown reason. */
+		if (rec.owner == R3R_RESV_NO_OWNER) continue;
+		uint8_t purposes = rec.purposes;
+		if (purposes == 0) purposes = (uint8_t)R3R_RESV_PURPOSE_ALL;
+
+		const uint32_t bit_key = (uint32_t)index;
+		const TileIndex tile((uint32_t)bit_key >> 3);
+		const uint8_t slot = (uint8_t)(bit_key & 7u);
+		const Track track = (slot == R3R_RESV_SLOT_WHOLE_TILE) ? INVALID_TRACK : (Track)slot;
+
+		_r3r_resv_by_owner[rec.owner].push_back(R3RResvLedgerRec{tile, track, purposes});
+		_r3r_resv_owner_of_bit[bit_key] = rec.owner;
+	}
 }
 
 /**
@@ -2344,7 +2431,7 @@ Train *GetR3RWholeTileReservationOwnerNearby(TileIndex tile)
  * protecting the vehicle standing there and is left alone). Exposed as the console
  * command 'r3r_resv_purge' so a save with ghosts inherited from an older build can
  * be cleaned on demand; the periodic reservation audit does the same thing on its own
- * once a bit has been stray for R3R_RESV_REAP_AUDITS audits.
+ * once a bit has been stray for R3R_RESV_REAP_TICKS ticks.
  *
  * @return Number of released reservations (track bits / whole tiles).
  */

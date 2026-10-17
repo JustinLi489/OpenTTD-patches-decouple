@@ -18,6 +18,18 @@
 
 #include "../safeguards.h"
 
+/* R3R (第 245 轮, KI-371): implemented in pbs.cpp next to the ledger itself --
+ * keeping the save/load code there means pbs.h does not have to grow an accessor
+ * (which would force a full rebuild under the KI-183 guard). */
+void Save_R3RL();
+void Load_R3RL();
+
+/* R3R (第 246 轮 / 第 5 项): implemented in train_cmd.cpp next to the two tables it
+ * writes (the decouple seam interlock and the orphan reservation age stamps). Same
+ * reasoning as R3RL: keeping the code there means no header grows an accessor. */
+void Save_R3DS();
+void Load_R3DS();
+
 /**
  * R3R: couple group pool chunk (one entry per group).
  */
@@ -343,6 +355,8 @@ extern const ChunkHandler couple_group_chunk_handlers[] = {
 	{ 'CGVR', Save_CGVR, Load_CGVR, nullptr, nullptr, CH_SPARSE_TABLE },   // Couple Group Vehicle mapping chunk
 	{ 'R3VP', Save_R3VP, Load_R3VP, Ptrs_R3VP, nullptr, CH_SPARSE_TABLE }, // R3R parked schedule / segment bookkeeping chunk
 	{ 'R3SG', Save_R3SG, Load_R3SG, Ptrs_R3SG, nullptr, CH_SPARSE_TABLE }, // R3R segment identity table chunk
+	{ 'R3RL', Save_R3RL, Load_R3RL, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R reservation ledger chunk
+	{ 'R3DS', Save_R3DS, Load_R3DS, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R decouple seam / orphan age chunk
 };
 
 extern const ChunkHandlerTable _couple_group_chunk_handlers(couple_group_chunk_handlers);

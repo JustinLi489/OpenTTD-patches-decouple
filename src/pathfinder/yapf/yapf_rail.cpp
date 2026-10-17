@@ -22,6 +22,7 @@
 #include "../../r3r_perf.h"
 #include "../../couple_group.h"
 #include "../../pbs.h"
+#include "../../date_func.h" // R3R (第 246 轮): _tick_counter, for the synchronized couple-scan throttle
 #include <map> // R3R (KI-190): per-vehicle couple scan throttle state
 
 #include "../../safeguards.h"
@@ -1744,7 +1745,9 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
  * as it was, because a successful search clears the hold again.
  */
 struct R3RCoupleScanState {
-	uint hold = 0; ///< Number of upcoming calls to answer without searching.
+	uint64_t empty_tick = 0; ///< Tick of the last search that came back empty.
+	bool holding = false;    ///< Whether the retry throttle is currently armed.
+	bool logged = false;     ///< Whether the skipped-call probe was already written for this episode.
 };
 
 static std::map<int, R3RCoupleScanState> _r3r_couple_scan_state;
@@ -1752,20 +1755,60 @@ static const uint R3R_COUPLE_SCAN_RETRY = 8;
 
 /**
  * Try to skip the upcoming couple search for this vehicle.
+ *
+ * R3R (第 246 轮 / 第 4 项): the window is measured against `_tick_counter`, not
+ * against a per-machine count of calls. The old form decremented a counter once
+ * per call, so on a machine that issued the same commands but reached this code
+ * a different number of times (a client that joined or loaded mid-session, a
+ * different amount of pathfinder traffic before the same tick) the throttle
+ * expired after a different number of *ticks*. The throttle decides whether a
+ * locomotive searches for a coupling target at all, and the search decides where
+ * it books a path, so the two machines could end up with different reservations.
+ * A tick-based window is the same on every machine. `_tick_counter` is part of
+ * the savegame and advanced by the game loop on every machine, and the anchor
+ * (the tick of the last empty search) is itself derived from it.
+ *
+ * @param v The train whose search is about to run.
+ * @param dont_reserve Whether the search would be a "look, do not book" pass.
  * @return 0 if the search must run, otherwise the number of calls still skipped.
  */
-static uint R3RCoupleScanHold(const Train *v)
+static uint R3RCoupleScanHold(const Train *v, bool dont_reserve)
 {
 	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
-	if (st.hold == 0) return 0;
-	return st.hold--;
+	if (!st.holding) return 0;
+	const uint64_t age = (uint64_t)_tick_counter - st.empty_tick;
+	if (age >= (uint64_t)R3R_COUPLE_SCAN_RETRY) {
+		st.holding = false;
+		return 0;
+	}
+	if (!st.logged) {
+		/* R3R probe: the full search was skipped by the throttle above. Logged
+		 * once per throttle episode so a waiting locomotive does not flood the
+		 * log it is supposed to stop flooding. */
+		st.logged = true;
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "CPL-SKIP veh=%d tile=%d,%d orderType=%d dontReserve=%d retryIn=%u holdAge=%u\n",
+					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+					(int)v->current_order.GetType(), (int)dont_reserve,
+					(uint)(R3R_COUPLE_SCAN_RETRY - age), (uint)age);
+			fclose(dbg);
+		}
+	}
+	return (uint)(R3R_COUPLE_SCAN_RETRY - age);
 }
 
 /** Remember whether this couple search found a path, so an empty result can be retried less eagerly. */
 static void R3RCoupleScanResult(const Train *v, bool found)
 {
 	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
-	st.hold = found ? 0 : (R3R_COUPLE_SCAN_RETRY - 1);
+	if (found) {
+		st.holding = false;
+	} else {
+		st.holding = true;
+		st.empty_tick = (uint64_t)_tick_counter;
+		st.logged = false;
+	}
 }
 
 /**
@@ -1776,22 +1819,8 @@ static void R3RCoupleScanResult(const Train *v, bool found)
  */
 Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 {
-	const uint hold = R3RCoupleScanHold(v);
-	if (hold != 0) {
-		/* R3R probe: the full search was skipped by the throttle above (see
-		 * R3RCoupleScanHold). Logged once per throttle episode so a waiting
-		 * locomotive does not flood the log it is supposed to stop flooding. */
-		if (hold == R3R_COUPLE_SCAN_RETRY - 1) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-SKIP veh=%d tile=%d,%d orderType=%d dontReserve=%d retryIn=%d\n",
-						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-						(int)v->current_order.GetType(), (int)dont_reserve, (int)R3R_COUPLE_SCAN_RETRY);
-				fclose(dbg);
-			}
-		}
-		return INVALID_TRACK;
-	}
+	const uint hold = R3RCoupleScanHold(v, dont_reserve);
+	if (hold != 0) return INVALID_TRACK;
 
 	{
 		FILE *dbg = R3RFopenDbg("a");

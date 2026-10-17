@@ -64,6 +64,10 @@
 #include "tbtr_template_vehicle_cmd.h"
 #include "3rdparty/cpp-btree/btree_map.h"
 
+/* R3R (第 246 轮 / 第 5 项): the R3DS block (decouple seams plus orphan reservation
+ * age stamps) is written from this file, so the save/load machinery is needed here. */
+#include "sl/saveload.h"
+
 #include "table/strings.h"
 #include "table/train_cmd.h"
 #include "date_func.h"
@@ -2358,6 +2362,17 @@ static bool R3RDecoupleInterlockWait(const Train *consist)
 		return false;
 	}
 
+	/* R3R (第 246 轮 / 第 5 项): a seam can come back from the savegame now, so it has
+	 * to prove it still describes the split it was written for. The entry is keyed by
+	 * the follower's index, and an index can be handed to a new vehicle between the
+	 * save and the load (the block may even load before the vehicle pool exists, so
+	 * this cannot be filtered at load time). A missing leader means that split is over
+	 * and whatever stands here now is not its rear half. */
+	if (Train::GetIfValid(seam.head) == nullptr) {
+		_r3r_decomp_seams.erase(it);
+		return false;
+	}
+
 	const Train *const seam_car = Train::GetIfValid(seam.seam_car);
 	uint dist = 0;
 	if (seam_car != nullptr) {
@@ -3231,7 +3246,7 @@ static bool _r3r_resv_audit_due = false;
 static void R3RMarkReservationAuditDue() { _r3r_resv_audit_due = true; }
 
 /* R3R (KI-364): true while the previous audit left a stray bit ageing towards its
- * reap. Such a bit only leaves after R3R_RESV_REAP_AUDITS passes, so the steady
+ * reap. Such a bit only leaves after R3R_RESV_REAP_TICKS ticks, so the steady
  * 2048-tick cadence would keep a black preview (and a blocked tile) around for about
  * 6144 ticks -- longer than the player waits. While something is still pending the
  * audit therefore comes back every 256 ticks instead. Cleared by the audit itself
@@ -6770,20 +6785,37 @@ static std::unordered_map<uint32_t, uint64_t> _r3r_pair_scan_tick;
  * holds no steady state and cannot keep a stale timestamp alive.
  */
 struct R3RCoupleEnterStamp {
-	const Train *owner; ///< the chain head this stamp was issued to
-	uint64_t tick;      ///< the tick on which @c owner entered its couple order
+	/* R3R (第 246 轮 / 第 7 项): the stamped chain is identified by its vehicle id,
+	 * not by a pointer to the Train object. Both forms answer the same question
+	 * ("is this stamp still the one for the chain I am looking at"), and the id
+	 * compares identically on either end of a session. The pointer form only ever
+	 * compared a value -- it was never dereferenced -- but once the vehicle is
+	 * deleted the recorded pointer dangles, and the comparison then reads the
+	 * address of a freed object. An id cannot dangle, and it also makes explicit
+	 * that this is synchronized data, not a machine-local handle. */
+	VehicleID owner; ///< the chain head this stamp was issued to
+	uint64_t tick;   ///< the tick on which @c owner entered its couple order
 };
 static std::unordered_map<uint32_t, R3RCoupleEnterStamp> _r3r_couple_enter_tick;
 
-/** R3R (KI-182): @return the stamp stored for @p index, or nullptr if absent/stale. */
-static const R3RCoupleEnterStamp *R3RFindCoupleEnterStamp(uint32_t index, const Train *owner)
+/**
+ * R3R (KI-182, 第 246 轮 / 第 7 项): @return the stamp stored for @p id, or nullptr
+ * if absent/stale.
+ *
+ * The lookup is deliberately expressed entirely in synchronized values: the key is
+ * the vehicle id and the stored owner is compared as an id. Both are the same
+ * quantity on either end of a session, whereas the old form took a @c Train* and
+ * compared a pointer -- a machine-local handle which dangles once the vehicle is
+ * deleted, and which says nothing about "is this still the run I am looking at".
+ */
+static const R3RCoupleEnterStamp *R3RFindCoupleEnterStamp(VehicleID id)
 {
-	auto it = _r3r_couple_enter_tick.find(index);
+	auto it = _r3r_couple_enter_tick.find(id.base());
 	if (it == _r3r_couple_enter_tick.end()) return nullptr;
 	/* A freed index can be handed to a new vehicle. Without this check the
 	 * newcomer would inherit the old run's (very early) stamp and win every
 	 * contention. */
-	if (it->second.owner != owner) return nullptr;
+	if (it->second.owner != id) return nullptr;
 	return &it->second;
 }
 
@@ -6797,7 +6829,7 @@ static uint64_t R3RCoupleEnterTick(Train *v)
 	if (v == nullptr) return 0;
 	Train *head = Train::From(v->First());
 	if (head == nullptr || !head->current_order.IsType(OT_GOTO_COUPLE)) return 0;
-	const R3RCoupleEnterStamp *stamp = R3RFindCoupleEnterStamp(head->index.base(), head);
+	const R3RCoupleEnterStamp *stamp = R3RFindCoupleEnterStamp(head->index);
 	return stamp == nullptr ? 0 : stamp->tick;
 }
 
@@ -11775,8 +11807,8 @@ static void R3REnsureCouplePair(Train *v)
 	/* R3R (KI-182, player rule 2026-09-24): stamp the tick this chain entered the
 	 * order. Every later contention for a waiting consist is settled by this
 	 * stamp, so "whoever started the couple first" wins. */
-	if (R3RFindCoupleEnterStamp(coupler->index.base(), coupler) == nullptr) {
-		_r3r_couple_enter_tick[coupler->index.base()] = R3RCoupleEnterStamp{ coupler, _tick_counter };
+	if (R3RFindCoupleEnterStamp(coupler->index) == nullptr) {
+		_r3r_couple_enter_tick[coupler->index.base()] = R3RCoupleEnterStamp{ coupler->index, (uint64_t)_tick_counter };
 	}
 
 	/* Still locked onto a consist which still qualifies: nothing to do. This is
@@ -11998,11 +12030,11 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
  * (i.e. once per R3R_COUPLE_DEST_IDLE_LIMIT ticks). */
 static const uint32_t R3R_COUPLE_DEST_IDLE_LIMIT = 500; ///< ~15 s at normal game speed.
 
-/** R3R (KI-193): per-locomotive counter of ticks spent "at the GOTO_COUPLE
- *  destination with nothing to couple onto". Keyed by VehicleID; a stale entry for a
- *  deleted vehicle only wastes a few bytes and is dropped as soon as a locomotive with
- *  the same index passes through this handler. */
-static btree::btree_map<VehicleID, uint32_t> _r3r_couple_dest_idle;
+/* R3R (第 246 轮 / 第 6 项): the per-locomotive "ticks spent parked at the
+ * GOTO_COUPLE destination" counter that used to live here is gone. The wait gate
+ * in TrainCoupleHandler() is now a pure function of the synchronized tick counter
+ * and the vehicle index, so no machine-local counter has to be kept -- and none
+ * can be out of step between machines. */
 
 /** R3R (KI-320, round 213): edge-triggered news throttle for "this GOTO_COUPLE
  *  order names a depot, so the locomotive is driving straight to the depot
@@ -12095,9 +12127,10 @@ static bool TrainCoupleHandler(Train *v)
 		 * schedule moved on) — any couple-failure news throttle episode is over;
 		 * allow a fresh failure to report again. */
 		_r3r_couple_fail_news_shown.erase(v->index);
-		/* R3R (KI-193): the GOTO_COUPLE order is gone (coupled / skipped), so any
-		 * "parked at the destination without a candidate" episode is over. */
-		_r3r_couple_dest_idle.erase(v->index);
+		/* R3R (第 246 轮 / 第 6 项): the "parked at the destination without a
+		 * candidate" episode no longer keeps per-vehicle state here; the wait gate in
+		 * TrainCoupleHandler() is derived from _tick_counter and the vehicle index, so
+		 * there is nothing to clear when the order goes away. */
 		/* R3R (KI-193 fallback): likewise for the "a candidate is there but the merge
 		 * never commits" episode. */
 		_r3r_couple_commit_fail.erase(v->index);
@@ -12136,11 +12169,19 @@ static bool TrainCoupleHandler(Train *v)
 	 * R3R_COUPLE_DEST_IDLE_LIMIT is allowed to run the candidate search below (and to
 	 * reach the wait heartbeat in the u == nullptr branch). Every other tick drops out
 	 * right here -- that is what stops a waiting loco from scanning the whole map, and
-	 * from drifting along the platform, on every single tick. */
+	 * from drifting along the platform, on every single tick.
+	 *
+	 * R3R (第 246 轮 / 第 6 项): which tick that is used to be decided by a
+	 * per-locomotive counter stored on this machine, which advanced only while the
+	 * vehicle stood at the destination; the counter was not part of the savegame, so
+	 * a client that loaded or joined later could be at a different point of the wait
+	 * window and let the map-wide search through on a different tick. That search
+	 * books reservations, so it is a desync. The phase is now derived from the
+	 * synchronized tick counter plus the (also synchronized) vehicle index: the rate
+	 * stays one search per R3R_COUPLE_DEST_IDLE_LIMIT ticks, but every machine picks
+	 * the same ticks, and nothing has to be saved. */
 	if (!r3r_rolling && R3RCoupleOrderDestinationReached(v)) {
-		uint32_t &idle = _r3r_couple_dest_idle[v->index];
-		if (++idle < R3R_COUPLE_DEST_IDLE_LIMIT) return false;
-		idle = 0;
+		if (((uint32_t)_tick_counter + v->index.base()) % R3R_COUPLE_DEST_IDLE_LIMIT != 0) return false;
 	}
 
 	bool reverse = false;
@@ -12288,7 +12329,8 @@ static bool TrainCoupleHandler(Train *v)
 			}
 			return false;
 		} else {
-			_r3r_couple_dest_idle.erase(v->index);
+			/* R3R (第 246 轮 / 第 6 项): nothing to reset here any more; the wait gate
+			 * is derived from the tick counter and the vehicle index. */
 			/* R3R (KI-330, U-2): read-only diagnosis. A GOTO_COUPLE loco with no
 			 * candidate anywhere reaches this branch on every tick while it is still
 			 * *off* its order destination, so the KI-193 parked-wait gate above never
@@ -14929,7 +14971,14 @@ struct R3RResvRec {
 };
 
 static std::unordered_map<uint32_t, std::vector<R3RResvRec>> _r3r_consist_resv;
-static uint8_t _r3r_consist_resv_gc_clock = 0;
+/* R3R (REG-246-A family, round 246): the garbage collection used to be paced by a
+ * machine-local call counter (`++clock == 0`, once per 256 calls). Two machines
+ * that issue the same commands still reach call number 256 at different ticks
+ * when one of them loaded or joined later, and the GC releases stale ledger
+ * entries -- releasing them early hands a tile to another train earlier. The
+ * bookkeeping itself does not depend on the tick, only the cadence does, so the
+ * cadence is taken from the synchronized tick counter. */
+static const uint32_t R3R_CONSIST_RESV_GC_TICKS = 256;
 
 /** R3R: does this consist hold its platform reservation on purpose? (Same gate
  * as the platform-waiter call site in TrainLocoHandler.) */
@@ -15025,6 +15074,108 @@ static bool R3RResvCollectAllPathTiles(std::unordered_map<uint32_t, uint8_t> &ou
  * assert -- unlike the unreserve path of KI-203b, which crashed on tiles whose
  * type had changed since the reservation was booked.
  */
+
+/**
+ * R3R (第 246 轮 / 第 5 项, REG-246-B): orphan reservation age stamps.
+ *
+ * Keyed by the reservation bit key (tile << 3 | slot), valued by the synchronized tick
+ * counter at which the bit was *first* seen without an owner. At file scope rather than
+ * inside R3RReservationAudit() so the R3DS block below can write it; the audit only
+ * ever touches it through this name.
+ */
+static std::unordered_map<uint32_t, uint64_t> _r3r_resv_stray_since;
+
+/**
+ * R3R (第 246 轮 / 第 5 项): the two "when did this machine start counting" tables,
+ * written to the savegame as one sparse block.
+ *
+ * Why they have to be saved at all: both tables hold an age measured against
+ * `_tick_counter`, which is synchronized, but the moment the counting *started* is
+ * not. A client joining a running session mid-game loads a savegame and starts with
+ * empty tables, while the server has been counting for a while -- the server then
+ * releases a decouple interlock (or reaps an orphan bit) several ticks earlier than
+ * the joiner, and from that tick onwards the two ends disagree about the map. Writing
+ * the stamps makes both ends derive the same age from the same start.
+ *
+ * The block is a CH_SPARSE_TABLE with a named table header, so an old savegame simply
+ * has no R3DS chunk and both tables start empty -- exactly today's behaviour, no SLV
+ * bump. It is registered from couple_group_sl.cpp while these two functions live here,
+ * so no header has to grow an accessor (which would force a full rebuild, KI-183).
+ */
+struct R3RDesyncStateRec {
+	uint8_t  kind; ///< 0 = decouple seam, 1 = orphan reservation stamp
+	uint32_t key;  ///< seam: follower vehicle index; stray: reservation bit key
+	uint32_t a;    ///< seam: the leader half; stray: unused
+	uint32_t b;    ///< seam: the leader's seam car; stray: unused
+	uint32_t tile; ///< seam: that car's tile right after the split; stray: unused
+	uint64_t tick; ///< both: `_tick_counter` when the row was created
+};
+
+static const NamedSaveLoad _r3r_desync_state_desc[] = {
+	NSL("kind", SLE_VAR(R3RDesyncStateRec, kind, SLE_UINT8)),
+	NSL("key",  SLE_VAR(R3RDesyncStateRec, key,  SLE_UINT32)),
+	NSL("a",    SLE_VAR(R3RDesyncStateRec, a,    SLE_UINT32)),
+	NSL("b",    SLE_VAR(R3RDesyncStateRec, b,    SLE_UINT32)),
+	NSL("tile", SLE_VAR(R3RDesyncStateRec, tile, SLE_UINT32)),
+	NSL("tick", SLE_VAR(R3RDesyncStateRec, tick, SLE_UINT64)),
+};
+
+void Save_R3DS()
+{
+	SaveLoadTableData slt = SlTableHeader(_r3r_desync_state_desc);
+	uint i = 0;
+
+	for (const auto &kv : _r3r_decomp_seams) {
+		R3RDesyncStateRec rec{};
+		rec.kind = 0;
+		rec.key  = kv.first.base();
+		rec.a    = kv.second.head.base();
+		rec.b    = kv.second.seam_car.base();
+		rec.tile = kv.second.seam_tile.base();
+		rec.tick = kv.second.tick;
+		SlSetArrayIndex(i++);
+		SlObjectSaveFiltered(&rec, slt);
+	}
+	for (const auto &kv : _r3r_resv_stray_since) {
+		R3RDesyncStateRec rec{};
+		rec.kind = 1;
+		rec.key  = kv.first;
+		rec.tick = kv.second;
+		SlSetArrayIndex(i++);
+		SlObjectSaveFiltered(&rec, slt);
+	}
+}
+
+void Load_R3DS()
+{
+	SaveLoadTableData slt = SlTableHeaderOrRiff(_r3r_desync_state_desc);
+
+	/* The savegame is the whole truth: nothing from an earlier load (or a previous game
+	 * in the same process) may survive into this one. */
+	_r3r_decomp_seams.clear();
+	_r3r_resv_stray_since.clear();
+
+	int index;
+	while ((index = SlIterateArray()) != -1) {
+		R3RDesyncStateRec rec{};
+		SlObjectLoadFiltered(&rec, slt);
+
+		if (rec.kind == 0) {
+			R3RDecompSeam seam{};
+			seam.head      = VehicleID((uint16_t)rec.key);
+			seam.seam_car  = VehicleID((uint16_t)rec.b);
+			seam.seam_tile = TileIndex(rec.tile);
+			seam.tick      = rec.tick;
+			/* The "wait" line is per session, never remembered across one. */
+			seam.reported  = false;
+			_r3r_decomp_seams[VehicleID((uint16_t)rec.key)] = seam;
+		} else if (rec.kind == 1) {
+			_r3r_resv_stray_since[rec.key] = rec.tick;
+		}
+		/* Unknown kinds are ignored on purpose: a later version may add rows here. */
+	}
+}
+
 static void R3RReservationAudit(const char *tag)
 {
 	/* KI-207: self-healing for bits that are already orphaned when an existing
@@ -15034,15 +15185,26 @@ static void R3RReservationAudit(const char *tag)
 	 * A bit that resolves to nobody is, by the engine's own measure, an orphan
 	 * (see the comment above). It can however *look* ownerless for a tick or two
 	 * while a path is being rebuilt, so a bit must stay ownerless for
-	 * R3R_RESV_REAP_AUDITS consecutive audits before it is released. Every release
-	 * is logged, and the counter is dropped as soon as the bit resolves again, so
-	 * a reaped tile either stays clean or comes straight back with its origin
-	 * visible in the RESV-WATCH lines. */
-	static const uint8_t R3R_RESV_REAP_AUDITS = 3;
+	 * R3R_RESV_REAP_TICKS ticks before it is released. Every release is logged, and
+	 * the stamp is dropped as soon as the bit resolves again, so a reaped tile
+	 * either stays clean or comes straight back with its origin visible in the
+	 * RESV-WATCH lines.
+	 *
+	 * R3R (第 246 轮 / 第 2 项): the grace period is measured in ticks against the
+	 * synchronized tick counter instead of in "audits seen". Counting audits tied
+	 * the wait to a machine-local schedule: the audit grid is derived from
+	 * `_tick_counter` now, but the *first sighting* of a bit is still a local event,
+	 * and the old counter also silently capped at 255, so the effective wait
+	 * depended on how often the pass happened to run. A tick stamp makes the wait
+	 * exact within one session and is the form that can be written to the savegame
+	 * verbatim later (REG-246-B). 3 * 2048 keeps the previous worst-case delay
+	 * (three full cadence intervals) while removing the audit counting. */
+	static const uint64_t R3R_RESV_REAP_TICKS = 3 * 2048;
 	/* KI-207c: key slot for a whole-tile reservation (track slots 0..5 are real
 	 * tracks, 6 is TRACK_END), so station/waypoint strays age in the same map. */
 	static const uint32_t R3R_RESV_WHOLE_TILE_KEY = 7;
-	static std::unordered_map<uint32_t, uint8_t> _r3r_resv_stray_age;
+	/* The stamps themselves live at file scope (_r3r_resv_stray_since), just above this
+	 * function, so the R3DS save/load block can reach them. */
 
 	auto bit_key = [](TileIndex t, uint32_t track) -> uint32_t {
 		return (t.base() << 3) | track;
@@ -15122,15 +15284,16 @@ static void R3RReservationAudit(const char *tag)
 			if (owner == nullptr || ledger_dead) {
 				stray++;
 				strays_now.push_back(wkey);
-				const auto aged = _r3r_resv_stray_age.find(wkey);
+				const auto aged = _r3r_resv_stray_since.find(wkey);
+				const uint64_t since = (aged != _r3r_resv_stray_since.end()) ? aged->second : (uint64_t)_tick_counter;
 				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=stn kind=%s age=%u lowner=%d why=%s\n",
 						tag, (int)TileX(t), (int)TileY(t), IsRailWaypointTile(t) ? "WAYPOINT" : "STATION",
-						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0),
+						(uint)((uint64_t)_tick_counter - since),
 						(lowner == R3R_RESV_NO_OWNER) ? -1 : (int)lowner,
 						(owner == nullptr) ? "walk" : "dead");
 			} else {
 				owned++;
-				_r3r_resv_stray_age.erase(wkey);
+				_r3r_resv_stray_since.erase(wkey);
 				if (R3RIsWatchedResvTile(t)) {
 					R3RDbgWrite("RESV-AUDIT-OWNER %s tile=%d,%d track=stn kind=%s owner=veh%u\n",
 							tag, (int)TileX(t), (int)TileY(t), IsRailWaypointTile(t) ? "WAYPOINT" : "STATION",
@@ -15166,15 +15329,16 @@ static void R3RReservationAudit(const char *tag)
 			if (owner == nullptr || ledger_dead || ledger_absent) {
 				stray++;
 				strays_now.push_back(bkey);
-				const auto aged = _r3r_resv_stray_age.find(bkey);
+				const auto aged = _r3r_resv_stray_since.find(bkey);
+				const uint64_t since = (aged != _r3r_resv_stray_since.end()) ? aged->second : (uint64_t)_tick_counter;
 				R3RDbgWrite("RESV-AUDIT-STRAY %s tile=%d,%d track=%u bits=0x%X age=%u lowner=%d why=%s\n",
 						tag, (int)TileX(t), (int)TileY(t), (uint)track, (uint)bits,
-						(uint)(aged != _r3r_resv_stray_age.end() ? aged->second : 0),
+						(uint)((uint64_t)_tick_counter - since),
 						(lowner == R3R_RESV_NO_OWNER) ? -1 : (int)lowner,
 						(owner == nullptr) ? "walk" : (ledger_dead ? "dead" : "norow"));
 			} else {
 				owned++;
-				_r3r_resv_stray_age.erase(bkey);
+				_r3r_resv_stray_since.erase(bkey);
 				/* One line per reserved bit per audit was the biggest remaining
 				 * flood (and pure noise once the bit resolves). Keep it only for a
 				 * watched tile, where the owner's identity is the whole point. */
@@ -15186,11 +15350,15 @@ static void R3RReservationAudit(const char *tag)
 		}
 	}
 
-	/* Age the strays seen this pass, and release the ones that are old enough. */
+	/* Age the strays seen this pass, and release the ones that are old enough.
+	 * R3R (第 246 轮 / 第 2 项): "old enough" is now a tick difference. emplace()
+	 * inserts only when the key is absent, so the stamp keeps the moment of the
+	 * first sighting and an already-known stray is never re-stamped. */
 	for (uint32_t key : strays_now) {
-		uint8_t &age = _r3r_resv_stray_age[key];
-		if (age < 255) age++;
-		if (age < R3R_RESV_REAP_AUDITS) continue;
+		const auto ins = _r3r_resv_stray_since.emplace(key, (uint64_t)_tick_counter);
+		const uint64_t since = ins.first->second;
+		const uint64_t age = (uint64_t)_tick_counter - since;
+		if (age < R3R_RESV_REAP_TICKS) continue;
 
 		const TileIndex tile(key >> 3);
 		const uint32_t slot = key & 7;
@@ -15211,7 +15379,7 @@ static void R3RReservationAudit(const char *tag)
 			R3RDbgWrite("RESV-REAP %s tile=%d,%d track=stn kind=%s age=%u\n",
 					tag, (int)TileX(tile), (int)TileY(tile),
 					IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", (uint)age);
-			_r3r_resv_stray_age.erase(key);
+			_r3r_resv_stray_since.erase(key);
 			continue;
 		}
 
@@ -15229,17 +15397,17 @@ static void R3RReservationAudit(const char *tag)
 		reaped++;
 		R3RDbgWrite("RESV-REAP %s tile=%d,%d track=%u age=%u\n",
 				tag, (int)TileX(tile), (int)TileY(tile), (uint)track, (uint)age);
-		_r3r_resv_stray_age.erase(key);
+		_r3r_resv_stray_since.erase(key);
 	}
 
 	/* Forget strays that resolved in the meantime: not a leak. */
-	for (auto it = _r3r_resv_stray_age.begin(); it != _r3r_resv_stray_age.end(); ) {
+	for (auto it = _r3r_resv_stray_since.begin(); it != _r3r_resv_stray_since.end(); ) {
 		bool seen = false;
 		for (uint32_t key : strays_now) {
 			if (key == it->first) { seen = true; break; }
 		}
 		if (!seen) {
-			it = _r3r_resv_stray_age.erase(it);
+			it = _r3r_resv_stray_since.erase(it);
 		} else {
 			++it;
 		}
@@ -15250,7 +15418,7 @@ static void R3RReservationAudit(const char *tag)
 	 * ("the game was paused, _tick_counter did not advance" vs. "the audit
 	 * stopped being scheduled"). */
 	R3RDbgWrite("RESV-AUDIT-SUMMARY %s tick=%u reservedTiles=%u owned=%u strayTiles=%u reaped=%u pendingStray=%u\n",
-			tag, (uint)_tick_counter, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_age.size());
+			tag, (uint)_tick_counter, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_since.size());
 
 	/* R3R (KI-363, Mirror law): reconcile the ledger against the map once per sweep.
 	 * A writer that bypassed the setters (a station rebuilt over the tile, a platform
@@ -15263,7 +15431,7 @@ static void R3RReservationAudit(const char *tag)
 
 	/* R3R (KI-364): tell the scheduler whether the next pass has to come back early
 	 * to keep ageing the strays that are still here. */
-	_r3r_resv_audit_has_pending = !_r3r_resv_stray_age.empty();
+	_r3r_resv_audit_has_pending = !_r3r_resv_stray_since.empty();
 }
 
 /**
@@ -15389,7 +15557,7 @@ void Train::ReserveTrackUnderConsist() const
 	 * per vehicle) and it runs on the platform-waiter path only, i.e. for the
 	 * consists that actually hold reservations. */
 	R3RReconcileConsistReservation(this->index.base(), r3r_fresh, "moved");
-	if (++_r3r_consist_resv_gc_clock == 0) R3RGcConsistReservations();
+	if ((uint32_t)_tick_counter % R3R_CONSIST_RESV_GC_TICKS == 0) R3RGcConsistReservations();
 }
 
 /** R3R: clear any stale reservation under the consist before re-reserving. */
@@ -17564,11 +17732,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * loadgame tells whether a given reserved tile came in with the savegame or
 	 * was created during this session. */
 	{
-		static uint32_t r3r_resv_audit_tick = 0;
-		static uint32_t r3r_resv_audit_wait_log = 0;
 		static bool r3r_resv_audit_armed = false;
 		static const uint32_t R3R_RESV_AUDIT_TICKS = 2048;
 		static const uint32_t R3R_RESV_AUDIT_TICKS_SOON = 256;
+		/* R3R (REG-246-A, round 246): the pass is scheduled on the *absolute* tick
+		 * grid instead of on a machine-local counter. The old form kept a static
+		 * "last pass tick" that reset to 0 on load, so a client that joined
+		 * mid-session (or reloaded) ran its first pass immediately and every later
+		 * pass on a grid shifted by up to one full interval -- and because the pass
+		 * can release stray bits, the two machines then mutated the map on different
+		 * ticks. `_tick_counter` is part of the savegame and is advanced by the game
+		 * loop on every machine, so deriving the phase from it puts every machine on
+		 * the same grid. 256 divides 2048, so switching between the two cadences
+		 * never lands between grid lines. */
+		const uint32_t r3r_audit_now = (uint32_t)_tick_counter;
 		const bool audit_due = _r3r_resv_audit_due;
 		/* R3R (KI-364): three speeds. A command that can orphan a path pulls the pass
 		 * forward (KI-355), and a stray bit that is still ageing towards its reap does
@@ -17588,21 +17765,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			R3RDbgWrite("RESV-AUDIT-ARM tick=%u interval=%u due=%u pending=%u\n",
 					(uint)_tick_counter, (uint)interval, (uint)audit_due, (uint)_r3r_resv_audit_has_pending);
 		}
-		if (_tick_counter - r3r_resv_audit_tick >= interval) {
-			r3r_resv_audit_tick = _tick_counter;
+		if (r3r_audit_now % interval == 0) {
 			_r3r_resv_audit_due = false;
 			/* R3R (KI-355): say so when this pass was pulled forward by a
 			 * sell/depot-rearrange command, so a RESV-REAP that follows can be
 			 * attributed to the command rather than to the plain cadence. */
 			if (audit_soon) R3RDbgWrite("RESV-AUDIT-DUE tick=%u interval=%u due=%u pending=%u\n",
-					(uint)_tick_counter, (uint)interval, (uint)audit_due, (uint)_r3r_resv_audit_has_pending);
+					(uint)r3r_audit_now, (uint)interval, (uint)audit_due, (uint)_r3r_resv_audit_has_pending);
 			R3RReservationAudit("tick");
-		} else if ((uint32_t)_tick_counter - r3r_resv_audit_tick >= interval / 2 &&
-				(uint32_t)_tick_counter - r3r_resv_audit_wait_log >= interval) {
-			r3r_resv_audit_wait_log = (uint32_t)_tick_counter;
-			const uint32_t waited = (uint32_t)_tick_counter - r3r_resv_audit_tick;
+		} else if (r3r_audit_now % interval == interval / 2) {
+			/* R3R (REG-246-A): one "still waiting" marker per interval, on the
+			 * opposite half of the grid, so a session too short to reach the
+			 * cadence can still prove that the gate is alive. */
 			R3RDbgWrite("RESV-AUDIT-WAIT tick=%u waited=%u interval=%u due=%u pending=%u\n",
-					(uint)_tick_counter, (uint)waited, (uint)interval,
+					(uint)r3r_audit_now, (uint)(interval / 2), (uint)interval,
 					(uint)audit_due, (uint)_r3r_resv_audit_has_pending);
 		}
 	}
