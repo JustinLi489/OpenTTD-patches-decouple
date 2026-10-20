@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include "r3r_perf.h"
 #include "error.h"
 #include "articulated_vehicles.h"
@@ -6683,6 +6684,7 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_SPDDROP,      ///< KI-348: a train's cur_speed fell to zero (which commit point stopped it)
 	R3REDGE_LOCOMOVE,     ///< KI-348: a GOTO_COUPLE loco entered the *movement* branch (TrainController runs)
 	R3REDGE_REDSIG,       ///< KI-349: a train hit a red signal in TrainController (who owns the block behind it)
+	R3REDGE_WALKLOOP,     ///< KI-371: ExtendTrainReservation() walked a closed loop (its old one-lap bound is gone)
 	R3REDGE_COUNT,
 };
 
@@ -10657,7 +10659,26 @@ static uint R3RReleaseChainReservations(const Train *head, const char *why)
 		p->bits.insert((static_cast<uint64_t>(t.base()) << 3) | static_cast<uint64_t>(TrackdirToTrack(td)));
 	}, &own_path);
 
-	for (TileIndex t(0); t < Map::Size(); t++) {
+	/* R3R (KI-385, round 255): this sweep used to walk `for (TileIndex t(0); t < Map::Size(); t++)`
+	 * -- 4 194 304 tiles on a 2048x2048 map -- and then throw almost every one of them away on
+	 * the `own_path` membership test just below (the station branch at "own_path.tiles.find(t)"
+	 * and the plain-rail branch at "own_path.bits.find(...)"). The candidate set is therefore
+	 * *entirely* determined by `own_path`, so walking the map was only an expensive way of
+	 * enumerating a set we already hold. And `R3RReleaseChainReservations()` runs at every
+	 * couple / decouple / waiter commit point, i.e. exactly when a coupling is being finished
+	 * and the player is watching.
+	 *
+	 * Walking `own_path.tiles` directly is byte-for-byte equivalent:
+	 *  - the collector lambda above inserts into `tiles` and `bits` in the same call, so every
+	 *    tile that has a `bits` entry is also in `tiles` (i.e. `tiles` is a superset of the
+	 *    tile part of `bits`); nothing the plain-rail branch could have matched is skipped.
+	 *    **If those two inserts are ever split apart, this loop has to become the union.**
+	 *  - `btree_set<TileIndex>` iterates in ascending order, the same order the old counter
+	 *    produced, so `doomed` is filled in the same sequence and `RESV-GHOST*` lines are
+	 *    unchanged.
+	 *  - the two membership tests are deliberately left in place: they are now tautological,
+	 *    but they are the contract this loop depends on, and they cost nothing. */
+	for (TileIndex t : own_path.tiles) {
 		/* KI-207c: a station tile (platform or waypoint) is reserved as one
 		 * whole-tile bit, so it is attributed as a whole tile here. */
 		if (IsTileType(t, TileType::Station)) {
@@ -11910,7 +11931,11 @@ static void R3REnsureCouplePair(Train *v)
 	if (R3RDbgEdge(R3REDGE_CPLPAIR, g_key, (uint64_t)best_dist)) {
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
-			fprintf(dbg, "[R3R] CPL-PAIR act=%d tgt=%d dist=%u actTile=%d,%d tgtTile=%d,%d\n",
+			/* R3R (第 255 轮, P0)：补 tick=。没有它，日志里相邻两行 CPL-PAIR 到底
+			 * 隔了 1 个 tick 还是 2000 个 tick 只能靠上下文猜，而"挂车要等多久"本身
+			 * 就是本轮要测的量（T_tick = 从订单开始运行到 COUPLE-OK 的 tick 数）。 */
+			fprintf(dbg, "[R3R] CPL-PAIR tick=%u act=%d tgt=%d dist=%u actTile=%d,%d tgtTile=%d,%d\n",
+					(uint)_tick_counter,
 					(int)coupler->index.base(), (int)best->index.base(), best_dist,
 					TileX(coupler->tile), TileY(coupler->tile),
 					TileX(best->tile), TileY(best->tile));
@@ -12029,6 +12054,51 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
  * heartbeat of a loco waiting in place; it is emitted at most once per wait window
  * (i.e. once per R3R_COUPLE_DEST_IDLE_LIMIT ticks). */
 static const uint32_t R3R_COUPLE_DEST_IDLE_LIMIT = 500; ///< ~15 s at normal game speed.
+
+/* R3R (第 255 轮, P2): phase limit for the *other* half of the same problem.
+ *
+ * A standstill GOTO_COUPLE loco that is still OFF its order destination does not
+ * reach the wait gate above (R3RCoupleOrderDestinationReached() is false), so it
+ * runs the whole handler on every tick -- the KI-330 U-2 report (2026-10-06,
+ * veh=57 frozen off-destination) was exactly that.
+ *
+ * What this constant actually gates (scope corrected in round 255; the earlier
+ * comment in TrainCoupleHandler claimed the *map-wide* candidate search ran every
+ * tick, which is not true -- that search lives in YapfTrainCoupleTrack() and is
+ * already throttled after every empty result by R3RCoupleScanHold(), 8 ticks):
+ *   - the 3x3 touch/overlap scan around the loco, i.e. 9 tile hash lookups plus
+ *     R3RCanCoupleNow() per candidate -- cheap per tile, but pure waste at a
+ *     standstill, because the geometry around a stopped loco cannot change
+ *     between two ticks;
+ *   - everything downstream of finding a candidate (TryTrainCouple, fold
+ *     correction, the reservation booking of a merge).
+ * The exact-position test (GetCouplePosition) and the bookkeeping the stuck
+ * self-heal depends on stay on every tick on purpose: a target that stops on the
+ * precise coupling pixel must be seen at once, and dropping the "no target"
+ * marker now and then would make the heal budget fire at random.
+ *
+ * Value = 8 ticks (~0.27 s at normal speed), picked to equal the YAPF empty-search
+ * retry (R3RCoupleScanHold) so the touch scan can never lag behind the retry that
+ * would actually start the loco moving. Deliberately NOT 256 (~8.5 s): the case
+ * this scan exists for is a loco that stopped a couple of pixels short of the
+ * consist, which is a normal rendezvous outcome, and an 8.5 s invisible wait there
+ * would read as "coupling is broken" to a player.
+ *
+ * It is a single named constant on purpose. The 250/500 numbers scattered through
+ * this file are on the cleanup list (memo §9.3, round 255) -- this one is new and
+ * must not become another anonymous magic number. Growing backoff (scan every
+ * 1, 2, 4, ... ticks) is deliberately NOT implemented: an interval derived from
+ * "how long has *this* machine been failing" differs between a host and a client
+ * that joined later, and the scan books reservations, so that would be a desync.
+ * The gate is therefore the same derived phase as the wait gate above: a pure
+ * function of the synchronized tick counter and the (synchronized) vehicle index,
+ * with nothing to save.
+ *
+ * Scope of the gate: OFF destination only. An on-destination loco is already
+ * limited to one pass per R3R_COUPLE_DEST_IDLE_LIMIT by the wait gate, and a
+ * second, non-aligned phase on top of that would only add latency to the normal
+ * rendezvous at the platform. */
+static const uint32_t R3R_COUPLE_SCAN_PHASE = 8;
 
 /* R3R (第 246 轮 / 第 6 项): the per-locomotive "ticks spent parked at the
  * GOTO_COUPLE destination" counter that used to live here is gone. The wait gate
@@ -12184,6 +12254,11 @@ static bool TrainCoupleHandler(Train *v)
 		if (((uint32_t)_tick_counter + v->index.base()) % R3R_COUPLE_DEST_IDLE_LIMIT != 0) return false;
 	}
 
+	/* R3R (第 255 轮, P2): declared here (not inside the open-track branch) so the
+	 * off-destination touch scan below can see it. Same derived phase as the
+	 * parked-wait gate above -- pure function of tick and vehicle index, no state. */
+	const bool r3r_scan_due = (((uint32_t)_tick_counter + v->index.base()) % R3R_COUPLE_SCAN_PHASE) == 0;
+
 	bool reverse = false;
 	Train *u = nullptr;
 	if (v->track == TRACK_BIT_DEPOT) {
@@ -12218,11 +12293,32 @@ static bool TrainCoupleHandler(Train *v)
 		}
 	} else {
 		u = GetCouplePosition(v, reverse);
+		/* R3R (第 255 轮, P2): the exact-position test above is cheap and stays on
+		 * every tick -- a target that ends up on the precise coupling spot must be
+		 * seen immediately. What is rate limited is the widening search below (the
+		 * 3x3 touch scan). Two reasons it is cheap to defer:
+		 *   - it only runs when the exact test missed, i.e. the loco is *not* on the
+		 *     coupling pixel yet, and around a standstill loco the geometry does not
+		 *     change between two ticks;
+		 *   - the scan has only a loose upper bound (<= half-length sum), so it can
+		 *     bridge a couple of pixels -- a phase delay cannot lose the candidate.
+		 *
+		 * IMPORTANT: only the OFF-destination case is phase limited. A standstill loco
+		 * ON its order destination is already throttled to one pass per
+		 * R3R_COUPLE_DEST_IDLE_LIMIT ticks by the wait gate above; adding a second,
+		 * non-aligned phase on top of that would only add latency (up to a whole
+		 * extra window) to the ordinary "target arrived at the platform" rendezvous.
+		 * So: on destination -> run whenever the handler runs (unchanged behaviour),
+		 * off destination -> at most once per R3R_COUPLE_RETRY_BACKOFF_MAX ticks.
+		 * The phase is the same derived one as the wait gate (tick + index, no state),
+		 * because the scan reads reservations and can never be allowed to differ
+		 * between machines. */
+		const bool r3r_off_dest = !R3RCoupleOrderDestinationReached(v);
 		/* R3R (KI-106 fix 1): the 9-tile touch/overlap scan below has only a loose
 		 * upper bound (<= half-length sum), so running it while rolling would
 		 * couple at an arbitrary distance short of the exact pixel -- the exact
 		 * opposite of the fix. It therefore stays a standstill-only fallback. */
-		if (u == nullptr && !r3r_rolling) {
+		if (u == nullptr && !r3r_rolling && (!r3r_off_dest || r3r_scan_due)) {
 			/* R3R: also couple when the loco is touching/overlapping the waiting
 			 * consist, or parked at the exact end-to-end distance that
 			 * CheckTrainCollision's 8px hash gate misses. GetCouplePosition only
@@ -12334,8 +12430,13 @@ static bool TrainCoupleHandler(Train *v)
 			/* R3R (KI-330, U-2): read-only diagnosis. A GOTO_COUPLE loco with no
 			 * candidate anywhere reaches this branch on every tick while it is still
 			 * *off* its order destination, so the KI-193 parked-wait gate above never
-			 * engages: no heartbeat is written and the full map-wide candidate scan
-			 * runs every tick (the 2026-10-06 report had veh=57 frozen here). Log the
+			 * engages and no heartbeat is written (the 2026-10-06 report had veh=57
+			 * frozen here). The expensive part of this state is *not* reached from here
+			 * any more: the map-wide YAPF candidate search lives in YapfTrainCoupleTrack()
+			 * and is throttled after every empty search (R3RCoupleScanHold), and the
+			 * widening touch scan above is now phase limited for off-destination locos
+			 * (第 255 轮, P2). What remains on the per-tick path is the bookkeeping the
+			 * stuck self-heal depends on, so this branch deliberately keeps running. Log the
 			 * order destination once per (vehicle, tile) so an unreachable destination
 			 * can be told apart from a missing coupling target. */
 			const Order &r3r_co = v->current_order;
@@ -13174,9 +13275,64 @@ static Track DoTrainCouplePathfind(const Train *v, bool do_track_reservation)
  * @param temporary_slot_state The temporary slot to use (will be activated/deactivated as necessary if it isn't already)
  * @return INVALID_TILE indicates that the reservation failed.
  */
+/* R3R (第 251 轮, KI-384): memoise a closed-loop abort of the trial extension.
+ *
+ * KI-371 added the explicit bounds inside the walk below, which stop it within one
+ * tick (the freeze is gone), but those bounds are hit again on every following
+ * tick: the train is stuck, its origin does not move, so the very same walk (564
+ * steps on the reported loop) is laid down and rolled back again and again --
+ * measured 9.4ms per attempt, 284ms/s, see R3R_perf_hitch_round250_memo.md §九.
+ *
+ * The walk is deterministic for a given (vehicle, origin tile, origin trackdir)
+ * as long as nothing on the loop changes: when it is aborted by returning to the
+ * origin tile, nothing external stopped it, so the verdict can only change if the
+ * train moves (new origin => new key) or a tile on the loop gains/loses a
+ * reservation, a signal or a train. So replay the memoised answer for a bounded
+ * number of ticks instead of re-walking.
+ *
+ * Not a behaviour change for the caller: only a *failed* extension (okay=false)
+ * is ever memoised, and the replay returns that same verdict. It expires after
+ * R3R_LOOP_MEMO_TICKS so a loop that really opened up is re-examined.
+ */
+static const uint32_t R3R_LOOP_MEMO_TICKS = 60;
+
+struct R3RLoopMemo {
+	TileIndex tile;
+	Trackdir td;
+	TrackBits new_tracks;
+	DiagDirection enterdir;
+	uint32_t tick;
+};
+
+/* Key = vehicle index (<= 2^20) : origin tile (<= 2^25) : origin trackdir (4 bit).
+ * 20 + 25 + 4 = 49 bit, fits a uint64_t with room to spare. */
+static std::unordered_map<uint64_t, R3RLoopMemo> _r3r_loop_memo;
+
 static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &origin, TrackBits *new_tracks, DiagDirection *enterdir, TraceRestrictSlotTemporaryState &temporary_slot_state)
 {
 	CFollowTrackRail ft(v);
+
+	/* R3R (第 251 轮, KI-384): replay a recently memoised closed-loop abort. See
+	 * R3R_LOOP_MEMO_TICKS above for why this cannot change the verdict. */
+	const uint64_t r3r_memo_key = ((uint64_t)v->index.base() << 29) | ((uint64_t)origin.tile.base() << 4) | (uint64_t)origin.trackdir;
+	{
+		const auto it = _r3r_loop_memo.find(r3r_memo_key);
+		if (it != _r3r_loop_memo.end()) {
+			if (static_cast<uint32_t>(_tick_counter - it->second.tick) < R3R_LOOP_MEMO_TICKS) {
+				if (new_tracks != nullptr) *new_tracks = it->second.new_tracks;
+				if (enterdir != nullptr) *enterdir = it->second.enterdir;
+				const uint64_t r3r_memo_edge = R3RDbgTagHash("LOOP-MEMO") | ((uint64_t)v->index.base() << 32);
+				if (R3RDbgEdge(R3REDGE_WALKLOOP, r3r_memo_edge, (uint64_t)_tick_counter)) {
+					R3RDbgWrite("LOOP-MEMO veh=%u origin=%d,%d/%d tile=%d,%d/%d age=%u\n",
+							(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+							(int)TileX(it->second.tile), (int)TileY(it->second.tile), (int)it->second.td,
+							(unsigned)(_tick_counter - it->second.tick));
+				}
+				return PBSTileInfo(it->second.tile, it->second.td, false);
+			}
+			_r3r_loop_memo.erase(it);
+		}
+	}
 
 	/* R3R (第 243 轮, REG-243-O): name the first failure exit this trial extension
 	 * takes, so the back-out below can report *why* it could not extend. Log only:
@@ -13206,6 +13362,31 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 
 	TileIndex tile = origin.tile;
 	Trackdir  cur_td = origin.trackdir;
+	/* R3R (第 249 轮, KI-371): the walk below used to be bounded by accident --
+	 * TryReserveTrack() returns false on an already-reserved bit, so a second lap
+	 * around a closed loop broke out with "reserve-fail". KI-361 (pbs.cpp,
+	 * TryReserveRailTrackdir) now reports an own-chain bit as a successful
+	 * reservation, which removed that implicit bound: on a loop without signals,
+	 * stations, depots, waypoints or choices every exit condition above stays
+	 * false and the follower circles the loop forever inside one tick (window
+	 * frozen, no log output). The bound is a geometric one, not a length limit:
+	 *  - a valid path books distinct reservation bits, at most two per tile (one per
+	 *    Track), so coming back to the same (tile, Track) *is* a closed loop.
+	 * There is deliberately no step cap: the number of distinct (tile, Track) pairs
+	 * is itself bounded by 2 * map size, so the loop test already bounds the walk.
+	 * Hitting it is "path valid but no safe waiting position": hand the tile to the
+	 * pathfinder (okay=false, like the choice branch) instead of failing, so the
+	 * train is not marked stuck on a loop it could still drive around. */
+	uint32_t r3r_walk_steps = 0;
+	/* R3R (第 252 轮, KI-384): the only bound is the loop test itself. Track (not
+	 * trackdir) is the key because both directions of one track share one
+	 * reservation bit, so a second visit of the same (tile, Track) means the walk
+	 * laid itself down twice. Cost: one hash insert per walked tile (~40ns), a few
+	 * dozen per normal extension; the table is per call, hence no cross-tick state
+	 * and nothing to expire. */
+	std::unordered_set<uint32_t> r3r_visited;
+	r3r_visited.reserve(64);
+	r3r_visited.insert((origin.tile.base() << 3) | (uint32_t)TrackdirToTrack(origin.trackdir));
 	while (ft.Follow(tile, cur_td)) {
 		if (KillFirstBit(ft.new_td_bits) == TRACKDIR_BIT_NONE) {
 			/* Possible signal tile. */
@@ -13298,6 +13479,30 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 
 		tile = ft.new_tile;
 		cur_td = FindFirstTrackdir(ft.new_td_bits);
+
+		/* R3R (第 252 轮, KI-384): closed-loop test, see the comment above the loop. */
+		++r3r_walk_steps;
+		if (!r3r_visited.insert((tile.base() << 3) | (uint32_t)TrackdirToTrack(cur_td)).second) {
+			if (new_tracks != nullptr) *new_tracks = TrackdirBitsToTrackBits(ft.new_td_bits);
+			if (enterdir != nullptr) *enterdir = ft.exitdir;
+			/* R3R (第 251 轮, KI-384): remember this verdict so the following ticks do
+			 * not re-walk the same closed loop (see R3R_LOOP_MEMO_TICKS). Only the loop
+			 * exit memoises: a reservation refusal depends on other trains and is
+			 * retried at once. Both outputs are already finalised above. */
+			if (_r3r_loop_memo.size() >= 4096) _r3r_loop_memo.clear();
+			_r3r_loop_memo[r3r_memo_key] = R3RLoopMemo{tile, ft.old_td,
+					new_tracks != nullptr ? *new_tracks : TRACK_BIT_NONE,
+					enterdir != nullptr ? *enterdir : DiagDirection::Invalid, (uint32_t)_tick_counter};
+			const uint64_t r3r_loop_key = R3RDbgTagHash("LOOP-CLOSED") | ((uint64_t)v->index.base() << 32);
+			if (R3RDbgEdge(R3REDGE_WALKLOOP, r3r_loop_key, ((uint64_t)tile.base() << 8) | (uint32_t)cur_td)) {
+				R3RDbgWrite("LOOP-CLOSED veh=%u origin=%d,%d/%d tile=%d,%d/%d steps=%u track=%d\n",
+						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+						(int)TileX(tile), (int)TileY(tile), (int)cur_td, (unsigned)r3r_walk_steps,
+						(int)TrackdirToTrack(cur_td));
+			}
+			/* Same (tile, trackdir) convention as the choice branch above. */
+			return PBSTileInfo(tile, ft.old_td, false);
+		}
 
 		if (IsSafeWaitingPosition(v, tile, cur_td, true, _settings_game.pf.forbid_90_deg)) {
 			PBSWaitingPositionRestrictedSignalState restricted_signal_state;
@@ -13622,22 +13827,32 @@ public:
 	}
 };
 
+/* Diagnostic only (read-only): records which branch decided the "long enough"
+ * answer, so LR-TRACE can tell "reservation already long enough" apart from
+ * "no long-reserve signal chain at all". 0 = reached the final return false. */
+static uint _r3r_le_reason = 0;
+static int  _r3r_le_lookahead_end = -1;
+
 static bool IsReservationLookAheadLongEnough(const Train *v, const ChooseTrainTrackLookAheadState &lookahead_state)
 {
-	if (!v->UsingRealisticBraking() || v->lookahead == nullptr) return true;
+	if (!v->UsingRealisticBraking() || v->lookahead == nullptr) { _r3r_le_reason = 1; return true; }
 
-	if (v->current_order.IsAnyLoadingType() || v->current_order.IsType(OT_WAITING)) return true;
+	if (v->current_order.IsAnyLoadingType() || v->current_order.IsType(OT_WAITING)) { _r3r_le_reason = 2; return true; }
 
-	if (HasBit(lookahead_state.flags, CTTLASF_STOP_FOUND) || v->lookahead->flags.Test(TrainReservationLookAheadFlag::DepotEnd)) return true;
+	if (HasBit(lookahead_state.flags, CTTLASF_STOP_FOUND) || v->lookahead->flags.Test(TrainReservationLookAheadFlag::DepotEnd)) { _r3r_le_reason = 3; return true; }
 
 	if (v->reverse_distance >= 1) {
-		if (v->lookahead->reservation_end_position >= v->lookahead->current_position + v->reverse_distance - 1) return true;
+		if (v->lookahead->reservation_end_position >= v->lookahead->current_position + v->reverse_distance - 1) { _r3r_le_reason = 4; return true; }
 	}
 
 	if (v->lookahead->lookahead_end_position <= v->lookahead->reservation_end_position && _settings_game.vehicle.realistic_braking_aspect_limited == TRBALM_ON &&
 			v->lookahead->reservation_end_position > v->lookahead->current_position + 24) {
+		_r3r_le_reason = 5;
+		_r3r_le_lookahead_end = v->lookahead->lookahead_end_position;
 		return true;
 	}
+
+	_r3r_le_lookahead_end = v->lookahead->lookahead_end_position;
 
 	TrainDecelerationStats stats(v, v->lookahead->cached_zpos);
 
@@ -13649,10 +13864,10 @@ static bool IsReservationLookAheadLongEnough(const Train *v, const ChooseTrainTr
 
 	for (const TrainReservationLookAheadItem &item : v->lookahead->items) {
 		if (item.type == TRLIT_REVERSE) {
-			if (v->lookahead->reservation_end_position >= item.start + v->gcache.cached_total_length) return true;
+			if (v->lookahead->reservation_end_position >= item.start + v->gcache.cached_total_length) { _r3r_le_reason = 6; return true; }
 		}
 		if (item.type == TRLIT_STATION && HasBit(lookahead_state.flags, CTTLASF_REVERSE_FOUND) && lookahead_state.reverse_dest == item.data_id) {
-			if (v->lookahead->reservation_end_position >= item.start + v->gcache.cached_total_length) return true;
+			if (v->lookahead->reservation_end_position >= item.start + v->gcache.cached_total_length) { _r3r_le_reason = 7; return true; }
 		}
 
 		if (found_signal) {
@@ -13678,6 +13893,7 @@ static bool IsReservationLookAheadLongEnough(const Train *v, const ChooseTrainTr
 		 * beyond the current end of the reservation, e.g. banner repeaters and shunt signals */
 		if (AdvanceTrainReservationLookaheadEnd(v, v->lookahead->current_position + 24) <= v->lookahead->reservation_end_position &&
 				v->lookahead->reservation_end_position > v->lookahead->current_position + 24) {
+			_r3r_le_reason = 8;
 			return true;
 		}
 	}
@@ -13686,9 +13902,10 @@ static bool IsReservationLookAheadLongEnough(const Train *v, const ChooseTrainTr
 		int delta_z = v->lookahead->reservation_end_z - signal_z;
 		delta_z += (delta_z >> 2); // Slightly overestimate slope changes to compensate for non-uniform descents
 		int64_t distance = GetRealisticBrakingDistanceForSpeed(stats, signal_speed, 0, delta_z);
-		if (signal_position + distance <= v->lookahead->reservation_end_position) return true;
+		if (signal_position + distance <= v->lookahead->reservation_end_position) { _r3r_le_reason = 9; return true; }
 	}
 
+	_r3r_le_reason = 0;
 	return false;
 }
 
@@ -13745,9 +13962,174 @@ static TileIndex CheckLongReservePbsTunnelBridgeOnTrackdir(Train *v, TileIndex t
 
 bool _long_reserve_disabled = false;
 
+/* R3R (round 249, crash C00000FD / STATUS_STACK_OVERFLOW):
+ * recursion guard for the long-reserve round trip below.
+ *
+ * TryLongReserveChooseTrainTrack() calls ChooseTrainTrack() for the tile past an LR
+ * (long reserve) signal, and ChooseTrainTrack() calls TryLongReserveChooseTrainTrack()
+ * again at its end (:14208). That pair is unbounded: every level only advances one
+ * tile, so any layout where the lookahead never becomes "long enough" -- a trace
+ * restrict program which keeps returning TRPRF_LONG_RESERVE, a reservation end which
+ * does not advance, or simply a run of LR signals longer than the lookahead window --
+ * recurses until the stack is exhausted. The crash report shows exactly this shape:
+ * 54 alternating ChooseTrainTrack / TryLongReserveChooseTrainTrack frames
+ * (crash-20261018T144344Z.log, triggered by CmdReverseTrainDirection on veh 285).
+ *
+ * Capping the depth is safe and local: the reservation up to the current point has
+ * already been made by the caller; what is skipped is only "reserve further past the
+ * next LR signal". The limit is deliberately far above any legitimate use (each level
+ * crosses one LR signal, and even a maximum length train only needs a few dozen), so
+ * normal long reserves are unaffected. */
+static uint _r3r_long_reserve_depth = 0;
+static const uint R3R_LONG_RESERVE_MAX_DEPTH = 128;
+
+/* R3R (round 249, second failure mode: hang instead of crash):
+ * Capping the depth bounds the stack, but not the total work. Every level of
+ * TryLongReserveChooseTrainTrack() calls ChooseTrainTrack(), which runs a full YAPF
+ * search and can fan out over several signal branches, so 128 levels times that
+ * fan-out can burn minutes of CPU inside a single tick without ever overflowing the
+ * stack. That is exactly the 2026-10-19 hang: TPR-WALK was the last line written,
+ * the recursion never unwound (LR-TRACE only prints at depth 0), and the process sat
+ * at 100% CPU with a frozen window.
+ *
+ * This counter bounds the total number of recursion nodes per top-level entry. It is
+ * reset whenever the recursion returns to depth 0, so it measures one reservation
+ * attempt, not the lifetime of the process. The limit is far above any legitimate
+ * long reserve (a full-length train needs a few dozen nodes), so normal reservations
+ * are unaffected; hitting it means the walk is runaway, and giving up only skips
+ * "reserve further past the next LR signal" for this attempt. */
+static uint _r3r_long_reserve_nodes = 0;
+static const uint R3R_LONG_RESERVE_MAX_NODES = 1024;
+
+/* Tiles already visited by the current long-reserve recursion, used to detect a
+ * loop. A normal long reserve only ever moves forwards, so coming back to a tile
+ * which this same recursion already entered means the reservation has closed a
+ * circle (a signal loop, a triangle, a reversing yard produced by PBS signals) --
+ * and no amount of further recursion can make the reservation longer. */
+static TileIndex _r3r_long_reserve_visited[R3R_LONG_RESERVE_MAX_DEPTH];
+
+/* Diagnostic only (read-only). Remembers the deepest level the long-reserve
+ * recursion reached during one entry, and reports it once the recursion has
+ * unwound back to depth 0. This makes "how far did it actually walk" measurable
+ * without changing any behaviour: no early return, no extra reservation.
+ * Printed at most once per tick. depth 0 (no LR signal at all) stays silent,
+ * so a missing LR-TRACE line means "this line has no long-reserve signal chain". */
+static uint _r3r_lr_trace_max_depth = 0;
+static TileIndex _r3r_lr_trace_max_tile = INVALID_TILE;
+static Trackdir _r3r_lr_trace_max_td = INVALID_TRACKDIR;
+static const Train *_r3r_lr_trace_train = nullptr;
+static uint32_t _r3r_lr_trace_last_tick = UINT32_MAX;
+
+struct R3RLongReserveDepthGuard {
+	bool entered = false;
+	uint slot = 0;
+	R3RLongReserveDepthGuard(TileIndex tile)
+	{
+		if (_r3r_long_reserve_depth < R3R_LONG_RESERVE_MAX_DEPTH) {
+			this->slot = _r3r_long_reserve_depth;
+			_r3r_long_reserve_visited[this->slot] = tile;
+			++_r3r_long_reserve_depth;
+			this->entered = true;
+		}
+	}
+	~R3RLongReserveDepthGuard()
+	{
+		if (!this->entered) return;
+
+		--_r3r_long_reserve_depth;
+
+		/* Whole recursion has unwound: report the deepest level it reached. */
+		if (_r3r_long_reserve_depth == 0 && _r3r_lr_trace_max_depth >= 1) {
+			if (_r3r_lr_trace_last_tick != (uint32_t)_tick_counter) {
+				_r3r_lr_trace_last_tick = (uint32_t)_tick_counter;
+				int res_end = -1;
+				int cur = -1;
+				if (_r3r_lr_trace_train != nullptr && _r3r_lr_trace_train->lookahead != nullptr) {
+					res_end = _r3r_lr_trace_train->lookahead->reservation_end_position;
+					cur = _r3r_lr_trace_train->lookahead->current_position;
+				}
+				R3RDbgWrite("LR-TRACE veh=%d depth=%u tile=%d,%d td=%d res_end=%d cur=%d le=%d reason=%u nodes=%u\n",
+						(_r3r_lr_trace_train != nullptr) ? (int)_r3r_lr_trace_train->index.base() : -1,
+						(unsigned)_r3r_lr_trace_max_depth,
+						(int)TileX(_r3r_lr_trace_max_tile), (int)TileY(_r3r_lr_trace_max_tile),
+						(int)_r3r_lr_trace_max_td, res_end, cur,
+						_r3r_le_lookahead_end, (unsigned)_r3r_le_reason,
+						(unsigned)_r3r_long_reserve_nodes);
+			}
+			_r3r_lr_trace_max_depth = 0;
+			_r3r_lr_trace_max_tile = INVALID_TILE;
+			_r3r_lr_trace_max_td = INVALID_TRACKDIR;
+			_r3r_lr_trace_train = nullptr;
+		}
+
+		/* Round 249: the node budget is per top-level entry, so reset it the moment
+		 * the recursion is back at depth 0 -- no matter which way the deeper levels
+		 * ended (normal return, depth cap, cycle, or budget). */
+		if (_r3r_long_reserve_depth == 0) _r3r_long_reserve_nodes = 0;
+	}
+};
+
+static bool R3RLongReserveCycleDetected(TileIndex tile)
+{
+	for (uint i = 0; i < _r3r_long_reserve_depth; i++) {
+		if (_r3r_long_reserve_visited[i] == tile) return true;
+	}
+	return false;
+}
+
 static void TryLongReserveChooseTrainTrack(Train *v, TileIndex tile, Trackdir td, bool force_res, ChooseTrainTrackLookAheadState lookahead_state)
 {
 	if (_long_reserve_disabled) return;
+
+	/* Round 249: bound the total work of one top-level reservation attempt, not just
+	 * its depth. Depth alone only protects the stack; a closed loop with a signal on
+	 * every tile lets each level fan out, and the run never returns from this tick.
+	 * Returning here keeps the reservation made so far by the callers and only stops
+	 * extending it past this LR signal -- the same semantics as the depth cap. */
+	if (_r3r_long_reserve_depth == 0) _r3r_long_reserve_nodes = 0;
+	if (_r3r_long_reserve_nodes >= R3R_LONG_RESERVE_MAX_NODES) {
+		static uint32_t last_budget_tick = 0;
+		if (last_budget_tick == 0 || (uint32_t)_tick_counter - last_budget_tick >= 64) {
+			last_budget_tick = (uint32_t)_tick_counter;
+			R3RDbgWrite("LR-BUDGET veh=%d tile=%d,%d td=%d depth=%u nodes=%u limit=%u\n",
+					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
+					(unsigned)_r3r_long_reserve_depth, (unsigned)_r3r_long_reserve_nodes,
+					(unsigned)R3R_LONG_RESERVE_MAX_NODES);
+		}
+		return;
+	}
+	++_r3r_long_reserve_nodes;
+
+	if (_r3r_long_reserve_depth >= R3R_LONG_RESERVE_MAX_DEPTH) {
+		/* Stop walking past LR signals instead of recursing any further. */
+		static uint32_t last_cap_tick = 0;
+		if (last_cap_tick == 0 || (uint32_t)_tick_counter - last_cap_tick >= 64) {
+			last_cap_tick = (uint32_t)_tick_counter;
+			R3RDbgWrite("LR-DEPTH-CAP veh=%d tile=%d,%d td=%d depth=%u limit=%u\n",
+					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
+					(unsigned)_r3r_long_reserve_depth, (unsigned)R3R_LONG_RESERVE_MAX_DEPTH);
+		}
+		return;
+	}
+	if (R3RLongReserveCycleDetected(tile)) {
+		/* Already walked through this tile during this very recursion: the reservation
+		 * has looped back on itself, so continuing cannot extend it any further. */
+		static uint32_t last_cycle_tick = 0;
+		if (last_cycle_tick == 0 || (uint32_t)_tick_counter - last_cycle_tick >= 64) {
+			last_cycle_tick = (uint32_t)_tick_counter;
+			R3RDbgWrite("LR-CYCLE veh=%d tile=%d,%d td=%d depth=%u\n",
+					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
+					(unsigned)_r3r_long_reserve_depth);
+		}
+		return;
+	}
+	if (_r3r_long_reserve_depth + 1 > _r3r_lr_trace_max_depth) {
+		_r3r_lr_trace_max_depth = _r3r_long_reserve_depth + 1;
+		_r3r_lr_trace_max_tile = tile;
+		_r3r_lr_trace_max_td = td;
+		_r3r_lr_trace_train = v;
+	}
+	R3RLongReserveDepthGuard depth_guard(tile);
 
 	const bool long_enough = IsReservationLookAheadLongEnough(v, lookahead_state);
 
@@ -14201,11 +14583,36 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			}
 			orders.SwitchToNextOrder(true);
 		}
+		bool r3r_extend_long_reserve = true;
 		if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) {
+			/* R3R (round 249, T-2): the lookahead must actually grow for the LR
+			 * round trip to be worth another level. TryLongReserveChooseTrainTrack()
+			 * re-enters ChooseTrainTrack() one tile further on, which rebuilds the
+			 * lookahead here. If the reservation end did not move at all, the
+			 * reservation is already as long as this layout allows (line ends,
+			 * blocked track, or a signal loop), so recursing again would walk the
+			 * same ground forever -- that is the stack overflow of C00000FD. */
+			const bool had_lookahead = consist->lookahead != nullptr;
+			const int prev_res_end = had_lookahead ? consist->lookahead->reservation_end_position : 0;
 			FillTrainReservationLookAhead(consist);
-			if (consist->lookahead != nullptr) lookahead_state.order_items_start = (uint)consist->lookahead->items.size();
+			if (consist->lookahead != nullptr) {
+				lookahead_state.order_items_start = (uint)consist->lookahead->items.size();
+				if (had_lookahead && consist->lookahead->reservation_end_position <= prev_res_end) {
+					r3r_extend_long_reserve = false;
+					static uint32_t last_noprog_tick = 0;
+					if (last_noprog_tick == 0 || (uint32_t)_tick_counter - last_noprog_tick >= 64) {
+						last_noprog_tick = (uint32_t)_tick_counter;
+						R3RDbgWrite("LR-NO-PROGRESS veh=%d tile=%d,%d td=%d end=%d prev=%d depth=%u\n",
+								(int)consist->index.base(), (int)TileX(res_dest.tile), (int)TileY(res_dest.tile), (int)res_dest.trackdir,
+								(int)consist->lookahead->reservation_end_position, (int)prev_res_end,
+								(unsigned)_r3r_long_reserve_depth);
+					}
+				}
+			}
 		}
-		TryLongReserveChooseTrainTrack(consist, res_dest.tile, res_dest.trackdir, (flags & CTTF_FORCE_RES), lookahead_state);
+		if (r3r_extend_long_reserve) {
+			TryLongReserveChooseTrainTrack(consist, res_dest.tile, res_dest.trackdir, (flags & CTTF_FORCE_RES), lookahead_state);
+		}
 	}
 
 	if (!HasBit(lookahead_state.flags, CTTLASF_NO_RES_VEH_TILE)) {
@@ -15176,8 +15583,27 @@ void Load_R3DS()
 	}
 }
 
+/** R3R (第 255 轮, P1): sink for R3RResvLedgerForEachBit(), see the roster pass in
+ *  R3RReservationAudit(). A plain function + ctx keeps pbs.h free of <vector>. */
+struct R3RResvRosterSink {
+	std::vector<TileIndex> *tiles;
+};
+
+static void R3RResvRosterCollect(TileIndex tile, Track, void *ctx)
+{
+	static_cast<R3RResvRosterSink *>(ctx)->tiles->push_back(tile);
+}
+
+/** Per-tick tile budget of the map sweep (R3RResvSweepSlice). 8192 tiles/tick is a
+ *  full 4.19M-tile map every 512 ticks (~17 s at 30 tps) for roughly 20 us per tick:
+ *  the same coverage the old whole-map audit gave, spread out so that no single
+ *  frame ever pays for it. Deliberately a tile budget, not a fraction of the map --
+ *  see the KI entry for why a "percentage of Map::Size()" knob is worse. */
+static const uint32_t R3R_RESV_SWEEP_TILES = 8192;
+
 static void R3RReservationAudit(const char *tag)
 {
+	const uint64_t audit_t0 = R3RPerfNowNs();
 	/* KI-207: self-healing for bits that are already orphaned when an existing
 	 * save is loaded -- the two-pass release (R3RReleaseChainReservations) stops
 	 * new ghosts from being created, but cannot help the ones already in the file.
@@ -15233,7 +15659,33 @@ static void R3RReservationAudit(const char *tag)
 				(all_path_tiles.find(t.base()) != all_path_tiles.end());
 	};
 
-	for (TileIndex t(0); t < Map::Size(); t++) {
+	/* R3R (第 255 轮, P1): walk the roster, not the map.
+	 *
+	 * This pass used to be `for (TileIndex t(0); t < Map::Size(); t++)`: 4.19M tiles
+	 * on a 2048^2 map, every 2048 ticks, to find the few thousand bits that are
+	 * actually booked -- the slowest periodic job in the game, and the reason a ghost
+	 * could only ever be noticed on that cadence. Every bit this pass can *act* on is
+	 * a bit the ledger books (and the ledger rides the savegame, R3RL), so the roster
+	 * is the complete work list, and it is three orders of magnitude smaller.
+	 *
+	 * Bits booked *without* an R3R actor have no row and are therefore not in the
+	 * roster. Those are the fallback path's job: R3RResvSweepSlice() walks the map
+	 * with a fixed tile budget per tick, ages exactly that kind and releases it, so
+	 * coverage is kept without any single frame paying for the whole map.
+	 */
+	std::vector<TileIndex> roster_tiles;
+	{
+		R3RResvRosterSink sink{&roster_tiles};
+		R3RResvLedgerForEachBit(R3RResvRosterCollect, &sink);
+		/* The table is unordered: sort (and dedupe -- a tile booked on two tracks is
+		 * one tile) so that two machines reap in the same order even when their
+		 * bucket layouts differ. */
+		std::sort(roster_tiles.begin(), roster_tiles.end());
+		roster_tiles.erase(std::unique(roster_tiles.begin(), roster_tiles.end()), roster_tiles.end());
+	}
+	const uint32_t scanned = (uint32_t)roster_tiles.size();
+
+	for (TileIndex t : roster_tiles) {
 		/* KI-207: the reap below only sees plain rail, the only place a single
 		 * track bit can be booked on its own. A watched tile may however be a
 		 * station platform, a depot or a crossing, whose reservation is a
@@ -15293,7 +15745,12 @@ static void R3RReservationAudit(const char *tag)
 						(owner == nullptr) ? "walk" : "dead");
 			} else {
 				owned++;
-				_r3r_resv_stray_since.erase(wkey);
+				/* R3R (KI-381): a healthy session never has a stray ageing, so the
+				 * map is empty here and the lookup below is pure overhead -- one
+				 * hash probe per booked bit, every pass. Skip it when there is
+				 * nothing to remove (the forget loop at the end of the pass would
+				 * drop the key anyway). */
+				if (!_r3r_resv_stray_since.empty()) _r3r_resv_stray_since.erase(wkey);
 				if (R3RIsWatchedResvTile(t)) {
 					R3RDbgWrite("RESV-AUDIT-OWNER %s tile=%d,%d track=stn kind=%s owner=veh%u\n",
 							tag, (int)TileX(t), (int)TileY(t), IsRailWaypointTile(t) ? "WAYPOINT" : "STATION",
@@ -15338,7 +15795,9 @@ static void R3RReservationAudit(const char *tag)
 						(owner == nullptr) ? "walk" : (ledger_dead ? "dead" : "norow"));
 			} else {
 				owned++;
-				_r3r_resv_stray_since.erase(bkey);
+				/* R3R (KI-381): see the whole-tile branch above -- no stray ageing
+				 * means no lookup at all. */
+				if (!_r3r_resv_stray_since.empty()) _r3r_resv_stray_since.erase(bkey);
 				/* One line per reserved bit per audit was the biggest remaining
 				 * flood (and pure noise once the bit resolves). Keep it only for a
 				 * watched tile, where the owner's identity is the whole point. */
@@ -15416,9 +15875,16 @@ static void R3RReservationAudit(const char *tag)
 	/* R3R (REG-243-A): print the tick the pass ran on, so a session that shows
 	 * fewer SUMMARY lines than the 2048-tick cadence predicts can be told apart
 	 * ("the game was paused, _tick_counter did not advance" vs. "the audit
-	 * stopped being scheduled"). */
-	R3RDbgWrite("RESV-AUDIT-SUMMARY %s tick=%u reservedTiles=%u owned=%u strayTiles=%u reaped=%u pendingStray=%u\n",
-			tag, (uint)_tick_counter, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_since.size());
+	 * stopped being scheduled").
+	 *
+	 * R3R (第 255 轮, P0+P1): scanned= 是本次实际查过的格子数（现在是花名册条数，
+	 * 以前恒等于 Map::Size()），us= 是这次 pass 的墙钟耗时。这两个数就是"审计到底
+	 * 有多贵"的唯一实测来源——以前只能拿 4.19M 去估。注意 reservedTiles/owned/
+	 * strayTiles 现在只统计花名册里的位，所以数值会比旧日志小，这是口径变化而不是
+	 * 泄漏变少；跨版本对比请一律用 scanned= 与 us=。 */
+	const uint32_t audit_us = (uint32_t)((R3RPerfNowNs() - audit_t0) / 1000);
+	R3RDbgWrite("RESV-AUDIT-SUMMARY %s tick=%u scanned=%u reservedTiles=%u owned=%u strayTiles=%u reaped=%u pendingStray=%u us=%u\n",
+			tag, (uint)_tick_counter, scanned, reserved, owned, stray, reaped, (uint)_r3r_resv_stray_since.size(), audit_us);
 
 	/* R3R (KI-363, Mirror law): reconcile the ledger against the map once per sweep.
 	 * A writer that bypassed the setters (a station rebuilt over the tile, a platform
@@ -15432,6 +15898,131 @@ static void R3RReservationAudit(const char *tag)
 	/* R3R (KI-364): tell the scheduler whether the next pass has to come back early
 	 * to keep ageing the strays that are still here. */
 	_r3r_resv_audit_has_pending = !_r3r_resv_stray_since.empty();
+}
+
+/** Ageing stamps of the map sweep, keyed exactly like the audit's (tile << 3 | slot).
+ *  Kept apart from _r3r_resv_stray_since on purpose: the audit's "forget what
+ *  resolved" loop drops every key the *audit* did not see in this pass, which would
+ *  wipe the sweep's stamps every 2048 ticks and keep them from ever ageing out.
+ *  In-memory only: after a load the sweep simply starts over. */
+static std::unordered_map<uint32_t, uint64_t> _r3r_resv_sweep_since;
+/** Next tile the sweep looks at. Advanced by R3R_RESV_SWEEP_TILES per tick, i.e. the
+ *  sweep is a continuous ring around the map rather than a per-pass job. */
+static uint32_t _r3r_resv_sweep_cursor = 0;
+/** _tick_counter of the last slice, so the slice runs once per tick (this lives in
+ *  TrainLocoHandler, which is called once per train, not once per tick). */
+static uint32_t _r3r_resv_sweep_tick = UINT32_MAX;
+
+static const uint64_t R3R_RESV_SWEEP_REAP_TICKS = 3 * 2048;  ///< same grace as the audit
+static const uint32_t R3R_RESV_SWEEP_WHOLE_TILE_SLOT = 7;    ///< see R3R_RESV_WHOLE_TILE_KEY
+
+/**
+ * R3R (第 255 轮, P1): the fallback half of the reservation audit.
+ *
+ * The audit itself walks the ledger roster now (R3RResvLedgerForEachBit), which is
+ * complete for every bit R3R booked and three orders of magnitude cheaper than the
+ * old whole-map pass. It is however *not* complete for the map: a bit booked by an
+ * engine path that sets the reservation without an R3R actor (or one that came in
+ * with a savegame written before the ledger existed, R3RL) has no row, so no roster
+ * can name it -- and precisely that was the "ghost I cannot find with any probe"
+ * class of the last few rounds.
+ *
+ * This function therefore still looks at every tile, but only R3R_RESV_SWEEP_TILES
+ * per tick, so a full map takes ~512 ticks and each frame pays a few microseconds
+ * instead of one frame paying 4.19M tile checks. It is deliberately *narrower* than
+ * the audit: it only considers bits that (a) have no ledger row, (b) have no train
+ * standing on the tile and (c) that the walk cannot attribute to anybody. Those are
+ * exactly the conditions under which the audit used to release a bit, so a bit the
+ * sweep releases is one the audit would have released too -- it just does not have
+ * to wait for the 2048-tick cadence any more.
+ */
+static void R3RResvSweepSlice()
+{
+	const uint32_t map_size = (uint32_t)Map::Size();
+	if (map_size == 0) return;
+
+	const uint64_t now = (uint64_t)_tick_counter;
+	uint32_t budget = R3R_RESV_SWEEP_TILES;
+	uint32_t cursor = _r3r_resv_sweep_cursor;
+	if (cursor >= map_size) cursor = 0;
+
+	while (budget-- > 0) {
+		const TileIndex tile(cursor);
+		const uint32_t base_key = cursor << 3;
+		bool fragile_tile = false;
+
+		/* Whole-tile bit of a rail station platform / waypoint (KI-207c). */
+		if (GetTileType(tile) == TileType::Station && HasStationRail(tile) && HasStationReservation(tile)) {
+			const uint32_t wkey = base_key | R3R_RESV_SWEEP_WHOLE_TILE_SLOT;
+			const bool rowed = R3RResvLedgerOwner(tile, INVALID_TRACK) != R3R_RESV_NO_OWNER;
+			const bool occupied = GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr;
+			const bool walked = GetTrainForWholeTileReservation(tile) != nullptr;
+
+			if (!rowed && !occupied && !walked) {
+				fragile_tile = true;
+				const uint64_t since = _r3r_resv_sweep_since.emplace(wkey, now).first->second;
+				const uint64_t age = now - since;
+				if (age >= R3R_RESV_SWEEP_REAP_TICKS) {
+					const TrackBits rail_bits = GetStationReservationTrackBits(tile);
+					if (rail_bits != TRACK_BIT_NONE) {
+						{
+							R3RResvPhaseGuard phase_guard("sweep-stn");
+							UnreserveRailTrack(tile, FindFirstTrack(rail_bits));
+						}
+						R3RDbgWrite("RESV-SWEEP-REAP tile=%d,%d track=stn kind=%s age=%u\n",
+								(int)TileX(tile), (int)TileY(tile),
+								IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", (uint)age);
+						_r3r_resv_sweep_since.erase(wkey);
+					}
+				}
+			} else {
+				_r3r_resv_sweep_since.erase(wkey);
+			}
+		}
+
+		/* Plain rail bits (the only place a single track bit is booked on its own). */
+		if (GetTileType(tile) == TileType::Railway && IsPlainRailTile(tile)) {
+			const TrackBits bits = GetRailReservationTrackBits(tile);
+			if (bits != TRACK_BIT_NONE) {
+				fragile_tile = true;
+				for (Track track = TRACK_BEGIN; track < TRACK_END; track++) {
+					if (!HasBit(bits, track)) continue;
+					const uint32_t bkey = base_key | (uint32_t)track;
+					/* A row means the roster audit owns this bit; never touch it here. */
+					if (R3RResvLedgerOwner(tile, track) != R3R_RESV_NO_OWNER ||
+							GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr ||
+							GetTrainForReservation(tile, track) != nullptr) {
+						_r3r_resv_sweep_since.erase(bkey);
+						continue;
+					}
+					const uint64_t since = _r3r_resv_sweep_since.emplace(bkey, now).first->second;
+					const uint64_t age = now - since;
+					if (age < R3R_RESV_SWEEP_REAP_TICKS) continue;
+					{
+						R3RResvPhaseGuard phase_guard("sweep-reap");
+						UnreserveRailTrack(tile, track);
+					}
+					R3RDbgWrite("RESV-SWEEP-REAP tile=%d,%d track=%u age=%u\n",
+							(int)TileX(tile), (int)TileY(tile), (uint)track, (uint)age);
+					_r3r_resv_sweep_since.erase(bkey);
+				}
+			}
+		}
+
+		/* Housekeeping: a tile that has nothing fragile any more must not keep a stamp
+		 * (otherwise the map would grow one entry per tile ever seen). Guarded by the
+		 * empty() test because a healthy session never has a stamp at all, and this
+		 * runs for every tile of the map. */
+		if (!fragile_tile && !_r3r_resv_sweep_since.empty()) {
+			_r3r_resv_sweep_since.erase(base_key | R3R_RESV_SWEEP_WHOLE_TILE_SLOT);
+			for (Track track = TRACK_BEGIN; track < TRACK_END; track++) {
+				_r3r_resv_sweep_since.erase(base_key | (uint32_t)track);
+			}
+		}
+
+		if (++cursor >= map_size) cursor = 0;
+	}
+	_r3r_resv_sweep_cursor = cursor;
 }
 
 /**
@@ -17724,16 +18315,36 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * player keeps reporting is reaped by R3RReservationAudit(), which asks the
 	 * engine who owns each booked bit (GetTrainForReservation /
 	 * GetTrainForWholeTileReservation); the nearest-train distance heuristic this
-	 * comment used to describe is gone. Because the pass is a full map scan it
-	 * runs at a long steady-state cadence here, and a command that can orphan a
-	 * path (selling or rearranging a train) shortens the interval of the next
-	 * pass via R3RMarkReservationAuditDue() -- otherwise the ghosts would only
-	 * disappear when the player typed "r3r_resv_purge". The first entry after a
-	 * loadgame tells whether a given reserved tile came in with the savegame or
-	 * was created during this session. */
+	 * comment used to describe is gone. R3R (第 255 轮, P1): the pass walks the
+	 * ledger roster now instead of the whole map, so it is cheap enough to keep the
+	 * cadence below; the map itself is still covered, but by the incremental sweep
+	 * (R3RResvSweepSlice) that runs a slice per tick. A command that can orphan a
+	 * path (selling or rearranging a train) still pulls the next pass forward via
+	 * R3RMarkReservationAuditDue() -- otherwise the ghosts would only disappear when
+	 * the player typed "r3r_resv_purge". The first entry after a loadgame tells
+	 * whether a given reserved tile came in with the savegame or was created during
+	 * this session. */
 	{
 		static bool r3r_resv_audit_armed = false;
-		static const uint32_t R3R_RESV_AUDIT_TICKS = 2048;
+		/* R3R (第 255 轮, P1): one sweep slice per tick. The guard is not an
+		 * optimisation -- this function runs once per train, and the cursor must
+		 * advance exactly once per tick or two machines would look at different
+		 * tiles and release different bits. */
+		if (_r3r_resv_sweep_tick != (uint32_t)_tick_counter) {
+			_r3r_resv_sweep_tick = (uint32_t)_tick_counter;
+			R3RResvSweepSlice();
+		}
+		/* R3R (KI-381): the audit is kept in every build -- it is the only thing
+		 * that reaps ghost reservations (KI-203c / KI-345) -- but a build without
+		 * probes does not need its *log*, and the full map pass is the most
+		 * expensive diagnostic left in a release binary. Scan four times less
+		 * often when probes are off. The two fast paths below (a command that can
+		 * orphan a path, and a stray bit ageing towards its reap) keep the 256-tick
+		 * cadence in both tiers, so a ghost still disappears in the same number of
+		 * ticks; only a clean ledger pays the longer interval. R3RDbgOn() folds to
+		 * a constant in a release build, so this is a compile-time choice in
+		 * practice. */
+		const uint32_t R3R_RESV_AUDIT_TICKS = R3RDbgOn() ? 2048 : 8192;
 		static const uint32_t R3R_RESV_AUDIT_TICKS_SOON = 256;
 		/* R3R (REG-246-A, round 246): the pass is scheduled on the *absolute* tick
 		 * grid instead of on a machine-local counter. The old form kept a static
@@ -17743,8 +18354,9 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * can release stray bits, the two machines then mutated the map on different
 		 * ticks. `_tick_counter` is part of the savegame and is advanced by the game
 		 * loop on every machine, so deriving the phase from it puts every machine on
-		 * the same grid. 256 divides 2048, so switching between the two cadences
-		 * never lands between grid lines. */
+		 * the same grid. 256 divides both cadences (2048 and the KI-381 release
+		 * interval 8192), so switching between them never lands between grid
+		 * lines. */
 		const uint32_t r3r_audit_now = (uint32_t)_tick_counter;
 		const bool audit_due = _r3r_resv_audit_due;
 		/* R3R (KI-364): three speeds. A command that can orphan a path pulls the pass

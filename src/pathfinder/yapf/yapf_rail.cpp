@@ -834,8 +834,10 @@ public:
 		}
 		/* R3R (第 236 轮, KI-344): 无条件清点回放 —— 这是回答"found=0 到底是等待链
 		 * 不在场还是被闸门拒掉"的唯一出口，与 CPL-PATHFOUND 同频（每次寻路一行）。 */
+		/* R3R (第 255 轮, P0): nodes = closed + enter，即本次搜索真正走过的节点数。 */
 		R3RCoupleScanDump((int)v->index.base(), path_found ? 1 : 0,
-				(uint)Yapf().nodes.ClosedCount(), (uint)Yapf().GetMaxSearchNodes());
+				(uint)Yapf().nodes.ClosedCount(), (uint)Yapf().GetMaxSearchNodes(),
+				(uint)(Yapf().nodes.ClosedCount() + _r3r_cpl_scan_enter), (uint32_t)_tick_counter);
 		if (!path_found) return INVALID_TRACKDIR;
 
 		/* Found a destination, set as reservation target. */

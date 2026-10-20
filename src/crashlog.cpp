@@ -34,6 +34,8 @@
 #include "fontcache.h"
 #include "news_func.h"
 #include "news_gui.h"
+#include "openttd.h"
+#include "r3r_perf.h"
 #include "scope_info.h"
 #include "command_func.h"
 #include "command_log.h"
@@ -53,8 +55,10 @@
 #include "company_func.h"
 #include "walltime_func.h"
 
+#include <algorithm>
 #include <bit>
 #include <exception>
+#include <filesystem>
 
 #ifdef WITH_ALLEGRO
 #	include <allegro.h>
@@ -661,6 +665,36 @@ static void LogDesyncDateHeader(format_target_ctrl &buffer)
 }
 
 /**
+ * R3R (round 254, KI-380): the two multiplayer state fields the desync report was
+ * missing while the crash report has both.
+ *
+ *  - Pause state. A desync that happens while the game is paused (pause-on-join,
+ *    command-during-pause, autosave pause) cannot be reproduced without knowing that
+ *    no ticks were advancing. `_pause_mode` is a bitmask, so it is written as hex plus
+ *    a plain running/paused word.
+ *  - Last sync record type. This tells whether the divergence happened in a command
+ *    frame or in the periodic sync frame, which decides whether the command log or the
+ *    vehicle state is the suspect. Only meaningful when sync records are being kept.
+ */
+static void LogDesyncStateFields(format_target_ctrl &buffer)
+{
+	buffer.format("Pause mode: 0x{:02X} ({})\n", (uint)_pause_mode.base(),
+			_pause_mode.Any() ? "paused" : "running");
+
+	if (_record_sync_records && !_network_sync_records.empty()) {
+		uint total = 0;
+		for (uint32_t count : _network_sync_record_counts) {
+			total += count;
+		}
+		NetworkSyncRecordEvents event = NSRE_BEGIN;
+		if (_network_sync_records.size() > total + 1) {
+			event = (NetworkSyncRecordEvents)(_network_sync_records.back().frame);
+		}
+		buffer.format("Last sync record type: {}\n", GetSyncRecordEventName(event));
+	}
+}
+
+/**
  * Fill the crash log buffer with all data of a desync event.
  * @param buffer The output buffer.
  */
@@ -682,6 +716,7 @@ void CrashLog::FillDesyncCrashLog(format_target_ctrl &buffer, const DesyncExtraI
 		buffer.format("{}\n", info.desync_frame_info);
 	}
 	LogDesyncDateHeader(buffer);
+	LogDesyncStateFields(buffer);
 
 	if (info.client_id >= 0) {
 		buffer.format("Client #{}, \"{}\"\n", info.client_id, info.client_name != nullptr ? info.client_name : "");
@@ -1016,6 +1051,43 @@ void CrashLog::MakeCrashLogWithStackBuffer()
 }
 
 /**
+ * R3R (round 254, KI-380): keep at most 20 desync logs.
+ *
+ * The name already carries the UTC second (`desync-<mode>-<stamp>Z.log`), so every
+ * event gets its own file and nothing is overwritten -- that was already true. What
+ * was missing is a bound: a desync that repeats writes one file per event and the
+ * personal directory grows without limit (each file also embeds the crash savegame
+ * reference, so they are not tiny). Pruning sorts by name, which is chronological for
+ * a fixed `YYYYMMDDTHHMMSSZ` stamp, and only ever touches `desync-*.log`.
+ *
+ * Never lets an error escape: failing to prune must not turn a desync into a crash.
+ */
+static void R3RPruneDesyncLogs()
+{
+	static const size_t keep = 20;
+	std::error_code ec;
+	std::vector<std::filesystem::directory_entry> files;
+	const std::filesystem::path dir = OTTD2FS(_personal_dir);
+	for (std::filesystem::directory_iterator it(dir, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+		const std::filesystem::path &path = it->path();
+		const std::string name = path.filename().string();
+		if (name.rfind("desync-", 0) != 0 || path.extension() != ".log") continue;
+		files.push_back(*it);
+	}
+	if (ec || files.size() <= keep) return;
+
+	std::sort(files.begin(), files.end(), [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b) {
+		return a.path().filename().string() < b.path().filename().string();
+	});
+	uint removed = 0;
+	for (size_t i = 0; i + keep < files.size(); i++) {
+		std::error_code rm_ec;
+		if (std::filesystem::remove(files[i].path(), rm_ec) && !rm_ec) removed++;
+	}
+	R3RDbgWrite("DESYNC-LOG-PRUNE removed=%u kept=%u total=%u\n", removed, (uint)keep, (uint)files.size());
+}
+
+/**
  * Makes a desync crash log, writes it to a file and then subsequently tries
  * to make a crash savegame. It uses DEBUG to write
  * information like paths to the console.
@@ -1049,8 +1121,13 @@ void CrashLog::MakeDesyncCrashLog(const std::string *log_in, std::string *log_ou
 
 	bool bret = this->WriteGeneralLogFile(buffer, filename, lastof(filename), name_buffer, info.log_file);
 	if (bret) {
+		/* KI-380: make the path reachable from R3R_debug.log, so a report does not
+		 * depend on someone having copied the console output. Debug builds only. */
+		R3RDbgWrite("DESYNC-LOG file=%s mode=%s\n", filename, mode);
+		R3RPruneDesyncLogs();
 		printf("Desync log written to %s. Please add this file to any bug reports.\n\n", filename);
 	} else {
+		R3RDbgWrite("DESYNC-LOG-FAIL mode=%s\n", mode);
 		printf("Writing desync log failed.\n\n");
 	}
 

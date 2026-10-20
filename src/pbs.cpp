@@ -17,6 +17,7 @@
 #include "newgrf_newsignals.h"
 #include "train_speed_adaptation.h"
 #include "bridge_signal_map.h"
+#include "date_func.h"
 #include "r3r_perf.h"
 #include "train.h"
 #include "sl/saveload.h"
@@ -144,10 +145,25 @@ bool R3RIsWatchedResvTile(TileIndex tile)
  * R3RResvLedgerPurpose(). The reason string handed to R3RResvLedgerForget() picks
  * the mask of the release; see R3RResvLedgerForgetMask().
  */
+
+/** The ledger's age clock (KI-379). Only used for the diagnostic `age=` field. */
+static inline uint32_t R3RResvLedgerNow()
+{
+	return (uint32_t)_tick_counter;
+}
+
 struct R3RResvLedgerRec {
 	TileIndex tile;
 	Track track;
 	uint8_t purposes;  ///< bitmask of R3RResvPurpose, i.e. why the bit is held
+	/**
+	 * R3R (第 254 轮, KI-379): _tick_counter when the row was booked, so a release
+	 * can report how long the bit was held (`age=`). Deliberately *not* saved: a
+	 * savegame starts a new tick counter, so an absolute value would be nonsense
+	 * after loading. Rows read from R3RL start at 0, which is reported as age=0
+	 * ("booked before this session"). Purely diagnostic; never read for a decision.
+	 */
+	uint32_t booked;
 };
 
 /** Why a bit is held; see the two laws in the ledger comment above. */
@@ -275,6 +291,62 @@ static void R3RResvLedgerResync();
 static const uint32_t R3R_LEDGER_RESYNC_NOTES = 8192;
 static uint32_t _r3r_resv_ledger_notes = 0;
 
+/*
+ * R3R (第 254 轮, KI-379): make every release attributable.
+ *
+ * The map layer already funnels every release through the six accessors and hence
+ * through R3RResvLedgerNote()'s "CLEAR-*" branch, which is the single place where
+ * the ledger row is dropped. Logging there therefore covers all 40+ bare
+ * UnreserveTrack()/SetRailStationReservation() sites in train_cmd.cpp and the
+ * engine-internal releases as well, without touching any of them.
+ *
+ * Volume: a plain path bit is released on every path rebuild (a handful per train
+ * per tick), and one line per bit is exactly what made the round-250 diagnostic log
+ * unusable (KI-383). So:
+ *   - whole-tile (platform / waypoint) and consist bits -> one RESV-REL line each;
+ *     these are the releases that used to be invisible, and they are rare.
+ *   - plain path bits -> one RESV-REL-PATH sample every 512 releases (count= is
+ *     cumulative, so the total is exact even though the lines are sampled).
+ *   - a release with no ledger row (bit carried in by a savegame, or written by an
+ *     engine path without an R3R actor) -> RESV-REL-NOOWNER sample every 256.
+ * All three carry who=/veh=/tile=/track=/phase=, and the per-line ones carry age=
+ * (ticks since the row was booked) plus purposes=.
+ */
+static unsigned _r3r_resv_rel_path = 0;
+static unsigned _r3r_resv_rel_noowner = 0;
+
+/** The phase guard name, never nullptr (printf would fault on it). */
+static inline const char *R3RResvPhaseName()
+{
+	return (r3r_resv_phase != nullptr) ? r3r_resv_phase : "-";
+}
+
+static void R3RResvLedgerReportRelease(const char *kind, uint32_t owner, TileIndex tile, Track track, uint8_t purposes, uint32_t age)
+{
+	if (!R3RDbgOn()) return;
+	const bool whole = (track == INVALID_TRACK);
+	if (!whole && (purposes & R3R_RESV_PURPOSE_CONSIST) == 0) {
+		/* Plain path bit: sampled, count is exact. */
+		if (++_r3r_resv_rel_path % 512 != 0) return;
+		R3RDbgWrite("RESV-REL-PATH count=%u who=%s veh=%u tile=%d,%d track=0x%X age=%u phase=%s\n",
+				_r3r_resv_rel_path, kind, owner, (int)TileX(tile), (int)TileY(tile),
+				(uint)track, age, R3RResvPhaseName());
+		return;
+	}
+	R3RDbgWrite("RESV-REL who=%s veh=%u tile=%d,%d track=%s owner=%u age=%u phase=%s purposes=0x%X\n",
+			kind, owner, (int)TileX(tile), (int)TileY(tile), whole ? "whole" : "rail",
+			owner, age, R3RResvPhaseName(), (unsigned)purposes);
+}
+
+static void R3RResvLedgerReportUnowned(const char *kind, TileIndex tile, Track track)
+{
+	if (!R3RDbgOn()) return;
+	if (++_r3r_resv_rel_noowner % 256 != 0) return;
+	R3RDbgWrite("RESV-REL-NOOWNER count=%u who=%s tile=%d,%d track=%s phase=%s\n",
+			_r3r_resv_rel_noowner, kind, (int)TileX(tile), (int)TileY(tile),
+			(track == INVALID_TRACK) ? "whole" : "rail", R3RResvPhaseName());
+}
+
 void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track)
 {
 	/* Mirror law: every so often, check the whole ledger against the map, in case a
@@ -293,9 +365,31 @@ void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track)
 	 * flag keeps the six map setters untouched: they already spell it out in kind. */
 	if (kind[0] == 'C' && kind[1] == 'L') {
 		const auto bit_it = _r3r_resv_owner_of_bit.find(bit_key);
-		if (bit_it == _r3r_resv_owner_of_bit.end()) return;
-		R3RResvLedgerDropRow(bit_it->second, tile, track);
+		if (bit_it == _r3r_resv_owner_of_bit.end()) {
+			/* No row: a bit that came in with a savegame, or one written by an
+			 * engine path without an R3R actor. Still worth counting -- "somebody
+			 * freed a bit nobody claims" is precisely the KI-379 question. */
+			R3RResvLedgerReportUnowned(kind, tile, track);
+			return;
+		}
+		const uint32_t owner = bit_it->second;
+		/* Read age/purposes before the row goes away. A reverse entry without a
+		 * forward row is impossible in practice; report it as age=0/purposes=0. */
+		uint32_t age = 0;
+		uint8_t purposes = 0;
+		const auto own_it = _r3r_resv_by_owner.find(owner);
+		if (own_it != _r3r_resv_by_owner.end()) {
+			for (const R3RResvLedgerRec &row : own_it->second) {
+				if (row.tile == tile && row.track == track) {
+					purposes = row.purposes;
+					if (row.booked != 0) age = R3RResvLedgerNow() - row.booked;
+					break;
+				}
+			}
+		}
+		R3RResvLedgerDropRow(owner, tile, track);
 		_r3r_resv_owner_of_bit.erase(bit_it);
+		R3RResvLedgerReportRelease(kind, owner, tile, track, purposes, age);
 		return;
 	}
 
@@ -323,7 +417,7 @@ void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track)
 			}
 			/* A reverse entry without a forward row cannot happen; repair it rather
 			 * than losing the bit. */
-			_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose});
+			_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose, R3RResvLedgerNow()});
 			return;
 		}
 		R3RResvLedgerDropRow(bit_it->second, tile, track);
@@ -331,13 +425,31 @@ void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track)
 	} else {
 		_r3r_resv_owner_of_bit.emplace(bit_key, owner);
 	}
-	_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose});
+	_r3r_resv_by_owner[owner].push_back(R3RResvLedgerRec{tile, track, purpose, R3RResvLedgerNow()});
 }
 
 uint32_t R3RResvLedgerOwner(TileIndex tile, Track track)
 {
 	const auto it = _r3r_resv_owner_of_bit.find(R3RResvBitKey(tile, track));
 	return (it == _r3r_resv_owner_of_bit.end()) ? R3R_RESV_NO_OWNER : it->second;
+}
+
+/**
+ * R3R (第 255 轮, P1): walk the roster.
+ *
+ * _r3r_resv_owner_of_bit is the forward table (bit key -> owner) and holds exactly
+ * one entry per booked bit, so it is both the cheapest and the most complete answer
+ * to "which bits could the audit possibly have to look at". The reverse table is not
+ * used here on purpose: it would hand out the same bits once per purpose record.
+ */
+void R3RResvLedgerForEachBit(R3RResvBitVisitor visit, void *ctx)
+{
+	if (visit == nullptr) return;
+	for (const auto &kv : _r3r_resv_owner_of_bit) {
+		const uint32_t slot = kv.first & 7;
+		visit(TileIndex(kv.first >> 3),
+				(slot == (uint32_t)R3R_RESV_SLOT_WHOLE_TILE) ? INVALID_TRACK : (Track)slot, ctx);
+	}
 }
 
 /**
@@ -474,7 +586,7 @@ void R3RResvLedgerForget(VehicleID owner, const char *why)
 		/* Take this purpose off the bit; only a bit nothing else needs may go. */
 		const uint8_t left = (uint8_t)(row.purposes & ~mask);
 		if (left != 0) {
-			_r3r_resv_by_owner[key].push_back(R3RResvLedgerRec{row.tile, row.track, left});
+			_r3r_resv_by_owner[key].push_back(R3RResvLedgerRec{row.tile, row.track, left, row.booked});
 			++kept;
 			continue;
 		}
@@ -502,8 +614,8 @@ void R3RResvLedgerForget(VehicleID owner, const char *why)
 		++released;
 	}
 
-	R3RDbgWrite("RESV-LEDGER-FORGET veh=%u why=%s mask=0x%X released=%u kept=%u\n",
-			key, why, (unsigned)mask, released, kept);
+	R3RDbgWrite("RESV-LEDGER-FORGET veh=%u why=%s mask=0x%X released=%u kept=%u phase=%s\n",
+			key, why, (unsigned)mask, released, kept, R3RResvPhaseName());
 }
 
 /** Reconcile the whole ledger against the map (Mirror law). Rows whose bit is not
@@ -684,7 +796,9 @@ void Load_R3RL()
 		const uint8_t slot = (uint8_t)(bit_key & 7u);
 		const Track track = (slot == R3R_RESV_SLOT_WHOLE_TILE) ? INVALID_TRACK : (Track)slot;
 
-		_r3r_resv_by_owner[rec.owner].push_back(R3RResvLedgerRec{tile, track, purposes});
+		/* booked = 0: the row came from a savegame and predates this session's tick
+		 * counter, so its age is reported as 0 rather than as a huge span (KI-379). */
+		_r3r_resv_by_owner[rec.owner].push_back(R3RResvLedgerRec{tile, track, purposes, 0});
 		_r3r_resv_owner_of_bit[bit_key] = rec.owner;
 	}
 }

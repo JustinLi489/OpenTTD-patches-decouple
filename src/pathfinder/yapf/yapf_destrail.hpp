@@ -62,16 +62,20 @@ inline void R3RCoupleScanReset()
  *  closed / limit 取自 YAPF 自身的节点统计：closed == limit != 0 表示"搜索被节点上限
  *  截断"，此时 found=0 只说明没搜完，**不能**据此断言"候选不在场"；只有 closed < limit
  *  （或 limit == 0 无限）才是"真的穷尽了可达空间"。 */
-inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit)
+inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit, uint nodes, uint32_t tick)
 {
 	FILE *dbg = R3RFopenDbg("a");
 	if (dbg == nullptr) return;
 	static const char * const why_names[6] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait" };
 	const bool has_last = (_r3r_cpl_scan_last_why >= 0);
 	const char *why = (has_last && _r3r_cpl_scan_last_why < 6) ? why_names[_r3r_cpl_scan_last_why] : "none";
-	fprintf(dbg, "CPL-SCAN veh=%d found=%d closed=%u limit=%u enter=%u noplat=%u nores=%u noconsist=%u consist=%u "
+	/* R3R (第 255 轮, P0)：补 tick= 与 nodes=。tick 是同步 tick（30/s），有了它才能把
+	 * "一次挂接在 YAPF 里烧掉多少节点"与"挂车总耗时多久"直接相减；nodes = closed + enter
+	 * 是本次搜索真正走过的节点规模（enter 含 PfCalcEstimate 的重复访问，closed 只算扩展），
+	 * 二者一起才能回答"大地图上一次搜索是不是 O(地图)"。 */
+	fprintf(dbg, "CPL-SCAN tick=%u veh=%d found=%d closed=%u limit=%u nodes=%u enter=%u noplat=%u nores=%u noconsist=%u consist=%u "
 			"rej=%u/%u/%u/%u acc=%u/%u last=%d,%d lastveh=%d why=%s\n",
-			veh, found, closed, limit,
+			(unsigned)tick, veh, found, closed, limit, (unsigned)nodes,
 			(unsigned)_r3r_cpl_scan_enter, (unsigned)_r3r_cpl_scan_noplat,
 			(unsigned)_r3r_cpl_scan_nores, (unsigned)_r3r_cpl_scan_noconsist,
 			(unsigned)_r3r_cpl_scan_consist,

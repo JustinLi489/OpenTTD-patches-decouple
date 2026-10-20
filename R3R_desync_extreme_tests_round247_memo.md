@@ -30,6 +30,13 @@
 | 诊断 | 两端加 `-d desync=3` | `src/debug.h:44-45`、`:112-114` |
 
 **必做**：openttd.exe **分别复制到两个目录**（`build\srv\`、`build\cli\`）——探针日志走相对 `fopen("R3R_debug.log")` ⇒ 落在**进程 CWD**，同 CWD 会互相覆盖（§15.4-1，P-1 坑）。
+uint r3r_extend_steps = 0;
+static const uint R3R_EXTEND_MAX_STEPS = 512;
+while (ft.Follow(tile, cur_td)) {
+    if (++r3r_extend_steps > R3R_EXTEND_MAX_STEPS) { r3r_backout_reason = "max-steps"; break; }
+    if (r3r_extend_steps > 1 && ft.new_tile == origin.tile) { r3r_backout_reason = "loop-origin"; break; }
+    ...
+}
 
 **已就绪（2026-10-18 搭建）**：`build\srv\` 与 `build\cli\` 已各含一份 `openttd.exe`（51 882 496 B / 2026-10-17 00:00:54）+ 9 个数据子目录**联接（Junction）**——`lang` / `baseset` / `ai` / `game` / `content_download` / `newgrf` / `scenario` / `scripts` / `social_integration` 均指向 `build\` 同名目录，零占用且跟随构建更新。`save` / `screenshot` / `orderlist` 故意**不联接** ⇒ 两端存档与截图天然分离。
 

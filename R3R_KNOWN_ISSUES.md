@@ -12640,3 +12640,290 @@ RESV-WATCH CLEAR-RAIL tile=1092,139 track=0 phase=extend-backout actor=23 head=2
 
 **待办（本轮未做）**：①push 与 GitHub Release 上传（对外动作，等玩家明确）；②`PROBES=1` 的 Release 诊断包（若朋友需要交日志）；③U-A-1（`commands-out.log` 实际落点）仍待首次复测实测。
 
+## 第 249 轮（2026-10-19）：朋友崩溃日志 + 预留销毁无主 + desync 独立日志 + 发布版探针分离（取证与设计阶段）
+
+**本轮性质**：收到玩家四条报告，按规则**先落盘备忘与 KI 条目**，随后逐项取证/实施。
+临时报告：`R3R_crash_resv_desync_round249_memo.md`。
+
+### KI-378（崩溃）栈溢出 `C00000FD`，`CmdReverseTrainDirection` 期间两地址无限互递归
+
+- **来源**：`C:\Users\冯洁敏\Downloads\crash-20261018T144344Z.log`（709 行）/ 玩家 2026-10-19 第一条
+- **严重度**：高（崩溃、丢会话）
+- **状态**：已修（第 249 轮，2026-10-19 已编译通过；**复测搁置**——2026-10-19 玩家决定，见 `R3R_perf_hitch_round250_memo.md` §十四）
+- **已确认事实**：
+  1. `:8` `Exception: C00000FD` = `STATUS_STACK_OVERFLOW`（非访问违规/堆损坏）。
+  2. `:32-33` 栈顶 `[00][01]` 是 `ntdll RtlAllocateHeap` ⇒ 栈耗尽后的表象，不是堆 bug。
+  3. `:41-95` `[09]~[63]` 为 `0x7FF634CBCF41` ↔ `0x7FF634CDE8CB` **严格交替 54 帧**（`[09]` 另有 `0x...CBCA69`）⇒ A↔B 互递归，且真实深度远超 dump 的 64 帧窗口。
+  4. `:15` 触发点 `DoCommandP: tile A37B95 (2965x2615), cmd 0x31 CmdReverseTrainDirection, payload 285`。
+  5. `:19` 崩溃线程 `ottd:game`（模拟线程）；`:29` `R3R_PROBES_DEFAULT=0`（发布版，无探针日志可用）。
+  6. 模块基址推定 `0x00007FF634000000` ⇒ 关键 RVA：`0xCBCA69 / 0xCBCF41 / 0xCDE8CB`（递归双方）、`0xFF2FA4 / 0x405649 / 0x418080 / 0x41F48A / 0x4195B8 / 0x44643A / 0x440E79`（`[02]~[08]`）。
+- **根因（已符号化确认，2026-10-19）**：真实基址 `0x7FF633F90000`（原推定 `0x7FF634000000` 错误）。判据=栈帧必须落在 `E8 rel32` 之后且目标在 `.text`，全帧扫描得唯一解（9/10 帧命中 `E8`、0 个 `FF` 间接）。符号链：`[02] _malloc_base` ← `[03] BumpAllocContainer<CYapfRailSegment,1024>::New`(arena_alloc.hpp:130) ← `[04] NodeList<CYapfRailNode>::FindOpenNode`(nodelist.hpp:154，内联 AddStartupNode) ← `[05] FindPath`(yapf_base.hpp:165) ← `[06] Yapf`(yapf_rail.cpp:1265，内联 ChooseRailTrack 1352) ← `[07] stChooseRailTrack`(1311) ← `[08] YapfTrainChooseTrack`(1502) ← `[09] ChooseTrainTrack`(train_cmd.cpp:14092，内联 DoTrainPathfind 13153) ← **`[10] TryLongReserveChooseTrainTrack`(13831)** ↔ **`[11] ChooseTrainTrack`(14208→14211)**，此后交替共 54 帧。⇒ **长预留（LR 信号）分支无界互递归**：`TryLongReserveChooseTrainTrack()` 末尾跨过 LR 信号回调 `ChooseTrainTrack()`，而 `ChooseTrainTrack()` 末尾又调 `TryLongReserveChooseTrainTrack()`，两者均无深度/访问上限，每层只前进一格；当 `IsReservationLookAheadLongEnough()` 恒假（`reservation_end_position` 不推进 / trace restrict 恒返 `TRPRF_LONG_RESERVE` / LR 信号连续较密）时无限递归。触发=`CmdReverseTrainDirection`(veh 285) 后的预留重算（`TryPathReserve` → `ChooseTrainTrack`），YAPF 帧只是最外层那次寻路仍在栈上，`_malloc_base` 是爆栈瞬间正在分配 YAPF 段。**G-1（`GetNextUnit`/双头互递归）、G-2（`R3RFlipChainBySegments` 缺上限）均证伪**。
+- **修法（已实施，仅 `src\train_cmd.cpp`，未碰 `.h`）**：新增 `static uint _r3r_long_reserve_depth` + `R3R_LONG_RESERVE_MAX_DEPTH = 128` + `struct R3RLongReserveDepthGuard`（构造 `++`、析构 `--`，RAII 覆盖全部 return）；`TryLongReserveChooseTrainTrack()` 入口在 `_long_reserve_disabled` 之后判 `depth >= 128` ⇒ 打 `LR-DEPTH-CAP veh= tile= td= depth= limit=`（同 tick 64 节流）并 `return`。**安全性**：到本层为止的预留已由上一层 `ChooseTrainTrack` 完成，被跳过的只是"越过下一个 LR 信号继续预留"；不写游戏状态、判定只依赖地图与信号配置（同步数据）故不影响 desync；128 远高于任何合法用量（每层只跨一个 LR 信号，满长列车仅需几十层）又远低于栈危险值。
+- **治本（同日第二轮，T-1 环检测，已编译）**：递归闭合点=`ChooseTrainTrack()` 尾部 `train_cmd.cpp:14253-14257`（`FillTrainReservationLookAhead` 后调 `TryLongReserveChooseTrainTrack`）；递归条件=`HasLongReservePbsSignalOnTrackdir()` 仅在**下一格有 PBS 信号**（`:13702`）且非 no-entry（`:13703`）时返回 `default_value`（`:13715`）；`default_value = !long_enough`，而 `IsReservationLookAheadLongEnough()`（`:13625-13693`）是只读旧 `lookahead` 的纯判定，**没有任何"预留不再延伸"的检测** ⇒ 一旦预订末端无法推进（环线/三角线/站场折返构成的信号闭环，或线路尽头/前方被占），`long_enough` 恒 false ⇒ 沿环无限递归。修法=新增 `static TileIndex _r3r_long_reserve_visited[128]`，`R3RLongReserveDepthGuard` 改 `Guard(TileIndex tile)` 把本层 tile 写入 `slot=depth++`，入口用新增的 `R3RLongReserveCycleDetected()` 线性扫描，命中即打 `LR-CYCLE veh= tile= td= depth=` 并 `return`。正常长预留只单向前进、绝不回访已访问格，故语义零变化；代价每层最多 128 次比较 + 512 B 静态内存。构建：内测 `EXIT_CODE=0`(14:37:41, exe 51 889 152 B @14:37:28)、发布 `EXIT_CODE=0`(14:39:31, exe 23 140 864 B @14:39:19)、lint 0。
+- **治本第二轮（同日第三轮改动，T-2 无进展检测，已编译）**：T-1 只覆盖"环"，遇到"长信号链/预订被挡"仍会一路递归到 128 层上限（功能上等于长预留被硬截）。T-2 在递归闭合点加"本层是否真的把预留推远了"的判据：`ChooseTrainTrack()` 的 `if (result_flags & CTTRF_RESERVATION_MADE)` 块内（`train_cmd.cpp:14283` 一带）新增 `bool r3r_extend_long_reserve = true;`，realistic 分支在 `FillTrainReservationLookAhead(consist)` 前采样 `prev_res_end = consist->lookahead->reservation_end_position`（`had_lookahead` 为假即首次创建时不判），重建后若 `reservation_end_position <= prev_res_end` ⇒ 置假 + 打 `LR-NO-PROGRESS veh= tile= td= end= prev= depth=`（同 tick 64 节流），末尾 `TryLongReserveChooseTrainTrack(...)` 用 `if (r3r_extend_long_reserve)` 包住。理由：末端没前进 ⇒ 这一层既没推远预留、也不可能让 `IsReservationLookAheadLongEnough()` 变真 ⇒ 再递归一层收益恒为零。非 realistic 分支不加（无 `lookahead` 可比，`long_enough` 恒 true，递归只能由 restrict 显式 `TRPRF_LONG_RESERVE` 触发，仍由 T-1 + 128 上限兜底）。未碰 `.h`。
+- **构建自证**（内测树，逐次刷新；行号与体积随时间变化，以时间戳为准）：
+  - 第 1 次（T-0 深度上限）：`[5/5] Linking`、`EXIT_CODE=0`(14:29:14)、obj 14:26:35 → exe 14:28:52(51 889 152 B)、exe 命中 `LR-DEPTH-CAP`。
+  - 第 2 次（+T-1 环检测）：`[2/3] train_cmd.cpp.obj` → `[3/3] Linking`、`EXIT_CODE=0`(14:37:41)、exe 14:37:28；同轮发布树 `EXIT_CODE=0`(14:39:31)、`build-release\openttd.exe` 14:39:19(23 140 864 B)。发布版 exe 内检索不到 `LR-DEPTH-CAP` 属预期（`R3R_PROBES_DEFAULT=0` 使 `R3RDbgWrite` 块与其字面量在编译期消失），止血逻辑本身仍在。
+  - 第 3 次（+T-2 无进展检测，**只编内测树**，玩家 2026-10-19 口径「平时只编译探针内测版本，发布版本是我说要再编译的」）：`[2/3] train_cmd.cpp.obj` → `[3/3] Linking`、`EXIT_CODE=0`(14:43:54)、`src\train_cmd.cpp` 14:41:53 → obj 14:42:34 → `build\openttd.exe` 14:43:50(51 889 152 B)、`read_lints` 0。`build-release` 仍是第 2 次那版（含 T-1、不含 T-2）。
+- **诊断探针 `LR-TRACE`（2026-10-19，只读、零行为变更，仅 `src\train_cmd.cpp`）**：T-1/T-2 只在异常时打日志（环/不推进/撞上限），正常浅层递归完全静默，导致"没日志"无法区分"没递归"与"递归几层正常结束"。新增 `_r3r_lr_trace_max_depth/_tile/_td/_train/_last_tick`；`TryLongReserveChooseTrainTrack()` 在构造 `R3RLongReserveDepthGuard` 前记录本层深度（只写静态变量），`~R3RLongReserveDepthGuard()` 在深度回 0 且 `max_depth>=1` 时打 `LR-TRACE veh= depth= tile= td= res_end= cur=`（`res_end`/`cur` 取 `lookahead->reservation_end_position`/`current_position`，px；同 tick 最多一行）。判读：无 `LR-TRACE`=该线路没有 LR 信号链（最可能是 2026-10-19 复跑未触发的原因）；`depth=1~5`=链太短；`depth 20~60 且 res_end-cur 很小`=崩溃形态前身；`depth` 冲到 100+ 并出 `LR-DEPTH-CAP`=形态确认。
+- **场景画像（2026-10-19，玩家确认无该场景存档，改由源码判据 + 崩溃日志反推，详见备忘 §1.4d）**：
+  - 硬前置（不满足则此路径不会递归）：① **realistic braking 必开**——`IsReservationLookAheadLongEnough()` 首行 `:13627` 遇 `!UsingRealisticBraking()` 直接 `return true`，`long_enough` 真则 `default_value=!long_enough` 为假、`HasLongReservePbsSignalOnTrackdir()` 返假、不递归；另一入口 `:14042` 的 `default_value` 亦按 `train_braking_model == TBM_REALISTIC` 给。既然崩了即证明开着（原登记项 U-B 就此确定）。② 每层都**预留成功**——`:14028-14034` 若 `ExtendTrainReservation()` 返 `INVALID_TILE` 会 `MarkTrainAsStuck()` 后直接 `return` 不递归，故"被挡死"的形态进不到递归，现场是"订得出去但永远不够长"。③ 每层只前进 **1 格**（`:13907-13910` 递归传 `ft.new_tile`），深度≈跨过的连续 PBS 信号格数。④ 信号须是 PBS 且 **非 no-entry**（`:13702-13703`）。
+  - 强推断：⑤ 现场是"每 1 格一个 PBS 信号"的密度，否则攒不出千层；能产生连续信号的现实设施=带信号长隧道/长桥（`CheckLongReservePbsTunnelBridgeOnTrackdir`，`:14037`）、大编组场股道、环线。⑥ 列车速度/信号限速不低——`long_enough` 要求"某信号位置+真实制动距离 ≤ 预留末端"（`:13685-13690`），而末端每层只前进 1 格，制动距离随速度平方长 ⇒ 高速下永远差一点。⑦ `realistic_braking_aspect_limited` 分支（`:13637`，>current+24px 即判够长）未命中 ⇒ 现场预留末端距车不足 1.5 格，即"看得见的信号很近、制动距离远大于它"。⑧ 爆栈深度为**千层级**而非 128 级（崩溃版本 Build Oct 18 01:36:32 不含任何 R3R 防护，T-0 的 128 上限是 10-19 14:29 才编入）⇒ 那条路径至少千格连续 PBS 信号，或可无限绕的环。
+  - 猜测（待验证）：G-5a **环闭合**（三角线/灯泡线/站场两端连通，换端后沿环绕圈，可能性最高，内测版应打 `LR-CYCLE`）；G-5b **超长带信号隧道/桥 + 末端被挡**（应打 `LR-NO-PROGRESS`）；G-5c 巨型编组场（能攒深度但难到千层，最低）。
+  - 替代取证：① 最有效=让玩家取崩溃前最近的自动存档（`%USERPROFILE%\Documents\OpenTTD\save\autosave\autosave*.sav`），用内测版对那列车换端一次，看日志出 `LR-CYCLE` / `LR-NO-PROGRESS` / `LR-DEPTH-CAP` 即定形态；② 问玩家 4 问（是否环形/是否每格一信号/是否有长桥隧道/换端前是否刚停站或刚挂解挂）；③ 构造最小复现（开真实制动 + 40 格直线每格一个 PBS combo 信号 + 高速机车换端，再首尾相接成环对比）。
+- **第二次复跑取证（2026-10-19 15:27，玩家自建场景）**：玩家口述=南北向约 60 格长直轨、每格一个朝南可双向通行的 PBS 路径信号、两端车站各停一列孤立机车、中间是 200 km/h 动车组，**先加速到 200 km/h 再停车**后换端。日志三行 `REVERSEDIR ... spd=0`（`:649` / `:2226` / `:2461`）证明换端发生在**静止**状态 ⇒ 真实制动距离为 0，`IsReservationLookAheadLongEnough()` 首次即判"够长"，`HasLongReservePbsSignalOnTrackdir()` 返假、**递归 0 层**，故 `LR-*` 与 `LR-TRACE` 全无记录。⇒ **[2026-10-19 修正] §1.4g 的"唯一缺失条件是换端时的速度"不成立**：`IsReservationLookAheadLongEnough()`（`:13627`）无速度门，`:13637`/`:13669` 两个分支只看位置，停车换端同样会递归（详见备忘 §1.4i）。按代码重读，最可能的真因是**两端各停一列机车把递归两头都掐断**——预留失败时 `:14307-14313` 清掉 `CTTRF_RESERVATION_MADE`，`:14352` 的再入点不进，递归当场终止；60 格扣掉两端站台/机车/车长后实际可递归格数不足崩溃现场的 54 层。G-5a 环 / G-5b 桥隧 / G-5c 编组场三项猜测仍排除（玩家复现场景是直线），但**原现场仍可能是环**（环让信号链无限长；探针版会打 `LR-CYCLE` 作为判别）。**正确复现动作 = 移走两端机车、长轨拉到 150 格以上、200 km/h 行驶中直接换端**，以 `LR-TRACE depth=` 校准所需长度。
+- **构建自证（2026-10-19 15:45，`LR-TRACE` 探针版）**：复用 `_tmp_inc_build.cmd`（未新建 .cmd）；`[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`build\openttd.exe` @2026-10-19 15:45:07（51 889 152 B）；`findstr /C:"LR-TRACE veh="` 命中（LRTRACE_OK）。发布树 `build-release` 未编（按 2026-10-19 口径只编内测探针树）。
+- **复测判据**：C-1 同场景（反向 veh 285 所在 LR 密集区）不再 `C00000FD`；C-2 正常长预留不受影响（不得出现"该预留却没预留"导致的卡死/停摆）；C-3 内测版真撞上限时日志出现 `LR-DEPTH-CAP depth=128 limit=128`；C-4 反向操作后链序单调、无环；C-5 日志中 `LR-CYCLE` 与 `LR-NO-PROGRESS` 出现情况可判形态——**只出 `LR-CYCLE`**=信号闭环（T-1 命中）、**只出 `LR-NO-PROGRESS`**=长信号链/预订被挡（T-2 命中）、**两者都不出却仍崩**=两条判据都不覆盖，须回 1.4 节反汇编复核；C-6 若正常线路出现 `LR-NO-PROGRESS` 且伴随停摆，说明 T-2 过严，退回 T-1 单条并改做 T-3。
+- **第三次复跑取证（2026-10-19 17:18，巨大环 + 每格一信号 + 达速调头）+ `reason` 探针（2026-10-19 17:25，已编译）**：玩家场景=纯环、每格一个信号、无车站/路点，达速后调头。日志 `build\R3R_debug.log`（71 444 B / 1232 行）显示 `LR-TRACE veh=0 depth=2 tile=351,558 td=1 res_end=1282 cur=1066` 与 `depth=1` **逐格交替**（`:414/:417`、`:418/:421` …），`res_end` 每层 +16 px（正好一格），`res_end - cur` 恒 216 px（13.5 格）；`REVERSEDIR ... spd=0 ... order=0`。⇒ 递归**确实被执行**（环 + 每格信号形态正确、`LR-CYCLE` 未触发），但单次调用只走 1~2 层，与崩溃现场 54 层差两个数量级。**配置核对证伪"aspect_limited 可能是 OFF"**：`Documents\OpenTTD\openttd.cfg` 为 `train_braking_model=1`、`realistic_braking_aspect_limited=1`、`track_edit_ignores_realistic_braking=false`、`train_acc_braking_percent=100` ⇒ `:13643-13647` 只可能因前半句 `lookahead_end_position <= reservation_end_position` 成立而返回 true（"每格信号把可视间距压进预留终点"）。**新增只读探针**（仅 `src\train_cmd.cpp`，零行为变更）：`IsReservationLookAheadLongEnough()` 内加 `static uint _r3r_le_reason` + `static int _r3r_le_lookahead_end`，十个返回点分别置 1~9（1=非真实制动/无 lookahead、2=装货或 `OT_WAITING`、3=`CTTLASF_STOP_FOUND`/DepotEnd、4=`reverse_distance`、**5=`lookahead_end<=res_end && TRBALM_ON && res_end>cur+24`**、6=`TRLIT_REVERSE`、7=`TRLIT_STATION`+`CTTLASF_REVERSE_FOUND`、8=`AdvanceTrainReservationLookaheadEnd(cur+24)<=res_end`、9=`found_signal`+制动距离）、0=最终 `return false`；`LR-TRACE` 行尾追加 `le=%d reason=%u`。构建自证：复用 `_tmp_inc_build.cmd`（未新建 .cmd）、guard incremental is safe、`[2/3] train_cmd.cpp.obj` → `[3/3] Linking`、`EXIT_CODE=0`、`src\train_cmd.cpp` 17:22:04 → obj 17:23:07 → `build\openttd.exe` 17:24:39（51 891 712 B）、`read_lints` 0。发布树未编（按口径只编内测探针树）。**下一步**：用该 exe 重跑同一环，按 `reason=` 判读——5 ⇒ 改稀疏信号（间距 ≥10 格）再验；3 ⇒ 环内某信号被读成 stop；8/9 ⇒ 转查 lookahead 推进与 `found_signal`；0 但 `depth` 仍 1~2 ⇒ 转查 `HasLongReservePbsSignalOnTrackdir`。疑点 REG-249-C：`depth=1/2` 逐格交替说明同一 tick 内多次进入递归且每次只 1~2 层，与崩溃的"单次 54 层"形态不同，复现还缺一个让单次调用连续递进的要素。**猜测根因 REG-249-D（玩家提出，2026-10-19，代码已核对、待日志验证）**：复现场景的环不是完全闭合，中间有一处接车库。`src/pbs.cpp:1469-1473` 前瞻循环一旦 `IsRailDepotTile(tile)` 即置 `TrainReservationLookAheadFlag::DepotEnd` 并 `break`（库格是前瞻硬墙）；`src/pbs.cpp:1475` 若岔口挂非 PBS 信号也会 `break`；随后 `src/train_cmd.cpp:13637` 见 `DepotEnd` 或 `CTTLASF_STOP_FOUND` 即 `_r3r_le_reason=3` 并 `return true`（判"预留已够长"）⇒ 递归立即停止。反向推论：完美闭合环时前瞻走不到库格，会绕到 `src/pbs.cpp:1467` 的 `tile==start_tile && trackdir==start_trackdir` loop 检测才停，`lookahead_end` ≈ 一整圈 ⇒ 远大于 `res_end` ⇒ reason 5/8/9 均不成立 ⇒ `return false` ⇒ 递归才能一路堆到 54 层。⇒ 复现场景须改为**无岔口闭合环**（无库/站/路点/侧线）；若改后出现 `LR-CYCLE`（护栏拦截）即视为形态已复现。**复测结果 REG-249-E（2026-10-19，高）**：玩家照办拆掉车库岔口、改为在轨道上调向后，游戏**卡死且长时间不写崩溃报告**。实测：`openttd.exe` PID 21272 存活、Mem 116172 K、`Responding=False`、CPU 210.8 s（17:32:36 启动），`build\R3R_debug.log` 仅 29697 B 且 LastWriteTime `17:37:24` 后不再增长 ⇒ **纯 CPU 空转、零日志**，排除 KI-217 式刷屏。日志末尾逐字为 `REVERSEDIR veh=0 ... db=0` + 15 节 RF dump → `RESV-GC ×17 why=free-path` → `RESV-LEDGER-FORGET veh=0 why=free-path released=17` → `REVERSEDONE db=1 mvfront=14` + 15 节 RA dump → 末行 `TPR-WALK veh=0 mf=246,357 origin=246,357 td=9 okay=0 exit=3 new=246,356 reach=2 spd=0 one=0 look=0` 之后**永久静默**。判定：调向本身成功（RA 与 RF 逐行一致、预留正确回收），卡死点在调向后第一次预留 —— `TPR-WALK` 打印于 `src\train_cmd.cpp:14778`，紧接着 `:14796` 调 `ChooseTrainTrack()`，本应出现的 `CRT` 结果行全无 ⇒ 卡在 `ChooseTrainTrack` 内部，而它经 `:14366` 进入 `TryLongReserveChooseTrainTrack()` 递归。因 `LR-TRACE` 只在 `_r3r_long_reserve_depth == 0`（`:13819`）时打印，卡住时静默 = **递归未退栈**，与 REG-249-D 的推论方向一致（拆库后 `reason 5/8/9` 不再成立 ⇒ 递归不被"够长"截断）。已登记疑点：末两条 `LR-TRACE` 仍是 `reason=9` 且 `le` 仅比 `res_end` 大 1（`le=1075`/`res_end=1074`、`le=1091`/`res_end=1090`），但 `le`/`reason` 取的是**最后一次** `IsReservationLookAheadLongEnough` 调用的全局值（`:13832`），不代表最深层的读数，故不构成"环没绕整圈"的反证。待办：①加"单次递归总预算"护栏（超限打 `LR-BUDGET` 并返回，既定位也止血）②下次复现取栈或加 `ChooseTrainTrack` 成对心跳。**推论 REG-249-G（同根因、双出口，2026-10-19）**：10-18 崩溃与 10-19 卡死共享同一上游（`IsReservationLookAheadLongEnough` 未被截断 ⇒ `return false` ⇒ 递归续行），但下游出口相反——崩溃=**空间**耗尽（栈深 54，C00000FD，有 crash log）；卡死=**时间/工作量**耗尽（单 tick 不返回、CPU 满载、零日志、无 crash）。由此得出护栏漏洞：`R3R_LONG_RESERVE_MAX_DEPTH=128`（train_cmd.cpp:13779）只封纵向深度，未封每层 `ChooseTrainTrack` 的横向分支（多信号重试 × YAPF），故"深度已被截断"推不出"耗时可控"，护栏应按资源预算（节点数/时间）而非调用形态（深度）设计。**新疑点 REG-249-F**：10-18 现场有车库（GOTO_DEPOT 42,28）却出现 54 层连续递归，而按 REG-249-D 库格是前瞻硬墙（应得 reason=3 并 return true）；本轮拆库后反而卡死（拆掉打断点 = 前瞻变长 = 更糟）。三者并置 ⇒ 10-18 那条前瞻路径上**应当没有库格**，两现场拓扑不同，本轮拆库实验不可直接用于解释 10-18 的 54 层。待验证：KI-378 现场的线路拓扑（前瞻方向上是否存在库格/普通信号），需现场截图或 `LR-TRACE` 的 `tile=` 序列反推。**修法落地（2026-10-19，仅 `src\train_cmd.cpp`，未碰 `.h`）**：新增 `static uint _r3r_long_reserve_nodes` + `R3R_LONG_RESERVE_MAX_NODES = 1024`；`TryLongReserveChooseTrainTrack()` 入口在深度检查之前先做「`depth==0` 清零 → `nodes >= 1024` 则 64 tick 节流打 `LR-BUDGET veh= tile= td= depth= nodes= limit=` 后 return → 否则 `++nodes`」；`R3RLongReserveDepthGuard::~` 在回到 depth 0 时清零，使正常退栈/深度上限/环路/预算四种出口都重新计数；`LR-TRACE` 行尾追加 `nodes=%u`。语义与深度上限一致（只跳过"越过下一个 LR 信号继续订"，已订部分保留），1024 相对合法用量（几十个节点）留约 20 倍余量。构建自证：`_tmp_inc_build.cmd`（未新建 `.cmd`）、仅内测树、`EXIT_CODE=0`、`[2/3] train_cmd.cpp.obj` → `[3/3] Linking`、源码 18:03:44 → obj 18:04:21 → `build\openttd.exe` 18:05:18（51 891 712 B）、`read_lints` 0、exe 命中 `LR-BUDGET veh=` 与 `nodes=%u limit=%u`。状态＝已实现+已编译，游戏内复测待做（判据：①同场景不再卡死 ②若命中则日志精确给出 `tile=/td=/depth=` ③正常场景无 `LR-BUDGET` 且 `LR-TRACE nodes=` 在几十量级 ④正常长预留不变短、列车不提前停车）。未覆盖：单次 `ChooseTrainTrack` 内 YAPF 自身爆炸（预算只计递归节点）。
+
+**REG-249-H（2026-10-19 18:14 卡死复现，证据确凿地排除了递归爆炸）**：新日志 446 行 / 32 846 B / mtime 18:14:18，产生者=含 `LR-BUDGET` 的新 exe（18:05:18）。读数：`LR-BUDGET` **0 次**、`LR-TRACE` **130 行**（该行只在 depth 回到 0 时打印 ⇒ 递归反复正常退栈）、depth max **13** / avg 1.59、nodes max **13** / avg 1.59、`LR-DEPTH-CAP` 0、`LR-CYCLE` 0。⇒ **本次不是递归爆炸**，且 1024 预算相对正常量级（13）有约 78 倍余量、无误伤风险。`reason=9` 经 `train_cmd.cpp:13700` 确认为正常出口（制动距离已包含在前瞻内）。卡死点锁定：`:4575` `ReverseTrainDirection` 尾部 `TryPathReserve` → `:14839` `ChooseTrainTrack(consist,122,499,NW,TRACK_BIT_Y,CTTF_FORCE_RES|CTTF_MARK_STUCK)`；`ChooseTrainTrack`（`:14043`）内**无 `for(;;)` 主循环**（`:14351 continue`/`:14370` 无条件 `break` 属订单-目标重试块）。现场触发形态：`:395` `SPD-DROP veh=0 tile=122,503 prev=1 order=0 real=0 prog=145 track=02 dtile=4294967295`（`OT_NOTHING` + `INVALID_TILE`，无目的地）+ `:400-445` `REVERSEDONE db=1 mvfront=14` 与 15 节 `RA idx=0..14` dump + `:446`（末行）`TPR-WALK veh=0 mf=122,500 origin=122,500 td=9 okay=0 exit=3 new=122,499 reach=2 spd=0 one=0 look=0`。**猜测根因（待验证）G-1**：`:14126` `ExtendTrainReservation()`（定义 `:13177`）"沿轨道尽可能延伸，遇安全格/预留/岔口才停"，在**无信号无道岔无车站的闭环**上会永不 `break`，且该函数不打任何日志 ⇒ 与"TPR-WALK 后彻底静默"完全吻合；备选 G-2 `FillTrainReservationLookAhead()`（`:14152`）、G-3 `AdvanceOrdersFromVehiclePosition()`（`:14171`）、G-4 YAPF（`:14269`）。**区分判据**：在 `:14126`、`:14152` 前后加 ENTER/LEAVE 心跳，无 LEAVE 者为卡点。**修复方向（未落地）**：给 `ExtendTrainReservation` 加单次延伸预算（`tile+trackdir` 去重或 512 格上限），超限按 `okay=false`/`INVALID_TILE` 返回给既有 `MarkTrainAsStuck`+`FreeTrainTrackReservation` 分支；正常线路有信号/岔口/车站必停，零行为变更风险。
+
+### KI-379（预留）销毁侧无 owner 记录 —— "产生有记录、销毁无主"
+
+- **来源**：玩家 2026-10-19 第二条
+- **严重度**：中（可导致幽灵位/车卡死无法归因）
+- **状态**：已修（第 254 轮，只改 `src/pbs.cpp`，已编译通过；游戏内复测待做）
+- **实施（第 254 轮）**：清单与边界见 `R3R_three_pending_round254_memo.md` §15.1。
+  ① 关键结论：地图层释放**早已收敛**于六个 map accessor → `R3RResvWatchLog` → `R3RResvLedgerNote()` 的
+  `CLEAR-*` 分支（唯一删账点），故 `RESV-REL` 打在这里即覆盖 `train_cmd.cpp` 40+ 个裸写点与引擎内部释放，
+  无需逐个改造；② `R3RResvLedgerRec` 加 `uint32_t booked`（**不落盘**，读档写 0 ⇒ `age=0`，`R3RL` 格式不变），
+  释放时先取 owner/purposes/booked 再删行，输出
+  `RESV-REL who= veh= tile= track= owner= age= phase= purposes=`；③ 采样口径（防日志量回到 KI-383 水平）：
+  整格/consist 位逐行、纯 PATH 位每 512 次一行 `RESV-REL-PATH count=…`（count 精确）、无台账行每 256 次一行
+  `RESV-REL-NOOWNER count=…`；④ `RESV-LEDGER-FORGET` 汇总行补 `phase=`；⑤ 释放前自证（`-notowner`/`-hold`）未改。
+  边界：整格重建（`MakeStation`/`MakeRailDepot` 等）不经 setter，仍只能由 `R3RResvLedgerResync()` 事后对账。
+- **现状**：产生侧已有 `R3RL` 权威台账（`_r3r_resv_by_owner` / `_r3r_resv_owner_of_bit`，第 245 轮 KI-371 入档）；释放侧入口分散且不带归属：`UnreserveRailTrack`（`pbs.cpp`）、`SetRailStationReservation(false)`、`R3RReleaseChainReservations`、`R3RReleaseReservationSafe`、`R3RReconcileConsistReservation`、`R3RPurgeStrayReservations`、`R3RResvPhaseGuard`。⇒ 只能事后对账发现"位没了"，查不出"谁清的、为什么"。
+- **目标**：①所有改地图预留位的写操作收敛到单一入口并在其中同步删除台账条目；②每次释放写 `RESV-REL who= veh= tile= track= owner= age= phase=`；③保留"释放前自证该位仍归属"（`rail_map.h:168` 断言教训）。
+- **下一步**：先出全仓库释放调用点清单，再定"引擎原生释放（`FreeTrainTrackReservation` 等）只能事后对账"的边界。
+- **复测判据**：R-1 每次释放都有 `RESV-REL` 且台账条目已删（`strayTiles` 稳态 0）；R-2 `rail_map.h:168` 零命中。
+
+### KI-380（联机）同步错误缺独立日志，无法与"垃圾网络/邀请码服务器"区分
+
+- **来源**：玩家 2026-10-19 第三条
+- **严重度**：中（定位能力缺失）
+- **状态**：**已修（第 254 轮，只改 `src/crashlog.cpp`，已编译通过；游戏内复测待做）**
+- **现状**（承第 247 轮 KI-377）：`-d desync=N` 的 `commands-out.log` 落在 `Subdirectory::Autosave`，且 `"wb"` 每次启动覆盖；`-d command=N` 走 stderr（GUI 下丢失）；命令环形缓冲仅内存 256 条。
+- **订正（第 254 轮取证）**：原方案假设"缺独立日志"，与代码不符——`MakeDesyncCrashLog()`（`crashlog.cpp:1024`）早已生成 `desync-<client|server>-<UTC %Y%m%dT%H%M%SZ>.log`（秒级 UTC ⇒ 天然不覆盖），调用点 `network_client.cpp:332` / `network_server.cpp:1393`。真缺口只有四处：①无份数上限 ②缺 `_pause_mode` / `Last sync record type` 两字段 ③Debug 版无 `DESYNC-LOG file=` 探针 ④断线无独立落盘。
+- **实施（第 254 轮，仅 `src/crashlog.cpp`）**：①`LogDesyncStateFields()` 在 `LogDesyncDateHeader()` 之后写 `Pause mode: 0xNN (paused|running)` 与 `Last sync record type: …`（与崩溃报告同构）；②`R3RPruneDesyncLogs()` 按文件名保留最新 20 份 `desync-*.log`，`std::error_code` 全程吞错（剪枝失败不许把 desync 变成崩溃），成功剪枝写 `DESYNC-LOG-PRUNE removed= kept= total=`；③`MakeDesyncCrashLog()` 成功分支加 `DESYNC-LOG file=%s mode=%s` 再剪枝，失败分支加 `DESYNC-LOG-FAIL mode=%s`。
+- **`netdrop-*.log` 判定：不做**。理由：断线已被 `SendError`→`CloseConnection` 写进服务器日志；新增第四类磁盘文件与 desync 剪枝规则/玩家归档习惯冲突；S-1/S-2 判据不依赖它。将来若出现无线索断线现场，改为在 `CloseConnection` 向 `R3R_debug.log` 打单行 `NETDROP cli= reason=`（不落新文件）。
+- **构建自证（第 254 轮）**：复用 `_tmp_inc_build.cmd`；`GUARD: incremental is safe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `[3/3] Linking CXX executable openttd.exe` 仅 1 条；`error C*`/`fatal error`/`FAILED:`/`build stopped` 计数 0；`crashlog.cpp` 12:39 → `crashlog.cpp.obj` 12:40 → `build\openttd.exe` 12:42（51 942 912 B）；`read_lints` 0 条；exe 5/5 命中 `DESYNC-LOG file=` / `DESYNC-LOG-FAIL` / `DESYNC-LOG-PRUNE` / `Pause mode: 0x` / `Last sync record type:`。
+- **复测判据**：S-1 人为制造 desync 时出现新文件且内容完整（`R3R_debug.log` 有同路径 `DESYNC-LOG file=`）；S-2 无 desync 的会话不产生文件；S-3 连续制造 >20 次 desync 后旧文件被剪、总数稳定 20 且出现 `DESYNC-LOG-PRUNE`；S-4 负判据：剪枝不误删 `crash-*.log`、`FillCrashLog`/`FillInconsistencyLog` 路径逐字未变。
+
+### KI-381（性能）发布版只关了探针，审计/台账/对账等诊断开销仍在跑
+
+- **来源**：玩家 2026-10-19 第四条「这次的制备发行版似乎没有特意做探针分离」
+- **严重度**：中（性能）
+- **状态**：**部分修复（第 254 轮，只改 `src/train_cmd.cpp`，已编译通过；P-2 实测待出发布版）**
+- **现状**：`R3R_PROBES_DEFAULT=0` 使 `if (R3RDbgOn())` 块与日志字符串在编译期消失；但**非探针的诊断常驻开销**未分档：`R3RReservationAudit()` 全图预留扫描、`_r3r_consist_resv` reconcile/GC、`R3rResvPhaseGuard`、热路径台账查询等。
+- **第 254 轮取证（订正原方案）**：逐行复核 `r3r_perf.h` 后确认 P-1 在结构上**已经成立**——发布版里 `R3RDbgOn()` 常量假、`R3RDbgWrite()` 展开成 `((void)0)`（**连实参一起丢弃**）、`R3RIsWatchedResvTile()` 内联 `return false`（`pbs.h:50`）、`R3RFopenDbg()` 常量 nullptr（297 处裸 `fprintf` 全在 `if (dbg != nullptr)` 内 ⇒ 死代码）。因此原方案里「分档关闭全图审计」**不能照字面执行**：`R3RReservationAudit()` 不只是日志，它是**唯一会 reap 幽灵预留**的代码（KI-203c / KI-345 玩家实报黑线靠它自愈），关掉等于用一个玩家可见 bug 换性能。同理 `_r3r_consist_resv` reconcile/GC 与 `R3RL` 台账读写在 KI-379 之后是释放路径的判据，属正确性，**必须保留**。
+- **实施（第 254 轮，仅 `src/train_cmd.cpp`）**：①`R3RReservationAudit` 稳态间隔由硬编码 `2048` 改为 `R3RDbgOn() ? 2048 : 8192`（`SOON` 两档都保持 `256`）——探针关掉的构建每 4 倍时间才扫一次全图，而「命令置脏」与「有 stray 在老化」两条快路径逐字不变 ⇒ 幽灵回收时延不变，只有干净台账付长间隔；`R3RDbgOn()` 在发布版是常量 ⇒ 实践中即编译期选择（**未新增 `R3R_DIAG_DEFAULT` 宏，未碰任何 `src/*.h`**，避免 620 obj 全量重编）。②两处 `_r3r_resv_stray_since.erase(key)`（整格分支与 PATH 分支）前加 `if (!_r3r_resv_stray_since.empty())`——健康会话该表恒空，省掉**每个已记账位每趟一次**哈希查找；row 的最终清理由趟末 forget 循环保证，判决结果不变。
+- **仍未做**：`_r3r_consist_resv` reconcile 的每 tick 临时 vector（未改成复用缓冲，避免连带风险）；`R3rResvPhaseGuard` 保留（一次指针写，供 `RESV-GC`/`RESV-REAP` 定位，量级可忽略）。
+- **构建自证（第 254 轮）**：复用 `_tmp_inc_build.cmd`（未新建 `.cmd`）；`GUARD: incremental is safe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `[3/3] Linking CXX executable openttd.exe`；`error C`/`fatal error`/`FAILED:`/`build stopped` 计数 0；`train_cmd.cpp.obj` 12:46（12 465 482 B）→ `build\openttd.exe` 12:47（51 942 912 B）；`read_lints` 0 条。exe 字节数与上一版相同属预期（本轮无新增/删除字符串）。**验证边界**：内测树 `R3RDbgOn()` 为真 ⇒ 仍走 2048/256，`8192` 分支只有发布树会取到，本轮未编发布树，属"读代码自证"。
+- **复测判据**：P-1 发布版 exe 内诊断字符串消失（结构上已成立，需出发布版时用 `findstr` 复核 `RESV-AUDIT`/`TPR-BLOCKED` 等不再命中）；P-2 同存档 A/B 帧率不低于第 248 轮发布版（差距 < 3%）——**本轮未编发布树**（2026-10-19 口径：日常只编内测树），故 P-2 未实测；P-3 负判据：内测树（探针 ON）行为逐字不变（仍是 2048/256），`RESV-AUDIT-ARM/-DUE/-WAIT/-SUMMARY/-REAP` 触发时机与内容不变。
+
+### KI-382（高）`ExtendTrainReservation()` 在闭合环上单 tick 无限循环 ⇒ 整机冻结（KI-361 回归）
+
+- **来源**：玩家 2026-10-19 18:14 现场（`build\R3R_debug.log` 446 行 / 32 846 B @18:14:00，`R3R_perf.log` 285 673 B @18:13:59）——"游戏只是卡死，**没有日志暴涨**"。分析全文见 `R3R_crash_resv_desync_round249_memo.md` §1.4ag。
+- **严重度**：高（卡死）
+- **状态**：已修（第 249 轮，已编译通过；**复测搁置**——2026-10-19 玩家决定，见 `R3R_perf_hitch_round250_memo.md` §十四）
+- **现象**：日志最后一行 `TPR-WALK veh=0 mf=122,500 origin=122,500 td=9 okay=0 exit=3 new=122,499 reach=2 spd=0 one=0 look=0`（`train_cmd.cpp:14821` 打印，下一句就是 `:14839 ChooseTrainTrack(...CTTF_FORCE_RES...)`），之后**零输出**；窗口冻结、进程不退、单核 100%。
+- **根因**：`ChooseTrainTrack`（`train_cmd.cpp:14126`）在 `origin.okay == 0` 时调用 `ExtendTrainReservation`（`:13209` 起），其主循环 `while (ft.Follow(tile, cur_td))` 在"无信号、无站/库/路点、无岔口"的**闭合环**上所有退出条件全为假（单向信号/90° 禁转/target_seen/岔口/`IsSafeWaitingPosition` 都需要不存在的东西）。原本唯一的隐式兜底是第二圈 `TryReserveRailTrackdir()` 失败（`pbs.cpp` → `TryReserveTrack()` 在 `rail_map.h:267-277` 对已订位返回 false）⇒ `reason=reserve-fail; break;`。**KI-361（`pbs.cpp:810-816`）把"own 台账位"判成 `success = true`** 后该兜底消失 ⇒ 绕环无限 ⇒ 单 tick 不返回。
+- **顺带纠正**：本备忘多轮把同一现场归因为"512 格预留上限"是错的——现行 `ExtendTrainReservation` **没有任何格数上限**；玩家所指的"512 限流"是**上一轮被否掉的提议方案**，不是现存代码。
+- **修法（仅 `src\train_cmd.cpp`，未碰 `src\*.h`）**：主循环内新增两个**不可能误伤合法路径**的上界——(a) `tile == origin.tile`（回到出发格＝绕完一整圈；合法扩展不会重复经过同一格）；(b) 步数上限 `2 * Map::Size()`（合法扩展预订的是不同 track、每格至多 2 条 ⇒ 理论上无法达到）。命中时**不 `break`**（`break` 会走回滚 + `:14306 MarkTrainAsStuck`，即玩家抱怨的"对着空旷轨道停住"），而是设好 `*new_tracks` / `*enterdir` 并 `return PBSTileInfo(tile, cur_td, false)`，把控制权交棒给 `:14288 DoTrainPathfind` 按订单继续（与 `:13294-13296` 岔路口分支同构，已订的一圈保留）。探针：`LOOP-CLOSED veh=%u origin=%d,%d/%d tile=%d,%d/%d steps=%u capped=%d`，边沿触发（新增 `R3REDGE_WALKLOOP`），不会每 tick 刷屏。
+- **刻意不做**：不加"512 格"类格数上限（长直线/大环上会提前掐断预留 ⇒ 用新卡死换旧卡死，玩家已否决）；不撤 KI-361 的 own-bit-success（它修的是 `rp()` 的重复预订，撤了会复发）。
+- **残余风险**：若 `DoTrainPathfind` 也找不到去目的地的路，列车会走既有失败路径被标 `Stuck`——那是上游行为，属"停住"而非"冻结"，需复测确认现场是走掉还是停住。
+- **构建自证（第 249 轮）**：复用 `_tmp_inc_build.cmd`（未新建任何 `.cmd`）；`GUARD: incremental is safe`；`[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done=EXIT_CODE=0`；`src\train_cmd.cpp` 19:28:10 → `train_cmd.cpp.obj` 19:29:20 → `build\openttd.exe` 19:32:23（51 891 712 B）；`read_lints` 0 条；exe 命中 `LOOP-CLOSED`。
+- **复测判据**：①不再整机冻结（日志继续增长、可暂停/退出）；②`LOOP-CLOSED veh=N` 在状态变化时出现、非每 tick 刷屏，`capped=0`（走的是环闭合判据而非步数兜底）；③该列车随后出现 `CRT`/预留并驶离，或明确 `Stuck`（二者都可接受，冻死不可）；④负判据：长直线/大弯上的正常长预留不出现 `LOOP-CLOSED`，`COUPLE-OK` 与常规运行无回归；⑤`rail_map.h:168` / `pbs.cpp` 断言零命中。
+- **第 250 轮补充（判据②需修正）**：边沿触发只节流了**日志**，没有节流**工作**。现场 `LOOP-CLOSED` 仅 6 行（节流生效），但它下面压着 18 次 `released=563` 的整圈铺/拆。判据②的"非每 tick 刷屏"被证明是**假通过**——详见 KI-383。
+
+### KI-383（高·性能）闭合环上「每轮铺满 564 格长预留 → 立刻逐格拆掉 → 下一轮重来」活锁，叠加 `RESV-GC` 逐格 fopen 打日志
+
+- **来源**：玩家 2026-10-19「B 路现在不会卡死了，但是为什么相比于原生 OpenTTD，它还是显得卡顿呢（见 `R3R_debug.log`）」。取证全文见 `R3R_perf_hitch_round250_memo.md`。
+- **现场**：`build\R3R_debug.log` 589 073 B / mtime 19:41:39，产生者 `build\openttd.exe` @19:32:23（即 KI-382 修复版）⇒ 采样有效，卡顿发生在修复之后。
+- **严重度**：高（性能；不崩溃但持续掉帧）
+- **状态**：已修（第 251 轮负缓存 + 第 252 轮几何环判据，已编译通过；**复测搁置**——2026-10-19 玩家决定，见 `R3R_perf_hitch_round250_memo.md` §十四）。修法 (a) 日志降级**未做**——第 250 轮补充二已把日志量级降为次要项（`dbgWrite` 实测只占 284ms/s 的 <4%），主因（stuck 重试 9.4ms/次）由负缓存消掉。
+- **读数（逐条可复核）**：
+  - 日志标签分布：`RESV-GC` **10 714 行**（占全部 ~97%），`LR-TRACE` 94、`RESV-AUDIT-WATCH` 27、`RESV-LEDGER-FORGET` 20、`LOOP-CLOSED` 6、`RESV-AUDIT-SUMMARY` 3。
+  - `RESV-LEDGER-FORGET veh=0 why=free-path mask=0x1 released=563 kept=0` 出现 **17 次**（行 968/1535/2100/2667/3233/3798/4363/4928/5495/6061/6626/7191/7758/8326/8892/9457/10022/10587/11154 序列，其中首次为 `released=17` 的正常消耗）。
+  - `LOOP-CLOSED veh=0 origin=188,526/9 tile=188,526/9 steps=564 capped=0` 出现 6 次，参数逐字相同 ⇒ 同一列车、同一格、同一订单反复命中。
+  - 日志尾部是逐格拆除原文：`RESV-GC veh=0 tile=188,564 … 188,563 … 188,527`，收尾 `RESV-LEDGER-FORGET … released=563`，随后 `TRP veh=0 … look=0 one=0 res=0`。
+- **根因（三层叠加）**：
+  1. **活锁**：KI-382 的闭环检测命中后只是「这一轮放弃」，**没有负缓存**。下一轮同一列车、同一位置重新走完 564 步再放弃，对游戏状态零贡献。
+  2. **代价重复付两遍**：这 564 步里每一格都 `TryReserveRailTrack` + 台账 `push_back` 落账，闭环后才由 `R3RResvLedgerForget` 逐行 `R3RReleaseReservationLedgerChecked` 拆账。铺一遍 + 拆一遍 = 同一批格位做两次 map 操作。
+  3. **日志放大**：`src\r3r_perf.h:224-239` 的 `R3RDbgWrite()` **每次调用都 `fopen("R3R_debug.log","a")` + `fclose()`**（无缓冲、无句柄复用）。`RESV-GC` 六个打印点（`src\pbs.cpp:393/403/412/422/433/440`）全走它 ⇒ 一轮释放 = **563 次 CreateFile + 563 次 CloseHandle**，按 5~30 µs/次估算约 3~17 ms，与一帧（约 30 ms）同量级。
+- **为什么四层护栏一个都没拦住**：T-0 深度上限（128）、T-1 环检测、T-2 无进展、T-3 节点预算（1024）**全部挂在 `TryLongReserveChooseTrainTrack` 的递归上**；而本现场 `LR-TRACE` 仅 94 行、`steps=564` 是 `ExtendTrainReservation` 内**平铺 `while` 循环**的步数，递归深度极浅。真正拦住死循环的只有 KI-382 新加的闭环检测。
+- **为什么 T-2「无进展」也没用**：绕环时预留末端每步都在**推进**（离起点越来越远），"有进展"恒真；有意义的判据不是"端点有没有动"，而是"**离目标有没有变近**"或"**是否绕回了起点**"。后者才是 KI-382 用的判据。
+- **修法方向（未落地，待拍板）**：
+  - **(a) 日志降级（最省事、立竿见影）**：`RESV-GC` 逐格行改为**每轮汇总一行**（`RESV-GC-SUM veh= why= released= tiles=a,b..c,d`）；`RESV-LEDGER-FORGET` 的信息量已足够定位，逐格行在正常运行时也应默认关闭或按 `why` 边沿打印。
+  - **(b) 停顿活锁（治根）**：`LOOP-CLOSED` 命中时登记 `(veh, cur_real_order_index, origin_tile)` 短期负缓存（如 300 tick 或直到订单/位置变化），期间直接走普通 PBS，不再尝试长预留。
+  - **(c) 不做无谓落账**：闭环确定后不必"先铺满再拆"，可在检测到 `tile == origin.tile` 时直接放弃本轮已铺部分并**不写台账**——但注意 KI-382 明确要求"已订的一圈保留"用于交棒寻路，故 (c) 与 (b) 需一起评估，以免退回"对着空旷轨道停住"。
+- **落地（第 251 轮，治根=(b)）**：`src\train_cmd.cpp` 的 `ExtendTrainReservation()` 头部新增 `_r3r_loop_memo`（`std::unordered_map<uint64_t, R3RLoopMemo>`，key=`车 index<<29 | origin.tile<<4 | origin.trackdir`，`:13218`），环闭合时登记 `{终点 tile, trackdir, new_tracks, enterdir, tick}`（`:13393-13396`）并打 `LOOP-CLOSED`；下一次同 key 调用在 `R3R_LOOP_MEMO_TICKS = 60`（`:13198`）内直接复读 `PBSTileInfo(..., false)`（`:13220-13235`，日志 `LOOP-MEMO`），不再重走 564 步、也不再重复铺账/拆账。**语义不变**：只缓存 `okay=false` 这一种结论，返回给寻路方的仍是同一条"交给寻路"；过期或被挤出（`size() >= 4096` 全清，`:13393`）即重新实测。
+- **落地（第 252 轮，护栏=(d)）**：见 KI-384 的"落地（第 252 轮）"，B 路刹车由步数上限改为 `(tile, Track)` 回访集合。
+- **复测口径补充**：判据 ②「`LOOP-CLOSED` 每场景只出现一次」实际是**每 60 tick 一次**（负缓存 TTL），运行数分钟的正常形态是"零星几条 `LOOP-CLOSED` + 大量 `LOOP-MEMO`"，不是永久一条；真正的判据是 `RESV-GC` 万级→个位数、`LOOP-MEMO` 与 `LOOP-CLOSED` 同 key 成对比、`stk=` 耗时回到正常量级。
+- **未确认（REG-250 系列）**：
+  - **REG-250-A**：`RESV-AUDIT-SUMMARY` 只有 3 条、tick 号最大 2048，而后续 `LOOP-CLOSED` 仍有 5 次 ⇒ 2048 tick 后审计是否停摆（暂停态 `_tick_counter` 不前进？还是被抑制？）需要在 SUMMARY 行补 `tick=` 才能判。
+  - **REG-250-B**：`TRP veh=0 … dest=4294967295`（INVALID_TILE）、`look=0 one=0 res=0` ⇒ 该列车此刻**没有有效订单终点**，为何仍在反复尝试长预留（订单类型/是否 `OT_WAIT_COUPLE`）未取数。
+  - **REG-250-C**：这 18 轮铺/拆的**真实频率**（每 tick 一轮？）日志无 tick 号，需借 `R3R_perf.log` 的 `dbg_writes` / `dbg_ns` 累计值反推。
+- **复测判据**：①同场景 `RESV-GC` 从万级降到个位数；②`LOOP-CLOSED` **每 60 tick 至多一次**（负缓存 TTL=`R3R_LOOP_MEMO_TICKS`），正常形态是"零星 `LOOP-CLOSED` + 大量 `LOOP-MEMO`"，不是永久只出现一次；③手感接近原生、`R3R_perf.log` 的 `dbg_ns` 占比 < 1%；④负判据：直线/站台/车库场景的释放行为与汇总数值逐字不变。
+- **第 250 轮补充二（2026-10-19，性能计数器实测，结论有修正）**：`build\R3R_perf.log` 共 736 条 `PERF-TICK`，其中 **680 条是 `loco=0.0/s`（暂停期采样，不可用）**，可用的 56 条给出决定性读数（行 1042/908/906）：
+  - `loco=60.5/s 285ms/s … stk=30.2/s 284ms/s | rev=0.0/s | sub=284ms/s resid=1ms/s | nl=100ms/s glTrains=9.16ms`
+  - `sub ≈ loco`、`stk ≈ sub`、`ctrl=0.0/s`、`mov=0.0/s`、`coll=0.0/s` ⇒ **`TrainLocoHandler` 的时间几乎 100% 落在 stuck 块（`src\train_cmd.cpp:18778-18842`）**，且该车从未进入 `TrainController`（一直没动）。块内唯一重活是 `:18800 TryPathReserveWithResultFlags(consist)`，实测 **9.4ms/次**（284 ÷ 30.2）。
+  - **日志估算修正**：`dbgWrite` 全程实测 `0.5~15.6/s`、`5~12ms/s`，只占 284ms/s 的 **<4%**——因为 563 行 burst 全会话只发生 19 次，不是每 tick 刷。⇒ 上面第 3 条根因的量级应降级为「次要项」，**主因是 stuck 重试**。
+  - **REG-250-C 结案**：真实频率＝该车每 tick 进 stuck 块（30/s），其中每次 `path_backoff_interval` 到点就重跑一遍完整长预留；活锁在修复后仍以「失败重试」形态持续，只是每次都能返回、不再冻结。
+  - **修法追加 (d)**：stuck 块加**失败负缓存**——`TryPathReserveWithResultFlags` 返回 `!TPRRF_RESERVATION_OK` 时记 `(veh, origin tile, cur_real_order_index, dest_tile)`，在 `path_backoff_interval` 到期前直接 `return true`；`LOOP-CLOSED`（几何上不可达）记更长期限并打 `LR-NEGCACHE veh= why=loop`。与 (b) 互补：(b) 省掉"这一轮"的 564 步，(d) 省掉"后续每 tick"的重跑。
+  - **判据追加**：⑤`stk` 桶从 `~284ms/s` 降到 **<10ms/s**（`loco=/s` 不变＝仍每 tick 进块，但块内不再做长预留）；⑥`ctrl=0` 保持、`nl`/`glTrains` 回落到帧时间 <5%；⑦负判据：可正常预留的列车 `stk` 桶仍为 0。
+  - **判读纪律（新增）**：`R3R_perf.log` 必须先筛 `loco>0` 的行，暂停期样本会让 `glTrains` 给出冻结的假值（9.16ms 反复出现即此故）。
+
+### 今日 A/B 两问题的口径登记（2026-10-19，第 251 轮）
+
+玩家口径定名：**A = 朋友那次崩溃（KI-378）；B = 18:14 那次卡死（KI-382，残余 KI-383）**。两者都在长预留里，但**路径不同、刹车不同**，不得互相套用结论：
+
+| 维度 | A 路 = KI-378（崩溃） | B 路 = KI-382（冻结） |
+|---|---|---|
+| 无限的东西 | `TryLongReserveChooseTrainTrack` ↔ `ChooseTrainTrack` 互相递归 | `ExtendTrainReservation` 里一个 `while` 循环 |
+| 刹车机制 | 「下一层预留失败」⇒ 递归终止 | 「第二圈重复预订必然失败」⇒ 循环终止 |
+| 刹车为何失效 | 每层都预留成功（`long_enough` 恒假 ⇒ 一直往上跨信号） | 10-16 的 KI-361 让「自己的台账位」算成功 |
+| 耗尽资源 | 空间（栈）⇒ 崩溃，**有** crash log | 时间（单 tick 不返回）⇒ 冻结，**无** log、不崩 |
+| 确认手段 | 反汇编逐帧符号化，两函数**交替 54 帧** | 日志 `LR-BUDGET` **0 次**、`depth` 最大 13 ⇒ 排除递归 |
+
+**共同点**：两条路的刹车都是**间接推断**（A 靠"下层会失败"、B 靠"第二圈会失败"），而非显式上限判据；任何让「失败」不再失败的改动都会同时拆掉刹车——KI-361 就是实例。
+
+### KI-384（中高 · 已修（第 251/252 轮）· 结构性）：长预留两条实现路径的护栏不对等，A 路的四层护栏在 B 路上一个都拦不到
+
+- **描述**：T-0 深度上限（128）、T-1 环检测、T-2 无进展、T-3 节点预算（1024）全部挂在 `TryLongReserveChooseTrainTrack` 的**递归**上；而 `ExtendTrainReservation` 是**平铺 `while` 循环**（现场 `steps=564`），四层护栏一个都不生效。B 路唯一的刹车是"第二圈重复预订失败"这一隐含依赖，被 KI-361 解除后即冻结。
+- **来源**：`R3R_perf_hitch_round250_memo.md` §七（`12740` 行同款结论）、§十；KI-382/KI-383。
+- **状态**：已修（第 251 轮 + 第 252 轮，已编译通过；**复测搁置**——2026-10-19 玩家决定，见 `R3R_perf_hitch_round250_memo.md` §十四）。
+- **落地（第 251 轮）**：闭环失败负缓存 `_r3r_loop_memo`（key=车/起点格/起点 trackdir，`R3R_LOOP_MEMO_TICKS=60` tick 内复读 `okay=false`，日志 `LOOP-MEMO`），把"每 tick 重走 564 步"降为"每 60 tick 走一次"。
+- **落地（第 252 轮，玩家 2026-10-19 硬性口径）**：**不设任何步数/长度上限**（`2 * Map::Size()` 也删除）。B 路唯一的刹车改为几何判据：`std::unordered_set<uint32_t> r3r_visited`，key=`(tile, Track)`，入口插入 origin，每步插入新格，插入失败即环。用 `Track` 而非 `trackdir`：一个 Track 的两位方向共用同一预留位，重复访问同一 `(tile, Track)` ⇔ 预留位重复 ⇔ 环。`LOOP-CLOSED` 的 `capped=` 改为 `track=`。
+- **代价**：每走一格一次哈希插入（~40ns），正常延伸几十步 ⇒ 每次调用 +0.2~2µs；集合条数=本次步数，正常 ~1KB；不同 `(tile, Track)` 最多 `2*Map::Size()`，是判据推出的自然上界，非人为常数。
+- **为什么不能只留"回到起点"**：起点在支线上、进环绕行时永不回起点格（KI-361 后自链位又算预留成功），会退回冻结；必须用完整回访集合。
+- **严重度**：中高（不修则任何"预订永久成功"的改动都会重演 B 路冻结；A 路护栏也无法为 B 路兜底）。
+- **护栏覆盖面审计（第 253 轮，纯静态核对，未改码）**：既然 B 路原先四层护栏全落空，本轮把"还有哪些入口能绕开 A 路 T-0 深度闸"逐个点名核对，结论=**没有第三条无闸路径**：
+  1. `FlushDeferredDetermineCombineNormalShuntMode()` 定义在 `src\signal.cpp:1789-1801`，函数体只做两件事——对 `_deferred_lookahead_combined_normal_shunt_mode` 逐项调 `DetermineCombineNormalShuntModeWithLookahead()`、对 `_deferred_determine_combined_normal_shunt_mode` 逐项 `SetCombinedNormalShuntModeSignalToShunt()`，随后清表。**不含任何寻路/预订调用**，不调 `ChooseTrainTrack`/`TryPathReserve`/`ExtendTrainReservation` ⇒ 它不是递归入口，也与长预留预算无关（它决定的是"合并正常/调车信号该走哪种路由"这一个信号位）。
+  2. 它的三处调用点 `src\train_cmd.cpp:13851`（隧道桥出口可用格计算后）、`:14089`（隧道桥分支里 `ChooseTrainTrack(...)` **返回之后**）、`:16411`（lambda 里 `TryPathReserve(consist)` **返回之后**）全部是"预订流程收尾时补算信号模式"，处于调用栈**返回侧**而非入口侧，不会形成 预订→flush→预订 的环。
+  3. 所有真正会进入长预留的路径（`TryPathReserve` → `TryLongReserveChooseTrainTrack`，以及 `ChooseTrainTrack` 内部的递归/前瞻重入）都必须先过 `TryLongReserveChooseTrainTrack` 的 T-0 深度闸；B 路 `ExtendTrainReservation` 是它的**被调者**，故第 252 轮的 `(tile, Track)` 回访集合是唯一落在闸门之外的刹车，位置正确。
+  4. `ChooseTrainTrack` 里 `for (;;)` + `orders.SwitchToNextOrder()` 的循环**有界**（每条订单分支都推进 `cur_real_order_index` 或在 `OT_NOTHING`/`OT_END` 处 return，订单表长度有限）⇒ 不存在"订单循环空转"这一独立隐患（此前的假说在 `R3R_perf_hitch_round250_memo.md` §1.4af 已证伪）。
+- **复测判据**：见 KI-383 的四条（`RESV-GC` 万级→个位、`LOOP-MEMO`/`LOOP-CLOSED` 成对且不再每 tick 重走、`stk=` 耗时回落、负判据=直线/站台/车库行为逐字不变）。
+
+### KI-385（性能）挂接/解挂提交点的预留清扫做**全图 419 万格**遍历，而候选集合其实完全由 `own_path` 决定
+
+- **来源**：玩家 2026-10-20 报告「挂接寻路/配对是不是有一个要用到全图搜索的，这个可能会导致列车挂接等很久，能不能优化一下它」。分析报告 `R3R_couple_scan_round255_memo.md`。
+- **严重度**：中（不改行为，只浪费；图越大越疼。2048×2048 = 4 194 304 格/次）
+- **状态**：**已修（第 255 轮，已编译通过；游戏内复测待做）** —— 见文末「落地（第 255 轮）」其一。
+- **玩家猜测的订正（重要）**：**配对本身不是全图搜索**。`TrainCoupleHandler()` 找目标只查「本车格 + 库出口格」两格的车辆哈希链（`src\train_cmd.cpp:12195-12198`）、明线查「回溯本车预留链」（`:12222` → `:11933` `FollowTrainReservation`）、贴靠兜底查 3×3 邻格（`:12239-12243`），范围是常数级。YAPF 挂接寻路从机车当前 tile 出发（`yapf_rail.cpp:813,824`），上限 `max_search_nodes` 默认 10000（`aystar.h:28`），**也不是全图**。
+- **真正的全图扫描在这里**：`R3RReleaseChainReservations()`（定义 `src\train_cmd.cpp:10589`）的 `for (TileIndex t(0); t < Map::Size(); t++)`（`:10662`），调用点 = **每个挂接/解挂/等待者提交点**：`:10893`(couple)、`:11000`(couple-settled)、`:8484-8485`(decouple)、`:18178`(waiter)。
+- **为什么可以安全去掉全图外壳（等价性论证）**：循环体对每个 `t` 的第一件事就是与 `own_path` 求交并 `continue`——站台分支在 `:10674` 要求 `own_path.tiles.find(t) != end`，普通轨分支在 `:10721` 要求 `own_path.bits.find((t<<3)|track) != end`。而 `own_path` 由 `R3RCollectReservedPathTiles(chain_head, ...)`（`:10656-10660`）填充，其 lambda **同时** `tiles.insert(t)` 与 `bits.insert(...)` ⇒ `own_path.tiles` 已是 `own_path.bits` 的 tile 超集。故「全图遍历 ∩ own_path」≡「直接遍历 own_path.tiles」，且 `btree_set<TileIndex>` 与 `t` 的升序一致 ⇒ `doomed` 的填充顺序与日志输出**逐字相同**。
+- **其余全图/全车遍历（登记，不在本条目范围）**：①`R3RReservationAudit()`（`:15544`）已节流 2048（内测）/8192（发布）tick；②配对锁 `R3REnsureCouplePair()` 的 `Train::Iterate()`（`:11841`）有 `R3R_PAIR_RESCAN_TICKS = 8` 节流（`:11835-11837`）；③`src\pbs.cpp:861` `IsRailStationPlatformFree()` 内的 `Vehicle::Iterate()` 全仓**无调用点**（死代码，仅为 `pbs.h:120` 的声明存在）。
+- **"挂接等很久"的真嫌疑不是搜索成本，而是三处等待型节流**（需现场日志定量，未取证完）：`R3R_COUPLE_DEST_IDLE_LIMIT = 500`（`:12033`，停在目的地的待挂机车约每 500 tick 才重试一次候选搜索）、`R3R_COUPLE_SCAN_RETRY = 8`（`yapf_rail.cpp:1754`/`:1822`，空手后 8 tick 冷却，日志 `CPL-SKIP retryIn=`）、`R3R_PAIR_RESCAN_TICKS = 8`。**判定：若玩家感受是"迟迟不开始挂接"，主因是 500 那个常量；若是"卡一下"，主因是本条的全图扫描。两者需日志区分，不得互相套用。**
+
+> 注：本条目内的行号是 KI-385 改动**前**的读数；改动后该函数内整体后移约 19 行（现为 `:10912` couple、`:11019` couple-settled、`:8484`/`:8485` decouple、`:18197` waiter）。
+
+### KI-386（行为）双方列车到位后到开始挂接要等很久：停稳在目的地后候选搜索被 500 tick 相位门限住
+
+- **来源**：玩家 2026-10-20 澄清「我想的是为什么每一次双方列车到位之后到成功配对开始执行挂接要那么久」。分析报告 `R3R_couple_latency_round255_memo.md`。
+- **严重度**：中（不丢数据，但玩家可直接感知，且每次挂接都发生）
+- **状态**：根因已定位（2026-10-20）；其中「off-destination 停稳时每 tick 跑加宽扫描」这一项**已落地（第 255 轮 P2，已编译通过，游戏内复测待做）**，见文末「落地（第 255 轮）」；候选搜索成本与 tick 时长两项仍未单独收口。
+- **与 KI-385 的关系**：**无关**。KI-385 的全图清扫发生在「挂接判定已成功、正在提交」那一刻，是一次性单帧成本，不参与任何排队。KI-385 保留，但它不是这个问题的答案。
+- **机制（四层）**：
+  1. **行驶中**：`r3r_rolling = v->cur_speed != 0`（`src\train_cmd.cpp:12179`），rolling 时机车**每 tick** 都跑完整搜索 + `TryTrainCouple`（`:12242-12246`、`:12285-12289`）⇒ 正常情况下边开边命中，0 延迟。
+  2. **停稳后**：一旦 `cur_speed == 0` 且 `R3RCoupleOrderDestinationReached(v)` 为真，进入相位门（`:12204-12206`）：`if (((uint32_t)_tick_counter + v->index.base()) % R3R_COUPLE_DEST_IDLE_LIMIT != 0) return false;` ⇒ **499/500 的 tick 直接返回，不寻路、不挂接、不移动**（停驶分支里 GOTO_COUPLE 只做 `CheckTrainCollision` + `TrainCoupleHandler`，不调 `TrainController`，见第 242 轮取证）。
+  3. **每次失败再等一整窗**：`R3R_COUPLE_DEST_IDLE_LIMIT = 500`（`:12052`，注释自陈 `~15 s at normal game speed`）。
+  4. **放弃**：`R3R_COUPLE_COMMIT_FAIL_LIMIT = 4`（`:12086`），注释自陈「each one a parked-wait window apart」⇒ 最坏 ≈ 2000 tick ≈ 67 s 后跳过订单。
+- **量化（常速 30 tick/s）**：最好 0 s；平均 ≈ 8.3 s；最坏 ≈ 16.7 s；每次额外失败 +16.7 s。
+- **加速因素（关键）**：`R3RCoupleOrderDestinationReached()`（`:12126-12136`）在车站场景只要求「车头压在目的车站**任意一格**」（`HasStationTileRail(tile) && GetStationIndex(tile) == ToStationID`），与车底相距多少格无关 ⇒ **机车一进目的站台就进入等待窗**，哪怕离目标还有整个站台。
+- **最刺眼的一处**：`Couple(v, u)` 之后的注释（`:12405-12410`）自陈「a fold-fix rollback leaves the two chains apart and **the loco is stopped on the exact pixel, retrying from standstill**」——即**折叠修正回滚后的「从停稳重试」正好被这个 500 tick 门限住**。玩家看到的「已经贴上了却干等」几乎必然是这个。
+- **设计动机（为什么当初加）**：`:12037-12052` 注释，第 109 轮现场 `veh=24` 有 27 次 `CPL-ENTRY`/7 次 `COUPLE-FAIL`/0 次 `CPL-BEST`，`veh=30` 从 60,30 漂移到 58,38 ⇒ 不加节流会每 tick 烧 tick 并沿站台漂移。且第 246 轮为 desync 特意把机器本地计数器改成 `_tick_counter` 相位 ⇒ **任何修法都必须保持确定性判据（只能用同步状态），不得引入本地计数器**。
+- **修法候选（未落地，待拍板）**：
+  - **A（推荐，最小改动）**：在门前加「贴靠放行」——若车头所在格或其邻格上存在另一列车（地图状态，天然同步、常数成本），则不看相位直接放行一次。覆盖「折叠回滚后停在精确像素上」这一最刺眼场景，同时「空无一物」的停稳机车仍走 500 轮询，不复活第 109 轮的漂移。风险：需确认站台上「旁边常停着别的车」不会让放行变常态（否则等于撤销此门）。
+  - **B**：停稳后前 K 次重试用短间隔（如 20 tick），之后退回 500。需要跨 tick 的「第几次」状态，且必须同步（可放 `R3VP` 稀疏块，代价是存档格式）。
+  - **C**：只把 500 降到 60（2 s）。最简单，空转开销 ×8，漂移风险同比上升。
+  - **不建议**：直接删门（复现第 109 轮）。
+- **复测判据**：R-1 同场景 `COUPLE-OK loco=` 与其前一条 `COUPLE-FAIL`/`CPL-*` 的 tick 差显著下降（或 `COUPLE-DEST-EMPTY` 心跳间隔不再是 500）；R-2 负判据：无候选的停稳 GOTO_COUPLE 机车不出现「沿站台漂移」（对照第 109 轮 `veh=30` 60,30→58,38）；R-3 负判据：两机同一存档同时跑，挂接发生 tick 完全一致（无 desync）；R-4 `R3R_COUPLE_COMMIT_FAIL_LIMIT` 的放弃行为不变。
+
+#### 订正（2026-10-20 实机日志，**上面第 2/3 层在本场景不成立**）
+
+> 取证全文见 `R3R_couple_latency_round255_memo.md`「六之四、实机日志实测」。
+
+玩家场景是「A 已在等待挂接、B 停在**机待线**」，日志实测证明 **500 tick 门从未生效**：
+
+- L688 `COUPLE-WAIT-OFFDEST veh=0 tile=200,378 ... destStn=0 destTile=189641 onStnTile=1`
+- `destTile=189641` 按 2048 宽 = **(1225,92)**，而 B 在 **(200,378)**、A 在 **(201,374)**
+- ⇒ B 的 `OT_GOTO_COUPLE` 目的地不是它当前所在的站 ⇒ `R3RCoupleOrderDestinationReached()` 恒 false ⇒ 相位门**不生效**，`TrainCoupleHandler` + 候选搜索 **每 tick 都跑**（与 `:12355-12359` 注释逐字对应）
+
+⇒ 本场景的正确归因是**第 1 层（行驶中/off-destination 每 tick 计算）与搜索成本**，不是第 2 层。日志中 B 从到位（L593 `CPL-PAIR dist=5`）到挂上（L742 `COUPLE-OK`）共 ≈149 行 ≈ **380 tick ≈ 13 s**，期间动作连续：L626 掉头 → L637-681 挂接寻路 → L682 `TRP ok=1 res=1` → L693 `LOCO-MOVE spd=61` → L737 `gap=3` → L742 成功。**没有任何"原地干等"的形态**。
+
+⇒ 「大地图更久」的机制因此改为：(a) off-destination 每 tick 的候选搜索成本随 B→A 距离增长（本日志 `CPL-SCAN closed=3 enter=9`，大地图数量级上升）；(b) tick 本身更慢（`R3RReservationAudit` 每 2048 tick 全图扫 419 万格）⇒ 同样 380 tick 的墙钟被拉长。**不是固定 tick 常量随地图变化**。
+
+⇒ 修法方向相应调整：优先做「候选搜索的增量/缓存」或「off-destination 停稳的同步判据节流」，而不是单纯调小 `R3R_COUPLE_DEST_IDLE_LIMIT`（那个门在本场景根本不参与）。修法仍须保持确定性判据（第 246 轮 desync 教训），不得引入本地计数器。
+
+- **新疑点 REG-255-A**：`RESERVECONSIST veh=3..8 tile=201,374/201,373 ok=0 resNow=1`（L615-620、L694-699）——A 的 6 节车底脚下轨道已处于预留态但自身预留恒失败。需确认是 A 合法 PBS 预留（幂等，无害）还是幽灵预留（会干扰挂接寻路「跟随等待列车预留」，`:14300-14306`）。本日志 `strayTiles=0` 倾向前者，未定。
+
+---
+
+## 落地（第 255 轮）
+
+> 详细取证与理由见 `R3R_couple_latency_round255_memo.md`「十、落地记录（P2 收尾，2026-10-20）」；扫描范围取证见 `R3R_couple_scan_round255_memo.md`。**本轮已编译通过（`EXIT_CODE=0`），游戏内复测待做。**
+
+### 一、KI-385（已修）——挂接/解挂提交点的预留清扫不再全图遍历
+
+`R3RReleaseChainReservations()`（`src\train_cmd.cpp:10589`，调用点 couple/couple-settled/decouple×2/waiter）的 `for (TileIndex t(0); t < Map::Size(); t++)` 已改为 `for (TileIndex t : own_path.tiles)`（`:10681`）。等价性论证写在函数内注释 `:10662-10680`：
+- 收集 lambda（`:10656-10660`）在**同一次调用**里同时写 `tiles` 与 `bits` ⇒ `tiles` 是 `bits` 的 tile 超集，普通轨分支不可能漏；
+- `btree_set<TileIndex>` 升序 = 旧计数器顺序 ⇒ `doomed` 填充序与 `RESV-GHOST*` 输出**逐字相同**；
+- 两处 `own_path` 成员测试（`:10693`、`:10737` 一带）刻意保留：现在是恒真，但它们是这段代码依赖的契约。
+- **若将来把两个 insert 拆开，这个循环必须改成二者并集**（已写进注释）。
+
+### 二、P2（已实现）——off-destination 停稳机车的加宽扫描改按同步相位限流
+
+- 新常量 `static const uint32_t R3R_COUPLE_SCAN_PHASE = 8;`（`src\train_cmd.cpp:12060` 起的注释块内声明，紧邻 `R3R_COUPLE_DEST_IDLE_LIMIT`）。
+- 相位判定 `const bool r3r_scan_due = (((uint32_t)_tick_counter + v->index.base()) % R3R_COUPLE_SCAN_PHASE) == 0;`，声明在 `TrainCoupleHandler()` 的 `bool reverse = false;` **之前**（开放轨道分支要用它，不能写在 `else` 里——初版就是这样写错、编译前自查发现）。
+- 3×3 贴靠兜底的门：`if (u == nullptr && !r3r_rolling && (!r3r_off_dest || r3r_scan_due))`，其中 `r3r_off_dest = !R3RCoupleOrderDestinationReached(v)`。
+- **只管 off-destination**：到点停稳的机车已有 `R3R_COUPLE_DEST_IDLE_LIMIT=500` 门，再叠一个不对齐的 8 tick 相位只会给站台会合平白加延迟。
+- **不设"非相位就提前 return"**（原计划有，实测论证后取消）：真正的全图候选搜索在 `YapfTrainCoupleTrack()` 且已被 `R3RCoupleScanHold()` 节流 8 tick；提前 return 会跳过 `_r3r_couple_no_target` 记账（stuck 自愈依赖）而省不出可测时间。
+- **不做递增退避**：`(_tick_counter + v->index.base())` 是纯同步相位，无跨 tick 状态；"失败次数"是非同步量，会 desync（第 246 轮教训）。
+- 初版取 256 tick（≈8.5 s）后改为 8 tick：这条扫描的典型触发形态是"机车停在差几像素处"，8.5 s 隐形等待会被玩家读成"挂车坏了"；8 tick 与 YAPF 空转重试同频，延迟不可感知。
+
+### 三、P0（已实现）——量化字段
+
+`CPL-PAIR` 补 `tick=`；`CPL-SCAN` 补 `tick=` 与 `nodes=`（`ClosedCount() + _r3r_cpl_scan_enter`，调用点 `yapf_rail.cpp`）；`RESV-AUDIT-SUMMARY` 补 `scanned=`（花名册格数）与 `us=`（本次审计墙钟微秒）。**口径变化**：`scanned=` 不再是地图面积，`us=` 是首次可用的开销读数，旧日志不可跨版本比较。
+
+### 四、P1（已实现）——预留审计改台账花名册 + 每 tick 定额增量扫掠
+
+- `pbs.h`/`pbs.cpp` 增 `R3RResvBitVisitor` + `R3RResvLedgerForEachBit()`（回调形式，避免 pbs.h 引入容器头）；`Train::ReserveTrackUnderConsist()` 记的每个位都能从台账枚举。
+- `R3RReservationAudit()` 主循环由"全图 4.19M 格"改为"花名册（`sort` + `unique` 后的 tile 列表，数千级）"，并计时输出 `us=`。
+- 无台账行的引擎原生位（幽灵位的主要来源）由新 `R3RResvSweepSlice()` 兜底：每 tick 定额 `R3R_RESV_SWEEP_TILES = 8192` 格的**环形游标**扫掠（约 512 tick 一轮全图），只对"无台账行 + 格上无车 + 走查无归属"的位打时间戳，年龄 ≥ `R3R_RESV_SWEEP_REAP_TICKS = 3*2048` 才释放并写 `RESV-SWEEP-REAP`。⇒ 覆盖率不降，单帧代价封顶（8192 格 ≈ 全图的 1/512）。扫掠判据刻意**窄于**审计：它只放审计也会放的位，不引入新的误释放面。
+- 每 tick 一次的门用 `_r3r_resv_sweep_tick != (uint32_t)_tick_counter` 防重复进入。
+
+### 五、口径订正（重要，防下一轮再被旧注释带偏）
+
+`TrainCoupleHandler()` 里两处注释原文都声称"off-destination 时**全图**候选搜索每 tick 都跑"，**这是错的**，本轮已改写为：
+- 全图量级搜索只有 `YapfTrainCoupleTrack()`/`FindNearestCoupleTrain()`，入口 `CPL-SCAN` 由 `R3RCoupleScanHold()` 在空手后节流 8 tick；
+- `TrainCoupleHandler()` 每 tick 做的是常数级（本格/库出口两格哈希链）+ 链长级（`FollowTrainReservation`）+ 9 格贴靠扫描，**与地图尺寸无关**。
+⇒ 因此"大地图更慢"的真成因是 **(a) tick 本身变慢（P1 的审计全图扫曾是最大一项）；(b) A↔B 距离变大导致同段 tick 内路径搜索/跟随成本上升**，不是这里的遍历规模。
+
+### 六、构建自证
+
+| 轮次 | 触发 | 结果 | 产物 |
+|---|---|---|---|
+| 第一轮（P0/P1/P2 初版 + KI-385） | 上轮改了 `src\pbs.h` ⇒ 护栏判 REMOVED 620 obj 转全量 | `[692/692] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done`=`EXIT_CODE=0`、错误计数 0 | `build\openttd.exe` @ 2026-10-20 14:38:09（52 003 328 B） |
+| 第二轮（P2 收尾） | `GUARD: incremental is safe` | `[3/3] Linking`、`EXIT_CODE=0`、错误计数 0 | `src\train_cmd.cpp` 14:46:44 → obj 14:47:20 → `build\openttd.exe` @ 2026-10-20 14:47:26（52 003 328 B） |
+
+`read_lints` 0 条；两轮均复用既有 `_tmp_inc_build.cmd`（**未新建任何 .cmd**）。**发布树 build-release 本轮未编**（按 2026-10-19 口径：日常只编内测探针树），故 `build-release` 仍停留在第 255 轮之前的版本，不含 P0/P1/P2 与 KI-385 的改动。
+
+### 七、待复测判据
+
+1. 滚动中贴靠/命中行为逐字不变（rolling 本就不跑 3×3 扫描，未触碰）。
+2. off-destination 停稳机车的 `CPL-PAIR` 心跳变成"每 8 tick 一簇"，`COUPLE-WAIT-OFFDEST` 仍按边沿输出、不消失。
+3. 停稳在差几像素处时，停稳→`COUPLE-OK` 的 tick 差 ≤ 8（≈0.27 s）；若出现明显 >8 tick 的干等 ⇒ 回退这条门。
+4. 到点停稳场景完全不受影响（仍按 500 tick 门）。
+5. 两台机器同存档 `COUPLE-OK` 的 tick 一致（无本地状态）。
+6. `RESV-AUDIT-SUMMARY` 出现 `scanned=`（数千级，不再是 4 194 304）与 `us=`；挂接/解挂提交点墙钟不随地图增大而变。
+7. 无新增 `RESV-SWEEP-REAP` 误释放：活车有主位、台账内有主的位一律不得被扫掠释放（对照 `RESV-AUDIT-STRAY` 应下降而非上升）。
+
+### 八、未做 / 残留
+
+- KI-386 的另两条成因（候选搜索本身的成本、tick 时长）未单独收口：前者需 `CPL-SCAN nodes=` 现场读数定量，后者靠 P1 落地缓解。
+- `R3R_COUPLE_DEST_IDLE_LIMIT = 500` 未调整（KI-386 修法候选 A/B/C 仍待拍板；本轮只保证不再在它之上叠相位）。
+- 扫掠游标 `_r3r_resv_sweep_cursor` 是内存态（NOSAVE）：读档后从 0 开始，覆盖周期不受影响，但读档首轮游标位置与运行前不同（无行为影响，因为判据只认"无主 + 无台账 + 年龄"）。
+- `R3RPurgeStrayReservations()` 仍是全图扫（§9.3 清理清单已登记，未在本轮改）。
+- REG-255-A（`RESERVECONSIST ok=0 resNow=1`）未定，未动。
+

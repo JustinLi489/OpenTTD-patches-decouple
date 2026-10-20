@@ -87,9 +87,9 @@ struct R3RResvPhaseGuard {
  * of whoever was acting at that moment, which is the only caller-side fact that
  * survives chain edits.
  *
- * The tables are in-memory and not saved: after loading they are empty and the
- * ownership question falls back to the walk plus the audit (which reaps bits whose
- * ledger owner no longer exists). Keys are VehicleID values, never Train pointers,
+ * The tables are saved in the R3RL chunk (src/sl/couple_group_sl.cpp) and rebuilt on
+ * load, so a booking survives a savegame round trip and the audit still knows who
+ * wrote a bit after loading. Keys are VehicleID values, never Train pointers,
  * because a train can be deleted between booking and releasing.
  */
 inline constexpr uint32_t R3R_RESV_NO_OWNER = UINT32_MAX;
@@ -106,6 +106,24 @@ void R3RResvLedgerForget(VehicleID owner, const char *why);
  *  pbs.cpp). Leaves the map alone when the check fails, so a stale ledger row can
  *  never free somebody else's bit. */
 void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why);
+
+/** Visitor for R3RResvLedgerForEachBit(): \a track is INVALID_TRACK for a whole-tile
+ *  (station platform / waypoint) bit. */
+typedef void (*R3RResvBitVisitor)(TileIndex tile, Track track, void *ctx);
+/**
+ * R3R (第 255 轮, P1): hand every bit the ledger currently books to \a visit, in
+ * whatever order the table happens to have -- callers that need a stable order must
+ * sort what they collect.
+ *
+ * This is the "roster" the reservation audit walks instead of the map: on a 2048^2
+ * map the audit used to look at 4.19M tiles every 2048 ticks to find a few thousand
+ * booked bits, which is both the slowest periodic job in the game and the reason a
+ * ghost could only be found on that cadence. The callback form (instead of returning
+ * a vector) keeps pbs.h free of container headers, and it is the caller's business
+ * to copy what it needs before releasing anything: the visit must not mutate the
+ * ledger, or the iteration would be invalidated mid-walk.
+ */
+void R3RResvLedgerForEachBit(R3RResvBitVisitor visit, void *ctx);
 
 /**
  * VehicleID of \a v for R3RResvPhaseGuard, tolerating a null pointer (that leaves the
