@@ -4583,6 +4583,9 @@ static bool ClickTile_Station(TileIndex tile)
 	return true;
 }
 
+/* R3R: defined in train_cmd.cpp. */
+bool R3RTrainStopsAtWaypoint(const Train *v);
+
 /** @copydoc VehicleEnterTileProc */
 static VehicleEnterTileStates VehicleEnterTile_Station(Vehicle *v, TileIndex tile, int x, int y)
 {
@@ -4634,8 +4637,34 @@ static VehicleEnterTileStates VehicleEnterTile_Station(Vehicle *v, TileIndex til
 			if (dir != DiagDirection::SE && dir != DiagDirection::SW) x = TILE_SIZE - 1 - x;
 			stop &= TILE_SIZE - 1;
 
-			if (x == stop) {
-				if (consist->UsingRealisticBraking() && consist->cur_speed > 15 && !(consist->lookahead != nullptr && consist->lookahead->flags.Test(TrainReservationLookAheadFlag::ApplyAdvisory))) {
+			/* R3R (第 287/288 轮, 玩家拍板 R287-P1/P2 + 第 288 轮三条口径)：
+			 * 「到达」不能等于「车头进格」。
+			 *
+			 * 只有「等待区路点」（当前单是 OT_GOTO_WAYPOINT 且下一条是 OT_GOTO_COUPLE，
+			 * 判据见 R3RTrainStopsAtWaypoint()）才使用这条判据：车头走到停车标
+			 * （格内相对位置 TILE_SIZE - 半车长，见 R3RWaitWaypointStopOffset()）就算
+			 * 到达。停车标是相对量，绝不写成绝对格末，也绝不写 TILE_SIZE 本身
+			 * （x 在格内不可能到 16，会造出永不成立的死判据）。
+			 *
+			 * 这里刻意不做任何减速/钳制（玩家明确拒绝把速度钳制引入游戏）：减速只由
+			 * look-ahead 的 0 速目标驱动的原生刹车完成（见 GetTrainStopLocation() 的
+			 * r3r_head_stop 分支与 PredictStationStoppingLocation()，三处取同一个
+			 * R3RWaitWaypointStopOffset()）。原来那条「必须在停驶分支兜底推进订单」
+			 * 的路径（R3RAdvanceStoppedWaitWaypointOrder）已按玩家口径删除：不符合
+			 * 条件的列车根本不会把路点当作安全停车位，不需要兜底。
+			 *
+			 * 普通站台停靠、普通通过式路点逐字走原生 `x == stop`。 */
+			const bool r3r_head_stop = IsRailWaypoint(tile) && R3RTrainStopsAtWaypoint(consist);
+			/* R3R (第 288 轮): x >= stop 就算到达。
+			 * 第 287 轮把「cur_speed == 0」也写进判据，构成自指：look-ahead 的减速地板
+			 * 是 REALISTIC_BRAKING_MIN_SPEED(5)，越过目标点后还会被抬到 15，速度永远
+			 * 到不了 0 ⇒ 订单永不推进，车带着 15 一路冲过路点。
+			 * 现在停车标与 look-ahead 目标由 R3RWaitWaypointStopOffset() 同源计算
+			 * （相对位置，落在格内 TILE_SIZE-半车长处），车走到 stop 就是到了；归零交给
+			 * TrainEnterStation()，与原生站台停靠走同一条路径。 */
+			const bool r3r_arrived = r3r_head_stop ? (x >= stop) : (x == stop);
+			if (r3r_arrived) {
+				if (!r3r_head_stop && consist->UsingRealisticBraking() && consist->cur_speed > 15 && !(consist->lookahead != nullptr && consist->lookahead->flags.Test(TrainReservationLookAheadFlag::ApplyAdvisory))) {
 					/* Travelling too fast, do not stop and report overshoot to player */
 					if (consist->owner == _local_company) {
 						EncodedString msg = GetEncodedString(STR_NEWS_TRAIN_OVERSHOT_STATION,

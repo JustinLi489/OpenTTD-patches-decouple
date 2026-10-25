@@ -70,11 +70,11 @@ static const Order *ResolveOrder(VehicleID vehicle_id, ScriptOrder::OrderPositio
 	}
 	const Order *order = v->GetFirstOrder();
 	assert(order != nullptr);
-	while (order->GetType() == OT_IMPLICIT) order = v->orders->GetNextNoWrap(order);
+	while (order->GetType() == OT_IMPLICIT) order = v->GetEffectiveOrders()->GetNextNoWrap(order);
 	while (order_position > 0) {
 		order_position = (ScriptOrder::OrderPosition)(order_position - 1);
-		order = v->orders->GetNextNoWrap(order);
-		while (order->GetType() == OT_IMPLICIT) order = v->orders->GetNextNoWrap(order);
+		order = v->GetEffectiveOrders()->GetNextNoWrap(order);
+		while (order->GetType() == OT_IMPLICIT) order = v->GetEffectiveOrders()->GetNextNoWrap(order);
 	}
 	return order;
 }
@@ -93,13 +93,13 @@ static int ScriptOrderPositionToRealOrderPosition(VehicleID vehicle_id, ScriptOr
 	assert(ScriptOrder::IsValidVehicleOrder(vehicle_id, order_position));
 
 	int res = (int)order_position;
-	const Order *order = v->orders->GetFirstOrder();
+	const Order *order = v->GetEffectiveOrders()->GetFirstOrder();
 	assert(order != nullptr);
-	for (; order->GetType() == OT_IMPLICIT; order = v->orders->GetNextNoWrap(order)) res++;
+	for (; order->GetType() == OT_IMPLICIT; order = v->GetEffectiveOrders()->GetNextNoWrap(order)) res++;
 	while (order_position > 0) {
 		order_position = (ScriptOrder::OrderPosition)(order_position - 1);
-		order = v->orders->GetNextNoWrap(order);
-		for (; order->GetType() == OT_IMPLICIT; order = v->orders->GetNextNoWrap(order)) res++;
+		order = v->GetEffectiveOrders()->GetNextNoWrap(order);
+		for (; order->GetType() == OT_IMPLICIT; order = v->GetEffectiveOrders()->GetNextNoWrap(order)) res++;
 	}
 
 	return res;
@@ -118,7 +118,7 @@ static ScriptOrder::OrderPosition RealOrderPositionToScriptOrderPosition(Vehicle
 	int num_implicit_orders = 0;
 	for (int i = 0; i < order_position; i++) {
 		if (order->GetType() == OT_IMPLICIT) num_implicit_orders++;
-		order = v->orders->GetNextNoWrap(order);
+		order = v->GetEffectiveOrders()->GetNextNoWrap(order);
 	}
 	return static_cast<ScriptOrder::OrderPosition>(order_position - num_implicit_orders);
 }

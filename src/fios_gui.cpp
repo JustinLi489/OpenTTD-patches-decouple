@@ -959,7 +959,7 @@ public:
 					};
 
 					const FiosOrderListInfo &info = *this->order_list_info;
-					if (info.veh->orders != nullptr && info.order_insert_index == INVALID_VEH_ORDER_ID) {
+					if (info.veh->GetEffectiveOrders() != nullptr && info.order_insert_index == INVALID_VEH_ORDER_ID) {
 						ShowQuery(GetEncodedString(STR_ORDERLIST_JSON_CONFIRM_OVERRIDE_QUERY_CAPTION), GetEncodedString(STR_ORDERLIST_JSON_CONFIRM_OVERRIDE), this, callback);
 					} else {
 						callback(this, true);
@@ -1141,7 +1141,7 @@ public:
 			} else if (this->abstract_filetype == AbstractFileType::Orderlist) {
 				auto fh = FileHandle::Open(FiosMakeOrderListName(this->filename_editbox.text.GetText().c_str()), "w");
 				if (fh.has_value()) {
-					std::string data = OrderListToJSONString(this->order_list_info->veh->orders);
+					std::string data = OrderListToJSONString(this->order_list_info->veh->GetEffectiveOrders());
 					fwrite(data.data(), 1, data.size(), *fh);
 					this->Close();
 				}

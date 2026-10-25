@@ -537,6 +537,66 @@ bool R3RReleaseReservationLedgerChecked(uint32_t key, TileIndex tile, Track trac
 		return true;
 	}
 
+	/* R3R (KI-425): a tunnel or a bridge carries ONE whole-tile reservation, exactly
+	 * like a station platform, but KI-207c only routed the station case through this
+	 * function. Everything else fell through to the "-gone" tail below, which drops
+	 * the ledger row and leaves the bit on the map -- so nobody ever frees it and the
+	 * next train is walled in for the rest of the game (KI-422). */
+	if (IsValidTile(tile) && GetTileType(tile) == TileType::TunnelBridge &&
+			GetTunnelBridgeTransportType(tile) == TRANSPORT_RAIL) {
+		const TrackBits bits = GetTunnelBridgeReservationTrackBits(tile);
+		if (bits == TRACK_BIT_NONE) {
+			R3RResvLedgerDropBit(tile, track);
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s-gone\n",
+					key, (int)TileX(tile), (int)TileY(tile),
+					IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
+			return true;
+		}
+		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr) {
+			/* A train inside a tunnel has the portal as its tile, a train on a bridge
+			 * has the bridge head/middle as its tile: either way the bit is still
+			 * doing its job, so keep it booked. */
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s-hold\n",
+					key, (int)TileX(tile), (int)TileY(tile),
+					IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
+			return false;
+		}
+		/* A bridge head only accepts the tracks that really exist on it, and
+		 * UnreserveRailTrack() asserts against GetTileTrackStatus(), so never hand it
+		 * INVALID_TRACK nor a track that belongs to another tile. */
+		const Track free_track = (track != INVALID_TRACK && HasBit(bits, track)) ? track : FindFirstTrack(bits);
+		R3RResvPhaseGuard phase_guard("gc-tb");
+		UnreserveRailTrack(tile, free_track);
+		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s\n",
+				key, (int)TileX(tile), (int)TileY(tile),
+				IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
+		return true;
+	}
+
+	/* R3R (KI-425): same story for level crossings (SetCrossingReservation). */
+	if (IsValidTile(tile) && GetTileType(tile) == TileType::Road && IsLevelCrossing(tile)) {
+		if (!HasCrossingReservation(tile)) {
+			R3RResvLedgerDropBit(tile, track);
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s-gone\n",
+					key, (int)TileX(tile), (int)TileY(tile), why);
+			return true;
+		}
+		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr) {
+			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s-hold\n",
+					key, (int)TileX(tile), (int)TileY(tile), why);
+			return false;
+		}
+		const TrackBits cr_bits = GetCrossingReservationTrackBits(tile);
+		if (cr_bits != TRACK_BIT_NONE) {
+			const Track free_track = (track != INVALID_TRACK && HasBit(cr_bits, track)) ? track : FindFirstTrack(cr_bits);
+			R3RResvPhaseGuard cr_phase_guard("gc-cr");
+			UnreserveRailTrack(tile, free_track);
+		}
+		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s\n",
+				key, (int)TileX(tile), (int)TileY(tile), why);
+		return true;
+	}
+
 	const bool ours = IsValidTile(tile) && GetTileType(tile) == TileType::Railway &&
 			IsPlainRailTile(tile) && HasTrack(tile, track) &&
 			HasBit(GetRailReservationTrackBits(tile), track);
@@ -681,15 +741,84 @@ void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
 
 #if R3R_PROBES
 	if (!R3RDbgOn()) return;
-	if (!R3RIsWatchedResvTile(tile)) return;
+	/* R3R (第 274 轮, 2026-10-22, memo §7.10): the gate used to be "watched tile
+	 * only", which left every *non-native* booking on an unwatched tile silent --
+	 * that is why the bridge-head bits at 220/223/226/230,235 could never be traced
+	 * to a code path (KI-415's other half). A non-native change is one made under a
+	 * named phase; the native engine runs with the default phase "misc". So: log the
+	 * watched tiles exactly as before, plus every non-native change anywhere.
+	 *
+	 * The second half of the line budget rule: an unwatched tile can be written many
+	 * times per tick by a retrying caller, so those are aggregated per (kind, phase)
+	 * with a first-occurrence line and a periodic summary (see the block below). */
+	const bool watched = R3RIsWatchedResvTile(tile);
+	if (!watched && R3RResvPhaseIs(r3r_resv_phase, "misc")) return;
 	int actor = -1;
 	int head = -1;
 	if (const Vehicle *v = Vehicle::GetIfValid(r3r_resv_actor); v != nullptr) {
 		actor = (int)v->index.base();
 		if (const Vehicle *h = v->First(); h != nullptr) head = (int)h->index.base();
 	}
-	R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
-			kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
+	if (watched) {
+		R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
+				kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
+		return;
+	}
+	/* R3R (第 274 轮续, 2026-10-22, KI-419②): the per-key form below this comment used
+	 * to print the first change of every (tile, track, kind, phase) key plus a 1/64
+	 * repeat line. The rate limiter itself worked -- the busiest tile had 5 lines --
+	 * but the *unit* was wrong: one route booking walks a thousand tiles, so a single
+	 * session produced 6578 lines spread over 1300+ tiles, 54% of the log, with no
+	 * single line worth reading. The unit that matters is not the tile but the code
+	 * path, so aggregate per (kind, phase) and carry the distinct-tile count in the
+	 * summary: one full line for the first event of a pair, then one RESV-WATCH-SUM
+	 * per R3R_WATCH_SUM events. "A retry loop hammering three tiles" and "one long
+	 * path over a thousand tiles" stay distinguishable because the summary reports
+	 * both n and tiles.
+	 * The key uses the literal addresses of kind/phase, which are string literals at
+	 * every call site, so they are stable for the process lifetime. */
+	static const uint32_t R3R_WATCH_SUM = 256;
+	static const size_t R3R_WATCH_SEEN_MAX = 8192;
+	struct R3RWatchAgg {
+		uint32_t n = 0;
+		uint32_t tiles = 0;
+		uint32_t capped = 0;
+		TileIndex last = INVALID_TILE;
+		int actor = -1;
+		int head = -1;
+	};
+	static std::unordered_map<uint64_t, R3RWatchAgg> unwatched_agg;
+	static std::unordered_map<uint64_t, uint32_t> unwatched_seen;
+	const uint64_t pair = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kind)) ^
+			(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r3r_resv_phase)) << 3);
+	R3RWatchAgg &agg = unwatched_agg[pair];
+	agg.n++;
+	agg.last = tile;
+	agg.actor = actor;
+	agg.head = head;
+	/* Mixed rather than shifted: a hash collision here only makes "tiles" an
+	 * undercount, so a cheap mixing function is enough. The set is capped so a very
+	 * long session cannot grow it without bound; past the cap the summary says
+	 * capped=1 instead of lying about the count. */
+	const uint64_t seen_key = pair * 0x9E3779B97F4A7C15ULL ^
+			(static_cast<uint64_t>(tile.base()) << 8) ^
+			static_cast<uint64_t>(static_cast<uint8_t>(track));
+	if (unwatched_seen.find(seen_key) == unwatched_seen.end()) {
+		if (unwatched_seen.size() < R3R_WATCH_SEEN_MAX) {
+			unwatched_seen.emplace(seen_key, 1);
+			agg.tiles++;
+		} else {
+			agg.capped = 1;
+		}
+	}
+	if (agg.n == 1) {
+		R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
+				kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
+	} else if (agg.n % R3R_WATCH_SUM == 0) {
+		R3RDbgWrite("RESV-WATCH-SUM %s phase=%s n=%u tiles=%u capped=%u last=%d,%d actor=%d head=%d\n",
+				kind, r3r_resv_phase, agg.n, agg.tiles, agg.capped,
+				(int)TileX(agg.last), (int)TileY(agg.last), agg.actor, agg.head);
+	}
 #endif
 }
 
@@ -1028,6 +1157,69 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 	return false;
 }
 
+#if R3R_PROBES
+/**
+ * R3R (第 243 轮 REG-243-M / 第 274 轮续 KI-419②): log one real release.
+ *
+ * Called from UnreserveRailTrack() before the map setter fires, so the line lands
+ * directly in front of the setter's CLEAR-* line and the two can be read as one
+ * event. Watched tiles keep one line per release -- that is the KI-207 ghost trace.
+ * Everything else is aggregated per phase: the first release of a phase prints in
+ * full, then one UNRES-SUM per R3R_UNRES_SUM releases, carrying the distinct-tile
+ * count so "a retry loop on three tiles" and "one long path over a thousand tiles"
+ * stay distinguishable.
+ */
+static void R3RUnresWatchLog(TileIndex tile, Track t)
+{
+	if (!R3RDbgOn()) return;
+
+	if (R3RIsWatchedResvTile(tile)) {
+		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
+				(int)TileX(tile), (int)TileY(tile), (int)t,
+				r3r_resv_phase, (uint)r3r_resv_actor.base());
+		return;
+	}
+
+	static const uint32_t R3R_UNRES_SUM = 256;
+	static const size_t R3R_UNRES_SEEN_MAX = 8192;
+	struct R3RUnresAgg {
+		uint32_t n = 0;
+		uint32_t tiles = 0;
+		uint32_t capped = 0;
+		TileIndex last = INVALID_TILE;
+		uint32_t actor = 0;
+	};
+	static std::unordered_map<uint64_t, R3RUnresAgg> unres_agg;
+	static std::unordered_map<uint64_t, uint32_t> unres_seen;
+	/* Phase literals are stable for the process lifetime, so the pointer is a key. */
+	const uint64_t pair = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r3r_resv_phase));
+	R3RUnresAgg &agg = unres_agg[pair];
+	agg.n++;
+	agg.last = tile;
+	agg.actor = (uint32_t)r3r_resv_actor.base();
+	const uint64_t seen_key = pair * 0x9E3779B97F4A7C15ULL ^
+			(static_cast<uint64_t>(tile.base()) << 8) ^
+			static_cast<uint64_t>(static_cast<uint8_t>(t));
+	if (unres_seen.find(seen_key) == unres_seen.end()) {
+		if (unres_seen.size() < R3R_UNRES_SEEN_MAX) {
+			unres_seen.emplace(seen_key, 1);
+			agg.tiles++;
+		} else {
+			agg.capped = 1;
+		}
+	}
+	if (agg.n == 1) {
+		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
+				(int)TileX(tile), (int)TileY(tile), (int)t,
+				r3r_resv_phase, (uint)r3r_resv_actor.base());
+	} else if (agg.n % R3R_UNRES_SUM == 0) {
+		R3RDbgWrite("UNRES-SUM phase=%s n=%u tiles=%u capped=%u last=%d,%d actor=%u\n",
+				r3r_resv_phase, agg.n, agg.tiles, agg.capped,
+				(int)TileX(agg.last), (int)TileY(agg.last), agg.actor);
+	}
+}
+#endif /* R3R_PROBES */
+
 /**
  * Lift the reservation of a specific trackdir on a tile
  * This also sets PBS signals to red if unreserving through the facing track direction
@@ -1066,9 +1258,14 @@ void UnreserveRailTrack(TileIndex tile, Track t)
 	 * Only logged when the tile really carries a reservation, which keeps the volume
 	 * at "one line per real release". */
 	if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
-		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
-				(int)TileX(tile), (int)TileY(tile), (int)t,
-				r3r_resv_phase, (uint)r3r_resv_actor.base());
+#if R3R_PROBES
+		/* R3R (第 274 轮续, 2026-10-22, KI-419②): per-tile lines for unwatched tiles are
+		 * now aggregated per phase. A back-out loop releases the same three tiles 400+
+		 * times in one session (1218 of 1225 extend-backout lines), which was 35% of
+		 * the log and said nothing new after the first pass; the watched tiles keep
+		 * their one-line-per-release trace because that is the KI-207 ghost trap. */
+		R3RUnresWatchLog(tile, t);
+#endif
 	}
 
 	switch (GetTileType(tile)) {
@@ -1805,7 +2002,7 @@ PBSTileInfo FollowTrainReservation(const Train *v, Vehicle **train_on_res, Follo
 
 	FindTrainOnTrackInfo ftoti;
 	ftoti.res = FollowReservation(v->owner, v->GetIndirectCompatibleRailTypes(), tile, trackdir, FRF_NONE, v, nullptr);
-	ftoti.res.okay = flags.Test(FollowTrainReservationFlag::OkayUnused) ? false : IsSafeWaitingPosition(v, ftoti.res.tile, ftoti.res.trackdir, true, _settings_game.pf.forbid_90_deg);
+	ftoti.res.okay = flags.Test(FollowTrainReservationFlag::OkayUnused) ? false : IsSafeWaitingPosition(v, ftoti.res.tile, ftoti.res.trackdir, true, _settings_game.pf.forbid_90_deg, true);
 	if (train_on_res != nullptr) {
 		CheckTrainsOnTrack(ftoti, ftoti.res.tile);
 		if (ftoti.best != nullptr) *train_on_res = ftoti.best->First();
@@ -2801,11 +2998,25 @@ void R3RCollectReservedPathTiles(const Train *v, R3RResvTileHandler handler, voi
  * @param trackdir The trackdir to test
  * @param include_line_end Should end-of-line tiles be considered safe?
  * @param forbid_90deg Don't allow trains to make 90 degree turns
+ * @param treat_waypoint_as_safe Treat a waypoint tile as a safe stopping position.
+ *        Only the reservation-end call chain passes true (see R3R 第 284 轮):
+ *        a waypoint is a legitimate place to stop when it is the order the train
+ *        is currently driving to, and stopping there keeps the reservation from
+ *        being extended into the *next* order (which is what made reservations
+ *        span waypoints and the signals behind them). YAPF cost / destination
+ *        detection and the track-removal protection pass false, so pathfinding
+ *        behaviour is unchanged.
  * @return True if it is a safe position
  */
-bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg)
+bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg, bool treat_waypoint_as_safe)
 {
 	if (IsRailDepotTile(tile)) return true;
+
+	/* R3R (第 284 轮): a waypoint the train is currently heading for is a valid
+	 * place to end the reservation. Checked first so that the "next tile" rules
+	 * below (which usually do not see a signal on a waypoint tile) cannot push
+	 * the reservation past it. See the parameter documentation above. */
+	if (treat_waypoint_as_safe && IsRailWaypointTile(tile)) return true;
 
 	/* For non-pbs signals, stop on the signal tile. */
 	if (HasBlockSignalOnTrackdir(tile, trackdir)) return true;

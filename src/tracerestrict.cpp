@@ -482,8 +482,8 @@ bool TraceRestrictIsVehicleInSlotGroup(const TraceRestrictSlotGroup *sg, Owner o
 
 static const Order *TraceRestrictGetNextGotoOrder(const Train *v)
 {
-	if (v->orders == nullptr) return nullptr;
-	if (v->orders->GetNumOrders() == 0) return nullptr;
+	if (v->GetEffectiveOrders() == nullptr) return nullptr;
+	if (v->GetEffectiveOrders()->GetNumOrders() == 0) return nullptr;
 
 	const auto num_orders = v->GetNumOrders();
 	const uint max_depth = std::min<uint>(32, num_orders);

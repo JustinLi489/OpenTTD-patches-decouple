@@ -39,9 +39,10 @@ inline uint32_t _r3r_cpl_scan_noconsist = 0; ///< 早退：格合格但格上扫
 inline uint32_t _r3r_cpl_scan_consist = 0;   ///< 扫到车底，进入三道闸门
 inline uint32_t _r3r_cpl_scan_rej[4] = { 0, 0, 0, 0 }; ///< GROUP / FIT / TARGET / ORDER
 inline uint32_t _r3r_cpl_scan_acc[2] = { 0, 0 };       ///< car-only / waiting
+inline uint32_t _r3r_cpl_scan_accwp = 0;      ///< R3R 第 276 轮：等待区路点被接受为终点（截断模式）
 inline uint32_t _r3r_cpl_scan_last_tile = 0;  ///< 最近扫到的车底所在格（TileIndex::base()）
 inline int _r3r_cpl_scan_last_veh = -1;       ///< 最近扫到的车底链头车号（-1=无）
-inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait
+inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait / 6=cut-wp
 
 /** 每次挂接寻路开始前清零（调用点：CYapfTrainRailT::FindNearestCoupleTrain）。 */
 inline void R3RCoupleScanReset()
@@ -53,6 +54,7 @@ inline void R3RCoupleScanReset()
 	_r3r_cpl_scan_consist = 0;
 	_r3r_cpl_scan_rej[0] = _r3r_cpl_scan_rej[1] = _r3r_cpl_scan_rej[2] = _r3r_cpl_scan_rej[3] = 0;
 	_r3r_cpl_scan_acc[0] = _r3r_cpl_scan_acc[1] = 0;
+	_r3r_cpl_scan_accwp = 0;
 	_r3r_cpl_scan_last_tile = 0;
 	_r3r_cpl_scan_last_veh = -1;
 	_r3r_cpl_scan_last_why = -1;
@@ -66,15 +68,15 @@ inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit, uint 
 {
 	FILE *dbg = R3RFopenDbg("a");
 	if (dbg == nullptr) return;
-	static const char * const why_names[6] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait" };
+	static const char * const why_names[7] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait", "cut-wp" };
 	const bool has_last = (_r3r_cpl_scan_last_why >= 0);
-	const char *why = (has_last && _r3r_cpl_scan_last_why < 6) ? why_names[_r3r_cpl_scan_last_why] : "none";
+	const char *why = (has_last && _r3r_cpl_scan_last_why < 7) ? why_names[_r3r_cpl_scan_last_why] : "none";
 	/* R3R (第 255 轮, P0)：补 tick= 与 nodes=。tick 是同步 tick（30/s），有了它才能把
 	 * "一次挂接在 YAPF 里烧掉多少节点"与"挂车总耗时多久"直接相减；nodes = closed + enter
 	 * 是本次搜索真正走过的节点规模（enter 含 PfCalcEstimate 的重复访问，closed 只算扩展），
 	 * 二者一起才能回答"大地图上一次搜索是不是 O(地图)"。 */
 	fprintf(dbg, "CPL-SCAN tick=%u veh=%d found=%d closed=%u limit=%u nodes=%u enter=%u noplat=%u nores=%u noconsist=%u consist=%u "
-			"rej=%u/%u/%u/%u acc=%u/%u last=%d,%d lastveh=%d why=%s\n",
+			"rej=%u/%u/%u/%u acc=%u/%u accwp=%u last=%d,%d lastveh=%d why=%s\n",
 			(unsigned)tick, veh, found, closed, limit, (unsigned)nodes,
 			(unsigned)_r3r_cpl_scan_enter, (unsigned)_r3r_cpl_scan_noplat,
 			(unsigned)_r3r_cpl_scan_nores, (unsigned)_r3r_cpl_scan_noconsist,
@@ -82,6 +84,7 @@ inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit, uint 
 			(unsigned)_r3r_cpl_scan_rej[0], (unsigned)_r3r_cpl_scan_rej[1],
 			(unsigned)_r3r_cpl_scan_rej[2], (unsigned)_r3r_cpl_scan_rej[3],
 			(unsigned)_r3r_cpl_scan_acc[0], (unsigned)_r3r_cpl_scan_acc[1],
+			(unsigned)_r3r_cpl_scan_accwp,
 			has_last ? (int)TileX(TileIndex(_r3r_cpl_scan_last_tile)) : -1,
 			has_last ? (int)TileY(TileIndex(_r3r_cpl_scan_last_tile)) : -1,
 			_r3r_cpl_scan_last_veh, why);
@@ -413,11 +416,65 @@ public:
 	 * 再加装货/货种/车数三条命令属性。机车自身路径的预留仍照常执行 tracerestrict
 	 * 程序（含 slot acquire/release），那属于寻路与信号系统，与挂接判定无关。 */
 
+	/* R3R (第 276 轮, KI-429): 等待区路点截断。
+	 *
+	 * 玩家口径（Q-276-4 拍板）：机车前往 GOTO_COUPLE 的途中，只要还没到"可以
+	 * 延伸预留"的状态，整条 PBS 预留就只允许订到**等待区路点**为止，绝不允许
+	 * 一路铺到（甚至越过）目标车底。截断点因此天然落在一个合法停车位上，不会
+	 * 再停在道岔格里（KI-429 的 FSCP tile=258,233）。
+	 *
+	 * 判定入口在 yapf_rail.cpp 的 FindNearestCoupleTrain()：由
+	 * R3RShouldCutCoupleAtWaitPoint()（train_cmd.cpp）决定本次寻路要不要截断，
+	 * 每 tick 重算 ⇒ A 停稳后自动解除，机车这才去订到 A 的那一段。
+	 *
+	 * 默认 false：非挂接寻路（其它 YAPF 用途不经过这里）与"已放行"的挂接寻路
+	 * 逐字不变。 */
+	bool couple_wait_cut = false;
+
+	/* 截断模式下唯一允许的终点：等待区路点的 StationID + 1（0 = 不限定）。
+	 *
+	 * 必须点名而不是"任一路点都算"：线路上可能还有别的路点（含刚驶过的那个），
+	 * 若一律接受，YAPF 的最小代价落点就可能变成身后的路点，把机车往回引。 */
+	uint32_t couple_wait_cut_wp = 0;
+
+	void SetCoupleWaitCut(bool cut, uint32_t wait_wp)
+	{
+		this->couple_wait_cut = cut;
+		this->couple_wait_cut_wp = wait_wp;
+	}
+
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
 	{
 		/* R3R (第 236 轮, KI-344): 无条件清点本次扫描，见文件头的 census 说明。 */
 		++_r3r_cpl_scan_enter;
+
+		/* R3R (第 276 轮, KI-429): 截断模式——本次寻路只认等待区路点作终点。
+		 *
+		 * 其它格（含站台、车库、以及"别的路点"）一律否决，这样 YAPF 的落点
+		 * 必定是路点、回溯/预留必定止于路点。
+		 *
+		 * 路点格恒是单轴站台格（GetRailStationTrackBits() = AxisToTrackBits(axis)），
+		 * 所以这里不额外判"是否单轨"——多轨路点在游戏里不存在。 */
+		if (this->couple_wait_cut) {
+			if (!IsRailWaypointTile(tile) ||
+					(this->couple_wait_cut_wp != 0 && (uint32_t)GetStationIndex(tile).base() + 1 != this->couple_wait_cut_wp)) {
+				++_r3r_cpl_scan_noplat;
+				return false;
+			}
+			++_r3r_cpl_scan_accwp;
+			_r3r_cpl_scan_last_tile = tile.base();
+			_r3r_cpl_scan_last_why = 6;
+			/* 一次扫描里路点可能被反复探测（含多格路点），只在第一格打一行。 */
+			if (_r3r_cpl_scan_accwp == 1) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFD-ACCEPT kind=waitwp tile=%d,%d\n", TileX(tile), TileY(tile));
+					fclose(dbg);
+				}
+			}
+			return true;
+		}
 
 		/* Only platform or depot tiles qualify. */
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) {
@@ -547,6 +604,45 @@ public:
 		 * every station/depot tile of every path search, so it may not be logged one
 		 * for one. */
 		if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), t)) {
+			/* R3R (第 289 轮, 只读取证): CPL-SCAN 的 rej[0]=3 已经证明拒绝来自
+			 * R3RCoupleAllowed() 的第一个子判据，但「pair 不成立 / 目的地不在本车站 /
+			 * 分组白名单」三种成因在日志里都只能推断，不能直读 —— 扫描层
+			 * TrainCoupleHandler 用的是**不含 pair**的 R3RCoupleAllowedIgnoringPair()，
+			 * 它能过、寻路层却全拒，本身就把嫌疑指向 pair-mismatch，但仍需铁证。
+			 *
+			 * 这一行把三个子判据的真值连同双方锁字段、停驶标志一次打出来：
+			 *   pairOK=0        -> R3RCouplePairMatches() 假（锁为空/只有一半）
+			 *   pairOK=1 ignOK=0 -> 目的地或分组；再看 tStn vs destStn / isDepot
+			 *   aStop/tStop     -> 直接检验「停驶即清锁」那条机制是否在生效
+			 * 限量 16 行/进程（BSS 静态计数），零行为变更。 */
+			static uint32_t r3r_why_seen = 0;
+			if (++r3r_why_seen <= 16) {
+				const Train *r3r_act = Train::From(Yapf().GetVehicle());
+				const Train *r3r_ch = (r3r_act != nullptr) ? Train::From(r3r_act->First()) : nullptr;
+				const Train *r3r_th = Train::From(t->First());
+				if (r3r_act != nullptr && r3r_ch != nullptr && r3r_th != nullptr) {
+					const bool r3r_pair_ok = R3RCouplePairMatches(r3r_act, t);
+					const bool r3r_ign_ok = R3RCoupleAllowedIgnoringPair(r3r_act, t);
+					const Order &r3r_co = r3r_ch->current_order;
+					const bool r3r_is_depot = r3r_co.GetCoupleIsDepot();
+					const uint r3r_dest_stn = r3r_is_depot ? 0u : (uint)r3r_co.GetDestination().ToStationID().base();
+					const uint r3r_a_stn = IsRailStationTile(r3r_ch->tile) ? (uint)GetStationIndex(r3r_ch->tile).base() : 0xFFFFu;
+					const uint r3r_t_stn = IsRailStationTile(r3r_th->tile) ? (uint)GetStationIndex(r3r_th->tile).base() : 0xFFFFu;
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "CPL-WHY node=%d,%d act=%d tgt=%d ch=%d th=%d pairTgt=%d pairReq=%d pairOK=%d ignOK=%d aStn=%d tStn=%d destStn=%d isDepot=%d aStop=%d tStop=%d n=%u\n",
+								(int)TileX(tile), (int)TileY(tile),
+								(int)r3r_act->index.base(), (int)t->index.base(),
+								(int)r3r_ch->index.base(), (int)r3r_th->index.base(),
+								(int)r3r_ch->r3r_couple_target.base(), (int)r3r_th->r3r_couple_requester.base(),
+								(int)r3r_pair_ok, (int)r3r_ign_ok,
+								(int)r3r_a_stn, (int)r3r_t_stn, (int)r3r_dest_stn, (int)r3r_is_depot,
+								(int)r3r_act->vehstatus.Test(VehState::Stopped),
+								(int)t->vehstatus.Test(VehState::Stopped), (unsigned)r3r_why_seen);
+						fclose(dbg);
+					}
+				}
+			}
 			r3r_dest_reject(0, tile, t);
 			return false;
 		}

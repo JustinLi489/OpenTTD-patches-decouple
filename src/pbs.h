@@ -290,7 +290,7 @@ int AdvanceTrainReservationLookaheadEnd(const Train *v, int lookahead_end_positi
 void SetTrainReservationLookaheadEnd(Train *v);
 void FillTrainReservationLookAhead(Train *v);
 bool TrainReservationPassesThroughTile(const Train *v, TileIndex search_tile);
-bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg = false);
+bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg = false, bool treat_waypoint_as_safe = false);
 
 struct TraceRestrictProgram;
 

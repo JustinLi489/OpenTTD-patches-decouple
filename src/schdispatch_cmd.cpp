@@ -77,14 +77,14 @@ CommandCost CmdSchDispatchAdd(DoCommandFlags flags, VehicleID veh, uint32_t sche
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (extra_slots > 512) return CommandCost(STR_ERROR_SCHDISPATCH_TRIED_TO_ADD_TOO_MANY_SLOTS);
 	if (extra_slots > 0 && offset == 0) return CMD_ERROR;
 
-	DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+	DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 
 	if (route_id != 0 && ds.GetSupplementaryName(DispatchSchedule::SupplementaryNameType::RouteID, route_id).empty()) return CMD_ERROR;
 
@@ -118,12 +118,12 @@ CommandCost CmdSchDispatchRemove(DoCommandFlags flags, VehicleID veh, uint32_t s
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).RemoveScheduledDispatch(time);
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).RemoveScheduledDispatch(time);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -147,12 +147,12 @@ CommandCost CmdSchDispatchSetDuration(DoCommandFlags flags, VehicleID veh, uint3
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+		DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 		ds.SetScheduledDispatchDuration(duration);
 		ds.UpdateScheduledDispatch(nullptr);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
@@ -178,12 +178,12 @@ CommandCost CmdSchDispatchSetStartDate(DoCommandFlags flags, VehicleID veh, uint
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+		DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 		ds.SetScheduledDispatchStartTick(start_tick);
 		ds.UpdateScheduledDispatch(nullptr);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
@@ -209,12 +209,12 @@ CommandCost CmdSchDispatchSetDelay(DoCommandFlags flags, VehicleID veh, uint32_t
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchDelay(max_delay);
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchDelay(max_delay);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -238,12 +238,12 @@ CommandCost CmdSchDispatchSetReuseSlots(DoCommandFlags flags, VehicleID veh, uin
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchReuseSlots(re_use_slots);
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchReuseSlots(re_use_slots);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -271,12 +271,12 @@ CommandCost CmdSchDispatchResetLastDispatch(DoCommandFlags flags, VehicleID veh,
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchLastDispatch(INVALID_SCHEDULED_DISPATCH_OFFSET);
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).SetScheduledDispatchLastDispatch(INVALID_SCHEDULED_DISPATCH_OFFSET);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -299,12 +299,12 @@ CommandCost CmdSchDispatchClear(DoCommandFlags flags, VehicleID veh, uint32_t sc
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).ClearScheduledDispatch();
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).ClearScheduledDispatch();
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -328,16 +328,18 @@ CommandCost CmdSchDispatchAddNewSchedule(DoCommandFlags flags, VehicleID veh, St
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders != nullptr && v->orders->GetScheduledDispatchScheduleCount() >= 4096) return CMD_ERROR;
+	if (v->GetEffectiveOrders() != nullptr && v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() >= 4096) return CMD_ERROR;
 
-	if (v->orders == nullptr && !OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
+	if (v->GetEffectiveOrders() == nullptr && !OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		if (v->orders == nullptr) {
+		/* R3R (KI-465 修法 D): 只在自己真没有表（也不是跟随者）时才新建；
+		 * 跟随者的排班挂在跟随表上，给它造一张自己的空表只会成为孤儿。 */
+		if (v->GetEffectiveOrders() == nullptr) {
 			v->orders = OrderList::Create(nullptr, v);
 		}
-		v->orders->GetScheduledDispatchScheduleSet().emplace_back();
-		DispatchSchedule &ds = v->orders->GetScheduledDispatchScheduleSet().back();
+		v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet().emplace_back();
+		DispatchSchedule &ds = v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet().back();
 		ds.SetScheduledDispatchDuration(duration);
 		ds.SetScheduledDispatchStartTick(start_tick);
 		ds.UpdateScheduledDispatch(nullptr);
@@ -363,12 +365,12 @@ CommandCost CmdSchDispatchRemoveSchedule(DoCommandFlags flags, VehicleID veh, ui
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		std::vector<DispatchSchedule> &scheds = v->orders->GetScheduledDispatchScheduleSet();
+		std::vector<DispatchSchedule> &scheds = v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
 		scheds.erase(scheds.begin() + schedule_index);
 		for (Order *o : v->Orders()) {
 			int idx = o->GetDispatchScheduleIndex();
@@ -429,9 +431,9 @@ CommandCost CmdSchDispatchRenameSchedule(DoCommandFlags flags, VehicleID veh, ui
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	bool reset = name.empty();
 
@@ -441,9 +443,9 @@ CommandCost CmdSchDispatchRenameSchedule(DoCommandFlags flags, VehicleID veh, ui
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		if (reset) {
-			v->orders->GetDispatchScheduleByIndex(schedule_index).ScheduleName().clear();
+			v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).ScheduleName().clear();
 		} else {
-			v->orders->GetDispatchScheduleByIndex(schedule_index).ScheduleName() = name;
+			v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).ScheduleName() = name;
 		}
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH | STWDF_ORDERS);
 	}
@@ -469,15 +471,15 @@ CommandCost CmdSchDispatchRenameTag(DoCommandFlags flags, VehicleID veh, uint32_
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 	if (tag_id >= DispatchSchedule::DEPARTURE_TAG_COUNT) return CMD_ERROR;
 
 	if (Utf8StringLength(name) >= MAX_LENGTH_VEHICLE_NAME_CHARS) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->GetDispatchScheduleByIndex(schedule_index).SetSupplementaryName(DispatchSchedule::SupplementaryNameType::DepartureTag, tag_id, name);
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).SetSupplementaryName(DispatchSchedule::SupplementaryNameType::DepartureTag, tag_id, name);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH | STWDF_ORDERS);
 	}
 
@@ -502,9 +504,9 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 	if (route_id == 0 && name.empty()) return CMD_ERROR;
 	if (route_id >= INVALID_DISPATCH_SLOT_ROUTE_ID) return CMD_ERROR;
 
@@ -512,7 +514,7 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 
 	if (!name.empty()) {
 		bool in_use = false;
-		v->orders->GetDispatchScheduleByIndex(schedule_index).IterateRouteIDNames([&](DispatchSlotRouteID existing_id, std::string_view existing_name) {
+		v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index).IterateRouteIDNames([&](DispatchSlotRouteID existing_id, std::string_view existing_name) {
 			if (existing_id != route_id && existing_name == name) in_use = true;
 		});
 		if (in_use) return CommandCost(STR_ERROR_NAME_MUST_BE_UNIQUE);
@@ -520,7 +522,7 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 
 	if (route_id == 0) {
 		/* Find suitable ID */
-		const DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+		const DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 		const auto &names = ds.GetSupplementaryNameMap();
 		route_id = 1;
 		auto it = names.find(DispatchSchedule::SupplementaryNameKey(DispatchSchedule::SupplementaryNameType::RouteID, route_id));
@@ -542,7 +544,7 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+		DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 
 		if (!name.empty()) {
 			ds.SetSupplementaryName(DispatchSchedule::SupplementaryNameType::RouteID, route_id, name);
@@ -602,13 +604,13 @@ CommandCost CmdSchDispatchDuplicateSchedule(DoCommandFlags flags, VehicleID veh,
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
-	if (v->orders->GetScheduledDispatchScheduleCount() >= 4096) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() >= 4096) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		DispatchSchedule &ds = v->orders->GetScheduledDispatchScheduleSet().emplace_back(v->orders->GetDispatchScheduleByIndex(schedule_index));
+		DispatchSchedule &ds = v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet().emplace_back(v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index));
 		ds.ResetStateAfterClone();
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
@@ -635,13 +637,15 @@ CommandCost CmdSchDispatchAppendVehSchedules(DoCommandFlags flags, VehicleID dst
 	CommandCost ret = CheckOwnership(v1->owner);
 	if (ret.Failed()) return ret;
 
-	if (v1->orders == nullptr || v2->orders == nullptr || v1->orders == v2->orders) return CMD_ERROR;
+	/* R3R (KI-465 修法 D): "同一张表"按有效表比较，跟随者自己的 orders 可能是无关的空表。 */
+	if (v1->GetEffectiveOrders() == nullptr || v2->GetEffectiveOrders() == nullptr ||
+			v1->GetEffectiveOrders() == v2->GetEffectiveOrders()) return CMD_ERROR;
 
-	if (v1->orders->GetScheduledDispatchScheduleCount() + v2->orders->GetScheduledDispatchScheduleCount() > 4096) return CMD_ERROR;
+	if (v1->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() + v2->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() > 4096) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		for (uint i = 0; i < v2->orders->GetScheduledDispatchScheduleCount(); i++) {
-			DispatchSchedule &ds = v1->orders->GetScheduledDispatchScheduleSet().emplace_back(v2->orders->GetDispatchScheduleByIndex(i));
+		for (uint i = 0; i < v2->GetEffectiveOrders()->GetScheduledDispatchScheduleCount(); i++) {
+			DispatchSchedule &ds = v1->GetEffectiveOrders()->GetScheduledDispatchScheduleSet().emplace_back(v2->GetEffectiveOrders()->GetDispatchScheduleByIndex(i));
 			ds.ResetStateAfterClone();
 		}
 		SetTimetableWindowsDirty(v1, STWDF_SCHEDULED_DISPATCH);
@@ -668,11 +672,11 @@ CommandCost CmdSchDispatchAdjust(DoCommandFlags flags, VehicleID veh, uint32_t s
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
-	DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+	DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 	if (abs(adjustment) >= (int)ds.GetScheduledDispatchDuration()) return CommandCost(STR_ERROR_SCHDISPATCH_ADJUSTMENT_TOO_LARGE);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -765,13 +769,13 @@ CommandCost CmdSchDispatchAdjustSlot(DoCommandFlags flags, VehicleID veh, uint32
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (!slots.IsValid()) return CMD_ERROR;
 
-	DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+	DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 	if (abs(adjustment) >= (int)ds.GetScheduledDispatchDuration()) return CommandCost(STR_ERROR_SCHDISPATCH_ADJUSTMENT_TOO_LARGE);
 
 	std::vector<DispatchSlot> schedule = ds.GetScheduledDispatch(); // Clone schedule
@@ -817,14 +821,14 @@ CommandCost CmdSchDispatchSwapSchedules(DoCommandFlags flags, VehicleID veh, uin
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	if (schedule_index_1 == schedule_index_2) return CMD_ERROR;
-	if (schedule_index_1 >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
-	if (schedule_index_2 >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index_1 >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index_2 >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		std::swap(v->orders->GetDispatchScheduleByIndex(schedule_index_1), v->orders->GetDispatchScheduleByIndex(schedule_index_2));
+		std::swap(v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index_1), v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index_2));
 		for (Order *o : v->Orders()) {
 			int idx = o->GetDispatchScheduleIndex();
 			if (idx == (int)schedule_index_1) {
@@ -887,13 +891,13 @@ CommandCost CmdSchDispatchSetSlotFlags(DoCommandFlags flags, VehicleID veh, uint
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (!slots.IsValid()) return CMD_ERROR;
 
-	DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+	DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 	uint32_t change_count = ApplyDispatchSlotSetToSchedule(ds.GetScheduledDispatchMutable(), slots, [&](DispatchSlot &slot) {
 		if (flags.Test(DoCommandFlag::Execute)) {
 			slot.flags &= ~mask;
@@ -928,13 +932,13 @@ CommandCost CmdSchDispatchSetSlotRoute(DoCommandFlags flags, VehicleID veh, uint
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (v->orders == nullptr) return CMD_ERROR;
+	if (v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
-	if (schedule_index >= v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+	if (schedule_index >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 
 	if (!slots.IsValid()) return CMD_ERROR;
 
-	DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_index);
+	DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 
 	if (route_id != 0 && ds.GetSupplementaryName(DispatchSchedule::SupplementaryNameType::RouteID, route_id).empty()) return CMD_ERROR;
 

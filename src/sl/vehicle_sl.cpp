@@ -729,7 +729,10 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 				const Train *wt = Train::From(w);
 				uint n = 0;
 				for (const Vehicle *q = w; q != nullptr; q = q->Next()) n++;
-				const Order *r = (w->orders != nullptr) ? w->GetOrder(w->cur_real_order_index) : nullptr;
+				/* R3R (KI-465 修法 D): dump what the chain actually runs; a follower's own
+				 * `orders` is just its parked/idle table and would print an empty schedule. */
+				const OrderList *const eff = w->GetEffectiveOrders();
+				const Order *r = (eff != nullptr) ? w->GetOrder(w->cur_real_order_index) : nullptr;
 				const bool rail_tile = IsTileType(w->tile, TileType::Railway);
 				const uint depot_idx = (rail_tile && IsRailDepotTile(w->tile)) ? GetDepotIndex(w->tile).base() : UINT_MAX;
 				fprintf(dbg, "R3RDUMP-CHAIN head=%d ow=%d isai=%d n=%u stopped=%d inDepot=%d spd=%u prio=%u borrow=%d"
@@ -739,15 +742,15 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 						(int)(Company::IsValidID(w->owner) ? Company::Get(w->owner)->is_ai : -1), n,
 						(int)w->vehstatus.Test(VehState::Stopped), (int)wt->IsStoppedInDepot(), (unsigned)wt->cur_speed,
 						(unsigned)w->r3r_priority, (int)w->r3r_orders_borrowed,
-						(unsigned)(w->orders != nullptr ? w->orders->GetNumOrders() : 0),
+						(unsigned)(eff != nullptr ? eff->GetNumOrders() : 0),
 						(int)(w->orders_backup != nullptr),
 						(unsigned)w->cur_real_order_index, (unsigned)w->cur_implicit_order_index,
 						(int)w->current_order.GetType(), (int)(r != nullptr ? r->GetType() : -1),
 						TileX(w->tile), TileY(w->tile), (int)(rail_tile ? GetTileOwner(w->tile).base() : -1),
 						(int)(depot_idx != UINT_MAX), (int)(depot_idx == UINT_MAX ? -1 : (int)depot_idx));
-				if (w->orders != nullptr) {
-					for (uint i = 0; i < w->orders->GetNumOrders(); i++) {
-						const Order *o = w->orders->GetOrderAt(i);
+				if (eff != nullptr) {
+					for (uint i = 0; i < eff->GetNumOrders(); i++) {
+						const Order *o = eff->GetOrderAt(i);
 						if (o == nullptr) continue;
 						fprintf(dbg, "R3RDUMP-ORDER head=%d i=%u type=%d dest=%u isDepot=%d\n",
 								(int)w->index.base(), i, (int)o->GetType(),

@@ -984,6 +984,49 @@ static StringID GetDepotOrderGoToString(const Order &order)
 }
 
 /**
+ * R3R (KI-397, 第 263 轮续三): is the order drawn at \a order_index a row the
+ * automatic recorder wrote into a segment's own schedule?
+ *
+ * The recorder keeps its rounds in the schedule of the segment which was *not*
+ * the one being driven, so the list on screen (the one of the vehicle the order
+ * window belongs to) only stands for a segment row when it really is that
+ * segment's own list; a segment running somebody else's schedule still owns its
+ * own list in `orders` (KI-465 fix D: following is a separate pointer, it never
+ * replaces the ownership), and the list on screen is the effective one. Rows
+ * inside an auto recorded range are a record only -- the train never executes
+ * them -- so they are drawn greyed out and suffixed, which is what tells them
+ * apart from commands the player wrote.
+ */
+static bool R3RIsAutoRecordedOrderRow(const Vehicle *v, int order_index)
+{
+	if (v == nullptr || v->type != VehicleType::Train || v->GetEffectiveOrders() == nullptr) return false;
+	if (order_index < 0 || order_index > 0xFFFF) return false;
+
+	const OrderList *const shown = v->GetEffectiveOrders();
+	const Vehicle *const head = v->First();
+	const uint16_t idx = (uint16_t)order_index;
+	for (const Vehicle *w = head; w != nullptr; w = w->Next()) {
+		if (w != head && !Train::From(w)->IsSegmentFront()) continue;
+		if (w->r3r_segment_id == R3R_SEGMENT_NONE) continue;
+
+		/* The segment's own list; the parked backup is only a fallback for the
+		 * legacy parked state (a depot drag before the follow pointer existed). */
+		const OrderList *const own = w->orders != nullptr ? w->orders : w->orders_backup;
+		if (own == nullptr || own != shown) continue;
+
+		const R3RSegmentRecord *const row = R3RSegmentGet(w->r3r_segment_id);
+		if (row == nullptr) continue;
+
+		for (uint8_t s = 0; s < R3RSegmentRecord::AUTO_RANGE_SLOTS; s++) {
+			if (row->auto_ranges_count[s] == 0) continue;
+			const uint16_t begin = row->auto_ranges_begin[s];
+			if (idx >= begin && idx < (uint16_t)(begin + row->auto_ranges_count[s])) return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Draws an order in order or timetable GUI
  * @param v Vehicle the order belongs to
  * @param order The order to draw
@@ -1010,8 +1053,10 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		DrawSprite(sprite, PAL_NONE, rtl ? right -     sprite_size.width : left,                     y + ((int)GetCharacterHeight(FontSize::Normal) - (int)sprite_size.height) / 2);
 	}
 
+	const bool auto_recorded = !timetable && R3RIsAutoRecordedOrderRow(v, order_index);
+
 	ExtendedTextColour colour{TextColour::Black};
-	if (order->IsType(OT_IMPLICIT)) {
+	if (order->IsType(OT_IMPLICIT) || auto_recorded) {
 		colour = ExtendedTextColour{selected ? TextColour::Silver : TextColour::Grey, ExtendedTextColourFlag::NoShade};
 	} else {
 		if (selected) {
@@ -1310,8 +1355,8 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 				std::string schedule_str;
 				if (schedule_id != UINT16_MAX) {
 					bool have_name = false;
-					if (schedule_id < v->orders->GetScheduledDispatchScheduleCount()) {
-						const DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(schedule_id);
+					if (schedule_id < v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+						const DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_id);
 						selected_schedule = &ds;
 						if (!ds.ScheduleName().empty()) {
 							schedule_str = ds.ScheduleName();
@@ -1570,7 +1615,7 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 
 	/* Check range for aircraft. */
 	if (v->type == VehicleType::Aircraft && Aircraft::From(v)->GetRange() > 0 && order->IsGotoOrder()) {
-		const Order *next = v->orders->GetNext(order);
+		const Order *next = v->GetEffectiveOrders()->GetNext(order);
 		if (GetOrderDistance(order, next, v) > Aircraft::From(v)->acache.cached_max_range_sqr) {
 			AppendStringInPlace(line, STR_ORDER_OUT_OF_RANGE);
 		}
@@ -1580,16 +1625,20 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		AppendStringInPlace(line, STR_TIMETABLE_LEAVE_EARLY_ORDER + order->GetLeaveType() - OLT_LEAVE_EARLY);
 	}
 
+	/* (KI-397) Mark the rows the automatic recorder wrote: they are a record of
+	 * where the segment went, never a command it executes. */
+	if (auto_recorded) AppendStringInPlace(line, STR_ORDER_R3R_AUTO_FILLED);
+
 	int edge = DrawString(rtl ? left : middle, rtl ? middle : right, y, line, colour);
 	line.clear();
 
 	if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && order->IsScheduledDispatchOrder(false) && edge != 0) {
 		StringID str = (order->IsWaitTimetabled() || !timetable) ? STR_TIMETABLE_SCHEDULED_DISPATCH_ORDER : STR_TIMETABLE_SCHEDULED_DISPATCH_ORDER_NO_WAIT_TIME;
-		const DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(order->GetDispatchScheduleIndex());
+		const DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(order->GetDispatchScheduleIndex());
 		if (!ds.ScheduleName().empty()) {
 			AppendStringInPlace(line, str, STR_TIMETABLE_SCHEDULED_DISPATCH_ORDER_NAMED_SCHEDULE, ds.ScheduleName());
 		} else {
-			AppendStringInPlace(line, str, v->orders->GetScheduledDispatchScheduleCount() > 1 ? STR_TIMETABLE_SCHEDULED_DISPATCH_ORDER_SCHEDULE_INDEX : STR_EMPTY,
+			AppendStringInPlace(line, str, v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() > 1 ? STR_TIMETABLE_SCHEDULED_DISPATCH_ORDER_SCHEDULE_INDEX : STR_EMPTY,
 					order->GetDispatchScheduleIndex() + 1);
 		}
 		edge = DrawString(rtl ? left : edge + 3, rtl ? edge - 3 : right, y, line, colour);
@@ -3036,7 +3085,7 @@ public:
 				y += line_height;
 
 				i++;
-				order = this->vehicle->orders->GetNextNoWrap(order);
+				order = this->vehicle->GetEffectiveOrders()->GetNextNoWrap(order);
 			}
 
 			/* Reset counters for drawing the orders. */
@@ -3054,7 +3103,7 @@ public:
 			y += line_height;
 
 			i++;
-			order = this->vehicle->orders->GetNextNoWrap(order);
+			order = this->vehicle->GetEffectiveOrders()->GetNextNoWrap(order);
 		}
 
 		if (this->vscroll->IsVisible(i)) {
@@ -3187,8 +3236,8 @@ public:
 
 				uint schedule_index = order->GetConditionDispatchScheduleID();
 				if (order != nullptr && order->IsType(OT_CONDITIONAL) && order->GetConditionVariable() == OrderConditionVariable::DispatchSlot && schedule_index != UINT16_MAX) {
-					if (schedule_index < this->vehicle->orders->GetScheduledDispatchScheduleCount()) {
-						const DispatchSchedule &ds = this->vehicle->orders->GetDispatchScheduleByIndex(schedule_index);
+					if (schedule_index < this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+						const DispatchSchedule &ds = this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 						if (!ds.ScheduleName().empty()) {
 							return ds.ScheduleName();
 						}
@@ -3217,8 +3266,8 @@ public:
 								} else {
 									uint schedule_index = order->GetConditionDispatchScheduleID();
 									if (order != nullptr && order->IsType(OT_CONDITIONAL) && order->GetConditionVariable() == OrderConditionVariable::DispatchSlot && schedule_index != UINT16_MAX) {
-										if (schedule_index < this->vehicle->orders->GetScheduledDispatchScheduleCount()) {
-											const DispatchSchedule &ds = this->vehicle->orders->GetDispatchScheduleByIndex(schedule_index);
+										if (schedule_index < this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+											const DispatchSchedule &ds = this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index);
 											std::string_view name = ds.GetSupplementaryName(DispatchSchedule::SupplementaryNameType::RouteID, route_id);
 											if (!name.empty()) return std::string{name};
 										}
@@ -3710,10 +3759,10 @@ public:
 				int selected = this->vehicle->GetOrder(this->OrderGetSel())->GetConditionDispatchScheduleID();
 				if (selected == UINT16_MAX) selected = -1;
 
-				uint count = this->vehicle->orders->GetScheduledDispatchScheduleCount();
+				uint count = this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount();
 				DropDownList list;
 				for (uint i = 0; i < count; ++i) {
-					const DispatchSchedule &ds = this->vehicle->orders->GetDispatchScheduleByIndex(i);
+					const DispatchSchedule &ds = this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(i);
 					if (ds.ScheduleName().empty()) {
 						list.push_back(MakeDropDownListStringItem(GetString(STR_TIMETABLE_ASSIGN_SCHEDULE_ID, i + 1), i, false));
 					} else {
@@ -3741,8 +3790,8 @@ public:
 				const DispatchSchedule *ds = nullptr;
 				uint16_t slot_flags = 0;
 				uint schedule_index = order->GetConditionDispatchScheduleID();
-				if (schedule_index < this->vehicle->orders->GetScheduledDispatchScheduleCount()) {
-					ds = &(this->vehicle->orders->GetDispatchScheduleByIndex(schedule_index));
+				if (schedule_index < this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+					ds = &(this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index));
 					for (const DispatchSlot &slot : ds->GetScheduledDispatch()) {
 						slot_flags |= slot.flags;
 					}
@@ -3847,7 +3896,7 @@ public:
 						if (ocv == OrderConditionVariable::CounterValue && !_settings_client.gui.show_adv_tracerestrict_features) {
 							continue;
 						}
-						if ((ocv == OrderConditionVariable::DispatchSlot) && this->vehicle->orders->GetScheduledDispatchScheduleCount() == 0) {
+						if ((ocv == OrderConditionVariable::DispatchSlot) && this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() == 0) {
 							continue;
 						}
 					}
@@ -3875,8 +3924,8 @@ public:
 					const DispatchSchedule *ds = nullptr;
 					uint16_t slot_flags = 0;
 					uint schedule_index = o->GetConditionDispatchScheduleID();
-					if (schedule_index < this->vehicle->orders->GetScheduledDispatchScheduleCount()) {
-						ds = &(this->vehicle->orders->GetDispatchScheduleByIndex(schedule_index));
+					if (schedule_index < this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+						ds = &(this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index));
 						for (const DispatchSlot &slot : ds->GetScheduledDispatch()) {
 							slot_flags |= slot.flags;
 						}
@@ -4275,8 +4324,8 @@ public:
 						const DispatchSchedule *ds = nullptr;
 						uint16_t slot_flags = 0;
 						uint schedule_index = o->GetConditionDispatchScheduleID();
-						if (schedule_index < this->vehicle->orders->GetScheduledDispatchScheduleCount()) {
-							ds = &(this->vehicle->orders->GetDispatchScheduleByIndex(schedule_index));
+						if (schedule_index < this->vehicle->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+							ds = &(this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(schedule_index));
 							for (const DispatchSlot &slot : ds->GetScheduledDispatch()) {
 								slot_flags |= slot.flags;
 							}

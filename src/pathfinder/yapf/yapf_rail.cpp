@@ -31,6 +31,11 @@
 #include <unistd.h>
 #endif
 
+/* R3R (第 276 轮, KI-429): 定义在 src\train_cmd.cpp。这里手写前向声明，避免为了一个
+ * 函数原型去改头文件（改 .h 会触发全量重编）。语义见 src\train_cmd.cpp 的定义处注释。
+ * 返回值：0 = 不截断；1 = 截断且终点 = 等待区路点；2 = 已在路点上但未放行。 */
+int R3RShouldCutCoupleAtWaitPoint(const Train *v, uint32_t *wait_wp);
+
 template <typename Tpf> void DumpState(Tpf &pf1, Tpf &pf2)
 {
 	DumpTarget dmp1, dmp2;
@@ -822,6 +827,47 @@ public:
 		}
 		/* Set origin and destination. */
 		Yapf().SetOrigin(origin.tile, origin.trackdir);
+
+		/* R3R (第 276 轮, KI-429): 等待区路点截断（玩家口径 Q-276-4 / §21.9）。
+		 *
+		 * 只要还没到"可以延伸预留"的状态（A 没有逐节停稳在同一站台区间，或者本车
+		 * 自己还没到等待区路点），本次寻路就只允许以等待区路点作终点 ⇒ 回溯/预留
+		 * 止于路点，不会再一路铺到目标车底、更不会铺进道岔区（KI-429 的
+		 * FSCP tile=258,233）。
+		 *
+		 * 判定每 tick 由 train_cmd.cpp 的 R3RShouldCutCoupleAtWaitPoint() 重算：
+		 *   0 = 不截断（没有等待区路点，或本次挂接已放行）
+		 *   1 = 截断，终点 = 等待区路点
+		 *   2 = 本车已站在等待区路点上但还没放行 */
+		uint32_t r3r_cut_wp = 0;
+		const int r3r_wait_cut = R3RShouldCutCoupleAtWaitPoint(v, &r3r_cut_wp);
+
+		/* 边沿触发：状态变化才写一行，避免每 tick 刷屏。 */
+		{
+			static std::map<uint32_t, int> r3r_cut_state;
+			const uint32_t r3r_key = v->index.base();
+			auto it = r3r_cut_state.find(r3r_key);
+			if (it == r3r_cut_state.end() || it->second != r3r_wait_cut) {
+				r3r_cut_state[r3r_key] = r3r_wait_cut;
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-WAITCUT veh=%d state=%d wp=%u tile=%d,%d\n",
+							(int)v->index.base(), r3r_wait_cut, (unsigned int)r3r_cut_wp,
+							(int)TileX(v->tile), (int)TileY(v->tile));
+					fclose(dbg);
+				}
+			}
+		}
+
+		if (r3r_wait_cut == 2) {
+			/* 已经停在等待区路点上、只是还没放行：本次寻路没有合法终点。
+			 * 直接报"无路径"——不能放任 YAPF 去找终点，否则它会为了一条自己
+			 * 脚下的路点把整张图搜一遍（每 tick 一次）。 */
+			return INVALID_TRACKDIR;
+		}
+
+		Yapf().SetCoupleWaitCut(r3r_wait_cut == 1, r3r_cut_wp);
+
 		Yapf().SetDestination(v);
 
 		bool path_found = Yapf().FindPath(v);
@@ -848,10 +894,23 @@ public:
 		TileIndex consist_head_tile = INVALID_TILE;
 		bool best_on_consist = false;
 		if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
+			/* R3R (第 276 轮续, KI-432): 绝不能把"自己"认成等待车底。
+			 * 放行之后 TryReservePath() 把路径铺到 best 节点，那一格的预留记在
+			 * 本车名下；下一 tick 在这里解析"谁等在这格"时 GetTrainForReservation()
+			 * 先命中自己 ⇒ ct = 本车 ⇒ h = 本车链头（自己脚下） ⇒ consist_head_tile
+			 * 等于起点 ⇒ reach() 首条即真 ⇒ best_td = 0，预留退化成 1 格、随即被
+			 * CLEAR-STN 释放，挂接永远不成立（现场 CPL-HEAD head=254,233 与
+			 * CPL-ENTRY tile=254,233 同格）。
+			 * GetCouplePosition() 早有 other_vehicle->First()->index == v->index 的
+			 * 同一守卫，这里补齐：命中自己就丢弃，回落到"格上真正停着的别的链"；
+			 * 若该格上没有别的链，consist_head_tile 保持 INVALID_TILE，下游会退到
+			 * pNode->GetLastTile()，绝不用自己脚下当耦合端。 */
+			const VehicleID self_first = v->First()->index;
 			Train *ct = GetTrainForReservation(pNode->GetLastTile(), TrackdirToTrack(pNode->GetLastTrackdir()));
+			if (ct != nullptr && ct->First()->index == self_first) ct = nullptr;
 			if (ct == nullptr) {
 				for (Train *tr : VehiclesOnTile<VehicleType::Train>(pNode->GetLastTile())) {
-					if (tr->IsFrontEngine()) { ct = tr; break; }
+					if (tr->IsFrontEngine() && tr->First()->index != self_first) { ct = tr; break; }
 				}
 			}
 			if (ct != nullptr) {
@@ -1750,6 +1809,10 @@ struct R3RCoupleScanState {
 	uint64_t empty_tick = 0; ///< Tick of the last search that came back empty.
 	bool holding = false;    ///< Whether the retry throttle is currently armed.
 	bool logged = false;     ///< Whether the skipped-call probe was already written for this episode.
+	/** R3R (第 272 轮, C-6): which of the four destination gates (GROUP/FIT/TARGET/ORDER)
+	 * rejected at least one candidate during the last real search. Zero means "nothing was
+	 * rejected", i.e. the empty result came from an empty reachable area instead. */
+	uint32_t last_rej_mask = 0;
 };
 
 static std::map<int, R3RCoupleScanState> _r3r_couple_scan_state;
@@ -1800,17 +1863,71 @@ static uint R3RCoupleScanHold(const Train *v, bool dont_reserve)
 	return (uint)(R3R_COUPLE_SCAN_RETRY - age);
 }
 
+/**
+ * R3R (第 271 轮): 上一次 YapfTrainCoupleTrack() 的 INVALID_TRACK 是不是
+ * "本轮被节流开关跳过"造成的。
+ *
+ * 现场（build/R3R_debug.log）：
+ *   CPL-SKIP veh=21 tile=205,273 orderType=16 dontReserve=0 retryIn=8 holdAge=0
+ *   RESV-GC veh=21 tile=205,267 track=0x1 why=free-path
+ *   RESV-LEDGER-FORGET veh=21 why=free-path mask=0x1 released=95 kept=0 phase=choose-track
+ *
+ * 节流（R3RCoupleScanHold：空搜索后 8 tick 内不再搜）把 INVALID_TRACK 交回去，
+ * 而 ChooseTrainTrack() 只看到"没找到可挂车底"，于是执行 KI-316 的
+ * FreeTrainTrackReservation() + MarkTrainAsStuck()，把已经铺好的一整段预留
+ * （现场 95 格）连同账本一起清掉。玩家看到的"明明已经铺了预留，走过去之前又被
+ * 神秘销毁，导致无法达速"就是这一段：每 8 tick 清一次，车永远只能走到预留末端。
+ *
+ * 节流跳过不改变任何地图状态，因此既不能撤销预留，也不该把车标成 stuck；
+ * 保持现状、下一 tick 再判断即可。
+ */
+static std::map<int, uint64_t> _r3r_couple_skipped_tick;
+
+/**
+ * Whether the couple search for @p v was skipped by the retry throttle on this tick.
+ * Callers must not treat that as "no coupling target exists".
+ * @param v The locomotive whose search is in question (nullptr safe).
+ */
+bool R3RCoupleSearchSkipped(const Train *v)
+{
+	if (v == nullptr) return false;
+	const auto it = _r3r_couple_skipped_tick.find((int)v->index.base());
+	return it != _r3r_couple_skipped_tick.end() && it->second == (uint64_t)_tick_counter;
+}
+
 /** Remember whether this couple search found a path, so an empty result can be retried less eagerly. */
 static void R3RCoupleScanResult(const Train *v, bool found)
 {
 	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
 	if (found) {
 		st.holding = false;
+		st.last_rej_mask = 0;
 	} else {
 		st.holding = true;
 		st.empty_tick = (uint64_t)_tick_counter;
 		st.logged = false;
+		/* R3R (第 272 轮, C-6): the destination gates counted rejections during this
+		 * very search (R3RCoupleScanReset() clears them just before it starts), so an
+		 * empty result with a non-zero mask means candidates *were* seen and refused,
+		 * as opposed to "there is simply no consist within reach". */
+		st.last_rej_mask = 0;
+		for (uint i = 0; i < 4; i++) {
+			if (_r3r_cpl_scan_rej[i] != 0) st.last_rej_mask |= (1U << i);
+		}
 	}
+}
+
+/**
+ * R3R (第 272 轮, C-6): how the destination gates rejected candidates in the last
+ * real (non-throttled) couple search of @p v.
+ * @param v The locomotive whose last search is in question (nullptr safe).
+ * @return Bit mask, bit 0 = GROUP, 1 = FIT, 2 = TARGET, 3 = ORDER; 0 = nothing rejected.
+ */
+uint32_t R3RCoupleSearchRejectMask(const Train *v)
+{
+	if (v == nullptr) return 0;
+	const auto it = _r3r_couple_scan_state.find((int)v->index.base());
+	return (it != _r3r_couple_scan_state.end()) ? it->second.last_rej_mask : 0;
 }
 
 /**
@@ -1822,7 +1939,14 @@ static void R3RCoupleScanResult(const Train *v, bool found)
 Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 {
 	const uint hold = R3RCoupleScanHold(v, dont_reserve);
-	if (hold != 0) return INVALID_TRACK;
+	if (hold != 0) {
+		/* R3R (第 271 轮): 这次 INVALID_TRACK 只是"本轮不搜"，必须让上层看得见，
+		 * 否则它会当作"没有可挂车底"并撤销整段预留（见 R3RCoupleSearchSkipped 的注释）。 */
+		_r3r_couple_skipped_tick[(int)v->index.base()] = (uint64_t)_tick_counter;
+		return INVALID_TRACK;
+	}
+	/* A real search ran this tick, so any stale "was skipped" stamp is gone. */
+	_r3r_couple_skipped_tick.erase((int)v->index.base());
 
 	{
 		FILE *dbg = R3RFopenDbg("a");

@@ -191,6 +191,12 @@ STR_CONFIG_SETTING_RAIL_DEPOT_SPEED_LIMIT_HELPTEXT              :The maximum per
 STR_CONFIG_SETTING_NON_LEADING_ENGINES_KEEP_NAME                :Non-leading train engines keep custom names: {STRING2}
 STR_CONFIG_SETTING_NON_LEADING_ENGINES_KEEP_NAME_HELPTEXT       :Whether train engines with a custom name should keep their custom name when moved to a non-leading position in a train consist
 
+STR_CONFIG_SETTING_IGNORE_GRF_ATTACH_LIMITS                     :Ignore NewGRF wagon attachment restrictions: {STRING2}
+STR_CONFIG_SETTING_IGNORE_GRF_ATTACH_LIMITS_HELPTEXT            :When enabled, the NewGRF allow-wagon-attach callback is not evaluated, so wagons can be attached even if the NewGRF forbids it.{}This allows forming consists which the NewGRF only intended for visual joining, for example real multiple units out of vehicles whose graphics are only meant to be displayed coupled together.{}The maximum train length limit is still enforced.{}Warning: the NewGRF may not provide suitable graphics or statistics for such combinations.
+
+STR_CONFIG_SETTING_IGNORE_GRF_STARTSTOP_LIMITS                  :Ignore NewGRF start/stop restrictions: {STRING2}
+STR_CONFIG_SETTING_IGNORE_GRF_STARTSTOP_LIMITS_HELPTEXT         :When enabled, the NewGRF start/stop callback is not evaluated, so vehicles which a NewGRF locks to a fixed formation can still be started or stopped individually.{}Other rules, such as requiring power to start a train or not stopping an aircraft in flight, are still enforced.
+
 STR_CONFIG_SETTING_BACK_ONE_WAY_PBS_SAFE_WAITING                :Pathfind up to back of one-way path signals: {STRING2}
 STR_CONFIG_SETTING_BACK_ONE_WAY_PBS_SAFE_WAITING_HELPTEXT       :When enabled, the train pathfinder may pathfind up to the back of a one-way path signal.
 

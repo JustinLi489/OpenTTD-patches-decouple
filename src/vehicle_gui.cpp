@@ -27,6 +27,7 @@
 #include "group_gui.h"
 #include "couple_group.h"
 #include "couple_group_gui.h"
+#include "r3r_perf.h"
 #include "strings_func.h"
 #include "strings_internal.h"
 #include "core/string_builder.hpp"
@@ -1016,12 +1017,27 @@ struct RefitWindow : public Window {
 		VehicleSet vehicles_to_refit;
 		GetVehicleSet(vehicles_to_refit, Vehicle::Get(this->selected_vehicle), this->num_vehicles);
 
+		/* R3R (KI-458) PROBE ONLY: opened once for the whole unit loop -- one
+		 * fopen/fclose per unit made the refit window visibly stall. */
+		FILE *const r3r_refit_dbg = R3RDbgOn() ? R3RFopenDbg("a") : nullptr;
+
 		do {
 			if (v->type == VehicleType::Train && std::ranges::find(vehicles_to_refit, v->index) == vehicles_to_refit.end()) continue;
 			if (v->type == VehicleType::Ship && this->num_vehicles == 1 && v->index != this->selected_vehicle) continue;
 			const Engine *e = v->GetEngine();
 			CargoTypes cmask = e->info.refit_mask;
 			VehicleCallbackMasks callback_mask = e->info.callback_mask;
+
+			/* R3R (KI-458) PROBE ONLY: the cargo identity this list is derived
+			 * from, per unit. Drift between units (or between a unit and its
+			 * group head) is what the livery symptom looks like. */
+			if (r3r_refit_dbg != nullptr && v->type == VehicleType::Train) {
+				fprintf(r3r_refit_dbg, "R3R-REFIT-VEH head=%d idx=%d cargo=%u/%u art=%d gm=%d gh=%d\n",
+						(int)v->First()->index.base(), (int)v->index.base(),
+						(unsigned)v->cargo_type, (unsigned)v->cargo_subtype,
+						v->IsArticulatedPart() ? 1 : 0, v->IsArticGroupMember() ? 1 : 0,
+						v->IsArticGroupHead() ? 1 : 0);
+			}
 
 			/* Skip this engine if it does not carry anything */
 			if (!e->CanCarryCargo()) continue;
@@ -1062,6 +1078,17 @@ struct RefitWindow : public Window {
 
 						StringID subtype = GetCargoSubtypeText(v);
 
+						/* R3R (KI-458) PROBE ONLY: what each unit reports for this
+						 * refit cycle. A unit that reports STR_EMPTY at cyc 0 makes the
+						 * intersection collapse to the single "keep current" option. */
+						if (r3r_refit_dbg != nullptr && v->type == VehicleType::Train && refit_cyc < 8) {
+							fprintf(r3r_refit_dbg, "R3R-REFIT-SUB idx=%d cargo=%u cyc=%u fv=%d sid=%u empty=%d sf=%d\n",
+									(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
+									first_vehicle ? 1 : 0, (unsigned)subtype,
+									subtype == STR_EMPTY ? 1 : 0,
+									Train::From(v)->IsSegmentFront() ? 1 : 0);
+						}
+
 						if (first_vehicle) {
 							/* Append new subtype (don't add duplicates though) */
 							if (subtype == STR_EMPTY) break;
@@ -1085,8 +1112,28 @@ struct RefitWindow : public Window {
 								uint pos = 1;
 								while (pos < list.size() && list[pos].subtype != refit_cyc) pos++;
 								if (pos < list.size() && list[pos].string != subtype) {
-									/* String mismatch, remove item keeping the order */
-									list.erase(list.begin() + pos);
+									/* R3R (KI-461): a label mismatch alone must not drop the option.
+									 * R3R split trains into several fake articulated groups; a GRF may
+									 * return a different caption string for the same (cargo, subtype)
+									 * depending on the car model/livery block (measured: group 1 gave
+									 * StringIDs 131442..131447, group 8 gave 131436..131441 for the very
+									 * same subtypes). Erasing on that mismatch removed every entry and
+									 * collapsed a whole-train refit list to the single "keep current"
+									 * option (options=1 for the chain vs options=7 for one car).
+									 * RefitVehicle() broadcasts one subtype to every unit anyway, so the
+									 * caption is cosmetic: keep the head unit's label.
+									 * Only relaxed for vehicles taking part in a fake articulated group,
+									 * so plain vanilla trains keep the strict behaviour. */
+									if (v->IsArticGroupHead() || v->IsArticGroupMember()) {
+										if (r3r_refit_dbg != nullptr) {
+											fprintf(r3r_refit_dbg, "R3R-REFIT-SUB-KEEP idx=%d cargo=%u cyc=%u keep=%u got=%u\n",
+													(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
+													(unsigned)list[pos].string, (unsigned)subtype);
+										}
+									} else {
+										/* String mismatch, remove item keeping the order */
+										list.erase(list.begin() + pos);
+									}
 								}
 							}
 						}
@@ -1103,6 +1150,9 @@ struct RefitWindow : public Window {
 			}
 		} while (v->IsArticulatedCallbackVehicleType() && (v = v->Next()) != nullptr);
 
+		/* R3R (KI-458) PROBE ONLY: close the handle opened before the loop. */
+		if (r3r_refit_dbg != nullptr) fclose(r3r_refit_dbg);
+
 		/* Restore the previously selected RefitOption. */
 		if (current_refit_option.has_value()) {
 			for (const auto &pair : this->refit_list) {
@@ -1113,6 +1163,23 @@ struct RefitWindow : public Window {
 					}
 				}
 				if (this->selected_refit != nullptr) break;
+			}
+		}
+
+		/* R3R (KI-458) PROBE ONLY: how many options each cargo ended up with.
+		 * More than one for a single cargo means subtypes are enumerated. */
+		if (R3RDbgOn()) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "R3R-REFIT-LIST win=%u sel=%d nveh=%u cargoes=%u auto=%d\n",
+						(unsigned)this->window_number, (int)this->selected_vehicle.base(),
+						(unsigned)this->num_vehicles, (unsigned)this->refit_list.size(),
+						this->auto_refit ? 1 : 0);
+				for (const auto &pair : this->refit_list) {
+					fprintf(dbg, "R3R-REFIT-OPT cargo=%u options=%u\n",
+							(unsigned)pair.first, (unsigned)pair.second.size());
+				}
+				fclose(dbg);
 			}
 		}
 
@@ -2088,7 +2155,7 @@ static void DrawSmallOrderList(const Vehicle *v, int left, int right, int y, uin
 			if (++i == 4) break;
 		}
 
-		v->orders->AdvanceOrderWithIndex(order, oid);
+		v->GetEffectiveOrders()->AdvanceOrderWithIndex(order, oid);
 	} while (oid != start);
 }
 
@@ -4550,8 +4617,8 @@ public:
 		format_buffer buf;
 		AppendStringInPlace(buf, STR_VEHICLE_VIEW_CAPTION, v->index);
 
-		if (_settings_client.gui.show_vehicle_route_id_vehicle_view && v->orders != nullptr && !v->dispatch_records.empty()) {
-			const auto schedule_count = v->orders->GetScheduledDispatchScheduleCount();
+		if (_settings_client.gui.show_vehicle_route_id_vehicle_view && v->GetEffectiveOrders() != nullptr && !v->dispatch_records.empty()) {
+			const auto schedule_count = v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount();
 			const std::pair<const uint16_t, LastDispatchRecord> *best_record = nullptr;
 			StateTicks best_tick = StateTicks{INT64_MIN};
 			for (const std::pair<const uint16_t, LastDispatchRecord> &record_pair : v->dispatch_records) {
@@ -4565,7 +4632,7 @@ public:
 			}
 
 			if (best_record != nullptr) {
-				const DispatchSchedule &schedule = v->orders->GetDispatchScheduleByIndex(best_record->first);
+				const DispatchSchedule &schedule = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(best_record->first);
 				std::string_view name = schedule.GetSupplementaryName(DispatchSchedule::SupplementaryNameType::RouteID, best_record->second.route_id);
 				if (!name.empty()) {
 					AppendStringInPlace(buf, STR_VEHICLE_VIEW_CAPTION_ROUTE_ID_SUFFIX, name);
@@ -4851,7 +4918,7 @@ public:
 
 				if (v->GetNumOrders() != 0) {
 					list.push_back(MakeDropDownListDividerItem());
-					const Colours current_colour = v->orders->GetRouteOverlayColour();
+					const Colours current_colour = v->GetEffectiveOrders()->GetRouteOverlayColour();
 					auto add_colour = [&](Colours colour) {
 						list.push_back(MakeDropDownListCheckedItem(current_colour == colour, STR_COLOUR_DARK_BLUE + to_underlying(colour), 0x100 + to_underlying(colour), false));
 					};

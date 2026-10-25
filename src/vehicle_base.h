@@ -375,6 +375,37 @@ public:
 	Order current_order{};                       ///< The current order (+ status, like: loading)
 
 	OrderList *orders = nullptr;                 ///< Pointer to the order list for this vehicle
+	/**
+	 * R3R (KI-465 修法 D / 第 294 轮): the "following pointer".
+	 *
+	 * Non-null means: this vehicle *executes* that order list, but it does not own it.
+	 * `orders` keeps honestly pointing at this vehicle's own list the whole time, so the
+	 * native invariant ("every live OrderList has at least one vehicle whose `orders`
+	 * points at it, and that vehicle is registered in its shared ring") stays intact and
+	 * neither DebugCheckSanity() assertion (:999 `v->orders == this`, :1001 count) can be
+	 * triggered by a borrow any more.
+	 *
+	 * Read `GetEffectiveOrders()` for anything that means "what am I running", and read
+	 * `orders` itself for ownership: destruction, FreeChain hand-over, shared registration
+	 * and the ORDL/R3VP save/load code.
+	 *
+	 * SAVED by the R3VP chunk (table-header driven, so old savegames simply default it).
+	 */
+	OrderList *r3r_follow_orders = nullptr;
+	VehicleID r3r_follow_owner = VehicleID::Invalid(); ///< R3R (KI-465 修法 D): the vehicle whose schedule we follow (diagnostics only). SAVED by the R3VP chunk.
+
+	/**
+	 * R3R (KI-465 修法 D): the order list this vehicle actually executes.
+	 *
+	 * Use this for everything that means "what am I running": order processing, station
+	 * arrival checks, destination lookup, dispatch/departures bookkeeping, GUI display and
+	 * script queries. Keep using `orders` for ownership (destruction, FreeChain hand-over,
+	 * shared registration, save/load).
+	 */
+	OrderList *GetEffectiveOrders() const { return this->r3r_follow_orders != nullptr ? this->r3r_follow_orders : this->orders; }
+	/** R3R (KI-465 修法 D): is this vehicle executing somebody else's order list? */
+	bool IsR3RFollower() const { return this->r3r_follow_orders != nullptr; }
+
 	OrderList *orders_backup = nullptr;          ///< R3R: backup of this vehicle's own orders while it executes a coupled consist's schedule (restored on decouple). SAVED separately by the R3VP chunk, so the vehicle table layout is untouched.
 	UnitID unitnumber_backup = 0;                ///< R3R: this vehicle's own unit number while it inherits the consist's number (restored on decouple). SAVED by the R3VP chunk.
 	TinyString name_backup{};                    ///< R3R (第 144 轮 / 需求贰): this segment head's own train name while it is not the chain head (depot drag park / fold-fix identity hand-over). Given back when the vehicle becomes a chain head again. NOSAVE: like a parked schedule after a load it is simply dropped (see R3RRestoreTrainName).
@@ -382,7 +413,7 @@ public:
 	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). SAVED by the R3VP chunk.
 	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. SAVED by the R3VP chunk.
 	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). SAVED by the R3VP chunk.
-	bool r3r_orders_borrowed = false;            ///< R3R: this->orders is BORROWED from another segment of the consist (route A), or parked in orders_backup after a depot drag; the owner keeps its own pointer, so this list must never be freed by this vehicle. SAVED by the R3VP chunk.
+	bool r3r_orders_borrowed = false;            ///< R3R: this vehicle runs another segment's schedule (route A). Since KI-465 修法 D this is expressed by r3r_follow_orders; the flag is kept as the legacy/borrow marker and is also set for an old-style borrow where `orders` itself was swapped (patched on load; those saves are migrated away by R3RRebuildCouplePriorities()). A borrowed list is owned by its owner and must never be freed by this vehicle. SAVED by the R3VP chunk.
 	uint16_t r3r_segment_id = R3R_SEGMENT_NONE;  ///< R3R (第 152 轮): the segment this car belongs to, or #R3R_SEGMENT_NONE while its chain holds a single segment (then the chain head's own fields are the only authority and nothing is looked up). Storing it on *every* car is what makes moving the SegmentFront marker free: the identity data stays in the segment table, only the marker moves. SAVED by the R3VP chunk.
 	CoupleGroupMask couple_groups = COUPLE_GROUP_MASK_NONE; ///< R3R: couple groups of the segment which this vehicle heads (only meaningful on a segment head, see couple_group.h). A segment may be in several groups at once (Q5); an empty mask forms one implicit group with every other unassigned segment. SAVED separately by the CGVR chunk, so the vehicle table layout is untouched.
 	/**
@@ -830,7 +861,7 @@ public:
 	 * Get the first order of the vehicles order list.
 	 * @return first order of order list.
 	 */
-	inline Order *GetFirstOrder() const { return (this->orders == nullptr) ? nullptr : this->orders->GetFirstOrder(); }
+	inline Order *GetFirstOrder() const { return (this->GetEffectiveOrders() == nullptr) ? nullptr : this->GetEffectiveOrders()->GetFirstOrder(); }
 
 	void StopSeparation();
 
@@ -865,13 +896,21 @@ public:
 	 * Get the number of orders this vehicle has.
 	 * @return the number of orders this vehicle has.
 	 */
-	inline VehicleOrderID GetNumOrders() const { return (this->orders == nullptr) ? 0 : this->orders->GetNumOrders(); }
+	inline VehicleOrderID GetNumOrders() const
+	{
+		const OrderList *ol = this->GetEffectiveOrders();
+		return (ol == nullptr) ? 0 : ol->GetNumOrders();
+	}
 
 	/**
 	 * Get the number of manually added orders this vehicle has.
 	 * @return the number of manually added orders this vehicle has.
 	 */
-	inline VehicleOrderID GetNumManualOrders() const { return (this->orders == nullptr) ? 0 : this->orders->GetNumManualOrders(); }
+	inline VehicleOrderID GetNumManualOrders() const
+	{
+		const OrderList *ol = this->GetEffectiveOrders();
+		return (ol == nullptr) ? 0 : ol->GetNumManualOrders();
+	}
 
 	/**
 	 * Get the next station the vehicle will stop at.
@@ -880,7 +919,8 @@ public:
 	inline CargoStationIDVectorSet GetNextStoppingStation() const
 	{
 		CargoStationIDVectorSet set;
-		if (this->orders != nullptr) set.FillNextStoppingStation(this, this->orders);
+		const OrderList *ol = this->GetEffectiveOrders();
+		if (ol != nullptr) set.FillNextStoppingStation(this, ol);
 		return set;
 	}
 
@@ -891,7 +931,8 @@ public:
 	inline StationIDVector GetNextStoppingStationCargoIndependent() const
 	{
 		StationIDVector set;
-		if (this->orders != nullptr) set = this->orders->GetNextStoppingStation(this, CargoTypes{}).station;
+		const OrderList *ol = this->GetEffectiveOrders();
+		if (ol != nullptr) set = ol->GetNextStoppingStation(this, CargoTypes{}).station;
 		return set;
 	}
 
@@ -1137,7 +1178,8 @@ public:
 	 */
 	inline const Order *GetOrder(VehicleOrderID index) const
 	{
-		return (this->orders == nullptr) ? nullptr : this->orders->GetOrderAt(index);
+		const OrderList *ol = this->GetEffectiveOrders();
+		return (ol == nullptr) ? nullptr : ol->GetOrderAt(index);
 	}
 
 	inline Order *GetOrder(VehicleOrderID index) { return const_cast<Order *>(const_cast<const Vehicle *>(this)->GetOrder(index)); }
@@ -1149,7 +1191,8 @@ public:
 	 */
 	inline VehicleOrderID GetIndexOfOrder(const Order *order) const
 	{
-		return (this->orders == nullptr) ? INVALID_VEH_ORDER_ID : this->orders->GetIndexOfOrder(order);
+		const OrderList *ol = this->GetEffectiveOrders();
+		return (ol == nullptr) ? INVALID_VEH_ORDER_ID : ol->GetIndexOfOrder(order);
 	}
 
 	/**
@@ -1158,7 +1201,8 @@ public:
 	 */
 	inline const Order *GetLastOrder() const
 	{
-		return (this->orders == nullptr) ? nullptr : this->orders->GetLastOrder();
+		const OrderList *ol = this->GetEffectiveOrders();
+		return (ol == nullptr) ? nullptr : ol->GetLastOrder();
 	}
 
 	bool IsEngineCountable() const;
@@ -1324,12 +1368,14 @@ public:
 	 */
 	OrderIterateWrapper<const Order> Orders(VehicleOrderID from = 0) const
 	{
-		return this->orders == nullptr ? OrderIterateWrapper<const Order>(nullptr, nullptr) : const_cast<const OrderList *>(this->orders)->Orders(from);
+		const OrderList *ol = this->GetEffectiveOrders();
+		return ol == nullptr ? OrderIterateWrapper<const Order>(nullptr, nullptr) : ol->Orders(from);
 	}
 
 	OrderIterateWrapper<Order> Orders(VehicleOrderID from = 0)
 	{
-		return this->orders == nullptr ? OrderIterateWrapper<Order>(nullptr, nullptr) : this->orders->Orders(from);
+		OrderList *ol = this->GetEffectiveOrders();
+		return ol == nullptr ? OrderIterateWrapper<Order>(nullptr, nullptr) : ol->Orders(from);
 	}
 
 	uint32_t GetDisplayMaxWeight() const;

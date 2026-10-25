@@ -70,6 +70,7 @@
 #include "vehicle_cmd.h"
 #include "tile_cmd.h"
 #include "r3r_perf.h"
+#include "couple_group.h"
 #include "3rdparty/cpp-btree/btree_set.h"
 #include "3rdparty/cpp-btree/btree_map.h"
 #include "3rdparty/robin_hood/robin_hood.h"
@@ -3197,6 +3198,25 @@ LiveryScheme GetEngineLiveryScheme(EngineID engine_type, EngineID parent_engine_
 			if (v != nullptr && parent_engine_type != EngineID::Invalid() && (UsesWagonOverride(v) || (v->IsArticGroupMember() && e->VehInfo<RailVehicleInfo>().railveh_type != RailVehicleType::Wagon))) {
 				/* Wagonoverrides use the colour scheme of the front engine.
 				 * Articulated parts (real or de-articulated group members) use the colour scheme of the first part. (Not supported for articulated wagons) */
+				/* R3R (第 290 轮, KI-458, L2): this substitution is where "livery 2 middle
+				 * car turns livery 1" actually happens -- the scheme (and hence the 2CC
+				 * colours) is taken from the parent engine, not from the vehicle's own
+				 * engine. Logged on the substitution path only, bounded, because it is
+				 * reached from the sprite path. */
+				if (R3RDbgOn()) {
+					static unsigned r3r_liv_lines = 0;
+					if (r3r_liv_lines < 500) {
+						r3r_liv_lines++;
+						FILE *r3r_dbg = R3RFopenDbg("a");
+						if (r3r_dbg != nullptr) {
+							fprintf(r3r_dbg, "LIVERY-SCHEME v=%d own=%d parent=%d useov=%d artgm=%d front=%d head_eng=%d\n",
+									(int)v->index.base(), (int)engine_type.base(), (int)parent_engine_type.base(),
+									UsesWagonOverride(v) ? 1 : 0, v->IsArticGroupMember() ? 1 : 0,
+									(int)v->First()->index.base(), (int)v->First()->engine_type.base());
+							fclose(r3r_dbg);
+						}
+					}
+				}
 				engine_type = parent_engine_type;
 				e = Engine::Get(engine_type);
 				/* Note: Luckily cargo_type is not needed for engines */
@@ -3273,6 +3293,53 @@ LiveryScheme GetEngineLiveryScheme(EngineID engine_type, EngineID parent_engine_
 }
 
 /**
+ * R3R (第 291 轮): the group whose livery a vehicle should display.
+ *
+ * The livery belongs to the **segment**, not to the physical chain. When two
+ * differently painted sets are coupled, the cars of the passive set must keep
+ * their own livery instead of inheriting the active (control) segment's; reading
+ * #Vehicle::First()->group_id gave every car of the chain one livery, which is
+ * exactly what repainted a livery-2 car into livery-3 after coupling.
+ *
+ * Cars of a single-segment chain carry #R3R_SEGMENT_NONE and every vehicle of a
+ * non-R3R train shares the same id, so those keep the historical behaviour byte
+ * for byte (including the chain head reading its own live group).
+ *
+ * @param v the vehicle; nullptr is answered with an invalid group.
+ * @return group to take the livery from.
+ */
+/* R3R (第 291 轮 / 修法 e): defined in couple_group.cpp; declared by hand on purpose
+ * so that this stays a .cpp-only change (a header edit forces a full rebuild, KI-183). */
+const Vehicle *R3RSegmentHeadOf(const Vehicle *v);
+
+static GroupID R3RLiveryGroupOf(const Vehicle *v)
+{
+	if (v == nullptr) return GroupID::Invalid();
+
+	const Vehicle *const chain_head = v->First();
+	if (v->r3r_segment_id == chain_head->r3r_segment_id) return chain_head->group_id;
+
+	/* Multi-segment chain: the livery belongs to this car's own segment.
+	 *
+	 * 第 292 轮 / KI-463 起分组**属于段**：每个段头自己持有 group_id，链结构变化不再把
+	 * 整链推平到控制段（R3RNormaliseChainGroups 只逐段取回 / 逐段统一），所以段头的活
+	 * 字段就是权威值。group_id_backup 只作兜底：第 144~291 轮的"整链推平"会把段头自己
+	 * 的分组停进备份、活字段改写成控制段的值，还没被提交点取回时仍以备份为准。
+	 * 两者都没有（= 该段本来就没有分组）才回退到段行（读出来是无分组 -> 公司涂装）。 */
+	const Vehicle *const seg = R3RSegmentHeadOf(v);
+	if (seg != nullptr) {
+		/* 第 293 轮 / KI-464：DEFAULT_GROUP(65534) 的"停放副本"不是分组归属，跳过它，
+		 * 否则这一段玩家后来设的分组会被涂装读成"未分组"（与 R3RIsParkedGroupUsable 同口径）。 */
+		if (seg->group_id_backup != GroupID::Invalid() && seg->group_id_backup != DEFAULT_GROUP) {
+			return seg->group_id_backup;
+		}
+		if (seg->group_id != DEFAULT_GROUP && seg->group_id != GroupID::Invalid()) return seg->group_id;
+	}
+
+	return R3RSegmentSectionGroupID(v);
+}
+
+/**
  * Determines the livery for a vehicle.
  * @param engine_type EngineID of the vehicle
  * @param company Owner of the vehicle
@@ -3289,7 +3356,7 @@ const Livery *GetEngineLivery(EngineID engine_type, CompanyID company, EngineID 
 
 	if (livery_setting == LIT_ALL || (livery_setting == LIT_COMPANY && company == _local_company)) {
 		if (v != nullptr && !ignore_group) {
-			const Group *g = Group::GetIfValid(v->First()->group_id);
+			const Group *g = Group::GetIfValid(R3RLiveryGroupOf(v));
 			if (g != nullptr) {
 				/* Traverse parents until we find a livery or reach the top */
 				while (!g->livery.in_use.Any({Livery::Flag::Primary, Livery::Flag::Secondary}) && g->parent != GroupID::Invalid()) {
@@ -3388,11 +3455,29 @@ PaletteID GetUncachedTrainPaletteIgnoringGroup(const Train *v)
 	return GetEngineColourMap(v->engine_type, v->owner, v->GetGroundVehicleCache()->first_engine, v, true);
 }
 
+/* R3R (第 297 轮 / KI-472 探针, 只读): 定义在 train_cmd.cpp。手写声明而不进
+ * 头文件，保持本轮"只改 .cpp"——一旦碰 src\*.h，KI-183 的构建护栏会把全部
+ * object 删掉、把增量构建变成全量（约 700 步）。 */
+void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag);
+
 /**
  * Delete all implicit orders which were not reached.
  */
 void Vehicle::DeleteUnreachedImplicitOrders()
 {
+	/* R3R (第 297 轮 / KI-472 探针, 只读): 订单表"变短"的头号嫌疑点。
+	 *
+	 * 崩溃（order_cmd.cpp:4909）的前提是 cur_implicit_order_index >= GetNumOrders()，
+	 * 而 cmd-skip 路径本身有 `sel_ord >= GetNumOrders()` 校验（order_cmd.cpp:2004），
+	 * 克隆推进（order_cmd.cpp:3251）算出的下标也要过那道校验 ⇒ 越界值只可能来自
+	 * "算的时候合法、之后表变短"。本函数是唯一会成批删订单的地方（DeleteOrder
+	 * 会让后面的索引整体前移），故在入口与两个出口各取一次快照。
+	 *
+	 * 判读：入口 impl == 出口 impl 而 n= 变小 ⇒ 就是这里把车留在越界位。
+	 * 玩家 2026-10-25 口径：只加探针、不加 clamp。 */
+	const Train *const r3r_watch_t = (this->type == VehicleType::Train) ? Train::From(this) : nullptr;
+	R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-in", nullptr);
+
 	if (this->IsGroundVehicle()) {
 		uint16_t &gv_flags = this->GetGroundVehicleFlags();
 		if (HasBit(gv_flags, GVF_SUPPRESS_IMPLICIT_ORDERS)) {
@@ -3407,6 +3492,7 @@ void Vehicle::DeleteUnreachedImplicitOrders()
 				}
 			}
 			InvalidateVehicleOrder(this, 0);
+			R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-out", "suppress");
 			return;
 		}
 	}
@@ -3424,10 +3510,11 @@ void Vehicle::DeleteUnreachedImplicitOrders()
 		}
 
 		/* Wrap around */
-		if (this->cur_implicit_order_index >= this->orders->GetNumOrders()) this->cur_implicit_order_index = 0;
+		if (this->cur_implicit_order_index >= this->GetNumOrders()) this->cur_implicit_order_index = 0;
 
 		order = this->GetOrder(this->cur_implicit_order_index);
 	}
+	R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-out", "deleted");
 }
 
 /**
@@ -3525,7 +3612,7 @@ void Vehicle::BeginLoading()
 						break;
 					}
 					target_index++;
-					if (target_index >= this->orders->GetNumOrders()) {
+					if (target_index >= this->GetNumOrders()) {
 						if (this->GetNumManualOrders() == 0 &&
 								this->GetNumOrders() < IMPLICIT_ORDER_ONLY_CAP) {
 							break;
@@ -3553,7 +3640,7 @@ void Vehicle::BeginLoading()
 							}
 
 							/* Wrap around */
-							if (this->cur_implicit_order_index >= this->orders->GetNumOrders()) this->cur_implicit_order_index = 0;
+							if (this->cur_implicit_order_index >= this->GetNumOrders()) this->cur_implicit_order_index = 0;
 
 							order = this->GetOrder(this->cur_implicit_order_index);
 
@@ -3561,7 +3648,7 @@ void Vehicle::BeginLoading()
 						}
 					}
 				} else if (!suppress_implicit_orders &&
-						((this->orders == nullptr ? OrderList::CanAllocateItem() : this->orders->GetNumOrders() < MAX_VEH_ORDER_ID))) {
+						((this->GetEffectiveOrders() == nullptr ? OrderList::CanAllocateItem() : this->GetEffectiveOrders()->GetNumOrders() < MAX_VEH_ORDER_ID))) {
 					/* Insert new implicit order */
 					Order implicit_order;
 					implicit_order.MakeImplicit(this->last_station_visited);
@@ -5183,8 +5270,8 @@ bool VehiclesHaveSameOrderList(const Vehicle *v1, const Vehicle *v2)
 		if (o1 == nullptr && o2 == nullptr) return true;
 		if (o1 == nullptr || o2 == nullptr) return false;
 		if (!o1->Equals(*o2)) return false;
-		o1 = v1->orders->GetNextNoWrap(o1);
-		o2 = v2->orders->GetNextNoWrap(o2);
+		o1 = v1->GetEffectiveOrders()->GetNextNoWrap(o1);
+		o2 = v2->GetEffectiveOrders()->GetNextNoWrap(o2);
 	}
 }
 

@@ -52,9 +52,9 @@ template <typename F> void RemoveVehicleOrdersIf(Vehicle * const v, F order_pred
 			UnregisterOrderDestination(order, v->type, v->owner);
 
 			/* Clear wait time */
-			if (!order->IsType(OT_CONDITIONAL)) v->orders->UpdateTotalDuration(-static_cast<Ticks>(order->GetWaitTime()));
+			if (!order->IsType(OT_CONDITIONAL)) v->GetEffectiveOrders()->UpdateTotalDuration(-static_cast<Ticks>(order->GetWaitTime()));
 			if (order->IsWaitTimetabled()) {
-				if (!order->IsType(OT_CONDITIONAL)) v->orders->UpdateTimetableDuration(-static_cast<Ticks>(order->GetTimetabledWait()));
+				if (!order->IsType(OT_CONDITIONAL)) v->GetEffectiveOrders()->UpdateTimetableDuration(-static_cast<Ticks>(order->GetTimetabledWait()));
 				order->SetWaitTimetabled(false);
 			}
 			order->SetWaitTime(0);

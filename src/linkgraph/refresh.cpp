@@ -28,7 +28,7 @@
 /* static */ void LinkRefresher::RunScoped(Vehicle *v, Vehicle *scope_begin, const Vehicle *scope_end, bool allow_merge, bool is_full_loading, CargoTypes cargo_mask)
 {
 	/* If there are no orders we can't predict anything.*/
-	if (v->orders == nullptr) return;
+	if (v->GetEffectiveOrders() == nullptr) return;
 
 	CargoTypes have_cargo_mask = v->GetLastLoadingStationValidCargoMask();
 
@@ -51,7 +51,7 @@
 		}
 
 		/* Make sure the first order is a useful order. */
-		const Order *first = v->orders->GetNextDecisionNode(v->GetOrder(v->cur_implicit_order_index), 0, iter_cargo_mask);
+		const Order *first = v->GetEffectiveOrders()->GetNextDecisionNode(v->GetOrder(v->cur_implicit_order_index), 0, iter_cargo_mask);
 		if (first != nullptr) {
 			HopSet seen_hops;
 			LinkRefresher refresher(v, &seen_hops, allow_merge, is_full_loading, iter_cargo_mask, scope_begin, scope_end);
@@ -103,8 +103,10 @@
 			seg_end = w;
 		}
 
-		/* The consist route was already handled above with the full capacity. */
-		if (seg->orders != nullptr && seg->orders != front->orders) {
+		/* The consist route was already handled above with the full capacity.
+		 * R3R (KI-465 修法 D): compare the schedules the segments actually run; a follower keeps
+		 * its own `orders` while running another vehicle's list. */
+		if (seg->GetEffectiveOrders() != nullptr && seg->GetEffectiveOrders() != front->GetEffectiveOrders()) {
 			RunScoped(seg, seg, seg_end, allow_merge, is_full_loading, cargo_mask);
 		}
 
@@ -224,7 +226,7 @@ LinkRefresher::TimetableTravelTime LinkRefresher::UpdateTimetableTravelSoFar(con
 			if (from->GetConditionVariable() == OrderConditionVariable::Unconditionally) {
 				/* Taken branch travel time */
 				travel.time_so_far += from->GetWaitTime();
-				from = this->vehicle->orders->GetOrderAt(from->GetConditionSkipToOrder());
+				from = this->vehicle->GetEffectiveOrders()->GetOrderAt(from->GetConditionSkipToOrder());
 				travel.flags.Set(TimetableTravelTimeFlag::NoTravelTime);
 			} else if (!travel.flags.Test(TimetableTravelTimeFlag::AllowCondition)) {
 				/* Unexpected conditional branch, give up */
@@ -232,7 +234,7 @@ LinkRefresher::TimetableTravelTime LinkRefresher::UpdateTimetableTravelSoFar(con
 				return travel;
 			} else {
 				/* Non-taken branch, ignore travel time field */
-				from = this->vehicle->orders->GetNext(from);
+				from = this->vehicle->GetEffectiveOrders()->GetNext(from);
 				travel.flags.Reset(TimetableTravelTimeFlag::NoTravelTime);
 			}
 		} else {
@@ -243,7 +245,7 @@ LinkRefresher::TimetableTravelTime LinkRefresher::UpdateTimetableTravelSoFar(con
 				}
 				travel.time_so_far += from->GetWaitTime();
 			}
-			from = this->vehicle->orders->GetNext(from);
+			from = this->vehicle->GetEffectiveOrders()->GetNext(from);
 			travel.flags.Reset(TimetableTravelTimeFlag::NoTravelTime);
 		}
 
@@ -290,25 +292,25 @@ std::pair<const Order *, LinkRefresher::TimetableTravelTime> LinkRefresher::Pred
 			if (next->GetConditionVariable() == OrderConditionVariable::Unconditionally) {
 				const Order *current = next;
 				CargoTypes this_cargo_mask = this->cargo_mask;
-				next = this->vehicle->orders->GetNextDecisionNode(
-						this->vehicle->orders->GetOrderAt(next->GetConditionSkipToOrder()),
+				next = this->vehicle->GetEffectiveOrders()->GetNextDecisionNode(
+						this->vehicle->GetEffectiveOrders()->GetOrderAt(next->GetConditionSkipToOrder()),
 						num_hops++, this_cargo_mask);
 				assert(this_cargo_mask == this->cargo_mask);
 				travel = this->UpdateTimetableTravelSoFar(current, next, travel);
 				continue;
 			}
 			CargoTypes this_cargo_mask = this->cargo_mask;
-			const Order *target = this->vehicle->orders->GetOrderAt(next->GetConditionSkipToOrder());
-			const Order *skip_to = this->vehicle->orders->GetNextDecisionNode(target, num_hops, this_cargo_mask);
+			const Order *target = this->vehicle->GetEffectiveOrders()->GetOrderAt(next->GetConditionSkipToOrder());
+			const Order *skip_to = this->vehicle->GetEffectiveOrders()->GetNextDecisionNode(target, num_hops, this_cargo_mask);
 			assert(this_cargo_mask == this->cargo_mask);
-			if (skip_to != nullptr && num_hops < std::min<uint>(64, this->vehicle->orders->GetNumOrders()) && skip_to != next) {
+			if (skip_to != nullptr && num_hops < std::min<uint>(64, this->vehicle->GetEffectiveOrders()->GetNumOrders()) && skip_to != next) {
 				/* Make copies of capacity tracking lists. There is potential
 				 * for optimization here: If the vehicle never refits we don't
 				 * need to copy anything. */
 
 				/* Record the branch before executing it,
 				 * to avoid recursively executing it again. */
-				Hop hop(this->vehicle->orders->GetIndexOfOrder(cur), this->vehicle->orders->GetIndexOfOrder(skip_to), this->cargo, flags);
+				Hop hop(this->vehicle->GetEffectiveOrders()->GetIndexOfOrder(cur), this->vehicle->GetEffectiveOrders()->GetIndexOfOrder(skip_to), this->cargo, flags);
 				auto iter = this->seen_hops->lower_bound(hop);
 				if (iter == this->seen_hops->end() || *iter != hop) {
 					this->seen_hops->insert(iter, hop);
@@ -327,8 +329,8 @@ std::pair<const Order *, LinkRefresher::TimetableTravelTime> LinkRefresher::Pred
 		 * depot.*/
 		CargoTypes this_cargo_mask = this->cargo_mask;
 		const Order *current = next;
-		next = this->vehicle->orders->GetNextDecisionNode(
-				this->vehicle->orders->GetNext(next), num_hops++, this_cargo_mask);
+		next = this->vehicle->GetEffectiveOrders()->GetNextDecisionNode(
+				this->vehicle->GetEffectiveOrders()->GetNext(next), num_hops++, this_cargo_mask);
 		assert(this_cargo_mask == this->cargo_mask);
 
 		travel.flags.Set(TimetableTravelTimeFlag::AllowCondition);
@@ -388,16 +390,16 @@ void LinkRefresher::RefreshStats(const Order *cur, const Order *next, uint32_t t
 			 * loading. Don't do that if the vehicle has been waiting for longer than the entire
 			 * order list is supposed to take, though. If that is the case the total duration is
 			 * probably far off and we'd greatly overestimate the capacity by increasing.*/
-			if (this->is_full_loading && this->vehicle->orders != nullptr &&
+			if (this->is_full_loading && this->vehicle->GetEffectiveOrders() != nullptr &&
 					st->index == vehicle->last_station_visited &&
-					this->vehicle->orders->GetTotalDuration() >
+					this->vehicle->GetEffectiveOrders()->GetTotalDuration() >
 					(Ticks)this->vehicle->current_order_time) {
 				uint effective_capacity = cargo_quantity * this->vehicle->load_unload_ticks;
-				if (effective_capacity > (uint)this->vehicle->orders->GetTotalDuration()) {
+				if (effective_capacity > (uint)this->vehicle->GetEffectiveOrders()->GetTotalDuration()) {
 					IncreaseStats(st, cargo, next_station, effective_capacity /
-							this->vehicle->orders->GetTotalDuration(), 0, 0,
+							this->vehicle->GetEffectiveOrders()->GetTotalDuration(), 0, 0,
 							EdgeUpdateModes{EdgeUpdateMode::Increase} | restricted_modes);
-				} else if (RandomRange(this->vehicle->orders->GetTotalDuration()) < effective_capacity) {
+				} else if (RandomRange(this->vehicle->GetEffectiveOrders()->GetTotalDuration()) < effective_capacity) {
 					IncreaseStats(st, cargo, next_station, 1, 0, 0, EdgeUpdateModes{EdgeUpdateMode::Increase} | restricted_modes);
 				} else {
 					IncreaseStats(st, cargo, next_station, cargo_quantity, 0, time_estimate, EdgeUpdateModes{EdgeUpdateMode::Refresh} | restricted_modes);
@@ -454,7 +456,7 @@ void LinkRefresher::RefreshLinks(const Order *cur, const Order *next, TimetableT
 
 		std::tie(next, travel) = this->PredictNextOrder(cur, next, travel, flags, num_hops);
 		if (next == nullptr) break;
-		Hop hop(this->vehicle->orders->GetIndexOfOrder(cur), this->vehicle->orders->GetIndexOfOrder(next), this->cargo);
+		Hop hop(this->vehicle->GetEffectiveOrders()->GetIndexOfOrder(cur), this->vehicle->GetEffectiveOrders()->GetIndexOfOrder(next), this->cargo);
 		auto iter = this->seen_hops->lower_bound(hop);
 		if (iter != this->seen_hops->end() && *iter == hop) {
 			break;

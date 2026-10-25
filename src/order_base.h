@@ -974,6 +974,28 @@ public:
 	inline bool HasNoTimetableTimes() const { return this->IsSlotCounterOrder() || this->IsType(OT_LABEL); }
 
 	/**
+	 * R3R (KI-391): does a wait time apply to this order?
+	 *
+	 * #OT_DECOUPLE is an instant command (like signing a path token): it neither
+	 * waits nor travels, so it must never carry a timetable time. Every other
+	 * order type keeps the upstream behaviour.
+	 * @return \c true iff a wait time is meaningful for this order.
+	 */
+	inline bool HasWaitTimetableTime() const { return !this->HasNoTimetableTimes() && !this->IsType(OT_DECOUPLE); }
+
+	/**
+	 * R3R (KI-391): does a travel time apply to this order?
+	 *
+	 * #OT_WAIT_COUPLE only waits for a coupling partner and never travels, while
+	 * #OT_GOTO_COUPLE travels to the partner (and may wait there once arrived).
+	 * @return \c true iff a travel time is meaningful for this order.
+	 */
+	inline bool HasTravelTimetableTime() const
+	{
+		return !this->HasNoTimetableTimes() && !this->IsType(OT_DECOUPLE) && !this->IsType(OT_WAIT_COUPLE);
+	}
+
+	/**
 	 * Does this order have an explicit wait time set?
 	 * @return \c true iff the wait time has been set.
 	 */
@@ -1127,6 +1149,11 @@ public:
 	 */
 	inline bool IsCompletelyTimetabled() const
 	{
+		/* R3R (KI-391): #OT_DECOUPLE never carries a timetable time at all and
+		 * #OT_WAIT_COUPLE only carries a wait time, so neither can be "missing"
+		 * the travel time that the upstream check below demands. */
+		if (this->IsType(OT_DECOUPLE)) return true;
+		if (this->IsType(OT_WAIT_COUPLE)) return this->IsWaitTimetabled();
 		if (!this->IsTravelTimetabled() && !this->IsType(OT_CONDITIONAL)) return false;
 		if (!this->IsWaitTimetabled() && this->IsType(OT_GOTO_STATION) &&
 				!(this->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) {

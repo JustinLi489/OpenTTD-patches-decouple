@@ -57,8 +57,9 @@ OrderBackup::OrderBackup(OrderBackupID index, const Vehicle *v, uint32_t user) :
 			this->orders.emplace_back(*order);
 		}
 
-		if (v->orders != nullptr) {
-			this->dispatch_schedules = v->orders->GetScheduledDispatchScheduleSet();
+		/* R3R (KI-465 修法 D): back up the schedule the vehicle actually runs. */
+		if (v->GetEffectiveOrders() != nullptr) {
+			this->dispatch_schedules = v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
 		}
 	}
 
@@ -75,6 +76,11 @@ void OrderBackup::DoRestore(Vehicle *v)
 	if (this->clone != nullptr) {
 		Command<Commands::CloneOrder>::Do(DoCommandFlag::Execute, CO_SHARE, v->index, this->clone->index);
 	} else if (!this->orders.empty() && OrderList::CanAllocateItem()) {
+		/* R3R (KI-465 修法 D): the restored list only takes effect once the vehicle
+		 * owns it again -- a stale follow pointer would keep overriding it. */
+		v->r3r_follow_orders = nullptr;
+		v->r3r_follow_owner = VehicleID::Invalid();
+		v->r3r_orders_borrowed = false;
 		v->orders = OrderList::Create(std::move(this->orders), v);
 		this->orders.clear();
 

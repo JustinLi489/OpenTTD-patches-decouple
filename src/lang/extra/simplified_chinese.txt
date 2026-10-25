@@ -154,6 +154,12 @@ STR_CONFIG_SETTING_RAIL_DEPOT_SPEED_LIMIT_HELPTEXT              :列车进出车
 STR_CONFIG_SETTING_NON_LEADING_ENGINES_KEEP_NAME                :多机车列车保留自定义机车名：{STRING}
 STR_CONFIG_SETTING_NON_LEADING_ENGINES_KEEP_NAME_HELPTEXT       :当一列列车中有多个机车时，保留其余机车的自定义名称
 
+STR_CONFIG_SETTING_IGNORE_GRF_ATTACH_LIMITS                     :无视 NewGRF 车厢连挂限制：{STRING}
+STR_CONFIG_SETTING_IGNORE_GRF_ATTACH_LIMITS_HELPTEXT            :启用后不再评估 NewGRF 的“允许车厢连挂”回调，即使 NewGRF 禁止也能连挂车厢。{}可用于组合 NewGRF 只打算做图像级假重联的车辆，例如把只应显示为连挂状态的车辆组成真正的重联列车。{}列车最大长度限制仍然有效。{}警告：NewGRF 可能没有为这类组合提供合适的图像或统计数值
+
+STR_CONFIG_SETTING_IGNORE_GRF_STARTSTOP_LIMITS                  :无视 NewGRF 启停限制：{STRING}
+STR_CONFIG_SETTING_IGNORE_GRF_STARTSTOP_LIMITS_HELPTEXT         :启用后不再评估 NewGRF 的启动/停止回调，从而可以单独启动或停止被 NewGRF 锁在固定编组中的车辆。{}其它规则（无动力不能启动、飞机飞行中不能停止等）仍然有效
+
 STR_CONFIG_SETTING_BACK_ONE_WAY_PBS_SAFE_WAITING                :寻路至单向路径信号的背面：{STRING}
 STR_CONFIG_SETTING_BACK_ONE_WAY_PBS_SAFE_WAITING_HELPTEXT       :启用之后允许 YAPF 寻路器寻路至单向路径信号的背面
 

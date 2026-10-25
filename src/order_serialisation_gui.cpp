@@ -84,8 +84,8 @@ struct OrderListImportErrorsWindow : GeneralVehicleWindow
 	void SaveOrders()
 	{
 		this->saved_vehicle_flags = this->vehicle->vehicle_flags;
-		if (this->vehicle->orders != nullptr) {
-			this->saved_orders.CopyOrderListContents(*this->vehicle->orders);
+		if (this->vehicle->GetEffectiveOrders() != nullptr) {
+			this->saved_orders.CopyOrderListContents(*this->vehicle->GetEffectiveOrders());
 		}
 	}
 
@@ -203,6 +203,10 @@ struct OrderListImportErrorsWindow : GeneralVehicleWindow
 
 			AutoRestoreBackup flag_backup(const_cast<Vehicle *>(this->vehicle)->vehicle_flags, this->saved_vehicle_flags);
 			AutoRestoreBackup order_backup(const_cast<Vehicle *>(this->vehicle)->orders, const_cast<OrderList *>(&this->saved_orders));
+			/* R3R (KI-465 修法 D): the follow pointer takes precedence over `orders`, so it
+			 * has to be dropped for the duration of the error listing, otherwise the rows
+			 * would be read from the schedule being followed instead of the saved copy. */
+			AutoRestoreBackup follow_backup(const_cast<Vehicle *>(this->vehicle)->r3r_follow_orders, static_cast<OrderList *>(nullptr));
 			AutoRestoreBackup order_idx_backup1(const_cast<Vehicle *>(this->vehicle)->cur_real_order_index, INVALID_VEH_ORDER_ID);
 			AutoRestoreBackup order_idx_backup2(const_cast<Vehicle *>(this->vehicle)->cur_implicit_order_index, INVALID_VEH_ORDER_ID);
 

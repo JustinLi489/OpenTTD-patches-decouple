@@ -463,7 +463,8 @@
 	if (!IsPrimaryVehicle(vehicle_id)) return false;
 
 	const Vehicle *v = ::Vehicle::Get(vehicle_id);
-	return v->orders != nullptr && v->orders->GetNumVehicles() > 1;
+	/* R3R (KI-465 修法 D): ask the effective list; a follower's own `orders` may be empty. */
+	return v->GetEffectiveOrders() != nullptr && v->GetEffectiveOrders()->GetNumVehicles() > 1;
 }
 
 /* static */ SQInteger ScriptVehicle::GetReliability(VehicleID vehicle_id)

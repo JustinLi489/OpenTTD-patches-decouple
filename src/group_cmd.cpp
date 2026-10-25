@@ -1072,6 +1072,11 @@ void SetTrainGroupID(Train *v, GroupID new_g)
 	assert(v->IsFrontEngine() || IsDefaultGroupID(new_g));
 
 	for (Vehicle *u = v; u != nullptr; u = u->Next()) {
+		/* R3R (第 292 轮 / KI-463, 玩家口径 C-3「分组属于段」): a chain may hold several
+		 * segments, each of which owns its group. Stop at the next segment front so that
+		 * a group change only rewrites the segment it was addressed to; a chain without
+		 * segment markers (every plain train) behaves exactly as before. */
+		if (u != v && Train::From(u)->IsSegmentFront()) break;
 		if (u->IsEngineCountable()) UpdateNumEngineGroup(u, u->group_id, new_g);
 
 		u->group_id = new_g;
@@ -1094,6 +1099,52 @@ void SetTrainGroupID(Train *v, GroupID new_g)
 	SetWindowDirty(WindowClass::ReplaceVehicle, VehicleType::Train);
 }
 
+/**
+ * R3R (第 292 轮 / KI-463): set the group of a single R3R segment.
+ *
+ * Player decision C-3 of round 292 makes the group a trait *of the segment*: a chain may
+ * hold several groups at once (one per segment) and coupling / decoupling must never
+ * flatten them onto the value of whichever segment happens to sit at the chain head.
+ *
+ * #SetTrainGroupID cannot serve the heads of the inner segments: its assertion requires a
+ * front engine and its loop walks the whole chain. This variant walks from @p v up to (but
+ * excluding) the next segment front, so it can rewrite exactly one segment, and it keeps
+ * Group::num_engines in step. Rows are not touched here: every caller sits at a commit
+ * point which is followed by R3RSettleChainSegments() and its trait sync.
+ *
+ * @param v First vehicle of the segment to change.
+ * @param new_g Group the segment is moved into.
+ * @return Number of vehicles whose group actually changed.
+ */
+uint R3RSetSegmentGroupID(Train *v, GroupID new_g)
+{
+	if (v == nullptr) return 0;
+	if (!Group::IsValidID(new_g) && !IsDefaultGroupID(new_g)) return 0;
+
+	uint changed = 0;
+	for (Train *u = v; u != nullptr; u = u->Next()) {
+		if (u != v && u->IsSegmentFront()) break;
+		if (u->group_id == new_g) continue;
+
+		if (u->IsEngineCountable()) UpdateNumEngineGroup(u, u->group_id, new_g);
+		u->group_id = new_g;
+		u->colourmap = PAL_NONE;
+		u->InvalidateNewGRFCache();
+		u->InvalidateImageCache();
+		/* Qualify the base version on purpose: Train declares its own two-argument
+		 * UpdateViewport() which hides Vehicle::UpdateViewport(bool); calling the qualified
+		 * name keeps the "only mark the sprite dirty" semantics (no geometry update). */
+		u->Vehicle::UpdateViewport(true);
+		changed++;
+	}
+
+	if (changed == 0 || _group_change_deferred_updates.refcount != 0) return changed;
+
+	GroupStatistics::UpdateAutoreplace(v->owner);
+	SetWindowDirty(WindowClass::ReplaceVehicle, VehicleType::Train);
+	return changed;
+}
+
 
 /**
  * Recalculates the groupID of a train. Should be called each time a vehicle is added
@@ -1108,6 +1159,9 @@ void UpdateTrainGroupID(Train *v)
 
 	GroupID new_g = (v->IsFrontEngine() || v->IsFrontWagon()) ? v->group_id : (GroupID)DEFAULT_GROUP;
 	for (Vehicle *u = v; u != nullptr; u = u->Next()) {
+		/* R3R (第 292 轮 / KI-463): the group belongs to the segment, so only the segment
+		 * of @p v is re-normalised; the segments behind it keep their own groups. */
+		if (u != v && Train::From(u)->IsSegmentFront()) break;
 		if (u->IsEngineCountable()) UpdateNumEngineGroup(u, u->group_id, new_g);
 
 		u->group_id = new_g;

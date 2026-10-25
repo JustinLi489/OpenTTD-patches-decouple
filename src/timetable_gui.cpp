@@ -133,14 +133,14 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 
 	/* Backup all DispatchSchedule positions for this order list, so that positions can be modified
 	 * during timetable traversal to allow conditional order prediction. */
-	const uint schedule_count = v->orders->GetScheduledDispatchScheduleCount();
+	const uint schedule_count = v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount();
 	auto schedule_position_backups = std::make_unique<DispatchSchedule::PositionBackup[]>(schedule_count);
 	for (uint i = 0; i < schedule_count; i++) {
-		schedule_position_backups[i] = v->orders->GetDispatchScheduleByIndex(i).BackupPosition();
+		schedule_position_backups[i] = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(i).BackupPosition();
 	}
 	auto guard = scope_guard([&]() {
 		for (uint i = 0; i < schedule_count; i++) {
-			v->orders->GetDispatchScheduleByIndex(i).RestorePosition(schedule_position_backups[i]);
+			v->GetEffectiveOrders()->GetDispatchScheduleByIndex(i).RestorePosition(schedule_position_backups[i]);
 		}
 	});
 
@@ -182,7 +182,7 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 							return GetVehicleLastDispatchRecord(v, schedule_index);
 						}
 					};
-					OrderConditionEvalResult result = EvaluateDispatchSlotConditionalOrder(order, v->orders->GetScheduledDispatchScheduleSet(), time, get_vehicle_records);
+					OrderConditionEvalResult result = EvaluateDispatchSlotConditionalOrder(order, v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet(), time, get_vehicle_records);
 					if (result.IsPredicted()) predicted = true;
 					jump = result.GetResult();
 					break;
@@ -233,7 +233,7 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 
 			if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && order->IsScheduledDispatchOrder(true) && !(i == start && !travelling)) {
 				if (!no_offset) sum -= v->lateness_counter;
-				DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(order->GetDispatchScheduleIndex());
+				DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(order->GetDispatchScheduleIndex());
 				ds.UpdateScheduledDispatchToDate(_state_ticks + sum);
 
 				StateTicks slot;
@@ -260,7 +260,7 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 
 		skip_travel = false;
 
-		v->orders->AdvanceOrderWithIndex(order, i);
+		v->GetEffectiveOrders()->AdvanceOrderWithIndex(order, i);
 	} while (i != start);
 
 	/* When loading at a scheduled station we still have to treat the
@@ -289,7 +289,7 @@ static void ChangeTimetableStartCallback(const Window *w, StateTicks tick, void 
 
 void ProcessTimetableWarnings(const Vehicle *v, std::function<void(std::string_view, bool)> handler_func, bool no_text = false)
 {
-	Ticks total_time = v->orders != nullptr ? v->orders->GetTimetableDurationIncomplete() : 0;
+	Ticks total_time = v->GetEffectiveOrders() != nullptr ? v->GetEffectiveOrders()->GetTimetableDurationIncomplete() : 0;
 
 	auto handler = [&](StringID str, bool warning) {
 		if (no_text) {
@@ -312,10 +312,13 @@ void ProcessTimetableWarnings(const Vehicle *v, std::function<void(std::string_v
 			have_conditional = true;
 			if (!order->IsWaitTimetabled()) have_non_timetabled_conditional_branch = true;
 		} else {
-			if (order->GetWaitTime() == 0 && !order->IsWaitTimetabled() && order->IsType(OT_GOTO_STATION) && !(order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) {
+			/* R3R (KI-391): #OT_DECOUPLE has no timetable times at all and
+			 * #OT_WAIT_COUPLE has no travel time, so they must not raise the
+			 * "missing timings" warnings for fields that do not apply. */
+			if (order->HasWaitTimetableTime() && order->GetWaitTime() == 0 && !order->IsWaitTimetabled() && order->IsType(OT_GOTO_STATION) && !(order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) {
 				have_missing_wait = true;
 			}
-			if (order->GetTravelTime() == 0 && !order->IsTravelTimetabled()) {
+			if (order->HasTravelTimetableTime() && order->GetTravelTime() == 0 && !order->IsTravelTimetabled()) {
 				have_missing_travel = true;
 			}
 		}
@@ -375,17 +378,17 @@ void ProcessTimetableWarnings(const Vehicle *v, std::function<void(std::string_v
 	if (have_bad_full_load) handler(STR_TIMETABLE_WARNING_FULL_LOAD, true);
 	if (have_conditional && v->vehicle_flags.Test(VehicleFlag::AutofillTimetable)) handler(STR_TIMETABLE_WARNING_AUTOFILL_CONDITIONAL, true);
 	if (total_time && have_non_timetabled_conditional_branch) handler(STR_TIMETABLE_NON_TIMETABLED_BRANCH, false);
-	if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && v->orders != nullptr) {
+	if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && v->GetEffectiveOrders() != nullptr) {
 		auto sd_warning = [&](int schedule_index, StringID str) {
 			if (no_text) {
 				handler_func({}, true);
-			} else if (v->orders->GetScheduledDispatchScheduleCount() > 1) {
+			} else if (v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() > 1) {
 				handler_func(GetString(STR_TIMETABLE_WARNING_SCHEDULE_ID, schedule_index + 1, str), true);
 			} else {
 				handler_func(GetString(str), true);
 			}
 		};
-		std::vector<bool> seen_sched_dispatch_orders(v->orders->GetScheduledDispatchScheduleCount());
+		std::vector<bool> seen_sched_dispatch_orders(v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount());
 
 		for (const Order *order : v->Orders()) {
 			int schedule_index = order->GetDispatchScheduleIndex();
@@ -621,13 +624,19 @@ struct TimetableWindow : GeneralVehicleWindow {
 				if (order != nullptr) {
 					if (selected % 2 != 0) {
 						/* Travel time */
-						disable = order->IsType(OT_CONDITIONAL) || order->IsType(OT_IMPLICIT) || order->HasNoTimetableTimes();
+						disable = order->IsType(OT_CONDITIONAL) || order->IsType(OT_IMPLICIT) || order->HasNoTimetableTimes() || !order->HasTravelTimetableTime();
 						disable_time = disable;
 						wait_lockable = !disable;
 						wait_locked = wait_lockable && order->IsTravelFixed();
 					} else {
 						/* Wait time */
 						if (order->IsType(OT_GOTO_WAYPOINT)) {
+							disable = false;
+							disable_time = false;
+							if (v->type != VehicleType::Train && !order->IsWaitTimetabled() && !order->IsWaitFixed()) disable_time = true;
+							clearable_when_wait_locked = true;
+						} else if (order->IsType(OT_GOTO_COUPLE) || order->IsType(OT_WAIT_COUPLE)) {
+							/* R3R (KI-391): waiting for a coupling partner is a timetabled wait. */
 							disable = false;
 							disable_time = false;
 							if (v->type != VehicleType::Train && !order->IsWaitTimetabled() && !order->IsWaitFixed()) disable_time = true;
@@ -661,9 +670,9 @@ struct TimetableWindow : GeneralVehicleWindow {
 			this->SetWidgetDisabledState(WID_VT_CHANGE_SPEED, disable_speed);
 			this->SetWidgetDisabledState(WID_VT_CLEAR_SPEED, disable_speed);
 
-			this->SetWidgetDisabledState(WID_VT_START_DATE, v->orders == nullptr || v->vehicle_flags.Test(VehicleFlag::TimetableSeparation) || v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch));
-			this->SetWidgetDisabledState(WID_VT_RESET_LATENESS, v->orders == nullptr);
-			this->SetWidgetDisabledState(WID_VT_AUTOFILL, v->orders == nullptr || v->vehicle_flags.Test(VehicleFlag::AutomateTimetable));
+			this->SetWidgetDisabledState(WID_VT_START_DATE, v->GetEffectiveOrders() == nullptr || v->vehicle_flags.Test(VehicleFlag::TimetableSeparation) || v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch));
+			this->SetWidgetDisabledState(WID_VT_RESET_LATENESS, v->GetEffectiveOrders() == nullptr);
+			this->SetWidgetDisabledState(WID_VT_AUTOFILL, v->GetEffectiveOrders() == nullptr || v->vehicle_flags.Test(VehicleFlag::AutomateTimetable));
 			this->SetWidgetDisabledState(WID_VT_AUTO_SEPARATION, v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) || v->HasUnbunchingOrder());
 			this->EnableWidget(WID_VT_AUTOMATE);
 			this->EnableWidget(WID_VT_ADD_VEH_GROUP);
@@ -695,7 +704,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 		this->SetWidgetLoweredState(WID_VT_SCHEDULED_DISPATCH, v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch));
 		this->SetWidgetLoweredState(WID_VT_SCHEDULED_DISPATCH, v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch));
 
-		this->SetWidgetDisabledState(WID_VT_SCHEDULED_DISPATCH, v->orders == nullptr);
+		this->SetWidgetDisabledState(WID_VT_SCHEDULED_DISPATCH, v->GetEffectiveOrders() == nullptr);
 		this->GetWidget<NWidgetStacked>(WID_VT_START_DATE_SELECTION)->SetDisplayedPlane(v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) ? 1 : 0);
 	}
 
@@ -790,11 +799,11 @@ struct TimetableWindow : GeneralVehicleWindow {
 							order = v->GetOrder(0);
 							final_order = true;
 						} else {
-							order = v->orders->GetNext(order);
+							order = v->GetEffectiveOrders()->GetNext(order);
 						}
 					} else {
 						ExtendedTextColour colour = (i == selected) ? TextColour::White : TextColour::Black;
-						if (order->IsType(OT_CONDITIONAL) || order->HasNoTimetableTimes()) {
+						if (order->IsType(OT_CONDITIONAL) || !order->HasTravelTimetableTime()) {
 							GetStringInPlace(buffer, STR_TIMETABLE_NO_TRAVEL);
 						} else if (order->IsType(OT_IMPLICIT)) {
 							GetStringInPlace(buffer, STR_TIMETABLE_NOT_TIMETABLEABLE);
@@ -849,7 +858,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 				 * i.e. are only shown if we can calculate all times.
 				 * Excluding order lists with only one order makes some things easier.
 				 */
-				Ticks total_time = v->orders != nullptr ? v->orders->GetTimetableDurationIncomplete() : 0;
+				Ticks total_time = v->GetEffectiveOrders() != nullptr ? v->GetEffectiveOrders()->GetTimetableDurationIncomplete() : 0;
 				if (total_time <= 0 || v->GetNumOrders() <= 1 || !v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) break;
 
 				std::unique_ptr<TimetableArrivalDeparture[]> arr_dep = std::make_unique<TimetableArrivalDeparture[]>(v->GetNumOrders());
@@ -913,11 +922,11 @@ struct TimetableWindow : GeneralVehicleWindow {
 					DrawString(tr, GetStringInPlace(buffer, str, std::forward<T>(params)...));
 				};
 
-				Ticks total_time = v->orders != nullptr ? v->orders->GetTimetableDurationIncomplete() : 0;
+				Ticks total_time = v->GetEffectiveOrders() != nullptr ? v->GetEffectiveOrders()->GetTimetableDurationIncomplete() : 0;
 				if (total_time != 0) {
 					auto params = GetTimetableParameters(total_time, true);
 					StringID str;
-					if (!v->orders->IsCompleteTimetable()) {
+					if (!v->GetEffectiveOrders()->IsCompleteTimetable()) {
 						str = STR_TIMETABLE_TOTAL_TIME_INCOMPLETE;
 					} else if (!_settings_client.gui.timetable_in_ticks && _settings_client.gui.timetable_leftover_time == TLT_OFF && total_time % TimetableDisplayUnitSize() != 0) {
 						str = STR_TIMETABLE_APPROX_TIME;
@@ -1039,7 +1048,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 			}
 
 			case WID_VT_START_DATE: { // Change the date that the timetable starts.
-				bool set_all = _ctrl_pressed && v->orders->IsCompleteTimetable();
+				bool set_all = _ctrl_pressed && v->GetEffectiveOrders()->IsCompleteTimetable();
 				if (EconTime::UsingWallclockUnits() && !_settings_time.time_in_minutes) {
 					this->set_start_date_all = set_all;
 					ShowQueryString({}, STR_TIMETABLE_START_SECONDS_QUERY, 6, this, CS_NUMERAL, QueryStringFlag::AcceptUnchanged);
@@ -1185,8 +1194,8 @@ struct TimetableWindow : GeneralVehicleWindow {
 				DropDownList list;
 				list.push_back(MakeDropDownListStringItem(STR_TIMETABLE_ASSIGN_SCHEDULE_NONE, -1, false));
 
-				for (uint i = 0; i < v->orders->GetScheduledDispatchScheduleCount(); i++) {
-					const DispatchSchedule &ds = this->vehicle->orders->GetDispatchScheduleByIndex(i);
+				for (uint i = 0; i < v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount(); i++) {
+					const DispatchSchedule &ds = this->vehicle->GetEffectiveOrders()->GetDispatchScheduleByIndex(i);
 					if (ds.ScheduleName().empty()) {
 						list.push_back(MakeDropDownListStringItem(GetString(STR_TIMETABLE_ASSIGN_SCHEDULE_ID, i + 1), i, false));
 					} else {

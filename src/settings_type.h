@@ -861,6 +861,8 @@ struct VehicleSettings {
 	uint16_t through_load_speed_limit;         ///< maximum speed for through load
 	uint16_t rail_depot_speed_limit;           ///< maximum speed entering/existing rail depots
 	bool     non_leading_engines_keep_name;    ///< allow engines moved to a non-leading position to retain their custom name
+	bool     ignore_grf_attach_limits;         ///< ignore NewGRF wagon attachment restrictions (CBID_TRAIN_ALLOW_WAGON_ATTACH)
+	bool     ignore_grf_startstop_limits;      ///< ignore NewGRF start/stop restrictions (CBID_VEHICLE_START_STOP_CHECK)
 };
 
 /** Settings related to the economy. */

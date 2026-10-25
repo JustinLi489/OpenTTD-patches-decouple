@@ -1655,7 +1655,7 @@ void PrepareUnload(Vehicle *front_v)
 	front_v->cargo_payment = CargoPayment::Create(front_v);
 
 	CargoStationIDVectorSet next_station = front_v->GetNextStoppingStation();
-	if (front_v->orders == nullptr || (front_v->current_order.GetUnloadType() != OrderUnloadType::NoUnload)) {
+	if (front_v->GetEffectiveOrders() == nullptr || (front_v->current_order.GetUnloadType() != OrderUnloadType::NoUnload)) {
 		Station *st = Station::Get(front_v->last_station_visited);
 		for (Vehicle *v = front_v; v != nullptr; v = v->Next()) {
 			if (GetUnloadType(v) == OrderUnloadType::NoUnload) continue;

@@ -552,6 +552,48 @@ struct R3RSegmentRecord {
 	UnitID unitnumber = 0;                                  ///< Unit number ("列车名") of this segment while it is not the chain head.
 	std::string name;                                       ///< Player given name of this segment; the formal home of #Vehicle::name_backup.
 	GroupID group_id = GroupID::Invalid();                  ///< "列车分组" of this segment while it is not the chain head; the formal home of #Vehicle::group_id_backup.
+
+	/* R3R (KI-388 / KI-395): the auto recorded ranges of this segment.
+	 *
+	 * While a segment is *not* the control segment, the orders of another segment
+	 * are the ones being driven, so this segment's own schedule says nothing about
+	 * where the train actually went. The automatic recorder therefore appends one
+	 * order per station / waypoint / depot the consist passes to the segment's own
+	 * list (see #orders), and remembers the resulting ranges here.
+	 *
+	 * A plan may hand over control several times (a1 -> couple c1 -> a2 -> couple
+	 * d1 -> a3 ...), and every hand-over gets its own range, so unlike KI-388 this
+	 * is a small array of ranges instead of one [begin, begin + count) pair. Slots
+	 * are handed out in the order the hand-overs happen and never overlap; a slot
+	 * whose #auto_ranges_count is 0 is free. A recording round picks the range its
+	 * anchor falls into (or the free slot right behind it), so the array order is
+	 * only a creation order. #auto_num_ranges is the high-water mark, so dropped
+	 * slots below it stay free instead of being compacted (the cursor map is keyed
+	 * by slot, compaction would renumber it for nothing).
+	 *
+	 * Each range is replaced as a whole: a round which produces exactly the same
+	 * orders must leave the list untouched, because the orders in it carry the
+	 * timetable and the wait times the player may have set. #auto_ranges_signature
+	 * is a hash of the range as written, so a range the player edited by hand is
+	 * never mistaken for ours (it is then dropped instead of deleted).
+	 *
+	 * KI-388 的实现注记：这些槽位是"段自己的表里哪几段是我们自动写的"的唯一凭据，
+	 * 必须随存档保存，否则读档后再挂一次会把旧区间当成玩家的订单、追加出重复。
+	 * KI-395 追加：auto_begin / auto_count / auto_signature 只剩"读旧档迁移"和
+	 * "存档时镜像 slot 0"两个用途，任何判定都不得再读它们。 */
+	static constexpr uint8_t AUTO_RANGE_SLOTS = 8;          ///< How many hand-over ranges one segment can remember.
+	uint8_t auto_num_ranges = 0;                            ///< (KI-395) High-water mark of the slot arrays below.
+	uint16_t auto_ranges_begin[AUTO_RANGE_SLOTS] = {};      ///< (KI-395) First order of every auto recorded range.
+	uint16_t auto_ranges_count[AUTO_RANGE_SLOTS] = {};      ///< (KI-395) Number of orders of every auto recorded range; 0 = free slot.
+	uint32_t auto_ranges_signature[AUTO_RANGE_SLOTS] = {};  ///< (KI-395) Hash of every auto recorded range as written, to tell our own orders from hand edited ones.
+
+	/* R3R (KI-388, legacy): the single range of pre-KI-395 savegames. Only read by
+	 * the loader to migrate into slot 0 and written back as a mirror of slot 0 so
+	 * that an older binary can still make sense of a one-range plan. */
+	uint16_t auto_begin = 0;
+	uint16_t auto_count = 0;
+	uint32_t auto_signature = 0;
+
 	bool in_use = false;                                    ///< NOSAVE: whether this slot holds a live segment (set by R3RSegmentAlloc() and the R3SG loader, cleared by R3RSegmentFree()).
 };
 

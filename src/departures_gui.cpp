@@ -722,7 +722,7 @@ public:
 		}
 
 		this->filter_target = CallAtTargetID();
-		this->order_list_filter = v->orders;
+		this->order_list_filter = v->GetEffectiveOrders();
 		this->UpdateVehicleTypeFilterDisableState();
 		this->OnInvalidateData(0, false);
 		ResetObjectToPlace();

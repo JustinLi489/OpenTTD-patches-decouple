@@ -853,14 +853,23 @@ void AfterLoadCoupleGroups()
 	}
 }
 
+/* R3R (第 292 轮 / KI-463): defined in group_cmd.cpp; declared here by hand so this stays
+ * a .cpp-only change. */
+uint R3RSetSegmentGroupID(Train *v, GroupID new_g);
+
 /**
- * R3R（2026-09-23）：读档收尾把每条物理链的「列车分组」与「挂接分组」收敛到实际控制段。
+ * R3R（第 292 轮 / KI-463，玩家口径 C-3）：读档收尾按**段**校正列车分组，并收敛挂接分组。
  *
- * 与 train_cmd.cpp 里 Couple() / DecoupleTrain() 提交点上调用的 R3RNormaliseChainGroups()
- * 同一口径（实际控制段 = R3RGetChainScheduleOwner() 选出的 r3r_priority 最小者），差别只有两点：
+ * 列车分组的口径已经反转：分组属于段，不再属于整列车。于是这里与 train_cmd.cpp 的
+ * R3RNormaliseChainGroups() 一样，只逐段把第 144 轮「整链推平」停放的分组还给该段（并清空备份），
+ * 再把每段内部统一到该段自己的分组 —— **绝不**把整链推平到控制段。
+ *
+ * 挂接分组仍是第 159 轮 / q-2=肆 的并集（OR）广播口径，未变。
+ *
+ * 与提交点版本的差别只有两点：
  *  - 面向整张地图遍历（读档时所有车辆刚建好），而不是单条链；
  *  - 不做 num_vehicle 簿记 —— 它由紧随其后的 GroupStatistics::UpdateAfterLoad() 整表重算，
- *    连 SetTrainGroupID 顺带维护的 num_engines 也一并被重算覆盖。
+ *    连 R3RSetSegmentGroupID 顺带维护的 num_engines 也一并被重算覆盖。
  *
  * 调用点（saveload/afterload.cpp）必须夹在 AfterLoadVehiclesPhase2() 之后、
  * GroupStatistics::UpdateAfterLoad() 之前：前者保证 orders 这条 REF 指针已经修正
@@ -869,6 +878,19 @@ void AfterLoadCoupleGroups()
  */
 static void R3RSegmentReconcileRows(const char *tag);
 
+/**
+ * R3R（第 293 轮 / KI-464）：Vehicle::group_id_backup 里的分组副本算不算"真分组"。
+ *
+ * DEFAULT_GROUP(65534，"未分组")是个合法值，旧口径（第 144~291 轮整链推平、以及
+ * 第 292 轮 R3RParkTrainGroupID 未设防时）确实会把它停进副本。但它**不能**当作可归还的
+ * 分组：归还时会把这一段玩家后来设的分组冲掉，段行随即被回收，界面就读到
+ * 0xFFFF/65535（玩家报的"解挂之后有个列车编号跑到 65535"）。
+ */
+static bool R3RIsParkedGroupUsable(GroupID g)
+{
+	return g != GroupID::Invalid() && g != DEFAULT_GROUP;
+}
+
 void R3RNormaliseChainGroupsAfterLoad()
 {
 	uint chains = 0;
@@ -876,38 +898,33 @@ void R3RNormaliseChainGroupsAfterLoad()
 	uint mask_fixes = 0;
 
 	for (Train *t : Train::Iterate()) {
-		if (t->Previous() != nullptr || !t->IsFrontEngine()) continue;
+		if (t->Previous() != nullptr || !(t->IsFrontEngine() || t->IsFrontWagon())) continue;
 		chains++;
 
-		const Train *owner = nullptr;
-		R3RGetChainScheduleOwner(t, &owner, nullptr, nullptr);
-		if (owner == nullptr) continue;
-
-		/* 列车分组：整链推平为控制段的分组。判据扫全链而不是只比链头 —— 不一致的
-		 * 往往正是被并入的那一段。 */
-		bool uniform = true;
-		for (const Vehicle *w = t; w != nullptr; w = w->Next()) {
-			if (w->group_id != owner->group_id) { uniform = false; break; }
-		}
-		if (!uniform) {
-			const GroupID old_g = t->group_id;
-			/* R3R (第 144 轮 / 需求伍): 与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径 ——
-			 * 先把"分组会被改写"的段头（含链头）自己的分组停放，等该段重新成为链头时由
-			 * NormaliseTrainHead() 取回。读档路径不做 num_vehicle 簿记：紧随其后的
-			 * GroupStatistics::UpdateAfterLoad() 会整表重算。 */
-			for (Train *s = t; s != nullptr; ) {
-				if ((s->Previous() == nullptr || s->IsSegmentFront()) && s->group_id != owner->group_id &&
-						s->group_id_backup == GroupID::Invalid()) {
-					s->group_id_backup = s->group_id;
-					R3RDbgWrite("GRP-PARK-LOAD veh=%d g=%u\n", (int)s->index.base(), (uint)s->group_id.base());
+		/* 列车分组：逐段取回 / 逐段统一，与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径。 */
+		for (Train *s = t; s != nullptr; ) {
+			if (s->Previous() == nullptr || s->IsSegmentFront()) {
+				GroupID parked = s->group_id_backup;
+				/* 第 293 轮 / KI-464：DEFAULT_GROUP 副本不是"真分组"，丢弃它、保留段头活值。 */
+				if (parked != GroupID::Invalid() && !R3RIsParkedGroupUsable(parked)) {
+					R3RDbgWrite("GRP-DROP-DEFAULT-LOAD veh=%d bk=%u live=%u\n",
+							(int)s->index.base(), (uint)parked.base(), (uint)s->group_id.base());
+					s->group_id_backup = GroupID::Invalid();
+					parked = GroupID::Invalid();
 				}
-				Vehicle *next = s->Next();
-				s = (next != nullptr) ? Train::From(next) : nullptr;
+				if (parked != GroupID::Invalid()) {
+					if (R3RSetSegmentGroupID(s, parked) != 0) group_fixes++;
+					s->group_id_backup = GroupID::Invalid();
+					R3RDbgWrite("GRP-RESTORE-SEG-LOAD veh=%d group=%u\n",
+							(int)s->index.base(), (uint)parked.base());
+				} else {
+					/* GroupID::Invalid() 不是活值，统一归到"未分组"以免界面显示 65535。 */
+					const GroupID own = (s->group_id == GroupID::Invalid()) ? DEFAULT_GROUP : s->group_id;
+					if (R3RSetSegmentGroupID(s, own) != 0) group_fixes++;
+				}
 			}
-			SetTrainGroupID(t, owner->group_id);
-			group_fixes++;
-			R3RDbgWrite("GRP-NORM-LOAD head=%d old=%u new=%u\n", (int)t->index.base(),
-					(uint)old_g.base(), (uint)owner->group_id.base());
+			Vehicle *next = s->Next();
+			s = (next != nullptr) ? Train::From(next) : nullptr;
 		}
 
 		/* 挂接分组（第 159 轮 / q-2=肆）：与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径 ——
@@ -1152,7 +1169,12 @@ GroupID R3RSegmentGroupID(const Vehicle *v)
 
 	const R3RSegmentRecord *const row = R3RSegmentTraitRow(v);
 	if (row != nullptr && row->group_id != GroupID::Invalid()) return row->group_id;
-	return v->First()->group_id;
+
+	/* 第 293 轮 / KI-464：兜底必须是 DEFAULT_GROUP（未分组）而不是 Invalid。
+	 * Invalid(0xFFFF) 会原样流到界面（玩家报的"列车编号跑到 65535"），而
+	 * DEFAULT_GROUP(0xFFFE) 才是"这一段没有分组"的唯一合法表示。 */
+	const GroupID own = v->First()->group_id;
+	return (own == GroupID::Invalid()) ? DEFAULT_GROUP : own;
 }
 
 /*
@@ -1196,7 +1218,37 @@ GroupID R3RSegmentSectionGroupID(const Vehicle *section)
 
 	const R3RSegmentRecord *const row = R3RSegmentGet(section->r3r_segment_id);
 	if (row != nullptr && row->group_id != GroupID::Invalid()) return row->group_id;
-	return section->group_id;
+
+	/* 第 293 轮 / KI-464：同 R3RSegmentGroupID()，兜底归一成 DEFAULT_GROUP。 */
+	const GroupID own = section->group_id;
+	return (own == GroupID::Invalid()) ? DEFAULT_GROUP : own;
+}
+
+/**
+ * R3R (第 291 轮 / 修法 e): the head of the segment which holds \a v.
+ *
+ * Consumed by the NewGRF `parent` scope (\c newgrf_engine.cpp,
+ * VehicleResolverObject ctor). The parent scope used to answer with
+ * #Vehicle::First(), i.e. with the head of the whole physical chain, so every
+ * parent variable read on a car of a passive set (0x42 consist cargo info,
+ * 0x43 company information/livery, 0x46 motion counter, 0x47 cargo info,
+ * 0x72 cargo subtype, ...) reported the **control set's** head -- and a GRF
+ * which picks its spriteset from the livery it sees there repainted the passive
+ * set with the active set's livery. Reading the segment head instead makes each
+ * set answer for itself.
+ *
+ * Single-segment chains (their cars all carry #R3R_SEGMENT_NONE) and every
+ * non-R3R vehicle answer with their own chain head, so their behaviour is
+ * unchanged byte for byte.
+ *
+ * @param v Any car of a chain; nullptr is answered with nullptr.
+ * @return First car of the segment containing \a v.
+ */
+const Vehicle *R3RSegmentHeadOf(const Vehicle *v)
+{
+	if (v == nullptr) return nullptr;
+	if (v->type != VehicleType::Train) return v->First();
+	return R3RGetCoupleGroupCarrier(Train::From(v));
 }
 
 void R3RSegmentStoreTraits(const Vehicle *v)
@@ -1237,12 +1289,15 @@ void R3RSegmentStoreTraits(const Vehicle *v)
 		row->name.clear();
 	}
 
+	/* 第 293 轮 / KI-464：DEFAULT_GROUP 不是有效的停放分组（见 R3RIsParkedGroupUsable）。
+	 * 旧口径只排除 Invalid，于是"停成未分组"的副本会把行写成 65534，段行再被回收后
+	 * 读侧就兜出 65535。活字段此时必为 DEFAULT_GROUP，直接写它即可。 */
 	if (head->group_id != DEFAULT_GROUP) {
 		row->group_id = head->group_id;
-	} else if (head->group_id_backup != GroupID::Invalid()) {
+	} else if (R3RIsParkedGroupUsable(head->group_id_backup)) {
 		row->group_id = head->group_id_backup;
 	} else {
-		row->group_id = head->group_id;
+		row->group_id = DEFAULT_GROUP;
 	}
 }
 
@@ -1272,13 +1327,32 @@ void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
 		/* Parked copies first: the commit points prefer those over the live
 		 * fields, so they are what makes the copy survive the next settle. */
 		if (!s->name_backup.empty()) d->name_backup = s->name_backup;
-		if (s->group_id_backup != GroupID::Invalid()) d->group_id_backup = s->group_id_backup;
+		if (R3RIsParkedGroupUsable(s->group_id_backup)) d->group_id_backup = s->group_id_backup;
 
 		/* A hidden segment head wears its own traits in the live fields. The chain
 		 * head does not: it wears the control segment's ones, and its name is set
 		 * by CloneVehicleName() further down the clone path. */
 		if (d != dst_chain && !s->name.empty()) d->name = s->name;
-		d->group_id = s->group_id;
+		/* R3R (第 301 轮 / KI-475 P3): 分组有两本账 —— 成员字段（列表过滤读它：
+		 * vehiclelist.cpp 的 GroupIsInGroup(R3RSegmentGroupID(v), group)）与
+		 * num_vehicle 统计量（组树计数读它：group_cmd.cpp 的 GetGroupNumVehicle）。
+		 * 建车时 GroupStatistics::CountVehicle(v, +1) 把车记进 DEFAULT_GROUP（此刻还
+		 * 没分组），而**唯一**的搬家动作是 AddVehicleToGroup() 里那对 -1/+1；
+		 * SetTrainGroupID()/R3RSetSegmentGroupID() 只维护 num_engines。
+		 * 这里原来是裸赋值 ⇒ 克隆品"成员字段进了组 3、未分组的计数却没减"，组树
+		 * 说它还在未分组、列表按 group_id 过滤又不显示（玩家报的 P3-a/P3-b/P3-c
+		 * 三个现象其实是同一个 bug）。只有链头参与 num_vehicle 簿记，故只对链头
+		 * 做一次配对搬迁；from == to 时净零，不动统计。 */
+		if (d == dst_chain && d->IsPrimaryVehicle() && d->group_id != s->group_id) {
+			const GroupID from = d->group_id;
+			GroupStatistics::CountVehicle(d, -1);
+			d->group_id = s->group_id;
+			GroupStatistics::CountVehicle(d, 1);
+			R3RDbgWrite("CLONE-TRAITS-GRP dst=%d from=%u to=%u\n",
+					(int)d->index.base(), (uint)from.base(), (uint)s->group_id.base());
+		} else {
+			d->group_id = s->group_id;
+		}
 
 		if (d == dst_chain || d->IsSegmentFront()) {
 			/* Only a segment head carries the group mask and the priority. */
@@ -1305,10 +1379,14 @@ void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
 				src_own = s->orders_backup;
 				src_real = s->orders_backup_real_index;
 				src_impl = s->orders_backup_implicit_index;
-			} else if (d != dst_chain && s->orders != nullptr && !s->r3r_orders_borrowed) {
+			} else if (d != dst_chain && s->orders != nullptr &&
+					(!s->r3r_orders_borrowed || s->IsR3RFollower())) {
 				/* A hidden segment which still holds its own orders in the live
 				 * field (never parked). The chain head is deliberately excluded:
-				 * its live orders are taken care of by CmdCloneOrder(). */
+				 * its live orders are taken care of by CmdCloneOrder().
+				 * KI-465 修法 D: a segment following somebody else's schedule keeps
+				 * its own list in `orders`, so only the legacy borrow layout (table
+				 * swapped into `orders`, no follow pointer) must be skipped here. */
 				src_own = s->orders;
 				src_real = s->cur_real_order_index;
 				src_impl = s->cur_implicit_order_index;
@@ -1444,10 +1522,11 @@ static void R3RSegmentReconcileRows(const char *tag)
 		} else if (!borrowed) {
 			row->name = head->name;
 		}
-		if (head->group_id_backup != GroupID::Invalid()) {
+		/* 第 293 轮 / KI-464：DEFAULT_GROUP 副本不是该段自己的分组，不能当成行值写回。 */
+		if (R3RIsParkedGroupUsable(head->group_id_backup)) {
 			row->group_id = head->group_id_backup;
 		} else if (!borrowed) {
-			row->group_id = head->group_id;
+			row->group_id = (head->group_id == GroupID::Invalid()) ? DEFAULT_GROUP : head->group_id;
 		}
 		rebuilt++;
 	}

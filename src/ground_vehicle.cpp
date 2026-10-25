@@ -16,6 +16,7 @@
 #include "slope_type.h"
 #include "company_func.h"
 #include "vehicle_func.h"
+#include "r3r_perf.h"
 
 #include "safeguards.h"
 
@@ -109,6 +110,26 @@ void GroundVehicle<T, Type>::CargoChanged()
 	uint32_t veh_offset = 0;
 	uint16_t articulated_weight = 0;
 
+	/* R3R (第 290 轮, KI-459): weight ledger. Only chains that actually carry
+	 * a baked override or an R3R group role are logged, so a healthy train leaves
+	 * nothing behind, while the "weight triples right after MakeSegment" case
+	 * lands one block with the contribution of every single vehicle. Capped in
+	 * total because CargoChanged() also runs on every cargo transfer and would
+	 * otherwise repeat the same block while a train is being loaded. */
+	static unsigned r3r_wlines = 0;
+	FILE *r3r_wdbg = nullptr;
+	if (R3RDbgBulkOn() && R3RDbgOn() && Type == VehicleType::Train && this->Next() != nullptr && r3r_wlines < 4000) {
+		uint r3r_scan = 0;
+		for (T *w = T::From(this); w != nullptr && r3r_scan < 512; w = w->Next(), r3r_scan++) {
+			const Train *tw = Train::From(w);
+			if (tw->weight_override != UINT16_MAX || tw->IsArticGroupMember() || tw->IsArticGroupHead()) {
+				r3r_wdbg = R3RFopenDbg("a");
+				break;
+			}
+		}
+	}
+
+	uint r3r_n = 0;
 	for (T *u = T::From(this); u != nullptr; u = u->Next()) {
 		uint32_t current_weight = u->GetCargoWeight();
 		if (u->IsArticulatedPart()) {
@@ -118,6 +139,20 @@ void GroundVehicle<T, Type>::CargoChanged()
 			uint part_count = u->GetEnginePartsCount();
 			articulated_weight = engine_weight / part_count;
 			current_weight += articulated_weight + (engine_weight % part_count);
+		}
+		r3r_n++;
+		if (r3r_wdbg != nullptr) {
+			/* "ew" is what the engine record / bake says, "pc" how many parts
+			 * the group weight is being spread over, "art" whether this vehicle
+			 * consumed the spread share instead of its own record.
+			 * (weight_override / group roles are Train-only members, hence the
+			 * down-cast: this block only runs when Type == VehicleType::Train.) */
+			const Train *r3r_tu = Train::From(u);
+			fprintf(r3r_wdbg, "CARGOWEIGHT-VEH head=%d idx=%d eng=%d art=%d gm=%d gh=%d ov=%u ew=%u pc=%u cw=%u acc=%u\n",
+					(int)T::From(this)->index.base(), (int)u->index.base(), (int)u->engine_type.base(),
+					u->IsArticulatedPart() ? 1 : 0, r3r_tu->IsArticGroupMember() ? 1 : 0, r3r_tu->IsArticGroupHead() ? 1 : 0,
+					(unsigned)r3r_tu->weight_override, (unsigned)u->GetWeightWithoutCargo(),
+					(unsigned)u->GetEnginePartsCount(), (unsigned)current_weight, (unsigned)weight);
 		}
 		if (Type == VehicleType::Train) {
 			Train::From(u)->tcache.cached_veh_weight = current_weight;
@@ -136,6 +171,14 @@ void GroundVehicle<T, Type>::CargoChanged()
 	}
 
 	/* Store consist weight in cache. */
+	if (r3r_wdbg != nullptr) {
+		fprintf(r3r_wdbg, "CARGOWEIGHT head=%d n=%u total=%u old=%u dmw=%u\n",
+				(int)T::From(this)->index.base(), (unsigned)r3r_n, (unsigned)weight,
+				(unsigned)this->gcache.cached_weight, (unsigned)T::From(this)->GetDisplayMaxWeight());
+		fclose(r3r_wdbg);
+		r3r_wdbg = nullptr;
+		r3r_wlines += r3r_n + 1;
+	}
 	this->gcache.cached_weight = std::max(1u, weight);
 	/* Friction in bearings and other mechanical parts is 0.1% of the weight (result in N). */
 	this->gcache.cached_axle_resistance = 10 * weight;

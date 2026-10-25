@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 /** Monotonic nanoseconds, for the RAII timers below. */
 inline uint64_t R3RPerfNowNs()
@@ -180,6 +181,59 @@ inline bool R3RPerfOn()
 #endif
 }
 
+/**
+ * R3R (第 296 轮, 2026-10-25): name of the debug log file.
+ *
+ * Server and client used to share one R3R_debug.log whenever they shared a
+ * working directory, which made it impossible to tell which line came from
+ * which side -- the 第 296 轮 log showed every CPL-PAIR edge twice, once per
+ * process. The name stays relative to the working directory, so launching the
+ * two ends from build\srv and build\cli already separates the files;
+ * R3R_DBG_FILE=<name> overrides it for the case where both ends must start from
+ * the same directory.
+ */
+inline const char *R3RDbgFileName()
+{
+	static char name[64] = "R3R_debug.log";
+	static const bool init = []() {
+		const char *env = std::getenv("R3R_DBG_FILE");
+		if (env != nullptr && env[0] != '\0') {
+			std::strncpy(name, env, sizeof(name) - 1);
+			name[sizeof(name) - 1] = '\0';
+		}
+		return true;
+	}();
+	(void)init;
+	return name;
+}
+
+/**
+ * R3R (第 296 轮, 2026-10-25): switch for the *bulk* probes.
+ *
+ * These five sites were 90% of the 第 296 轮 log (41658 lines) and none of them
+ * says anything about the three reported problems:
+ *   SPDD            19291 lines  per-vehicle per-tick speed dump (train_cmd.cpp)
+ *   GRF-WEIGHT       8381 lines  every NewGRF weight query (newgrf_engine.cpp)
+ *   CARGOWEIGHT-VEH  6144 lines  every cargo-weight recompute (ground_vehicle.cpp)
+ *   GEO              1848 lines  per-commit chain geometry dump (train_cmd.cpp)
+ *   SEGFE-VEH        1826 lines  per-vehicle segment-front probe (train_cmd.cpp)
+ *
+ * They stay in the binary but default to OFF; R3R_DBG_BULK=1 brings them back
+ * when a geometry / weight question needs them. R3R_DBG=0 still wins over both.
+ */
+inline bool R3RDbgBulkOn()
+{
+#if R3R_PROBES
+	static const bool on = []() {
+		const char *env = std::getenv("R3R_DBG_BULK");
+		return env != nullptr && (env[0] == '1' || env[0] == 'a' || env[0] == 'A');
+	}();
+	return on;
+#else
+	return false;
+#endif
+}
+
 /** RAII accumulator: adds the elapsed time to *acc on scope exit. */
 struct R3RPerfTimer {
 	uint64_t *acc;
@@ -200,7 +254,20 @@ struct R3RPerfTimer {
  */
 inline FILE *R3RFopenDbg(const char *mode)
 {
-	return R3RDbgOn() ? fopen("R3R_debug.log", mode) : nullptr;
+	/* R3R (第 274 轮续, 2026-10-22, KI-419③): this is the *second* log exit. It has
+	 * ~120 call sites that fprintf their own lines, so it carries no tag the filter
+	 * above could look at -- which is why GEO / CRT / TRP / TPR-WALK / DEPOT-ARR /
+	 * R3R-RES-ONCE kept showing up in a log where every tagged probe was supposed to
+	 * be quiet. Giving each site a tag would mean touching a hundred scopes; a coarse
+	 * switch gives the same control at zero risk: R3R_DBG_RAW=0 silences every raw
+	 * site at runtime (no rebuild), R3R_DBG=0 still silences everything. Defaults to
+	 * on, because these are event-scale probes (282 lines in the 第 274 轮 log) and
+	 * not the flood the aggregation work is about. */
+	static const bool raw_on = []() {
+		const char *env = std::getenv("R3R_DBG_RAW");
+		return !(env != nullptr && env[0] == '0');
+	}();
+	return (R3RDbgOn() && raw_on) ? fopen(R3RDbgFileName(), mode) : nullptr;
 }
 
 /**
@@ -220,14 +287,107 @@ inline FILE *R3RFopenDbg(const char *mode)
  * and unlike a `do {} while (0)` helper it stays a valid single statement, so a
  * braceless `if (...)` / `else` around a call site keeps compiling.
  */
+/**
+ * R3R (第 274 轮, 2026-10-22, memo §7.10): tag filter for probe convergence.
+ *
+ * The player's call was "keep the reservation probes, temporarily disable the
+ * rest". Every probe in the tree writes through R3RDbgWrite(), so the whole set
+ * can be switched off from here -- one predicate instead of commenting out
+ * several hundred call sites (and losing them).
+ *
+ * The tag is the first whitespace-delimited token of the format string, which is
+ * the convention every call site already follows ("RESV-WATCH ...", "UNRES-RAIL
+ * ...", "FOLDCHK ..."). Only the reservation side stays on by default:
+ *   RESV-*      (RESV-WATCH / -GC / -REAP / -PURGE / -AUDIT-* / -LEDGER-* / ...)
+ *   UNRES-RAIL  (the inner-most release line, see pbs.cpp)
+ *
+ * R3R_DBG_TAGS=all (or 1 / *) restores every probe at runtime, no rebuild needed.
+ * That is deliberately an environment variable and not a config setting: this is
+ * a diagnostic switch, and the probe-free and probe-full runs must be selectable
+ * from the launcher that starts the exe.
+ */
+inline bool R3RDbgTagAllowed(const char *fmt)
+{
+#if R3R_PROBES
+	static const bool all_tags = []() {
+		const char *env = std::getenv("R3R_DBG_TAGS");
+		if (env == nullptr) return false;
+		return env[0] == 'a' || env[0] == 'A' || env[0] == '1' || env[0] == '*';
+	}();
+	if (all_tags) return true;
+	if (fmt == nullptr) return false;
+	/* Bounded compare: a short literal must not make us read past its terminator. */
+	size_t n = 0;
+	while (n < 8 && fmt[n] != '\0' && fmt[n] != ' ' && fmt[n] != '\t' && fmt[n] != '\n') n++;
+	if (n >= 4 && std::strncmp(fmt, "RESV", 4) == 0) return true;
+	if (n >= 5 && std::strncmp(fmt, "UNRES", 5) == 0) return true;
+	/* R3R (第 274 轮续, 2026-10-22, KI-419①): the round-274 whitelist above switched
+	 * EXTEND-BACKOUT off, and that was a mistake -- it is the only line that says
+	 * *why* a trial extension failed, i.e. the one thing the reserved-path
+	 * investigation needs. In the 第 274 轮 log the companion phase guard let
+	 * UNRES-RAIL fire 1225 times, so it is proven that the back-out ran 1225 times
+	 * while not a single line survived. LOOP-CLOSED is its companion ("the
+	 * pathfinder gave up here"), and R3R-RES-ONCE names the ForceReserveOnce
+	 * consumption that decides whether a stopped train ever retries at all. All
+	 * three are reservation-side diagnosis, so they belong to the set that stays on.
+	 * Their volume is bounded at the call sites (EXTEND-BACKOUT is throttled per
+	 * key, see ExtendTrainReservation), not by this predicate. */
+	if (n >= 6 && std::strncmp(fmt, "EXTEND", 6) == 0) return true;
+	if (n >= 4 && std::strncmp(fmt, "LOOP", 4) == 0) return true;
+	if (n >= 7 && std::strncmp(fmt, "R3R-RES", 7) == 0) return true;
+	/* R3R (第 296 轮, 2026-10-25): the round-274 whitelist above was tuned for the
+	 * reservation investigation and switched off every couple / clone / order
+	 * probe. That is why the 第 296 轮 log had 0 UNIT-NEW, 0 CPL-HIT and 0
+	 * COUPLE-FAIL, i.e. it could not answer any of the three reported problems
+	 * (slow coupling, one pair that never couples, clones numbered 5/6 instead
+	 * of 3/4). The set below is exactly what those need. Every one of these tags
+	 * is event-scale or throttled at its call site (R3RDbgEdge, per-key maps),
+	 * so none of them floods -- the flooding came from the raw exit, see
+	 * R3RDbgBulkOn() above. */
+	/* (1) coupling: "too slow" + "never couples". */
+	if (n >= 6 && std::strncmp(fmt, "COUPLE", 6) == 0) return true; ///< COUPLE-OK/-FAIL/-PREFLIGHT/-POSTFOLD/-REFUSE-STILL-FOLDED/-WAIT-*
+	if (n >= 3 && std::strncmp(fmt, "CPL", 3) == 0) return true;    ///< CPL-S0-CHK/-WAITHOLD/-NOTREADY/-REFUSE-REAL-ARTIC/-HOLD-NOBOOK
+	if (n >= 4 && std::strncmp(fmt, "FOLD", 4) == 0) return true;   ///< FOLDCHK/-DIR/-DIR-OVERRIDE*/-REFUSE-*
+	if (n >= 6 && std::strncmp(fmt, "SPLICE", 6) == 0) return true; ///< SPLICE-GAP-REJECT/-LAST-RESORT/-WRONG-END
+	if (n >= 5 && std::strncmp(fmt, "ARTIC", 5) == 0) return true;  ///< ARTIC-SKIP-R3R (KI-274)
+	if (n >= 5 && std::strncmp(fmt, "SKIP-", 5) == 0) return true;  ///< SKIP-STOPPED (why a parked train is not processed)
+	/* (2) clone / unit numbers: "cloned as 5 and 6 instead of 3 and 4". */
+	if (n >= 4 && std::strncmp(fmt, "UNIT", 4) == 0) return true;   ///< UNIT-NEW/-PARK/-RESTORE*/-FREEZE/-RELBK
+	if (n >= 5 && std::strncmp(fmt, "CLONE", 5) == 0) return true;  ///< CLONE-MARKERS/-ORD/-TRAIT(S)
+	/* (3) orders / shared order lists: the "shared schedule" half of KI-470. */
+	if (n >= 3 && std::strncmp(fmt, "ORD", 3) == 0) return true;    ///< ORD-XFER/-IDX-WATCH/-RETURN-SHARED/-RETURN-ORPHAN
+	if (n >= 4 && std::strncmp(fmt, "CTRL", 4) == 0) return true;   ///< CTRL-PARK/-RECOVER/-UNBORROW
+	if (n >= 5 && std::strncmp(fmt, "AUTO-", 5) == 0) return true;  ///< AUTO-ORD* (KI-400 auto ranges)
+	if (n >= 5 && std::strncmp(fmt, "OWNER", 5) == 0) return true;  ///< OWNER-MOVE (schedule ownership hand-over)
+	if (n >= 4 && std::strncmp(fmt, "NAME", 4) == 0) return true;   ///< NAME-XFER/-RESTORE* (the clone/borrow counterpart of UNIT)
+	/* (4) what the couple gate / segment bookkeeping looks at. */
+	if (n >= 7 && std::strncmp(fmt, "RESERVE", 7) == 0) return true; ///< RESERVECONSIST (per-consist reservation state)
+	if (n >= 8 && std::strncmp(fmt, "DECOUPLE", 8) == 0) return true; ///< DECOUPLE-INTERLOCK/-SEG-SKIP-REAL-ARTIC
+	if (n >= 3 && std::strncmp(fmt, "SPD", 3) == 0) return true;      ///< SPD-DROP (KI-348: who zeroed the speed)
+	if (n >= 8 && std::strncmp(fmt, "DUALHEAD", 8) == 0) return true; ///< DUALHEAD (KI-334)
+	if (n >= 3 && std::strncmp(fmt, "TTB", 3) == 0) return true;      ///< TTB-PROBE (train-train boundary geometry)
+	if (n >= 5 && std::strncmp(fmt, "DEPOT", 5) == 0) return true;    ///< DEPOT-XFER-ID/-BEFORE-HEAD*/-INSEG-SKIP
+	if (n >= 5 && std::strncmp(fmt, "SEGID", 5) == 0) return true;    ///< SEGID-KEEP (segment id reconciliation)
+	if (n >= 6 && std::strncmp(fmt, "SEGROW", 6) == 0) return true;   ///< SEGROW-RECONCILE
+	if (n >= 6 && std::strncmp(fmt, "LEGACY", 6) == 0) return true;   ///< LEGACY-ARTIC-DEARTIC (read-game migration)
+	if (n >= 4 && std::strncmp(fmt, "CGRP", 4) == 0) return true;     ///< CGRP-NORM/-CLOSE (couple groups)
+	if (n >= 3 && std::strncmp(fmt, "GRP", 3) == 0) return true;      ///< GRP-NORM/-PARK/-RESTORE
+	if (n >= 4 && std::strncmp(fmt, "R3R-", 4) == 0) return true;     ///< R3R-CLONE-GROUP-MISMATCH / R3R-FROZEN-*
+	return false;
+#else
+	return false;
+#endif
+}
+
 #if R3R_PROBES
 inline void R3RDbgWrite(const char *fmt, ...)
 {
 	if (!R3RDbgOn()) return;
+	if (!R3RDbgTagAllowed(fmt)) return;
 	R3RPerfCounters &p = R3RP();
 	p.dbg_writes++;
 	const uint64_t t0 = R3RPerfNowNs();
-	FILE *dbg = fopen("R3R_debug.log", "a");
+	FILE *dbg = fopen(R3RDbgFileName(), "a");
 	if (dbg != nullptr) {
 		va_list ap;
 		va_start(ap, fmt);

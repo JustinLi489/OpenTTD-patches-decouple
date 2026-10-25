@@ -667,12 +667,18 @@ void OrderList::RecalculateTimetableDuration()
  */
 static Vehicle *R3RFindOrderListReferrer(const OrderList *ol, const Vehicle *except)
 {
+	Vehicle *follower = nullptr;
 	for (Vehicle *w : Vehicle::Iterate()) {
 		if (w == except) continue;
 		if (except != nullptr && w->type != except->type) continue;
+		/* A real owner always wins: for it `orders`/`orders_backup` point at the list. */
 		if (w->orders == ol || w->orders_backup == ol) return w;
+		/* R3R (KI-465 修法 D): a follower references the list it runs through the
+		 * follow pointer, not through `orders` (which stays on its own list). Only
+		 * used when nobody owns the list any more -- see OrderList::FreeChain(). */
+		if (follower == nullptr && w->r3r_follow_orders == ol) follower = w;
 	}
-	return nullptr;
+	return follower;
 }
 
 /**
@@ -694,6 +700,32 @@ void OrderList::FreeChain(bool keep_orderlist)
 	 * crash-20260917T130637Z.log. */
 	if (!keep_orderlist) {
 		if (Vehicle *other = R3RFindOrderListReferrer(this, nullptr)) {
+			if (other->orders != this) {
+				/* R3R (KI-465 修法 D): the only remaining user is a *follower* -- it ran
+				 * this list through r3r_follow_orders while its own `orders` stayed its
+				 * own (possibly empty) table. Hand the ownership over to it, otherwise
+				 * the list would stay alive without any `orders` owner, which breaks the
+				 * native invariant (`first_shared` ring must all point at the list, see
+				 * DebugCheckSanity) and leaves no Initialize() anchor for save/load.
+				 *
+				 * Its own table is parked in orders_backup first; a follower of this
+				 * design never has one parked there, so the single-level slot suffices. */
+				OrderList *const own = other->orders;
+				other->orders = this;
+				other->r3r_follow_orders = nullptr;
+				other->r3r_follow_owner = VehicleID::Invalid();
+				other->r3r_orders_borrowed = false;
+				if (own != nullptr) {
+					if (other->orders_backup == nullptr) {
+						other->orders_backup = own;
+						other->orders_backup_real_index = 0;
+						other->orders_backup_implicit_index = 0;
+					} else {
+						own->FreeChain(false);
+					}
+				}
+				this->num_vehicles = 1;
+			}
 			Vehicle *new_first = other->IsPrimaryVehicle() ? other : other->First();
 			if (new_first == nullptr) new_first = other;
 			this->first_shared = new_first;
@@ -807,7 +839,7 @@ CargoMaskedStationIDVector OrderList::GetNextStoppingStation(const Vehicle *v, C
 		}
 	}
 
-	const std::span<Order> order_span = v->orders->GetOrderVector();
+	const std::span<Order> order_span = v->GetEffectiveOrders()->GetOrderVector();
 	auto seen_order = [&](const Order *o) -> std::vector<bool>::reference { return seen_orders_container[o - order_span.data()]; };
 
 	do {
@@ -1107,7 +1139,7 @@ uint GetOrderDistance(const Order *prev, const Order *cur, const Vehicle *v, int
 		conditional_depth++;
 
 		int dist1 = GetOrderDistance(prev, v->GetOrder(cur->GetConditionSkipToOrder()), v, conditional_depth);
-		int dist2 = GetOrderDistance(prev, v->orders->GetNext(cur), v, conditional_depth);
+		int dist2 = GetOrderDistance(prev, v->GetEffectiveOrders()->GetNext(cur), v, conditional_depth);
 		return std::max(dist1, dist2);
 	}
 
@@ -1141,11 +1173,14 @@ uint GetOrderDistance(const Order *prev, const Order *cur, const Vehicle *v, int
  */
 static bool R3ROrdersSharedWithOtherCompany(const Vehicle *v)
 {
-	const OrderList *const ol = v->orders;
+	/* R3R (KI-465 修法 D): compare the schedules the vehicles actually run, not the
+	 * ownership pointers -- a follower keeps `orders` on its own (idle) list while
+	 * running the borrowed one, so `orders` alone would miss the foreign schedule. */
+	const OrderList *const ol = v->GetEffectiveOrders();
 	if (ol == nullptr) return false;
 
 	for (const Vehicle *w = v->First(); w != nullptr; w = w->Next()) {
-		if (w != v && w->orders == ol && w->owner != v->owner) return true;
+		if (w != v && w->GetEffectiveOrders() == ol && w->owner != v->owner) return true;
 	}
 	return false;
 }
@@ -1207,7 +1242,7 @@ CommandCost CmdSetRouteOverlayColour(DoCommandFlags flags, VehicleID veh_id, Col
 	if (colour >= Colours::End) return CMD_ERROR;
 
 	Vehicle *v = Vehicle::GetIfValid(veh_id);
-	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->orders == nullptr) return CMD_ERROR;
+	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
@@ -1219,7 +1254,7 @@ CommandCost CmdSetRouteOverlayColour(DoCommandFlags flags, VehicleID veh_id, Col
 	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		v->orders->SetRouteOverlayColour(colour);
+		v->GetEffectiveOrders()->SetRouteOverlayColour(colour);
 	}
 	return CommandCost();
 }
@@ -1655,7 +1690,7 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
 	}
 
 	if (v->GetNumOrders() >= MAX_VEH_ORDER_ID) return CommandCost(STR_ERROR_TOO_MANY_ORDERS);
-	if (v->orders == nullptr && !OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
+	if (v->GetEffectiveOrders() == nullptr && !OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		InsertOrder(v, Order(new_order), sel_ord);
@@ -1674,17 +1709,30 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
  */
 void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 {
-	/* Create new order and link in list */
-	if (v->orders == nullptr) {
+	/* Create new order and link in list.
+	 * R3R (KI-465 修法 D): 编辑的目标恒为"这列车实际在跑的表"。跟随者自己的表可能为空，
+	 * 甚至自己的表根本不存在（orders == nullptr 但 follow 指针非空），此时必须把订单
+	 * 插进跟着跑的那张表，而不是造一张玩家看不见的新表。 */
+	OrderList *const initial_orders = v->GetEffectiveOrders();
+	if (initial_orders == nullptr) {
 		v->orders = OrderList::Create(std::move(new_o), v);
 	} else {
-		v->orders->InsertOrderAt(std::move(new_o), sel_ord);
+		initial_orders->InsertOrderAt(std::move(new_o), sel_ord);
 	}
 
-	Vehicle *u = v->FirstShared();
-	DeleteOrderWarnings(u);
-	for (; u != nullptr; u = u->NextShared()) {
-		assert(v->orders == u->orders);
+	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的实际持有者环"。
+	 * 跟随者(v->orders != eff_orders)不在被跟随表的共享环里，所以环要从
+	 * eff_orders->first_shared 起步，并且单独补一次自己。
+	 * 注意不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者
+	 * 自己的（闲置）表环当成被编辑的表环，导致它被调整两次。 */
+	OrderList *const eff_orders = v->GetEffectiveOrders();
+	OrderList *const owned_orders = v->orders;
+	const bool follower = (eff_orders != nullptr && eff_orders != owned_orders);
+	Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
+	DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
+
+	auto adjust_indices = [&](Vehicle *u) {
+		if (u->GetEffectiveOrders() != eff_orders) return;
 
 		/* If there is added an order before the current one, we need
 		 * to update the selected order. We do not change implicit/real order indices though.
@@ -1725,7 +1773,17 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 
 		/* Update any possible open window of the vehicle */
 		InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (sel_ord << 16));
+	};
+
+	if (shared_ring != nullptr) {
+		/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
+		uint ring_guard = 0;
+		for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
+			adjust_indices(u);
+		}
 	}
+	/* 跟随者自己不在被跟随表的共享环里，补一次。 */
+	if (follower && shared_ring != v) adjust_indices(v);
 
 	/* As we insert an order, the order to skip to will be 'wrong'. */
 	VehicleOrderID cur_order_id = 0;
@@ -1847,12 +1905,22 @@ static void CancelLoadingDueToDeletedOrder(Vehicle *v)
  */
 void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord)
 {
-	v->orders->DeleteOrderAt(sel_ord);
+	/* R3R (KI-465 修法 D): 编辑的目标恒为"这列车实际在跑的表"。跟随者自己的表可能是空的，
+	 * 甚至根本不存在（orders == nullptr 但 follow 指针非空）。 */
+	OrderList *const eff_orders = v->GetEffectiveOrders();
+	if (eff_orders == nullptr) return;
+	eff_orders->DeleteOrderAt(sel_ord);
 
-	Vehicle *u = v->FirstShared();
-	DeleteOrderWarnings(u);
-	for (; u != nullptr; u = u->NextShared()) {
-		assert(v->orders == u->orders);
+	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的实际持有者环"。跟随者不在被跟随表的
+	 * 共享环里，所以环从 eff_orders->first_shared 起步，并且单独补一次自己。
+	 * 注意不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者自己的
+	 * （闲置）表环当成被编辑的表环，导致它被调整两次。 */
+	OrderList *const owned_orders = v->orders;
+	const bool follower = (eff_orders != owned_orders);
+	Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
+
+	auto adjust_indices = [&](Vehicle *u) {
+		if (u->GetEffectiveOrders() != eff_orders) return;
 
 		if (sel_ord == u->cur_real_order_index && u->current_order.IsAnyLoadingType()) {
 			CancelLoadingDueToDeletedOrder(u);
@@ -1889,7 +1957,18 @@ void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord)
 
 		/* Update any possible open window of the vehicle */
 		InvalidateVehicleOrder(u, sel_ord | (INVALID_VEH_ORDER_ID << 16));
+	};
+
+	DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
+	if (shared_ring != nullptr) {
+		/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
+		uint ring_guard = 0;
+		for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
+			adjust_indices(u);
+		}
 	}
+	/* 跟随者自己不在被跟随表的共享环里，补一次。 */
+	if (follower && shared_ring != v) adjust_indices(v);
 
 	/* As we delete an order, the order to skip to will be 'wrong'. */
 	VehicleOrderID cur_order_id = 0;
@@ -2012,12 +2091,19 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-move-in", "cmd-move-out");
-		v->orders->MoveOrders(moving_order, target_order, count);
+		/* R3R (KI-465 修法 D): 编辑的目标恒为"这列车实际在跑的表"。 */
+		OrderList *const eff_orders = v->GetEffectiveOrders();
+		eff_orders->MoveOrders(moving_order, target_order, count);
 
-		/* Update shared list */
-		Vehicle *u = v->FirstShared();
+		/* R3R (KI-465 修法 D): 索引调整覆盖"这张表的实际持有者环"；跟随者不在环里，
+		 * 环从 eff_orders->first_shared 起步，之后单独补一次跟随者自己。
+		 * 不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者自己的
+		 * （闲置）表环当成被编辑的表环，导致它被调整两次。 */
+		OrderList *const owned_orders = v->orders;
+		const bool follower = (eff_orders != owned_orders);
+		Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
 
-		DeleteOrderWarnings(u);
+		DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
 
 		auto adjust_order_idx = [&](VehicleOrderID idx) -> VehicleOrderID {
 			if (idx >= order_count) return idx;
@@ -2027,7 +2113,7 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 			return idx;
 		};
 
-		for (; u != nullptr; u = u->NextShared()) {
+		auto adjust_vehicle = [&](Vehicle *u) {
 			/* Update the current order.
 			 * There are multiple ways to move orders, which result in cur_implicit_order_index
 			 * and cur_real_order_index to not longer make any sense. E.g. moving another
@@ -2053,10 +2139,21 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 
 			u->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
 
-			assert(v->orders == u->orders);
+			/* R3R: 只调整真正在跑这张表的车；损坏的共享环成员直接跳过。 */
+			if (u->GetEffectiveOrders() != eff_orders) return;
 			/* Update any possible open window of the vehicle */
 			InvalidateVehicleOrderOnMove(u, moving_order, target_order, count);
+		};
+
+		if (shared_ring != nullptr) {
+			/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
+			uint ring_guard = 0;
+			for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
+				adjust_vehicle(u);
+			}
 		}
+		/* 跟随者自己不在被跟随表的共享环里，补一次。 */
+		if (follower && shared_ring != v) adjust_vehicle(v);
 
 		/* As we move an order, the order to skip to will be 'wrong'. */
 		for (Order *order : v->Orders()) {
@@ -2160,7 +2257,7 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 					return (order_count - 1) - idx;
 				};
 
-				std::vector<Order> &orders = v->orders->GetOrderVector();
+				std::vector<Order> &orders = v->GetEffectiveOrders()->GetOrderVector();
 				std::reverse(orders.begin(), orders.end());
 				AdjustTravelAfterOrderReverse(orders);
 
@@ -2202,10 +2299,10 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 				CommandCost ret = PreInsertOrderCheck(v, new_order, {CmdInsertOrderIntlFlag::AllowLoadByCargoType, CmdInsertOrderIntlFlag::NoUnbunchChecks});
 				if (ret.Failed()) return ret;
 
-				if (flags.Test(DoCommandFlag::Execute)) v->orders->InsertOrderAt(std::move(new_order), v->GetNumOrders());
+				if (flags.Test(DoCommandFlag::Execute)) v->GetEffectiveOrders()->InsertOrderAt(std::move(new_order), v->GetNumOrders());
 			}
 			if (flags.Test(DoCommandFlag::Execute)) {
-				std::vector<Order> &orders = v->orders->GetOrderVector();
+				std::vector<Order> &orders = v->GetEffectiveOrders()->GetOrderVector();
 				AdjustTravelAfterOrderReverse(std::span<Order>(orders).subspan(order_count));
 
 				Vehicle *u = v->FirstShared();
@@ -2535,7 +2632,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					break;
 
 				case OrderConditionVariable::DispatchSlot:
-					if (data != UINT16_MAX && data >= v->orders->GetScheduledDispatchScheduleCount()) {
+					if (data != UINT16_MAX && data >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
 						return CMD_ERROR;
 					}
 					break;
@@ -3106,17 +3203,17 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
  */
 static bool CheckAircraftOrderDistance(const Aircraft *v_new, const Vehicle *v_order)
 {
-	if (v_order->orders == nullptr || v_new->acache.cached_max_range == 0) return true;
+	if (v_order->GetEffectiveOrders() == nullptr || v_new->acache.cached_max_range == 0) return true;
 
 	/* Iterate over all orders to check the distance between all
 	 * 'goto' orders and their respective next order (of any type). */
-	for (const Order *o : v_order->orders->Orders()) {
+	for (const Order *o : v_order->GetEffectiveOrders()->Orders()) {
 		switch (o->GetType()) {
 			case OT_GOTO_STATION:
 			case OT_GOTO_DEPOT:
 			case OT_GOTO_WAYPOINT:
 				/* If we don't have a next order, we've reached the end and must check the first order instead. */
-				if (GetOrderDistance(o, v_order->orders->GetNext(o), v_order) > v_new->acache.cached_max_range_sqr) return false;
+				if (GetOrderDistance(o, v_order->GetEffectiveOrders()->GetNext(o), v_order) > v_new->acache.cached_max_range_sqr) return false;
 				break;
 
 			default: break;
@@ -3222,6 +3319,14 @@ CommandCost CmdCloneOrder(DoCommandFlags flags, CloneOptions action, VehicleID v
 			if (dst->type == VehicleType::Aircraft && !CheckAircraftOrderDistance(Aircraft::From(dst), src)) {
 				return CommandCost(STR_ERROR_AIRCRAFT_NOT_ENOUGH_RANGE);
 			}
+
+			/* R3R (KI-465 修法 D): a follower's `orders` points at its own list while the
+			 * schedule it actually runs lives behind r3r_follow_orders. Sharing "the orders
+			 * of src" would silently share that idle own list instead. Turning a borrow
+			 * into a native shared chain would break the ownership invariant (every live
+			 * OrderList must have a vehicle which points at it through `orders`), so
+			 * refuse instead of corrupting the pointer graph. */
+			if (src->IsR3RFollower() || dst->IsR3RFollower()) return CMD_ERROR;
 
 			if (src->orders == nullptr && !OrderList::CanAllocateItem()) {
 				return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
@@ -3335,8 +3440,8 @@ CommandCost CmdCloneOrder(DoCommandFlags flags, CloneOptions action, VehicleID v
 
 				/* Copy over scheduled dispatch data */
 				assert(dst->orders != nullptr);
-				if (src->orders != nullptr) {
-					dst->orders->GetScheduledDispatchScheduleSet() = src->orders->GetScheduledDispatchScheduleSet();
+				if (src->GetEffectiveOrders() != nullptr) {
+					dst->orders->GetScheduledDispatchScheduleSet() = src->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
 					for (DispatchSchedule &ds : dst->orders->GetScheduledDispatchScheduleSet()) {
 						ds.ResetStateAfterClone();
 					}
@@ -3408,10 +3513,15 @@ CommandCost CmdInsertOrdersFromVehicle(DoCommandFlags flags, VehicleID veh_dst, 
 		if (ret.Failed()) return ret;
 	}
 
-	if (src->orders == nullptr) return CommandCost();
+	if (src->GetEffectiveOrders() == nullptr) return CommandCost();
+
+	/* R3R (KI-465 修法 D): 写入的目标恒为「这列车实际在跑的表」。跟随者的
+	 * `orders` 可能是空表（甚至为空指针），照旧写 dst->orders 会造出一张
+	 * 玩家看不见、列车也不执行的影子表。 */
+	OrderList *const eff_dst = dst->GetEffectiveOrders();
 
 	/* make sure there are orders available */
-	if (dst->orders == nullptr && !OrderList::CanAllocateItem()) {
+	if (eff_dst == nullptr && !OrderList::CanAllocateItem()) {
 		return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
 	}
 
@@ -3424,16 +3534,16 @@ CommandCost CmdInsertOrdersFromVehicle(DoCommandFlags flags, VehicleID veh_dst, 
 	}
 
 	const VehicleOrderID new_orders_start = dst->GetNumOrders();
-	const uint existing_schedule_count = (dst->orders != nullptr) ? dst->orders->GetScheduledDispatchScheduleCount() : 0;
+	const uint existing_schedule_count = (eff_dst != nullptr) ? eff_dst->GetScheduledDispatchScheduleCount() : 0;
 
 	/* Copy over scheduled dispatch data */
 	if (flags.Test(DoCommandFlag::Execute)) {
-		if (dst->orders == nullptr) {
+		if (dst->GetEffectiveOrders() == nullptr) {
 			dst->orders = OrderList::Create(nullptr, dst);
 		}
 
-		const std::vector<DispatchSchedule> &src_scheds = src->orders->GetScheduledDispatchScheduleSet();
-		std::vector<DispatchSchedule> &dst_scheds = dst->orders->GetScheduledDispatchScheduleSet();
+		const std::vector<DispatchSchedule> &src_scheds = src->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
+		std::vector<DispatchSchedule> &dst_scheds = dst->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
 		dst_scheds.reserve(dst_scheds.size() + src_scheds.size());
 		for (const DispatchSchedule &src_ds : src_scheds) {
 			dst_scheds.push_back(src_ds);
@@ -3460,13 +3570,13 @@ CommandCost CmdInsertOrdersFromVehicle(DoCommandFlags flags, VehicleID veh_dst, 
 			if (flags.Test(DoCommandFlag::Execute)) {
 				/* Remove partially inserted orders */
 				while (dst->GetNumOrders() > new_orders_start) {
-					dst->orders->DeleteOrderAt(dst->GetNumOrders() - 1);
+					dst->GetEffectiveOrders()->DeleteOrderAt(dst->GetNumOrders() - 1);
 				}
 			}
 			return ret;
 		}
 
-		if (flags.Test(DoCommandFlag::Execute)) dst->orders->InsertOrderAt(std::move(order), dst->GetNumOrders());
+		if (flags.Test(DoCommandFlag::Execute)) dst->GetEffectiveOrders()->InsertOrderAt(std::move(order), dst->GetNumOrders());
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -3596,10 +3706,10 @@ void CheckOrders(const Vehicle *v)
 		}
 
 		/* Check if the last and the first order are the same, and the first order is a go to order */
-		if (v->GetNumOrders() > 1 && v->orders->GetFirstOrder()->IsGotoOrder()) {
+		if (v->GetNumOrders() > 1 && v->GetEffectiveOrders()->GetFirstOrder()->IsGotoOrder()) {
 			const Order *last = v->GetLastOrder();
 
-			if (v->orders->GetFirstOrder()->Equals(*last)) {
+			if (v->GetEffectiveOrders()->GetFirstOrder()->Equals(*last)) {
 				message = STR_NEWS_VEHICLE_HAS_DUPLICATE_ENTRY;
 			}
 		}
@@ -3608,7 +3718,7 @@ void CheckOrders(const Vehicle *v)
 		if (n_st < 2 && message == INVALID_STRING_ID) message = STR_NEWS_VEHICLE_HAS_TOO_FEW_ORDERS;
 
 #ifdef WITH_ASSERT
-		if (v->orders != nullptr) v->orders->DebugCheckSanity();
+		if (v->GetEffectiveOrders() != nullptr) v->GetEffectiveOrders()->DebugCheckSanity();
 #endif
 
 		if (message == INVALID_STRING_ID && !has_depot_order && v->type != VehicleType::Aircraft) {
@@ -3770,7 +3880,16 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
 	 * vehicle which is about to be destroyed. */
 	const bool r3r_borrow_is_shared = v->orders != nullptr && v->orders->IsShared() &&
 			(v->PreviousShared() != nullptr || v->FirstShared() == v);
-	if (v->r3r_orders_borrowed && !r3r_borrow_is_shared) {
+	if (v->IsR3RFollower()) {
+		/* R3R (KI-465 修法 D): the borrow is expressed by the follow pointer only; `orders`
+		 * still points at this vehicle's own list. Dropping the follow pointer is all that
+		 * is needed -- replacing `orders` by `orders_backup` (the pre-D layout) would throw
+		 * away the vehicle's own list and leave no holder for it. */
+		v->r3r_follow_orders = nullptr;
+		v->r3r_follow_owner = VehicleID::Invalid();
+	} else if (v->r3r_orders_borrowed && !r3r_borrow_is_shared && v->orders_backup != nullptr) {
+		/* Legacy layout (savegames written before 修法 D): the borrowed list sits in
+		 * `orders` and the vehicle's own list was parked in `orders_backup`. */
 		v->orders = v->orders_backup;
 		v->orders_backup = nullptr;
 		v->orders_backup_real_index = INVALID_VEH_ORDER_ID;
@@ -3862,11 +3981,15 @@ void DeleteVehicleOrders(Vehicle *v, bool keep_orderlist, bool reset_order_indic
  */
 static void ClearVehicleOrders(Vehicle *v, bool reset_order_indices = true)
 {
-	if (v->orders == nullptr) return;
+	/* R3R (KI-465 修法 D): the order list to clear is the one the vehicle actually
+	 * runs. FreeChain(true) only drops the orders and keeps the shell, so clearing a
+	 * borrowed list (which still has its real owner as a holder) stays safe. */
+	OrderList *const clear_ol = v->GetEffectiveOrders();
+	if (clear_ol == nullptr) return;
 
 	DeleteOrderWarnings(v->FirstShared());
 	InvalidateWindowClassesData(WindowClass::DepartureBoard);
-	v->orders->FreeChain(true);
+	clear_ol->FreeChain(true);
 
 	for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
 		/* Unbunching data is no longer valid. */
@@ -4341,7 +4464,7 @@ VehicleOrderID ProcessConditionalOrder(const Order *order, const Vehicle *v, Pro
 			auto get_vehicle_records = [&](uint16_t schedule_index) -> const LastDispatchRecord * {
 				return GetVehicleLastDispatchRecord(v, schedule_index);
 			};
-			skip_order = EvaluateDispatchSlotConditionalOrder(order, v->orders->GetScheduledDispatchScheduleSet(), _state_ticks, get_vehicle_records).GetResult();
+			skip_order = EvaluateDispatchSlotConditionalOrder(order, v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet(), _state_ticks, get_vehicle_records).GetResult();
 			break;
 		}
 		default: NOT_REACHED();
@@ -4463,6 +4586,32 @@ void FlushAdvanceOrderIndexDeferred(const Vehicle *v, bool apply)
 }
 
 /**
+ * R3R (KI-446): travel destination of an OT_GOTO_COUPLE order.
+ *
+ * UpdateOrderDest() resolved a plain station destination to Station::xy, the
+ * anchor tile of the station. On a station with more than one platform that
+ * anchor is unrelated to the platform the paired consist stands on, so PBS
+ * drove the locomotive into another platform than the one the couple
+ * pathfinder had reserved. Aim at the tile of the paired consist instead: that
+ * is the platform the couple pathfinder targets, so destination and path agree.
+ *
+ * @param v The vehicle that is about to travel to its couple target.
+ * @return Tile to travel to, or INVALID_TILE to keep the plain station anchor.
+ */
+static TileIndex R3RGetCoupleOrderDestination(const Vehicle *v)
+{
+	if (v->type != VehicleType::Train) return INVALID_TILE;
+
+	const Train *const tgt = R3RGetCouplePairPartner(Train::From(v));
+	if (tgt == nullptr) return INVALID_TILE;
+
+	const TileIndex target_tile = tgt->tile;
+	if (!IsRailStationTile(target_tile)) return INVALID_TILE;
+
+	return target_tile;
+}
+
+/**
  * Update the vehicle's destination tile from an order.
  * @param order the order the vehicle currently has
  * @param v the vehicle to update
@@ -4545,7 +4694,11 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 				if (!Depot::IsValidID(depot_id)) return false;
 				v->SetDestTile(Depot::Get(depot_id)->xy);
 			} else {
-				v->SetDestTile(v->GetOrderStationLocation(order->GetDestination().ToStationID()));
+				const TileIndex station_dest = v->GetOrderStationLocation(order->GetDestination().ToStationID());
+				/* R3R (KI-446): keep the travel target on the platform of the paired consist,
+				 * so that the PBS destination and the couple pathfinder agree. */
+				const TileIndex couple_dest = (station_dest != INVALID_TILE) ? R3RGetCoupleOrderDestination(v) : INVALID_TILE;
+				v->SetDestTile(couple_dest != INVALID_TILE ? couple_dest : station_dest);
 			}
 			return true;
 
@@ -4657,6 +4810,10 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 	return UpdateOrderDest(v, order, conditional_depth + 1, pbs_look_ahead);
 }
 
+/* R3R (KI-453, 第 286 轮): defined in train_cmd.cpp; used by ProcessOrders() below to
+ * keep a "wait zone" waypoint order open until the train has really stopped on it. */
+bool R3RTrainStopsAtWaypoint(const Train *v);
+
 /**
  * Handle the orders of a vehicle and determine the next place
  * to go to if needed.
@@ -4718,8 +4875,24 @@ bool ProcessOrders(Vehicle *v)
 	v->vehicle_flags.Reset(VehicleFlag::ConditionalOrderWait);
 
 	/* Check if we've reached a 'via' destination. */
+	/* R3R (KI-453, 第 286 轮, 玩家拍板 F-285-2 折中)：等待区路点（当前路点订单的
+	 * 下一条是 OT_GOTO_COUPLE，见 R3RTrainStopsAtWaypoint()）的完成判据从
+	 * 「运动前端进路点格」改到「已经停在格末的停车标上」。
+	 *
+	 * 原生判据在车头刚进格那一 tick 就成立，于是 OT_GOTO_WAYPOINT 立刻被推到
+	 * OT_GOTO_COUPLE：R3RTrainStopsAtWaypoint() 当场变假 ⇒ look-ahead 里
+	 * 「在路点格末以 0 速停住」这个唯一目标消失 ⇒ 列车在路点格内重新加速
+	 * （第 285 轮现场 55 → 19 → 30 → 最后被 MarkTrainAsStuck 的 ctx=stop-train
+	 * 硬刹）。
+	 *
+	 * 这里只对这类路点追加「cur_speed == 0」一个条件：普通通过式路点、
+	 * 以及带时间表等待的路点（本来就不进这个 via 分支）逐字不变。停稳之后
+	 * 走的是同一段原生代码（last_station_visited / 时间表 / 隐式订单索引都照旧
+	 * 处理），因此不需要另写一套订单推进逻辑。 */
+	const bool r3r_wait_waypoint = v->type == VehicleType::Train && R3RTrainStopsAtWaypoint(static_cast<const Train *>(v));
 	if (((v->current_order.IsType(OT_GOTO_STATION) && (v->current_order.GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) ||
-			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train))) &&
+			(v->current_order.IsType(OT_GOTO_WAYPOINT) && (!v->current_order.IsWaitTimetabled() || v->type != VehicleType::Train) &&
+					!(r3r_wait_waypoint && v->cur_speed != 0))) &&
 			IsTileType(moving_front->tile, TileType::Station) &&
 			v->current_order.GetDestination() == GetStationIndex(moving_front->tile)) {
 		v->DeleteUnreachedImplicitOrders();
@@ -4730,6 +4903,25 @@ bool ProcessOrders(Vehicle *v)
 		v->last_station_visited = v->current_order.GetDestination().ToStationID();
 		UpdateVehicleTimetable(v, true);
 		v->IncrementImplicitOrderIndex();
+	}
+
+	/* R3R (第 297 轮 / KI-472 探针, 只读): 断言前的现场取证。
+	 *
+	 * 玩家 2026-10-25 口径：「没事，你可以加探针，然后我建议先别防护，只加探针。
+	 * 反正目前我只是单人测试」⇒ 这里**刻意不加 clamp**，该崩还是崩，只留现场：
+	 * 越界值是多少、当时有多少条订单、真订单索引、当前订单类型、是否在库、
+	 * 车速、脚下格。
+	 *
+	 * R3RWatchOrderIndexSite 自带"按 (站点,车号) 分桶 + 值变化才打"的节流，
+	 * 同一坏值只会留一行（首次必打，因为该桶还没有快照），不会每 tick 刷屏。
+	 *
+	 * 现场（crash-20261025T032645Z.log）：崩溃车 veh 99 是克隆品、停在车库格
+	 * （trk 0x80）、vs:HD，正是本分支。 */
+	if (v->type == VehicleType::Train) {
+		const int r3r_oob_n = v->GetNumOrders();
+		if (r3r_oob_n > 0 && (int)v->cur_implicit_order_index >= r3r_oob_n) {
+			R3RWatchOrderIndexSite(Train::From(v), "process-orders-bad", "assert-4909");
+		}
 	}
 
 	/* Get the current order */
@@ -4823,8 +5015,16 @@ bool Order::ShouldStopAtStation(StationID last_station_visited, StationID statio
  * @param waypoint if station is a waypoint.
  * @return true if the vehicle should stop.
  */
+/* R3R: defined in train_cmd.cpp. */
+bool R3RTrainStopsAtWaypoint(const Train *v);
+
 bool Order::ShouldStopAtStation(const Vehicle *v, StationID station, bool waypoint) const
 {
+	/* R3R: a train whose next order is a GOTO_COUPLE stops with its front at this waypoint.
+	 * `this` must be the order being executed, so that only that train is affected; other
+	 * trains using the same order still pass the waypoint as usual. */
+	if (waypoint && v->type == VehicleType::Train && this == &v->current_order && R3RTrainStopsAtWaypoint(static_cast<const Train *>(v))) return true;
+
 	return this->ShouldStopAtStation(v->last_station_visited, station, waypoint);
 }
 
@@ -4986,7 +5186,7 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 		R3ROrderIdxWatch r3r_idx_watch(v, "cmd-bulk-in", "cmd-bulk-out");
 		InvalidateWindowData(WindowClass::VehicleOrderImportErrors, v->index);
 
-		if (v->orders == nullptr) {
+		if (v->GetEffectiveOrders() == nullptr) {
 			if (!OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
 			v->orders = OrderList::Create(nullptr, v);
 		}
@@ -5131,7 +5331,7 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 					if (buf.error) return CMD_ERROR;
 					if (count == INVALID_VEH_ORDER_ID) count = v->GetNumOrders() - start;
 					if (start < v->GetNumOrders() && start + count <= v->GetNumOrders() && v->GetNumOrders() > 1) {
-						std::vector<Order> &orders = v->orders->GetOrderVector();
+						std::vector<Order> &orders = v->GetEffectiveOrders()->GetOrderVector();
 						AdjustTravelAfterOrderReverse(std::span<Order>(orders).subspan(start, count));
 						for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
 							InvalidateVehicleOrder(u, VIWD_MODIFY_ORDERS);
@@ -5158,11 +5358,11 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 					}
 					if (v->GetNumOrders() == 0) {
 						/* No orders, fast path */
-						v->orders->GetScheduledDispatchScheduleSet().clear();
+						v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet().clear();
 						SchdispatchInvalidateWindows(v);
 					} else {
 						/* Delete schedules individually, perform order updates */
-						for (uint i = v->orders->GetScheduledDispatchScheduleCount(); i > 0; i--) {
+						for (uint i = v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount(); i > 0; i--) {
 							CmdSchDispatchRemoveSchedule(flags, cmd_data.veh, i - 1);
 						}
 					}
@@ -5176,8 +5376,8 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 					buf.Recv_generic_seq({}, start_tick, duration);
 					if (buf.error) return CMD_ERROR;
 					if (CmdSchDispatchAddNewSchedule(flags, cmd_data.veh, start_tick, duration).Succeeded()) {
-						active_schedule_id = v->orders->GetScheduledDispatchScheduleCount() - 1;
-						active_schedule = &v->orders->GetDispatchScheduleByIndex(active_schedule_id);
+						active_schedule_id = v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount() - 1;
+						active_schedule = &v->GetEffectiveOrders()->GetDispatchScheduleByIndex(active_schedule_id);
 						active_schedule_after_end = 0;
 					} else {
 						active_schedule_id = UINT_MAX;
@@ -5191,11 +5391,11 @@ CommandCost CmdBulkOrder(DoCommandFlags flags, const BulkOrderCmdData &cmd_data)
 
 					buf.Recv_generic_seq({}, active_schedule_id);
 					if (buf.error) return CMD_ERROR;
-					if (active_schedule_id >= v->orders->GetScheduledDispatchScheduleCount()) {
+					if (active_schedule_id >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
 						active_schedule_id = UINT_MAX;
 						active_schedule = nullptr;
 					} else {
-						active_schedule = &v->orders->GetDispatchScheduleByIndex(active_schedule_id);
+						active_schedule = &v->GetEffectiveOrders()->GetDispatchScheduleByIndex(active_schedule_id);
 						const std::vector<DispatchSlot> &dslist = active_schedule->GetScheduledDispatch();
 						active_schedule_after_end = dslist.empty() ? 0 : dslist.back().offset + 1;
 					}

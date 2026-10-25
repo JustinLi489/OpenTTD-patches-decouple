@@ -376,8 +376,20 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 	}
 	fprintf(dbg, "MAKESEG %s head=%d\n", tag, (int)head->index.base());
 	int i = 0;
+	uint32_t r3r_sum_w = 0;
+	uint32_t r3r_sum_pw = 0;
 	for (const Train *w = head; w != nullptr; w = w->Next()) {
-		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d SB=%d) eng=%d\n",
+		/* R3R (第 290 轮, KI-459): the weight columns. "ov" is the baked
+		 * per-vehicle override (65535 = not baked, so the engine record is
+		 * used), "rw" the raw GRF record weight, "pw" what callback 36
+		 * (PROP_TRAIN_WEIGHT) returns for this very vehicle and "w" what
+		 * GetWeightWithoutCargo() actually contributes. Comparing the sum of
+		 * "w" before and after the split against the raw record sum is what
+		 * settles the reported "weight triples after MakeSegment". */
+		const uint32_t r3r_pw = GetVehicleProperty(w, PROP_TRAIN_WEIGHT, RailVehInfo(w->engine_type)->weight);
+		r3r_sum_w += w->GetWeightWithoutCargo();
+		r3r_sum_pw += r3r_pw;
+		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d SB=%d) eng=%d ov=%u rw=%u pw=%u w=%u\n",
 			tag,
 			(int)w->index.base(),
 			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
@@ -392,9 +404,16 @@ static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
 			w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
 			w->IsSegmentFront() ? 1 : 0,
 			w->IsSegmentBack() ? 1 : 0,
-			(int)w->engine_type.base());
+			(int)w->engine_type.base(),
+			(unsigned)w->weight_override,
+			(unsigned)RailVehInfo(w->engine_type)->weight,
+			(unsigned)r3r_pw,
+			(unsigned)w->GetWeightWithoutCargo());
 		if (++i > 60) break;
 	}
+	fprintf(dbg, "MAKESEG-WEIGHT %s head=%d n=%d sumw=%u sumpw=%u cw=%u dmw=%u\n",
+			tag, (int)head->index.base(), i, (unsigned)r3r_sum_w, (unsigned)r3r_sum_pw,
+			(unsigned)head->gcache.cached_weight, (unsigned)head->GetDisplayMaxWeight());
 	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
 	fclose(dbg);
 }
@@ -538,6 +557,30 @@ static Train *R3RDearticulateOneGroup(Train *v)
 		p->weight_override = w_q;
 		p->power_override = p_q;
 		p->max_speed_override = max_speed;
+	}
+
+	/* R3R (第 290 轮, KI-459): what the split actually baked. "wtot" is the
+	 * snapshot taken from the still-articulated group head (the only vehicle
+	 * that contributes weight while the group is real, because genuine parts
+	 * are skipped by GetWeightWithoutCargo()), so a wrong "n" or a wrong wtot
+	 * shows up here before anything downstream can disguise it. */
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg != nullptr) {
+		fprintf(dbg, "DEARTIC-SPLIT head=%d n=%u wtot=%u wq=%u wr=%u ptot=%u pq=%u wagon=%d\n",
+				(int)v->index.base(), n_total, (unsigned)total_weight,
+				(unsigned)w_q, (unsigned)w_r, (unsigned)total_power, (unsigned)p_q, wagon_type ? 1 : 0);
+		int k = 0;
+		for (Train *p = v; p != nullptr && k < 64; p = p->Next(), k++) {
+			fprintf(dbg, "DEARTIC-PART head=%d i=%d idx=%d art=%d gm=%d gh=%d eng=%d ov=%u rw=%u w=%u cargo=%u/%u\n",
+					(int)v->index.base(), k, (int)p->index.base(),
+					p->IsArticulatedPart() ? 1 : 0, p->IsArticGroupMember() ? 1 : 0,
+					p->IsArticGroupHead() ? 1 : 0, p->IsEngine() ? 1 : 0,
+					(unsigned)p->weight_override, (unsigned)RailVehInfo(p->engine_type)->weight,
+					(unsigned)p->GetWeightWithoutCargo(),
+					(unsigned)p->cargo_type, (unsigned)p->cargo_subtype);
+			if (p == nxt) break;
+		}
+		fclose(dbg);
 	}
 
 	return nxt;
@@ -893,7 +936,11 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 				/* One-step demotion of a wagon-only segment: straight back to a
 				 * loose free wagon chain (a free wagon chain cannot hold a
 				 * schedule or a number). */
-				if (seg->orders != nullptr) DeleteVehicleOrders(seg);
+				/* R3R (KI-465 修法 D): a following segment has no list of its own in `orders`,
+				 * so the follow pointer (and a legacy parked backup) must also be cleared;
+				 * DeleteVehicleOrders() does all three, hence it has to be called even when
+				 * `orders` is null. */
+				if (seg->orders != nullptr || seg->IsR3RFollower() || seg->orders_backup != nullptr) DeleteVehicleOrders(seg);
 				if (seg->unitnumber != 0) Company::Get(seg->owner)->freeunits[VehicleType::Train].ReleaseID(seg->unitnumber);
 				/* R3R (KI-147 rev.3): 挂车时借出并暂存的车号也可能挂在本车上。头车在
 				 * 这里就要丢掉 front 身份,PreDestructor 的备份回收(仅 FrontEngine)
@@ -927,7 +974,7 @@ CommandCost CmdDemoteSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh
 	if (flags.Test(DoCommandFlag::Execute)) {
 		R3RStopChainInDepot(front);
 		/* A free wagon chain cannot hold a schedule. */
-		if (front->orders != nullptr) DeleteVehicleOrders(front);
+		if (front->orders != nullptr || front->IsR3RFollower() || front->orders_backup != nullptr) DeleteVehicleOrders(front);
 		/* Release the unit number back into the company pool. */
 		if (front->unitnumber != 0) Company::Get(front->owner)->freeunits[VehicleType::Train].ReleaseID(front->unitnumber);
 		/* R3R (KI-147 rev.3): 同上,借出暂存的车号也要一起回收。 */
@@ -1114,6 +1161,11 @@ struct RefitResult {
  */
 static CommandCost RefitVehicle(Vehicle *v, bool only_this, uint8_t num_vehicles, CargoType new_cargo_type, uint8_t new_subtype, DoCommandFlags flags, bool auto_refit)
 {
+	/* R3R (KI-458) PROBE ONLY: `v` below is consumed as the loop cursor
+	 * (`for (; v != nullptr; v = v->Next())`) and is nullptr once the loop
+	 * ends, so any probe placed after the loop must use this snapshot. */
+	Vehicle *const r3r_probe_veh = v;
+
 	CommandCost cost(v->GetExpenseType(false));
 	uint total_capacity = 0;
 	uint total_mail_capacity = 0;
@@ -1224,6 +1276,28 @@ static CommandCost RefitVehicle(Vehicle *v, bool only_this, uint8_t num_vehicles
 				w->cargo_cap = result.mail_capacity;
 				if (w->cargo.TotalCount() > w->refit_cap) w->cargo.Truncate(w->cargo.TotalCount() - w->refit_cap);
 			}
+		}
+	}
+
+	/* R3R (KI-458) PROBE ONLY: what the refit actually wrote onto every unit of
+	 * the chain. Drift between units (or between a unit and its group head) is
+	 * the livery symptom; this dump is the baseline to compare against. */
+	if (flags.Test(DoCommandFlag::Execute) && r3r_probe_veh != nullptr && r3r_probe_veh->type == VehicleType::Train && R3RDbgOn()) {
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			const Vehicle *head = r3r_probe_veh->First();
+			fprintf(dbg, "R3R-REFIT-DONE head=%d cargo=%u sub=%u actual=%u\n",
+					(int)head->index.base(), (unsigned)new_cargo_type, (unsigned)new_subtype,
+					(unsigned)actual_subtype);
+			uint k = 0;
+			for (const Vehicle *u = head; u != nullptr && k < 64; u = u->Next(), k++) {
+				fprintf(dbg, "R3R-REFIT-UNIT head=%d i=%u idx=%d cargo=%u/%u art=%d gm=%d gh=%d\n",
+						(int)head->index.base(), k, (int)u->index.base(),
+						(unsigned)u->cargo_type, (unsigned)u->cargo_subtype,
+						u->IsArticulatedPart() ? 1 : 0, u->IsArticGroupMember() ? 1 : 0,
+						u->IsArticGroupHead() ? 1 : 0);
+			}
+			fclose(dbg);
 		}
 	}
 
@@ -1403,7 +1477,9 @@ CommandCost CmdStartStopVehicle(DoCommandFlags flags, VehicleID veh_id, bool eva
 		default: return CMD_ERROR;
 	}
 
-	if (evaluate_startstop_cb) {
+	/* R3R: optionally ignore the NewGRF start/stop restrictions, so that vehicles which a
+	 * GRF locks to a fixed formation can still be started/stopped individually. */
+	if (evaluate_startstop_cb && !_settings_game.vehicle.ignore_grf_startstop_limits) {
 		/* Check if this vehicle can be started/stopped. Failure means 'allow'. */
 		uint16_t callback = GetVehicleCallback(CBID_VEHICLE_START_STOP_CHECK, 0, 0, v->engine_type, v);
 		StringID error = STR_NULL;

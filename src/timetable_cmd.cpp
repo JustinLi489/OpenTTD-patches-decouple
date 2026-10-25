@@ -16,6 +16,7 @@
 #include "window_func.h"
 #include "vehicle_base.h"
 #include "vehicle_func.h"
+#include "train.h"
 #include "settings_type.h"
 #include "company_base.h"
 #include "settings_type.h"
@@ -44,6 +45,17 @@ static void ChangeTimetable(Vehicle *v, VehicleOrderID order_number, uint32_t va
 	Order *order = v->GetOrder(order_number);
 	assert(order != nullptr);
 	if (order->HasNoTimetableTimes()) return;
+
+	/* R3R (KI-391): #OT_DECOUPLE is an instant command and carries neither a wait
+	 * nor a travel time, while #OT_WAIT_COUPLE only waits for a coupling partner.
+	 * Clamp (instead of rejecting) so that stale values written by older builds are
+	 * cleared as well and the duration bookkeeping stays consistent. */
+	if ((mtf == MTF_WAIT_TIME && !order->HasWaitTimetableTime()) ||
+			(mtf == MTF_TRAVEL_TIME && !order->HasTravelTimetableTime())) {
+		val = 0;
+		timetabled = false;
+		ignore_lock = true;
+	}
 
 	int total_delta = 0;
 	int timetable_delta = 0;
@@ -108,8 +120,8 @@ static void ChangeTimetable(Vehicle *v, VehicleOrderID order_number, uint32_t va
 		default:
 			NOT_REACHED();
 	}
-	v->orders->UpdateTotalDuration(total_delta);
-	v->orders->UpdateTimetableDuration(timetable_delta);
+	v->GetEffectiveOrders()->UpdateTotalDuration(total_delta);
+	v->GetEffectiveOrders()->UpdateTimetableDuration(timetable_delta);
 
 	SetTimetableWindowsDirty(v, (mtf == MTF_ASSIGN_SCHEDULE) ? STWDF_SCHEDULED_DISPATCH : STWDF_NONE);
 
@@ -220,7 +232,7 @@ CommandCost CmdChangeTimetable(DoCommandFlags flags, VehicleID veh, VehicleOrder
 
 		case MTF_ASSIGN_SCHEDULE:
 			dispatch_index = (int)data;
-			if (dispatch_index < -1 || dispatch_index >= (int)v->orders->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
+			if (dispatch_index < -1 || dispatch_index >= (int)v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) return CMD_ERROR;
 			break;
 
 		default:
@@ -248,6 +260,11 @@ CommandCost CmdChangeTimetable(DoCommandFlags flags, VehicleID veh, VehicleOrder
 			case OT_CONDITIONAL:
 				break;
 
+			case OT_GOTO_COUPLE:
+			case OT_WAIT_COUPLE:
+				/* R3R (KI-391): waiting for a coupling partner is a timetabled wait. */
+				break;
+
 			default: return CommandCost(STR_ERROR_TIMETABLE_ONLY_WAIT_AT_STATIONS);
 		}
 	}
@@ -270,6 +287,9 @@ CommandCost CmdChangeTimetable(DoCommandFlags flags, VehicleID veh, VehicleOrder
 	}
 
 	if (travel_time != order->GetTravelTime() && order->IsType(OT_CONDITIONAL)) return CMD_ERROR;
+	/* R3R (KI-391): #OT_DECOUPLE and #OT_WAIT_COUPLE have no travel time. Clearing
+	 * (travel_time == 0) stays allowed so stale values can be removed. */
+	if (travel_time > 0 && !order->HasTravelTimetableTime()) return CMD_ERROR;
 	if (travel_fixed != order->IsTravelFixed() && order->IsType(OT_CONDITIONAL)) return CMD_ERROR;
 	if (max_speed != order->GetMaxSpeed() && (order->IsType(OT_CONDITIONAL) || v->type == VehicleType::Aircraft)) return CMD_ERROR;
 	if (leave_type != order->GetLeaveType() && order->IsType(OT_CONDITIONAL)) return CMD_ERROR;
@@ -373,6 +393,44 @@ CommandCost CmdBulkChangeTimetable(DoCommandFlags flags, VehicleID veh, ModifyTi
 
 
 /**
+ * R3R (KI-389): read-only probe for "the three timetable buttons do nothing".
+ *
+ * The timetable window leaves "automate" / "autofill" / "separation" enabled for own
+ * vehicles, so a click which silently has no effect means the DoCommand below hit a
+ * `return CMD_ERROR` guard. Printing who the window's vehicle actually is tells the
+ * three candidate causes apart:
+ *  - H-a: a car inside a segment (its GVSF_FRONT was cleared when it was absorbed),
+ *  - H-b: the window was opened on a non-front car (`ShowTimetableWindow` keeps the
+ *         clicked index as window number and never normalises to `First()`),
+ *  - H-c: the control segment itself lost GVSF_FRONT at some commit point.
+ * Logged unconditionally (subject to R3RDbgOn()), i.e. for successful clicks too, so
+ * "no TT-CMD line at all" really means the command was never invoked.
+ */
+static void R3RTimetableCmdProbe(const char *cmd, const Vehicle *v, VehicleID veh)
+{
+	if (!R3RDbgOn()) return;
+
+	if (v == nullptr) {
+		R3RDbgWrite("TT-CMD %s veh=%d found=0\n", cmd, (int)veh.base());
+		return;
+	}
+
+	bool front = false;
+	bool front_wagon = false;
+	if (v->type == VehicleType::Train) {
+		const Train *const t = Train::From(v);
+		front = t->IsFrontEngine();
+		front_wagon = t->IsFrontWagon();
+	}
+
+	R3RDbgWrite("TT-CMD %s veh=%d found=1 type=%d primary=%d front=%d frontwagon=%d orders=%p owner=%d first=%d segid=%u prio=%u borrowed=%d\n",
+			cmd, (int)veh.base(), (int)v->type, v->IsPrimaryVehicle() ? 1 : 0,
+			front ? 1 : 0, front_wagon ? 1 : 0, (const void *)v->GetEffectiveOrders(),
+			(int)v->owner.base(), (int)v->First()->index.base(), (unsigned)v->r3r_segment_id,
+			(unsigned)v->r3r_priority, v->r3r_orders_borrowed ? 1 : 0);
+}
+
+/**
  * Clear the lateness counter to make the vehicle on time.
  * @param flags Operation to perform.
  * @param veh Vehicle with the orders to change.
@@ -382,7 +440,8 @@ CommandCost CmdBulkChangeTimetable(DoCommandFlags flags, VehicleID veh, ModifyTi
 CommandCost CmdSetVehicleOnTime(DoCommandFlags flags, VehicleID veh, bool apply_to_group)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->orders == nullptr) return CMD_ERROR;
+	R3RTimetableCmdProbe("on-time", v, veh);
+	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	/* A vehicle can't be late if its timetable hasn't started.
 	 * If we're setting all vehicles in the group, we handle that below. */
@@ -474,7 +533,7 @@ static bool VehicleTimetableSorter(Vehicle * const &a, Vehicle * const &b)
 CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timetable_all, StateTicks start_state_tick)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->orders == nullptr) return CMD_ERROR;
+	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
@@ -484,13 +543,13 @@ CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timet
 	/* ...or 1 unscaled year in the past. */
 	if (_state_ticks - start_state_tick > DAY_TICKS * DAYS_IN_LEAP_YEAR) return CMD_ERROR;
 
-	if (timetable_all && !v->orders->IsCompleteTimetable()) return CommandCost(STR_ERROR_TIMETABLE_INCOMPLETE);
+	if (timetable_all && !v->GetEffectiveOrders()->IsCompleteTimetable()) return CommandCost(STR_ERROR_TIMETABLE_INCOMPLETE);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		std::vector<Vehicle *> vehs;
 
 		if (timetable_all) {
-			for (Vehicle *w = v->orders->GetFirstSharedVehicle(); w != nullptr; w = w->NextShared()) {
+			for (Vehicle *w = v->GetEffectiveOrders()->GetFirstSharedVehicle(); w != nullptr; w = w->NextShared()) {
 				vehs.push_back(w);
 			}
 			SetTimetableWindowsDirty(v);
@@ -499,7 +558,7 @@ CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timet
 			SetWindowDirty(WindowClass::VehicleTimetable, v->index);
 		}
 
-		int total_duration = v->orders->GetTimetableTotalDuration();
+		int total_duration = v->GetEffectiveOrders()->GetTimetableTotalDuration();
 		int num_vehs = (uint)vehs.size();
 
 		if (num_vehs >= 2) {
@@ -539,7 +598,8 @@ CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timet
 CommandCost CmdAutofillTimetable(DoCommandFlags flags, VehicleID veh, bool autofill, bool preserve_wait_time)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->orders == nullptr) return CMD_ERROR;
+	R3RTimetableCmdProbe("autofill", v, veh);
+	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
@@ -585,6 +645,7 @@ CommandCost CmdAutofillTimetable(DoCommandFlags flags, VehicleID veh, bool autof
 CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool automate)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
+	R3RTimetableCmdProbe("automate", v, veh);
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
@@ -623,6 +684,7 @@ CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool autom
 CommandCost CmdTimetableSeparation(DoCommandFlags flags, VehicleID veh, bool separation)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
+	R3RTimetableCmdProbe("separation", v, veh);
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
@@ -648,6 +710,12 @@ CommandCost CmdTimetableSeparation(DoCommandFlags flags, VehicleID veh, bool sep
 static inline bool IsOrderUsableForSeparation(const Order *order)
 {
 	if (order->HasNoTimetableTimes()) return true;
+
+	/* R3R (KI-391/KI-392): #OT_DECOUPLE is an instant command and #OT_WAIT_COUPLE
+	 * only waits, so neither can ever carry the travel time checked for below.
+	 * Without this they made every schedule containing an R3R command unusable
+	 * for automatic separation. */
+	if (!order->HasTravelTimetableTime()) return true;
 
 	if (order->GetWaitTime() == 0 && order->IsType(OT_GOTO_STATION) && !(order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) {
 		// non-station orders are permitted to have 0 wait times
@@ -721,7 +789,7 @@ void UpdateSeparationOrder(Vehicle *v_start)
 	std::vector<TimetableProgress> progress_array = PopulateSeparationState(v_start);
 	if (progress_array.size() < 2) return;
 
-	const uint duration = v_start->orders->GetTotalDuration();
+	const uint duration = v_start->GetEffectiveOrders()->GetTotalDuration();
 	Vehicle *v = Vehicle::Get(progress_array.back().id);
 	Vehicle *v_ahead = Vehicle::Get(progress_array.front().id);
 	uint behind_index = (uint)progress_array.size() - 1;
@@ -879,7 +947,7 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 	if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && v->cur_implicit_order_index != INVALID_VEH_ORDER_ID) {
 		Order *real_implicit_order = v->GetOrder(v->cur_implicit_order_index);
 		if (real_implicit_order->IsScheduledDispatchOrder(true) && travelling) {
-			DispatchSchedule &ds = v->orders->GetDispatchScheduleByIndex(real_implicit_order->GetDispatchScheduleIndex());
+			DispatchSchedule &ds = v->GetEffectiveOrders()->GetDispatchScheduleByIndex(real_implicit_order->GetDispatchScheduleIndex());
 
 			/* Update scheduled information */
 			ds.UpdateScheduledDispatch(v);
@@ -1016,9 +1084,14 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 		}
 		uint time_to_set = CeilDiv(std::max(time_taken, 1U), rounding_factor) * rounding_factor;
 
-		if (travel_field && (autofilling || !real_timetable_order->IsTravelTimetabled())) {
+		/* R3R (KI-391): #OT_DECOUPLE has no timetable times at all and #OT_WAIT_COUPLE
+		 * has no travel time. Do not measure (and hence never autofill) a field that
+		 * does not apply to the order; ChangeTimetable() clamps it to zero anyway. */
+		if (travel_field && real_timetable_order->HasTravelTimetableTime() &&
+				(autofilling || !real_timetable_order->IsTravelTimetabled())) {
 			ChangeTimetable(v, v->cur_timetable_order_index, time_to_set, MTF_TRAVEL_TIME, autofilling);
-		} else if (!travel_field && (autofilling || !real_timetable_order->IsWaitTimetabled())) {
+		} else if (!travel_field && real_timetable_order->HasWaitTimetableTime() &&
+				(autofilling || !real_timetable_order->IsWaitTimetabled())) {
 			ChangeTimetable(v, v->cur_timetable_order_index, time_to_set, MTF_WAIT_TIME, autofilling);
 		}
 	}
@@ -1120,7 +1193,7 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 	 * length of a full cycle till lateness is less than the length of a timetable
 	 * cycle. When the timetable isn't fully filled the cycle will be INVALID_TICKS. */
 	if (v->lateness_counter > (int)timetabled) {
-		Ticks cycle = v->orders->GetTimetableTotalDuration();
+		Ticks cycle = v->GetEffectiveOrders()->GetTimetableTotalDuration();
 		if (cycle != INVALID_TICKS && v->lateness_counter > cycle) {
 			if (cycle == 0) {
 				v->lateness_counter = 0;

@@ -2672,7 +2672,7 @@ void ViewportRouteOverlay::PrepareRoutePathsConditionalOrder(const Vehicle *veh,
 	/* Prevent excessive recursion */
 	if (depth >= 10) return;
 
-	for (; order != nullptr && state.lines_added < 16; order = veh->orders->GetNext(order)) {
+	for (; order != nullptr && state.lines_added < 16; order = veh->GetEffectiveOrders()->GetNext(order)) {
 		if (!state.visited.insert(order).second) {
 			/* Already visited this order */
 			return;
@@ -2935,7 +2935,7 @@ void ViewportRouteOverlay::PrepareRouteSteps(const Vehicle *veh)
 
 	if (veh == nullptr || !_settings_client.gui.show_vehicle_route_steps || veh->GetNumOrders() == 0) return;
 
-	this->line_colour = veh->orders->GetRouteOverlayColour();
+	this->line_colour = veh->GetEffectiveOrders()->GetRouteOverlayColour();
 
 	/* Prepare data. */
 	uint16_t order_rank = 0;
@@ -5022,9 +5022,11 @@ void ViewportRouteOverlay::PrepareRoutePathsAndMarkDirtyIfChanged(const Vehicle 
 void ViewportRouteOverlay::PrepareRouteAndMarkDirtyIfChanged(const Vehicle *veh)
 {
 	bool force_change = false;
-	if (veh != nullptr && veh->orders != nullptr) {
-		if (veh->orders->GetRouteOverlayColour() != this->line_colour) force_change = true;
-		this->line_colour = veh->orders->GetRouteOverlayColour();
+	/* R3R (KI-465 修法 D): route overlay shows the schedule the train actually runs, which for a
+	 * follower lives in another vehicle's list while its own `orders` stays its own table. */
+	if (veh != nullptr && veh->GetEffectiveOrders() != nullptr) {
+		if (veh->GetEffectiveOrders()->GetRouteOverlayColour() != this->line_colour) force_change = true;
+		this->line_colour = veh->GetEffectiveOrders()->GetRouteOverlayColour();
 	}
 
 	this->PrepareRoutePathsAndMarkDirtyIfChanged(veh, force_change);
