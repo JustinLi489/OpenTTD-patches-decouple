@@ -4908,6 +4908,7 @@ STR_ORDER_GO_TO_STATION_CAN_T_USE_STATION                       :{PUSH_COLOUR}{R
 
 STR_ORDER_IMPLICIT                                              :{SPACE}(Implicit)
 STR_ORDER_R3R_AUTO_FILLED                                       :{SPACE}(auto-filled)
+STR_ORDER_R3R_COUPLE_END                                        :{SPACE}(end of reference)
 
 STR_ORDER_FULL_LOAD                                             :{SPACE}(Full load)
 STR_ORDER_FULL_LOAD_ANY                                         :{SPACE}(Full load any cargo)

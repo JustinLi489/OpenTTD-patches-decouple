@@ -263,11 +263,24 @@ inline FILE *R3RFopenDbg(const char *mode)
 	 * site at runtime (no rebuild), R3R_DBG=0 still silences everything. Defaults to
 	 * on, because these are event-scale probes (282 lines in the 第 274 轮 log) and
 	 * not the flood the aggregation work is about. */
+#if R3R_PROBES
 	static const bool raw_on = []() {
 		const char *env = std::getenv("R3R_DBG_RAW");
 		return !(env != nullptr && env[0] == '0');
 	}();
 	return (R3RDbgOn() && raw_on) ? fopen(R3RDbgFileName(), mode) : nullptr;
+#else
+	/* R3R (第 386 轮 / 探针分离): 编译期切掉整条日志出口。
+	 *
+	 * 原实现靠 `R3RDbgOn()` 在 R3R_PROBES=0 时恒 false 来折叠，但函数里那个
+	 * `raw_on` 是 **function-local static**：它的初始化在第一次执行到声明时
+	 * 发生，与后面的短路无关 —— 也就是说发布版仍会在这 169 个调用点共享的
+	 * 第一次进入时跑一次 getenv("R3R_DBG_RAW") 并留下一个 static 守卫对象。
+	 * 探针分离后这里连分支都不留：直接 nullptr，调用点的
+	 * `if (dbg != nullptr) { fprintf(...); }` 在 /O2 下随之整块消失。 */
+	(void)mode;
+	return nullptr;
+#endif
 }
 
 /**
@@ -364,6 +377,14 @@ inline bool R3RDbgTagAllowed(const char *fmt)
 	if (n >= 7 && std::strncmp(fmt, "RESERVE", 7) == 0) return true; ///< RESERVECONSIST (per-consist reservation state)
 	if (n >= 8 && std::strncmp(fmt, "DECOUPLE", 8) == 0) return true; ///< DECOUPLE-INTERLOCK/-SEG-SKIP-REAL-ARTIC
 	if (n >= 3 && std::strncmp(fmt, "SPD", 3) == 0) return true;      ///< SPD-DROP (KI-348: who zeroed the speed)
+	/* R3R (第 371 轮, 2026-10-29, KI-534): the round-369/370 waypoint-wait probes
+	 * (WP-LOCO-WAIT / WP-EXIT / WP-WAITHOLD / WP-HANDLE / WP-WAIT-KEEP) were all
+	 * written through R3RDbgWrite and therefore swallowed right here: the 第 370 轮
+	 * log had 0 "WP-" lines although the exe demonstrably contained the format
+	 * strings, and that 0 was mis-read as "the wait block is unreachable". This is
+	 * the third time the trap fires (after 第 274 轮 and 第 296 轮 above). Always
+	 * check a new tag against this predicate before trusting a 0 count. */
+	if (n >= 2 && std::strncmp(fmt, "WP", 2) == 0) return true;      ///< WP-LOCO-WAIT/-EXIT (KI-534 waypoint wait)
 	if (n >= 8 && std::strncmp(fmt, "DUALHEAD", 8) == 0) return true; ///< DUALHEAD (KI-334)
 	if (n >= 3 && std::strncmp(fmt, "TTB", 3) == 0) return true;      ///< TTB-PROBE (train-train boundary geometry)
 	if (n >= 5 && std::strncmp(fmt, "DEPOT", 5) == 0) return true;    ///< DEPOT-XFER-ID/-BEFORE-HEAD*/-INSEG-SKIP

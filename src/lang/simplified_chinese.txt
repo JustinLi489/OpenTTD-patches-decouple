@@ -4890,6 +4890,7 @@ STR_ORDER_GO_TO_STATION_CAN_T_USE_STATION                       :{PUSH_COLOUR}{R
 
 STR_ORDER_IMPLICIT                                              :(自动)
 STR_ORDER_R3R_AUTO_FILLED                                       :（自动填充）
+STR_ORDER_R3R_COUPLE_END                                        :（参考结束）
 
 STR_ORDER_FULL_LOAD                                             :（装满全部货物）
 STR_ORDER_FULL_LOAD_ANY                                         :（装满任意货物后离开）

@@ -217,13 +217,19 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 			reached_depot = true;
 		}
 
+		/* R3R (KI-541): an "air" placeholder is written down, not driven, so its
+		 * timetable is optional: an untimed one consumes no time and must not stop
+		 * the prediction (a normal untimed order does), while a time that is
+		 * written on it is counted exactly like any other order. */
+		const bool air = R3RIsCoupleAirOrder(v->GetEffectiveOrders(), i);
+
 		/* Automatic orders don't influence the overall timetable;
 		 * they just add some untimetabled entries, but the time till
 		 * the next non-implicit order can still be known. */
 		if (!skip) {
 			if (travelling || i != start) {
 				if (!skip_travel) {
-					if (!CanDetermineTimeTaken(order, true)) return;
+					if (!air && !CanDetermineTimeTaken(order, true)) return;
 					sum += order->GetTimetabledTravel();
 				}
 				table[i].arrival = sum;
@@ -250,7 +256,7 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 				extern LastDispatchRecord MakeLastDispatchRecord(const DispatchSchedule &ds, StateTicks slot, int slot_index);
 				dispatch_records[order->GetDispatchScheduleIndex()] = MakeLastDispatchRecord(ds, slot, slot_index);
 			} else {
-				if (!CanDetermineTimeTaken(order, false)) return;
+				if (!air && !CanDetermineTimeTaken(order, false)) return;
 				sum += order->GetTimetabledWait();
 			}
 			table[i].departure = sum;
@@ -267,7 +273,7 @@ static void FillTimetableArrivalDepartureTable(const Vehicle *v, VehicleOrderID 
 	 * travelling part of the first order. */
 	if (!travelling && table[i].arrival == INVALID_TICKS) {
 		if (!skip_travel) {
-			if (!CanDetermineTimeTaken(order, true)) return;
+			if (!R3RIsCoupleAirOrder(v->GetEffectiveOrders(), i) && !CanDetermineTimeTaken(order, true)) return;
 			sum += order->GetTimetabledTravel();
 		}
 		table[i].arrival = sum;
@@ -307,7 +313,14 @@ void ProcessTimetableWarnings(const Vehicle *v, std::function<void(std::string_v
 	bool have_autoseparate_bad_non_stop_type = false;
 
 	const bool assume_timetabled = v->vehicle_flags.Test(VehicleFlag::AutofillTimetable) || v->vehicle_flags.Test(VehicleFlag::AutomateTimetable);
-	for (const Order *order : v->Orders()) {
+	const VehicleOrderID num_orders = v->GetNumOrders();
+	for (VehicleOrderID order_index = 0; order_index < num_orders; order_index++) {
+		const Order *const order = v->GetOrder(order_index);
+		if (order == nullptr) continue;
+		/* R3R (KI-541): an "air" placeholder is never executed, so nothing written on
+		 * it can break the schedule: its missing timings are not a warning, and its
+		 * load/non-stop settings are irrelevant to timetable separation. */
+		if (R3RIsCoupleAirOrder(v->GetEffectiveOrders(), order_index)) continue;
 		if (order->IsType(OT_CONDITIONAL)) {
 			have_conditional = true;
 			if (!order->IsWaitTimetabled()) have_non_timetabled_conditional_branch = true;
@@ -346,8 +359,12 @@ void ProcessTimetableWarnings(const Vehicle *v, std::function<void(std::string_v
 
 	if (v->vehicle_flags.Test(VehicleFlag::TimetableSeparation)) {
 		auto no_set_waiting_orders = [&]() -> bool {
-			for (const Order *o : v->Orders()) {
+			for (VehicleOrderID idx = 0; idx < v->GetNumOrders(); idx++) {
+				const Order *const o = v->GetOrder(idx);
+				if (o == nullptr) continue;
 				if (o->IsType(OT_IMPLICIT) || o->HasNoTimetableTimes()) continue;
+				/* R3R (KI-541): a wait time on an air placeholder is never spent. */
+				if (R3RIsCoupleAirOrder(v->GetEffectiveOrders(), idx)) continue;
 
 				if (o->IsWaitTimetabled() && o->GetWaitTime() > 0 && ((o->IsType(OT_GOTO_STATION) && !(o->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION)) ||
 						(o->IsType(OT_GOTO_WAYPOINT) && v->type == VehicleType::Train))) {

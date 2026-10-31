@@ -18,15 +18,9 @@
 
 #include "../safeguards.h"
 
-/* R3R (第 245 轮, KI-371): implemented in pbs.cpp next to the ledger itself --
- * keeping the save/load code there means pbs.h does not have to grow an accessor
- * (which would force a full rebuild under the KI-183 guard). */
-void Save_R3RL();
-void Load_R3RL();
-
 /* R3R (第 246 轮 / 第 5 项): implemented in train_cmd.cpp next to the two tables it
- * writes (the decouple seam interlock and the orphan reservation age stamps). Same
- * reasoning as R3RL: keeping the code there means no header grows an accessor. */
+ * writes (the decouple seam interlock and the orphan reservation age stamps). Keeping
+ * the code there means no header grows an accessor. */
 void Save_R3DS();
 void Load_R3DS();
 
@@ -291,20 +285,11 @@ static const NamedSaveLoad _r3r_segment_desc[] = {
 	NSL("unitnumber",      SLE_VAR(R3RSegmentRecord, unitnumber, SLE_UINT16)),
 	NSL("name",            SLE_SSTR(R3RSegmentRecord, name, SLE_STR | SLF_ALLOW_CONTROL)),
 	NSL("group_id",        SLE_VAR(R3RSegmentRecord, group_id, SLE_UINT16)),
-	/* R3R (KI-388): the range of the segment's own schedule which the automatic
-	 * recorder wrote. Named fields, so a savegame written before this existed
-	 * simply reads them as 0 ("no auto range") and needs no version bump. */
-	NSL("auto_begin",      SLE_VAR(R3RSegmentRecord, auto_begin, SLE_UINT16)),
-	NSL("auto_count",      SLE_VAR(R3RSegmentRecord, auto_count, SLE_UINT16)),
-	NSL("auto_signature",  SLE_VAR(R3RSegmentRecord, auto_signature, SLE_UINT32)),
-	/* R3R (KI-395): one plan may cross several hand-over points, so the single
-	 * range above became an array of ranges (see R3RSegmentRecord). The legacy
-	 * three fields stay in the table for old savegames and are mirrored from the
-	 * first live slot on save, so an older binary still reads a one-range plan. */
-	NSL("auto_num_ranges",       SLE_VAR(R3RSegmentRecord, auto_num_ranges, SLE_UINT8)),
-	NSL("auto_ranges_begin",     SLE_ARR(R3RSegmentRecord, auto_ranges_begin, SLE_UINT16, R3RSegmentRecord::AUTO_RANGE_SLOTS)),
-	NSL("auto_ranges_count",     SLE_ARR(R3RSegmentRecord, auto_ranges_count, SLE_UINT16, R3RSegmentRecord::AUTO_RANGE_SLOTS)),
-	NSL("auto_ranges_signature", SLE_ARR(R3RSegmentRecord, auto_ranges_signature, SLE_UINT32, R3RSegmentRecord::AUTO_RANGE_SLOTS)),
+	/* R3R (KI-541): the auto recorded ranges (KI-388/KI-395) are no longer saved.
+	 * Their keys (auto_begin/auto_count/auto_signature, auto_num_ranges and the
+	 * three slot arrays) simply disappear from the table; a savegame which still
+	 * carries them has them skipped on load, because the table header format
+	 * ignores keys the running binary does not know. */
 };
 
 static void Load_R3SG()
@@ -322,23 +307,6 @@ static void Load_R3SG()
 		R3RSegmentRecord *rec = R3RSegmentGetOrCreate(static_cast<uint16_t>(index));
 		if (rec == nullptr) continue;
 		SlObjectLoadFiltered(rec, slt);
-		/* R3R (KI-395): a pre-KI-395 row carries exactly one range in the legacy
-		 * fields; fold it into slot 0 and clear them, so no code path can read the
-		 * legacy pair again (the arrays are the only truth from here on). */
-		if (rec->auto_count != 0) {
-			if (rec->auto_num_ranges == 0) {
-				rec->auto_num_ranges = 1;
-				rec->auto_ranges_begin[0] = rec->auto_begin;
-				rec->auto_ranges_count[0] = rec->auto_count;
-				rec->auto_ranges_signature[0] = rec->auto_signature;
-			}
-			rec->auto_begin = 0;
-			rec->auto_count = 0;
-			rec->auto_signature = 0;
-		}
-		if (rec->auto_num_ranges > R3RSegmentRecord::AUTO_RANGE_SLOTS) {
-			rec->auto_num_ranges = R3RSegmentRecord::AUTO_RANGE_SLOTS;
-		}
 		if (dbg != nullptr) {
 			fprintf(dbg, "SEGLOAD-ROW id=%u u=%u n=\"%s\" g=%d borrowed=%d orders=%d\n",
 					(unsigned)index,
@@ -364,19 +332,6 @@ static void Save_R3SG()
 	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
 		R3RSegmentRecord *rec = R3RSegmentGet(static_cast<uint16_t>(id));
 		if (rec == nullptr) continue;
-		/* R3R (KI-395): mirror the first live slot into the legacy fields. They are
-		 * never read by this binary, this is only so a pre-KI-395 binary can still
-		 * follow a plan which has a single range. */
-		rec->auto_begin = 0;
-		rec->auto_count = 0;
-		rec->auto_signature = 0;
-		for (uint8_t s = 0; s < R3RSegmentRecord::AUTO_RANGE_SLOTS; s++) {
-			if (rec->auto_ranges_count[s] == 0) continue;
-			rec->auto_begin = rec->auto_ranges_begin[s];
-			rec->auto_count = rec->auto_ranges_count[s];
-			rec->auto_signature = rec->auto_ranges_signature[s];
-			break;
-		}
 		if (dbg != nullptr) {
 			fprintf(dbg, "SEGSAVE-ROW id=%u use=%d u=%u n=\"%s\" g=%d borrowed=%d orders=%d\n",
 					(unsigned)id, rec->in_use ? 1 : 0,
@@ -408,7 +363,6 @@ extern const ChunkHandler couple_group_chunk_handlers[] = {
 	{ 'CGVR', Save_CGVR, Load_CGVR, nullptr, nullptr, CH_SPARSE_TABLE },   // Couple Group Vehicle mapping chunk
 	{ 'R3VP', Save_R3VP, Load_R3VP, Ptrs_R3VP, nullptr, CH_SPARSE_TABLE }, // R3R parked schedule / segment bookkeeping chunk
 	{ 'R3SG', Save_R3SG, Load_R3SG, Ptrs_R3SG, nullptr, CH_SPARSE_TABLE }, // R3R segment identity table chunk
-	{ 'R3RL', Save_R3RL, Load_R3RL, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R reservation ledger chunk
 	{ 'R3DS', Save_R3DS, Load_R3DS, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R decouple seam / orphan age chunk
 };
 

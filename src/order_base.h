@@ -325,6 +325,7 @@ public:
 	void MakeDecouple(OrderDecoupleFlags decouple, uint8_t num_decouple);
 	void MakeGoToCouple(DestinationID dest, OrderCoupleLoadFlags load = ODC_ANY, CargoType cargo = CT_COUPLE_ANY_CARGO, bool depot_target = false);
 	void MakeWaitCouple();
+	void MakeCoupleEnd();
 
 	/**
 	 * R3R (KI-302): convert the order type of this order from the old 5 bit
@@ -971,7 +972,7 @@ public:
 	inline bool IsSlotCounterOrder() const { return this->IsType(OT_COUNTER) || this->IsType(OT_SLOT) || this->IsType(OT_SLOT_GROUP); }
 
 	/** Does this order not have any associated travel or wait times */
-	inline bool HasNoTimetableTimes() const { return this->IsSlotCounterOrder() || this->IsType(OT_LABEL); }
+	inline bool HasNoTimetableTimes() const { return this->IsSlotCounterOrder() || this->IsType(OT_LABEL) || this->IsType(OT_COUPLE_END); }
 
 	/**
 	 * R3R (KI-391): does a wait time apply to this order?
@@ -1252,6 +1253,9 @@ struct OrderPoolItem : OrderPool::PoolItem<&_order_pool> {
 
 void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord);
 void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord);
+
+/* R3R (KI-541): restore the "every GOTO_COUPLE is followed by COUPLE_END" invariant. */
+void R3REnsureCoupleEndOrders(Vehicle *v);
 
 struct CargoMaskedStationIDVector {
 	CargoTypes cargo_mask;
@@ -1828,5 +1832,41 @@ public:
 };
 
 void UpdateOrderUIOnDateChange();
+
+/**
+ * R3R (KI-541): is the order at @p index part of an "air" range?
+ *
+ * An air range is the span between a #OT_GOTO_COUPLE order and the #OT_COUPLE_END
+ * marker that follows it. Those orders are a record of where the segment would run
+ * (and where a locomotive would pick it up); they are drawn greyed out and are never
+ * executed. The marker itself is not a command either.
+ *
+ * Walking backwards to the nearest boundary keeps this well defined even when the
+ * list was edited: an order belongs to the range when the closest #OT_GOTO_COUPLE is
+ * nearer (backwards) than the closest #OT_COUPLE_END. A marker without a preceding
+ * #OT_GOTO_COUPLE is an orphan and only makes itself air, never the whole list.
+ *
+ * @param list  Order list to inspect.
+ * @param index Order index to test.
+ * @return True when the order is a placeholder and must not be executed.
+ */
+inline bool R3RIsCoupleAirOrder(const OrderList *list, VehicleOrderID index)
+{
+	if (list == nullptr) return false;
+	const uint num = list->GetNumOrders();
+	if (num == 0 || index >= num) return false;
+
+	const Order *const self = list->GetOrderAt(index);
+	if (self == nullptr) return false;
+	if (self->IsType(OT_COUPLE_END)) return true;
+
+	for (uint step = 1; step < num; step++) {
+		const Order *const o = list->GetOrderAt((VehicleOrderID)((index + num - step) % num));
+		if (o == nullptr) return false;
+		if (o->IsType(OT_GOTO_COUPLE)) return true;
+		if (o->IsType(OT_COUPLE_END)) return false;
+	}
+	return false;
+}
 
 #endif /* ORDER_BASE_H */

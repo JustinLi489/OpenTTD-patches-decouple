@@ -92,6 +92,7 @@ enum OrderType : uint8_t {
 	OT_DECOUPLE      = 15,  ///< Decouple a number of vehicles (or minimal decouplable unit) from the back of the train.
 	OT_GOTO_COUPLE   = 16,  ///< Go to and couple onto a waiting consist (station or depot).
 	OT_WAIT_COUPLE   = 17,  ///< Wait in place to be coupled onto by a locomotive.
+	OT_COUPLE_END    = 18,  ///< Marker closing the "air" range which follows a #OT_GOTO_COUPLE order.
 	OT_END
 };
 

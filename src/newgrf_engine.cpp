@@ -416,6 +416,8 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
  * @param v the vehicle to get the position of.
  * @param consecutive whether to look at the whole chain or the vehicles
  *                    with the same 'engine type'.
+ * @param whole_chain R3R (KI-540): ignore segment boundaries and report the
+ *                    vanilla whole-chain reading.
  * @return the position in the chain from front and tail and chain length.
  *
  * R3R (position-in-segment rule): a train may be composed of several
@@ -426,8 +428,15 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
  * sprites from "position in consist" keeps every segment's head/tail faces
  * stable when a consist is coupled on. Chains without any SegmentFront
  * marker keep the original whole-chain semantics.
+ *
+ * R3R (KI-540, round 375): the segment-wise answer is only correct for sprite
+ * selection. A NewGRF may instead use 0x40/0x41 to derive how many identical
+ * units a consist is made of and scale the refit capacity from that (the
+ * Chinese train set reports `0,36,0` -> `0,12,0` once the consist becomes a
+ * segment). Capacity is computed once per consist change, so that callback
+ * asks for whole_chain = true and gets the vanilla reading back.
  */
-static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
+static uint32_t PositionHelper(const Vehicle *v, bool consecutive, bool whole_chain = false)
 {
 	/* R3R perf probe (KI-14): this runs on the sprite path, so its cost is a
 	 * frame-rate cost. pos_steps is the interesting one: the segment walk is
@@ -450,7 +459,11 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 	 * opens a new segment that starts AT the marked vehicle) and while there
 	 * is a predecessor; otherwise the segment front is the physical head. */
 	const Vehicle *seg_front = v;
-	if (v->type == VehicleType::Train) {
+	if (whole_chain) {
+		/* R3R (KI-540): vanilla reading -- count from the physical chain head
+		 * and never stop at a segment boundary. */
+		seg_front = v->First();
+	} else if (v->type == VehicleType::Train) {
 		const Vehicle *w = v;
 		while (w->Previous() != nullptr && !static_cast<const Train *>(w)->IsSegmentFront()) {
 			w = w->Previous();
@@ -465,8 +478,9 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 
 	while (u->Next() != nullptr && (!consecutive || u->Next()->engine_type == v->engine_type)) {
 		/* R3R: stop at the next segment boundary (the next SegmentFront is the
-		 * first vehicle of the following segment, so it is not counted). */
-		if (u->Next()->type == VehicleType::Train && static_cast<const Train *>(u->Next())->IsSegmentFront()) break;
+		 * first vehicle of the following segment, so it is not counted).
+		 * With whole_chain the boundary is meaningless, so keep walking. */
+		if (!whole_chain && u->Next()->type == VehicleType::Train && static_cast<const Train *>(u->Next())->IsSegmentFront()) break;
 		chain_after++;
 		u = u->Next();
 	}
@@ -482,11 +496,32 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 	 * every vehicle keeps its physical position. Report the pre-flip rank -- i.e.
 	 * swap the "before" and "after" counters -- so a NewGRF which selects sprites
 	 * from "position in consist" still keeps each vehicle's head/middle/tail face
-	 * after the flip (the segment length in the high word is unchanged). */
-	if (v->type == VehicleType::Train && static_cast<const Train *>(v)->IsSegmentFlipped()) {
+	 * after the flip (the segment length in the high word is unchanged).
+	 *
+	 * With whole_chain the flip mirror is deliberately NOT applied: the vanilla
+	 * reading is the physical chain order, which is exactly what the refit
+	 * capacity callback expects. */
+	if (!whole_chain && v->type == VehicleType::Train && static_cast<const Train *>(v)->IsSegmentFlipped()) {
 		const uint8_t tmp = chain_before;
 		chain_before = chain_after;
 		chain_after = tmp;
+	}
+
+	/* R3R (KI-540, round 375): record the whole-chain answer handed to the refit
+	 * capacity callback. That callback runs once per consist change (not on the
+	 * sprite path), so a bounded dump is enough to prove the fix. */
+	if (whole_chain && R3RDbgOn()) {
+		static unsigned r3r_poscap_lines = 0;
+		if (r3r_poscap_lines < 500) {
+			r3r_poscap_lines++;
+			FILE *r3r_dbg = R3RFopenDbg("a");
+			if (r3r_dbg != nullptr) {
+				fprintf(r3r_dbg, "POSCAP veh=%d eng=%d before=%u after=%u consec=%d head=%d\n",
+						(int)v->index.base(), (int)v->engine_type.base(), (unsigned)chain_before,
+						(unsigned)chain_after, consecutive ? 1 : 0, (int)v->First()->index.base());
+				fclose(r3r_dbg);
+			}
+		}
 	}
 
 	/* R3R (第 290 轮, KI-458, L3): record the "position in consist" answer the
@@ -495,7 +530,7 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive)
 	 * so this line is the control sample: if these look segment-correct while the
 	 * weight/livery ones go wrong, the defect is not in the segment boundary itself.
 	 * Bounded to the first 500 lines because this sits on the sprite path. */
-	if (R3RDbgOn()) {
+	if (!whole_chain && R3RDbgOn()) {
 		static unsigned r3r_pos_lines = 0;
 		if (r3r_pos_lines < 500) {
 			r3r_pos_lines++;
@@ -634,6 +669,11 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 			return v->GetGRFID();
 
 		case 0x40: // Get length of consist
+			/* R3R (KI-540, round 375): the refit capacity callback must see the
+			 * vanilla whole-chain reading, not the segment-wise one. The cache has
+			 * no notion of the two views, so this path bypasses it completely; it
+			 * runs once per consist change, not on the sprite path. */
+			if (object->ro.callback == CBID_VEHICLE_REFIT_CAPACITY) return PositionHelper(v, false, true);
 			if (!HasBit(v->grf_cache.cache_valid, NCVV_POSITION_CONSIST_LENGTH)) {
 				v->grf_cache.position_consist_length = PositionHelper(v, false);
 				SetBit(v->grf_cache.cache_valid, NCVV_POSITION_CONSIST_LENGTH);
@@ -641,6 +681,7 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 			return v->grf_cache.position_consist_length;
 
 		case 0x41: // Get length of same consecutive wagons
+			if (object->ro.callback == CBID_VEHICLE_REFIT_CAPACITY) return PositionHelper(v, true, true);
 			if (!HasBit(v->grf_cache.cache_valid, NCVV_POSITION_SAME_ID_LENGTH)) {
 				v->grf_cache.position_same_id_length = PositionHelper(v, true);
 				SetBit(v->grf_cache.cache_valid, NCVV_POSITION_SAME_ID_LENGTH);

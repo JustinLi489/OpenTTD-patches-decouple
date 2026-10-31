@@ -531,6 +531,11 @@ void SlXvChillPPSpecialSavegameVersions()
  */
 bool SlXvIsChunkDiscardable(uint32_t id)
 {
+	/* R3R (第 303 轮, 2026-10-25): the reservation ledger chunk is gone. Savegames
+	 * written by older builds still carry it, so discard it on load instead of
+	 * failing on an unregistered chunk type. */
+	if (id == 'R3RL') return true;
+
 	for (size_t i = 0; i < _sl_xv_discardable_chunk_ids.size(); i++) {
 		if (_sl_xv_discardable_chunk_ids[i] == id) {
 			return true;

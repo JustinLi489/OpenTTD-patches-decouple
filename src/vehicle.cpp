@@ -32,6 +32,7 @@
 #include "autoreplace_func.h"
 #include "autoreplace_gui.h"
 #include "station_base.h"
+#include "waypoint_base.h"
 #include "ai/ai.hpp"
 #include "depot_func.h"
 #include "network/network.h"
@@ -1239,18 +1240,6 @@ void Vehicle::PreDestructor()
 	if (this->type == VehicleType::Train && Train::From(this)->flags.Test(VehicleRailFlag::PendingSpeedRestriction)) {
 		_pending_speed_restriction_change_map.erase(this->index);
 		Train::From(this)->flags.Reset(VehicleRailFlag::PendingSpeedRestriction);
-	}
-
-	/* R3R (KI-359, memo §21.6): the train that booked reservation bits is ceasing
-	 * to exist, so no later release path can honour those bits -- hand them back
-	 * now instead of leaving them for the audit's "the booker is dead" pass.
-	 * The ledger is keyed on the chain head, so being called once per car of a
-	 * chain that is sold car by car is harmless: the first call clears the chain
-	 * and the rest are a single hash lookup (Forget normalises to the head, and
-	 * First() finds it even while `this` is a mid-chain wagon). */
-	if (this->type == VehicleType::Train) {
-		const Train *r3r_chain_head = Train::From(this)->First();
-		R3RResvLedgerForget((r3r_chain_head != nullptr) ? r3r_chain_head->index : this->index, "destroy");
 	}
 
 	if (this->Previous() == nullptr) {
@@ -3995,6 +3984,136 @@ void Vehicle::HandleLoading(bool mode)
 }
 
 /**
+ * R3R (KI-534, P1): is this OT_WAITING vehicle waiting at a *waypoint*?
+ *
+ * Only trains wait at waypoints, and MakeWaiting() keeps the destination of the
+ * order it replaces, so the destination of the OT_WAITING order still points at
+ * the waypoint that was just reached. Station/depot halts keep pointing at their
+ * station respectively depot, so they are not matched here.
+ */
+static bool R3RIsWaypointWait(const Vehicle *v)
+{
+	if (v->type != VehicleType::Train) return false;
+	if (!v->current_order.IsType(OT_WAITING)) return false;
+	return Waypoint::IsValidID(v->current_order.GetDestination().ToStationID());
+}
+
+/** R3R (KI-534, 第 370 轮补 2): 探针节流戳。 */
+struct R3RWaitProbeStamp {
+	uint32_t state; ///< 状态哈希，只含"变了才值得再看"的字段。
+	uint64_t tick;  ///< 上一次输出时的 _tick_counter。
+};
+
+/** R3R (KI-534, 第 370 轮补 2): WP-WAITHOLD 的节流表（键=车辆索引）。 */
+static robin_hood::unordered_map<uint32_t, R3RWaitProbeStamp> _r3r_wp_waithold_stamps;
+
+/** R3R (KI-534, 第 370 轮补 2): WP-HANDLE 的节流表（键=车辆索引）。 */
+static robin_hood::unordered_map<uint32_t, R3RWaitProbeStamp> _r3r_wp_handle_stamps;
+
+/**
+ * R3R (KI-534, 第 370 轮补 2): 等待探针的节流。
+ *
+ * 第 370 轮第一版用 `v->tick_counter % 64` 节流，整轮 0 命中 —— 只要该计数器在
+ * 停车时不前进（或从不落在 64 的整数倍上），探针就永远是哑的，"日志里没有"
+ * 也就无法区分"没走到"与"被节流吃掉"。改成按 _tick_counter 计时：
+ * 状态一变立刻输出，否则每 256 tick 至多一行。
+ * 调用方负责把随 tick 单调变化的字段（current_order_time、剩余 wait_time）
+ * 排除在 state 之外，否则每 tick 都算"状态变化"而刷屏。
+ */
+static bool R3RWaitProbeDue(robin_hood::unordered_map<uint32_t, R3RWaitProbeStamp> &stamps, uint32_t key, uint32_t state)
+{
+	auto it = stamps.find(key);
+	if (it == stamps.end()) {
+		stamps[key] = R3RWaitProbeStamp{state, _tick_counter};
+		return true;
+	}
+	if (it->second.state != state) {
+		it->second.state = state;
+		it->second.tick = _tick_counter;
+		return true;
+	}
+	if (_tick_counter - it->second.tick >= 256) {
+		it->second.tick = _tick_counter;
+		return true;
+	}
+	return false;
+}
+
+/**
+ * R3R (KI-534, 第 370 轮): read-only probe for the two gates that can keep a
+ * vehicle parked at a waypoint inside Vehicle::HandleWaiting().
+ *
+ * gate=time  -> the timetabled wait time has not expired yet
+ * gate=cond  -> ShouldVehicleContinueWaiting() reports a conditional-order loop
+ * gate=pass  -> both gates let it through, the vehicle leaves the order now
+ *
+ * A `WP-WAIT-KEEP` line followed by `gate=time` means the wait time of that
+ * waypoint order is what holds the train (which is correct behaviour if the
+ * order really is timetabled), and `gate=cond` means the loop detection thinks
+ * the order after the wait leads back to itself. Station/depot halts are not
+ * logged so the log stays small.
+ */
+static void R3RWaypointWaitProbe(const Vehicle *v, const char *gate, uint wait_time, bool stop_waiting)
+{
+	if (!R3RIsWaypointWait(v)) return;
+	if (!R3RDbgOn()) return;
+
+	uint32_t state = (uint32_t)v->cur_real_order_index * 2654435761u;
+	state ^= ((uint32_t)v->cur_implicit_order_index + 1) * 40503u;
+	state ^= (uint32_t)v->current_order.GetLeaveType() * 8191u;
+	state ^= (uint32_t)gate[0] * 131u;
+	state ^= v->vehicle_flags.Test(VehicleFlag::ConditionalOrderWait) ? 0x4000u : 0u;
+	state ^= stop_waiting ? 0x8000u : 0u;
+	if (!R3RWaitProbeDue(_r3r_wp_waithold_stamps, v->index.base(), state)) return;
+
+	R3RDbgWrite("WP-WAITHOLD gate=%s veh=%d real=%d impl=%d n=%d wtime=%u cot=%u ltype=%u cow=%d stop=%d\n",
+			gate, (int)v->index.base(), (int)v->cur_real_order_index,
+			(int)v->cur_implicit_order_index, (int)v->GetNumOrders(),
+			(unsigned)wait_time, (unsigned)v->current_order_time,
+			(unsigned)v->current_order.GetLeaveType(),
+			v->vehicle_flags.Test(VehicleFlag::ConditionalOrderWait) ? 1 : 0,
+			stop_waiting ? 1 : 0);
+}
+
+/**
+ * R3R (KI-534, 第 370 轮补 2): 进入 OT_WAITING 等待分支时的第一手快照。
+ *
+ * 第 370 轮现场：veh57 停在 tile 42,13、order=9(OT_WAITING)、real=4，之后上千
+ * tick 一行日志都没有；而 WP-WAITHOLD / WP-WAIT-KEEP 均 0 命中，无法判断是
+ * "等待块没跑"(C-1)、"R3RIsWaypointWait() 为假"(C-2) 还是"探针被节流吃掉"(C-3)。
+ * 本探针在两道门之前无条件写一行（仅节流），wantWp/validWp 直接回答 C-2：
+ *  - validWp=0 => current_order 的目的地已不是有效路点，R3R 的路点等待判定恒假；
+ *  - wantWp=1 且两道门都不拦 => 之后应看到 WP-WAITHOLD gate=pass / WP-WAIT-KEEP。
+ */
+static void R3RWaypointHandleProbe(const Vehicle *v, uint wait_time, bool stop_waiting, bool process_orders)
+{
+	if (v->type != VehicleType::Train) return;
+	if (!R3RDbgOn()) return;
+
+	const StationID dest = v->current_order.GetDestination().ToStationID();
+	const bool want_wp = R3RIsWaypointWait(v);
+	const bool valid_wp = Waypoint::IsValidID(dest);
+
+	uint32_t state = want_wp ? 0x1u : 0u;
+	state |= valid_wp ? 0x2u : 0u;
+	state ^= ((uint32_t)v->cur_real_order_index + 1) * 2654435761u;
+	state ^= ((uint32_t)v->cur_implicit_order_index + 1) * 40503u;
+	state ^= (uint32_t)v->current_order.GetTimetabledWait() * 8191u;
+	state ^= (uint32_t)v->current_order.GetLeaveType() * 131u;
+	state ^= stop_waiting ? 0x100000u : 0u;
+	state ^= process_orders ? 0x200000u : 0u;
+	if (!R3RWaitProbeDue(_r3r_wp_handle_stamps, v->index.base(), state)) return;
+
+	R3RDbgWrite("WP-HANDLE veh=%d wantWp=%d dest=%d validWp=%d waitT=%u lateness=%d wait_time=%u cot=%u ltype=%u sw=%d po=%d tile=%d,%d\n",
+			(int)v->index.base(), want_wp ? 1 : 0, (int)dest.base(), valid_wp ? 1 : 0,
+			(unsigned)v->current_order.GetTimetabledWait(), (int)v->lateness_counter,
+			(unsigned)wait_time, (unsigned)v->current_order_time,
+			(unsigned)v->current_order.GetLeaveType(),
+			stop_waiting ? 1 : 0, process_orders ? 1 : 0,
+			(int)TileX(v->tile), (int)TileY(v->tile));
+}
+
+/**
  * Handle the waiting time everywhere else as in stations (basically in depot but, eventually, also elsewhere ?)
  * Function is called when order's wait_time is defined.
  * @param stop_waiting should we stop waiting (or definitely avoid) even if there is still time left to wait ?
@@ -4005,18 +4124,65 @@ void Vehicle::HandleWaiting(bool stop_waiting, bool process_orders)
 	switch (this->current_order.GetType()) {
 		case OT_WAITING: {
 			uint wait_time = std::max<int>(this->current_order.GetTimetabledWait() - this->lateness_counter, 0);
+			/* R3R (KI-534, 第 370 轮补 2): 两道门之前先留快照，用来区分
+			 * "等待块在跑但判定为假" 与 "等待块根本没跑到"。 */
+			R3RWaypointHandleProbe(this, wait_time, stop_waiting, process_orders);
 			/* Vehicles holds on until waiting Timetabled time expires. */
 			if (!stop_waiting && this->current_order_time < wait_time && this->current_order.GetLeaveType() != OLT_LEAVE_EARLY) {
+				R3RWaypointWaitProbe(this, "time", wait_time, stop_waiting);
 				return;
 			}
-			if (!stop_waiting && process_orders && ShouldVehicleContinueWaiting(this)) {
-				return;
+			if (!stop_waiting && process_orders) {
+				/* R3R (KI-534, 第 370 轮): capture the result instead of calling it
+				 * inline - ShouldVehicleContinueWaiting() has side effects (it flushes
+				 * the deferred index advance and latches VehicleFlag::ConditionalOrderWait),
+				 * so it must still be called exactly once. */
+				if (ShouldVehicleContinueWaiting(this)) {
+					R3RWaypointWaitProbe(this, "cond", wait_time, stop_waiting);
+					return;
+				}
 			}
 
 			/* When wait_time is expired, we move on. */
+			R3RWaypointWaitProbe(this, "pass", wait_time, stop_waiting);
 			this->vehicle_flags.Reset(VehicleFlag::ConditionalOrderWait);
 			UpdateVehicleTimetable(this, false);
-			this->IncrementImplicitOrderIndex();
+			/* R3R (KI-534, P1): at a waypoint arrival the implicit index has already
+			 * been snapped onto the real one (DeleteUnreachedImplicitOrders(), the
+			 * GVF_SUPPRESS_IMPLICIT_ORDERS branch, sets cur_implicit = cur_real), so
+			 * IncrementImplicitOrderIndex() takes the "increment the real index as
+			 * well" branch (vehicle_base.h:1118) instead of just walking the implicit
+			 * index up to the real one. That silently consumes the *next* order:
+			 * player report 2026-10-29, veh57 stopped at waypoint 1706 (order 4) and
+			 * jumped straight from order 4 to the GOTO_COUPLE behind order 5, never
+			 * parsing order 5 (waypoint 917 at 21,7) and never leaving the tile.
+			 * Upstream never hits that branch because a normal arrival leaves an
+			 * OT_IMPLICIT order between the two indices; R3R deletes it. */
+			if (R3RIsWaypointWait(this)) {
+				/* R3R (KI-534, 第 372 轮): 第 369 轮的 P1 把这里写成"只 InvalidateVehicleOrder"，
+				 * 等价于一条订单都不推进 —— 2026-10-29 22:53 的日志（4672 行）实测：
+				 * gate=pass 与 gate=time 各 423 次 1:1 交替、real 恒 4、tile 恒 42,13、spd 恒 0，
+				 * 因为 MakeDummy() 之后 ProcessOrders() 又把已完成的 real=4 那条
+				 * OT_GOTO_WAYPOINT 重新解析成 OT_WAITING，形成无限等待。
+				 * 正确做法是推进"恰好一条"真实订单，并让 implicit 与 real 锁步：R3R 不生成
+				 * OT_IMPLICIT 订单，若放任 IncrementImplicitOrderIndex() 的
+				 * do{...}while(implicit != real && !IsType(OT_IMPLICIT)) 在没有 implicit 的
+				 * 表里绕圈，就会把 real 一口气吃到后面的订单（玩家报的 4→6 跳条）。 */
+				R3RDbgWrite("WP-WAIT-KEEP veh=%d real=%d impl=%d dest=%d n=%d\n",
+						(int)this->index.base(), (int)this->cur_real_order_index,
+						(int)this->cur_implicit_order_index,
+						(int)this->current_order.GetDestination().base(), (int)this->GetNumOrders());
+				const VehicleOrderID old_real = this->cur_real_order_index;
+				const VehicleOrderID old_impl = this->cur_implicit_order_index;
+				this->SkipToNextRealOrderIndex();
+				this->cur_implicit_order_index = this->cur_real_order_index;
+				R3RDbgWrite("WP-WAIT-ADV veh=%d real=%d->%d impl=%d->%d\n",
+						(int)this->index.base(), (int)old_real, (int)this->cur_real_order_index,
+						(int)old_impl, (int)this->cur_implicit_order_index);
+				InvalidateVehicleOrder(this, 0);
+			} else {
+				this->IncrementImplicitOrderIndex();
+			}
 			this->current_order.MakeDummy();
 			if (this->type == VehicleType::Train) Train::From(this)->force_proceed = TFP_NONE;
 			if (process_orders) ProcessOrders(this);

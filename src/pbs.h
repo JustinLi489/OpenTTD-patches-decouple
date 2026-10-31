@@ -33,11 +33,10 @@
  * rebuild by dropping "r3r_resv_watch.txt" (one "x y" pair per line, '#' starts a
  * comment) next to R3R_debug.log in the game working directory.
  *
- * R3R (KI-359, 2026-10-11): the phase/actor context below is compiled
- * unconditionally, because the reservation *ledger* (see R3RResvLedgerNote) is a
- * real fix rather than a probe: it books every reservation bit under the chain
- * head that laid it down, and it is fed from the very same hook. Only the
- * watched-tile logging stays behind R3R_PROBES. */
+ * R3R (第 303 轮): the phase/actor context below is compiled unconditionally so
+ * that the release/probe entry points keep the same signatures with the probes
+ * off; only the watched-tile logging stays behind R3R_PROBES. The reservation
+ * ledger that used to be fed from the same hook has been deleted. */
 extern const char *r3r_resv_phase;
 /** Acting train, as an ID rather than a pointer: the log is reached from deep
  *  inside the map setters, where a raw pointer could outlive the train it names. */
@@ -59,8 +58,7 @@ inline bool R3RIsWatchedResvTile(TileIndex) { return false; }
  * Passing \c nullptr for the phase (or VehicleID::Invalid() for the actor) leaves
  * that field alone -- that is how the generic pathfinder entry point adds "who"
  * without destroying the phase of the caller. It is a real type and not a macro so
- * that call sites compile identically with and without the probes, and since
- * KI-359 it is always a working guard, because the ledger depends on the actor.
+ * that call sites compile identically with and without the probes.
  */
 struct R3RResvPhaseGuard {
 	const char *prev_phase;
@@ -73,57 +71,6 @@ struct R3RResvPhaseGuard {
 	}
 	~R3RResvPhaseGuard() { r3r_resv_phase = prev_phase; r3r_resv_actor = prev_actor; }
 };
-
-/**
- * R3R (KI-359, 2026-10-11): the reservation ledger -- "which train laid down which
- * reservation bit".
- *
- * The engine's own walk (GetTrainForReservation) answers "which train stands at the
- * far end of this reserved path", which is a structurally wrong answer while a
- * locomotive couples to a waiting consist: the far end is then always the target, so
- * the bits a coupling path installs get attributed to the target (field log:
- * SET-RAIL actor=23 on the very tile the audit reported as owner=veh22). The ledger
- * instead books every bit written through the six map setters under the chain head
- * of whoever was acting at that moment, which is the only caller-side fact that
- * survives chain edits.
- *
- * The tables are saved in the R3RL chunk (src/sl/couple_group_sl.cpp) and rebuilt on
- * load, so a booking survives a savegame round trip and the audit still knows who
- * wrote a bit after loading. Keys are VehicleID values, never Train pointers,
- * because a train can be deleted between booking and releasing.
- */
-inline constexpr uint32_t R3R_RESV_NO_OWNER = UINT32_MAX;
-/** Book ("SET-*"/"CHG-*") or unbook ("CLEAR-*") one reservation bit. Called from the
- *  map setters via R3RResvWatchLog; a no-op while no actor is set. */
-void R3RResvLedgerNote(const char *kind, TileIndex tile, Track track);
-/** Ledger owner of one bit, or R3R_RESV_NO_OWNER when it was never booked (e.g. it
- *  came in with a savegame). */
-uint32_t R3RResvLedgerOwner(TileIndex tile, Track track);
-/** Release every bit booked under \a owner and drop its ledger rows. Used when the
- *  owning train is sold, decoupled or gives up its path. */
-void R3RResvLedgerForget(VehicleID owner, const char *why);
-/** Release one reservation bit after re-verifying that the tile still holds it (see
- *  pbs.cpp). Leaves the map alone when the check fails, so a stale ledger row can
- *  never free somebody else's bit. */
-void R3RReleaseReservationSafe(uint32_t key, TileIndex tile, Track track, const char *why);
-
-/** Visitor for R3RResvLedgerForEachBit(): \a track is INVALID_TRACK for a whole-tile
- *  (station platform / waypoint) bit. */
-typedef void (*R3RResvBitVisitor)(TileIndex tile, Track track, void *ctx);
-/**
- * R3R (第 255 轮, P1): hand every bit the ledger currently books to \a visit, in
- * whatever order the table happens to have -- callers that need a stable order must
- * sort what they collect.
- *
- * This is the "roster" the reservation audit walks instead of the map: on a 2048^2
- * map the audit used to look at 4.19M tiles every 2048 ticks to find a few thousand
- * booked bits, which is both the slowest periodic job in the game and the reason a
- * ghost could only be found on that cadence. The callback form (instead of returning
- * a vector) keeps pbs.h free of container headers, and it is the caller's business
- * to copy what it needs before releasing anything: the visit must not mutate the
- * ledger, or the iteration would be invalidated mid-walk.
- */
-void R3RResvLedgerForEachBit(R3RResvBitVisitor visit, void *ctx);
 
 /**
  * VehicleID of \a v for R3RResvPhaseGuard, tolerating a null pointer (that leaves the
@@ -322,6 +269,31 @@ Train *GetTrainForReservation(TileIndex tile, Track track);
  * starts from a plain rail track. Returns nullptr when the reservation is stray.
  */
 Train *GetTrainForWholeTileReservation(TileIndex tile);
+
+/**
+ * R3R (第 361 轮, REG-359-E): owner-arbitrated flavour of GetTrainForReservation().
+ *
+ * The plain version returns the first train found by walking from
+ * `TrackToTrackdir(track)` only -- when *both* ends of the reservation have a
+ * train on them that first hit wins, regardless of who actually booked the
+ * track (KI-350). This one walks both directions and arbitrates (see pbs.cpp):
+ * the *non-waiting* (not OT_WAIT_COUPLE) train wins, except on a station tile
+ * where the waiting one wins; equal states fall back to the old first-hit
+ * answer.
+ *
+ * Used only by the couple-reservation ownership test; every other caller keeps
+ * using GetTrainForReservation() unchanged.
+ */
+Train *GetTrainForReservationArbitrated(TileIndex tile, Track track);
+
+/**
+ * R3R (第 361 轮, REG-359-E): owner-arbitrated flavour of
+ * GetTrainForWholeTileReservation(). Same arbitration, but asked about a
+ * whole-tile (station / waypoint) reservation, where the "waiting train wins"
+ * rule of the station case actually applies. A train standing on the tile is
+ * still the owner by definition.
+ */
+Train *GetTrainForWholeTileReservationArbitrated(TileIndex tile);
 
 /**
  * R3R (KI-210): same two questions as above, but the answer is the *nearest*

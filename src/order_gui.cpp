@@ -984,46 +984,24 @@ static StringID GetDepotOrderGoToString(const Order &order)
 }
 
 /**
- * R3R (KI-397, 第 263 轮续三): is the order drawn at \a order_index a row the
- * automatic recorder wrote into a segment's own schedule?
+ * R3R (KI-541, 第 376 轮): is the order drawn at \a order_index inside an "air
+ * range"?
  *
- * The recorder keeps its rounds in the schedule of the segment which was *not*
- * the one being driven, so the list on screen (the one of the vehicle the order
- * window belongs to) only stands for a segment row when it really is that
- * segment's own list; a segment running somebody else's schedule still owns its
- * own list in `orders` (KI-465 fix D: following is a separate pointer, it never
- * replaces the ownership), and the list on screen is the effective one. Rows
- * inside an auto recorded range are a record only -- the train never executes
- * them -- so they are drawn greyed out and suffixed, which is what tells them
- * apart from commands the player wrote.
+ * An air range is a span the player wrote between an #OT_GOTO_COUPLE and the
+ * #OT_COUPLE_END marker behind it. It is a reference for the driver, never a
+ * command: the execution side jumps over it (R3RSkipCoupleAirRanges()) and the
+ * order window draws it greyed out and suffixed, which is what tells it apart
+ * from the commands the player actually wants to run.
+ *
+ * The list on screen is the effective one (the driven segment's when control is
+ * borrowed), and the markers live in that very list, so no segment row and no
+ * hash is involved any more -- the answer cannot go stale.
  */
-static bool R3RIsAutoRecordedOrderRow(const Vehicle *v, int order_index)
+static bool R3RIsCoupleAirOrderRow(const Vehicle *v, int order_index)
 {
-	if (v == nullptr || v->type != VehicleType::Train || v->GetEffectiveOrders() == nullptr) return false;
+	if (v == nullptr || v->type != VehicleType::Train) return false;
 	if (order_index < 0 || order_index > 0xFFFF) return false;
-
-	const OrderList *const shown = v->GetEffectiveOrders();
-	const Vehicle *const head = v->First();
-	const uint16_t idx = (uint16_t)order_index;
-	for (const Vehicle *w = head; w != nullptr; w = w->Next()) {
-		if (w != head && !Train::From(w)->IsSegmentFront()) continue;
-		if (w->r3r_segment_id == R3R_SEGMENT_NONE) continue;
-
-		/* The segment's own list; the parked backup is only a fallback for the
-		 * legacy parked state (a depot drag before the follow pointer existed). */
-		const OrderList *const own = w->orders != nullptr ? w->orders : w->orders_backup;
-		if (own == nullptr || own != shown) continue;
-
-		const R3RSegmentRecord *const row = R3RSegmentGet(w->r3r_segment_id);
-		if (row == nullptr) continue;
-
-		for (uint8_t s = 0; s < R3RSegmentRecord::AUTO_RANGE_SLOTS; s++) {
-			if (row->auto_ranges_count[s] == 0) continue;
-			const uint16_t begin = row->auto_ranges_begin[s];
-			if (idx >= begin && idx < (uint16_t)(begin + row->auto_ranges_count[s])) return true;
-		}
-	}
-	return false;
+	return R3RIsCoupleAirOrder(v->GetEffectiveOrders(), (VehicleOrderID)order_index);
 }
 
 /**
@@ -1053,10 +1031,10 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		DrawSprite(sprite, PAL_NONE, rtl ? right -     sprite_size.width : left,                     y + ((int)GetCharacterHeight(FontSize::Normal) - (int)sprite_size.height) / 2);
 	}
 
-	const bool auto_recorded = !timetable && R3RIsAutoRecordedOrderRow(v, order_index);
+	const bool air_range = !timetable && R3RIsCoupleAirOrderRow(v, order_index);
 
 	ExtendedTextColour colour{TextColour::Black};
-	if (order->IsType(OT_IMPLICIT) || auto_recorded) {
+	if (order->IsType(OT_IMPLICIT) || air_range) {
 		colour = ExtendedTextColour{selected ? TextColour::Silver : TextColour::Grey, ExtendedTextColourFlag::NoShade};
 	} else {
 		if (selected) {
@@ -1496,6 +1474,13 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 			AppendStringInPlace(line, STR_ORDER_WAIT_COUPLE);
 			break;
 
+		case OT_COUPLE_END:
+			/* (KI-541) Closing marker of the reference block which follows a
+			 * #OT_GOTO_COUPLE order. It is not a command; the rows above it are
+			 * reference only and the marker itself ends that block. */
+			AppendStringInPlace(line, STR_ORDER_R3R_COUPLE_END);
+			break;
+
 		case OT_SLOT: {
 			StringID str;
 			switch (order->GetSlotSubType()) {
@@ -1625,9 +1610,10 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		AppendStringInPlace(line, STR_TIMETABLE_LEAVE_EARLY_ORDER + order->GetLeaveType() - OLT_LEAVE_EARLY);
 	}
 
-	/* (KI-397) Mark the rows the automatic recorder wrote: they are a record of
-	 * where the segment went, never a command it executes. */
-	if (auto_recorded) AppendStringInPlace(line, STR_ORDER_R3R_AUTO_FILLED);
+	/* (KI-541) Mark the rows inside an air range: they are a reference written by
+	 * the player between GOTO_COUPLE and COUPLE_END, never a command executed.
+	 * The closing marker belongs to the range but is not itself a placeholder. */
+	if (air_range && !order->IsType(OT_COUPLE_END)) AppendStringInPlace(line, STR_ORDER_R3R_AUTO_FILLED);
 
 	int edge = DrawString(rtl ? left : middle, rtl ? middle : right, y, line, colour);
 	line.clear();
@@ -2987,6 +2973,23 @@ public:
 					}
 					break;
 				}
+
+				case OT_COUPLE_END:
+					/* (KI-541) The closing marker of a reference block is not a
+					 * command: show it like an empty row and keep every order
+					 * editing control out of reach. */
+					if (row_sel != nullptr) {
+						row_sel->SetDisplayedPlane(DP_ROW_EMPTY);
+					} else {
+						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_EMPTY);
+						this->DisableWidget(WID_O_NON_STOP);
+						this->RaiseWidget(WID_O_NON_STOP);
+					}
+					this->DisableWidget(WID_O_FULL_LOAD);
+					this->DisableWidget(WID_O_UNLOAD);
+					this->DisableWidget(WID_O_REFIT);
+					this->DisableWidget(WID_O_REFIT_DROPDOWN);
+					break;
 
 				default: // every other order
 					if (row_sel != nullptr) {

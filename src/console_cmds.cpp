@@ -471,9 +471,8 @@ static bool ConScrollToTile(std::span<std::string_view> argv)
  * R3R (KI-207): release track reservations that no train can be attributed to.
  * These are the "ghost" reservations left behind by chain edits: they block other
  * trains and paint a reservation preview along track nothing is going to drive.
- * The periodic reservation audit releases them on its own once they have been stray
- * for a few audits; this command is for cleaning a save that inherited ghosts from
- * an older build, or for checking a suspicion immediately.
+ * Since 第 304 轮 there is no automatic reaper (the periodic orphan audit was
+ * deleted), so this command is the only way to clean such a save.
  *
  * Pause the game before running it: a stray bit is by definition one the engine
  * cannot attribute to a train, but a running train that is in the middle of

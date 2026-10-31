@@ -360,6 +360,12 @@ void Order::MakeWaitCouple()
 	this->flags = 0;
 }
 
+void Order::MakeCoupleEnd()
+{
+	this->SetType(OT_COUPLE_END);
+	this->flags = 0;
+}
+
 /**
  * R3R (KI-302): convert the order type of this order from the old 5 bit encoding
  * (OT_GOTO_COUPLE = 0x10, OT_WAIT_COUPLE = 0x11) to the current encoding.
@@ -991,9 +997,18 @@ void OrderList::RemoveVehicle(Vehicle *v)
  */
 bool OrderList::IsCompleteTimetable() const
 {
-	for (const Order *o : this->Orders()) {
+	const uint num = this->GetNumOrders();
+	for (VehicleOrderID index = 0; index < num; index++) {
+		const Order *const o = this->GetOrderAt(index);
+		if (o == nullptr) return false;
 		/* Implicit orders are, by definition, not timetabled. */
 		if (o->IsType(OT_IMPLICIT)) continue;
+		/* R3R (KI-541): an "air" placeholder is a written-down reference, not a
+		 * command that is ever executed, so it can never be measured. A missing
+		 * time on it must not make the whole schedule unusable (that would block
+		 * timetable separation, autofill and "set start time for all"). A time
+		 * that *is* written on it is still counted by UpdateTimetableDuration(). */
+		if (R3RIsCoupleAirOrder(this, index)) continue;
 		if (!o->IsCompletelyTimetabled()) return false;
 	}
 	return true;
@@ -1709,6 +1724,12 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
  */
 void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 {
+	/* R3R (KI-541): a #OT_GOTO_COUPLE order always carries its closing
+	 * #OT_COUPLE_END marker directly behind it. Everything between the two is
+	 * the "air" range -- a record of where the segment would run, never a
+	 * command, see R3RIsCoupleAirOrder(). */
+	const bool add_couple_end = new_o.IsType(OT_GOTO_COUPLE);
+
 	/* Create new order and link in list.
 	 * R3R (KI-465 修法 D): 编辑的目标恒为"这列车实际在跑的表"。跟随者自己的表可能为空，
 	 * 甚至自己的表根本不存在（orders == nullptr 但 follow 指针非空），此时必须把订单
@@ -1804,7 +1825,107 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 		cur_order_id++;
 	}
 
+	/* R3R (KI-541): close the air range behind the freshly inserted GOTO_COUPLE.
+	 * The marker is inserted behind the new order and all indices at or behind
+	 * it are shifted once more, exactly like the main insertion above. */
+	if (add_couple_end) {
+		OrderList *const couple_list = v->GetEffectiveOrders();
+		const VehicleOrderID at = sel_ord + 1;
+		Order end_order{};
+		end_order.MakeCoupleEnd();
+		couple_list->InsertOrderAt(std::move(end_order), at);
+
+		auto adjust_for_marker = [&](Vehicle *u) {
+			if (u->GetEffectiveOrders() != couple_list) return;
+			if (at <= u->cur_real_order_index && u->cur_real_order_index + 1 < u->GetNumOrders()) u->cur_real_order_index++;
+			if (at <= u->cur_implicit_order_index && u->cur_implicit_order_index + 1 < u->GetNumOrders()) u->cur_implicit_order_index++;
+			if (u->cur_timetable_order_index != INVALID_VEH_ORDER_ID && at <= u->cur_timetable_order_index && u->cur_timetable_order_index + 1 < u->GetNumOrders()) u->cur_timetable_order_index++;
+			u->ResetDepotUnbunching();
+			InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (at << 16));
+		};
+		uint marker_guard = 0;
+		for (Vehicle *u = shared_ring; u != nullptr && marker_guard < 1000; u = u->NextShared(), ++marker_guard) {
+			adjust_for_marker(u);
+		}
+		if (follower && shared_ring != v) adjust_for_marker(v);
+
+		for (Order *order : v->Orders()) {
+			if (order->IsType(OT_CONDITIONAL)) {
+				const VehicleOrderID order_id = order->GetConditionSkipToOrder();
+				if (order_id >= at) order->SetConditionSkipToOrder((order_id + 1) % v->GetNumOrders());
+			}
+		}
+	}
+
 	/* Make sure to rebuild the whole list */
+	InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
+	InvalidateWindowClassesData(WindowClass::DepartureBoard);
+}
+
+/**
+ * R3R (KI-541): make sure every #OT_GOTO_COUPLE order is closed by an
+ * #OT_COUPLE_END marker before the next #OT_GOTO_COUPLE order (or the end of the
+ * list). The orders in between are the reference ("air") block of the coupling
+ * order, so the marker is normally *not* adjacent to the opening order. Order
+ * list edits which do not go through InsertOrder() (moving, removing, re-ordering
+ * orders) and loading an old save game can break that invariant, so it is
+ * restored here.
+ * @param v Vehicle owning (or following) the order list to check.
+ */
+void R3REnsureCoupleEndOrders(Vehicle *v)
+{
+	OrderList *const list = v->GetEffectiveOrders();
+	if (list == nullptr) return;
+
+	for (VehicleOrderID i = 0; i < v->GetNumOrders(); i++) {
+		const Order *const order = v->GetOrder(i);
+		if (order == nullptr || !order->IsType(OT_GOTO_COUPLE)) continue;
+
+		/* The block is closed when the first boundary behind the opening order is
+		 * a marker. Requiring an *adjacent* marker here would insert a second one
+		 * right behind the opening order as soon as the player edits an order in
+		 * the reference block, which would silently turn all reference orders into
+		 * live commands again. */
+		bool closed = false;
+		for (VehicleOrderID step = 1; step < v->GetNumOrders(); step++) {
+			const Order *const o = v->GetOrder((VehicleOrderID)((i + step) % v->GetNumOrders()));
+			if (o == nullptr) break;
+			if (o->IsType(OT_COUPLE_END)) {
+				closed = true;
+				break;
+			}
+			if (o->IsType(OT_GOTO_COUPLE)) break; // This one starts the next block.
+		}
+		if (closed) continue;
+
+		/* An unclosed block (old save game or a removed marker): close it directly
+		 * behind the opening order so the following orders keep their meaning. */
+		const VehicleOrderID at = i + 1;
+		Order end_order{};
+		end_order.MakeCoupleEnd();
+		list->InsertOrderAt(std::move(end_order), at);
+
+		Vehicle *const ring = list->GetFirstSharedVehicle();
+		uint guard = 0;
+		for (Vehicle *u = ring; u != nullptr && guard < 1000; u = u->NextShared(), ++guard) {
+			if (u->GetEffectiveOrders() != list) continue;
+			if (at <= u->cur_real_order_index && u->cur_real_order_index + 1 < u->GetNumOrders()) u->cur_real_order_index++;
+			if (at <= u->cur_implicit_order_index && u->cur_implicit_order_index + 1 < u->GetNumOrders()) u->cur_implicit_order_index++;
+			if (u->cur_timetable_order_index != INVALID_VEH_ORDER_ID && at <= u->cur_timetable_order_index && u->cur_timetable_order_index + 1 < u->GetNumOrders()) u->cur_timetable_order_index++;
+			u->ResetDepotUnbunching();
+			InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (at << 16));
+		}
+
+		for (Order *order : v->Orders()) {
+			if (order->IsType(OT_CONDITIONAL)) {
+				const VehicleOrderID order_id = order->GetConditionSkipToOrder();
+				if (order_id >= at) order->SetConditionSkipToOrder((order_id + 1) % v->GetNumOrders());
+			}
+		}
+
+		i++; // Skip the marker which was just inserted.
+	}
+
 	InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
 	InvalidateWindowClassesData(WindowClass::DepartureBoard);
 }
@@ -1986,6 +2107,14 @@ void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord)
 		cur_order_id++;
 	}
 
+	/* R3R (KI-541): "every #OT_GOTO_COUPLE is followed by a #OT_COUPLE_END" has to
+	 * survive the edit. Deleting the closing marker therefore re-creates it right
+	 * behind the opening one; deleting the opening one leaves the marker behind as
+	 * an orphan, which only ever marks itself (see R3RIsCoupleAirOrder()) and is
+	 * skipped as a no-op -- the orders of the range then become normal commands,
+	 * exactly what the player asked for by removing the coupling command. */
+	R3REnsureCoupleEndOrders(v);
+
 	InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
 	InvalidateWindowClassesData(WindowClass::DepartureBoard);
 }
@@ -2161,6 +2290,11 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 				order->SetConditionSkipToOrder(adjust_order_idx(order->GetConditionSkipToOrder()));
 			}
 		}
+
+		/* R3R (KI-541): a move can separate #OT_GOTO_COUPLE from its closing
+		 * marker (drag the opening order alone). Repair the pairing first, then
+		 * rebuild the list so the greyed-out drawing matches. */
+		R3REnsureCoupleEndOrders(v);
 
 		/* Make sure to rebuild the whole list */
 		InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
@@ -4595,6 +4729,23 @@ void FlushAdvanceOrderIndexDeferred(const Vehicle *v, bool apply)
  * pathfinder had reserved. Aim at the tile of the paired consist instead: that
  * is the platform the couple pathfinder targets, so destination and path agree.
  *
+ * R3R (第 345 轮): the tile no longer has to be a station tile. A consist that
+ * waits on plain track or at a waypoint left the order without any destination
+ * at all, which in turn starved the plain-pathfinder fallback of KI-511 (no
+ * target tile -> no path). Any rail tile the consist stands on is a valid aim
+ * point; the plain station anchor remains the fallback when no pair is known.
+ *
+ * R3R (第 346 轮, KI-515): aim at the *nearest* unit of the paired consist
+ * instead of its chain head. The chain head tile is occupied by the consist
+ * itself; a long consist (33 units in the field report) lies along the platform
+ * for dozens of tiles, so a pathfinder told to reach the head tile can never
+ * arrive there and detours onto the other track of the same station -- which
+ * the player sees as the locomotive taking the wrong track. The unit closest to
+ * the locomotive is both the nearest coupling end and a tile the locomotive can
+ * actually stop at. The chain head tile stays as the last resort, word for word
+ * as before. Restricting the result to the locomotive's own station was
+ * deliberately left out (player decision of 2026-10-28, C-2).
+ *
  * @param v The vehicle that is about to travel to its couple target.
  * @return Tile to travel to, or INVALID_TILE to keep the plain station anchor.
  */
@@ -4605,8 +4756,53 @@ static TileIndex R3RGetCoupleOrderDestination(const Vehicle *v)
 	const Train *const tgt = R3RGetCouplePairPartner(Train::From(v));
 	if (tgt == nullptr) return INVALID_TILE;
 
+	const int self_x = (int)TileX(v->tile);
+	const int self_y = (int)TileY(v->tile);
+
+	TileIndex best_tile = INVALID_TILE;
+	int best_dist = -1;
+
+	for (const Vehicle *u = tgt; u != nullptr; u = u->Next()) {
+		const TileIndex t = u->tile;
+		if (!IsValidTile(t)) continue;
+
+		switch (GetTileType(t)) {
+			case TileType::Railway:
+			case TileType::Station:
+			case TileType::TunnelBridge:
+				break;
+
+			default:
+				continue;
+		}
+
+		const int dx = (int)TileX(t) - self_x;
+		const int dy = (int)TileY(t) - self_y;
+		const int adx = dx < 0 ? -dx : dx;
+		const int ady = dy < 0 ? -dy : dy;
+		const int dist = adx > ady ? adx : ady;
+
+		if (best_dist < 0 || dist < best_dist) {
+			best_dist = dist;
+			best_tile = t;
+		}
+	}
+
+	if (best_tile != INVALID_TILE) return best_tile;
+
+	/* No unit of the pair yielded a usable tile: keep the pre-346 behaviour. */
 	const TileIndex target_tile = tgt->tile;
-	if (!IsRailStationTile(target_tile)) return INVALID_TILE;
+	if (!IsValidTile(target_tile)) return INVALID_TILE;
+
+	switch (GetTileType(target_tile)) {
+		case TileType::Railway:
+		case TileType::Station:
+		case TileType::TunnelBridge:
+			break;
+
+		default:
+			return INVALID_TILE;
+	}
 
 	return target_tile;
 }
@@ -4694,10 +4890,12 @@ bool UpdateOrderDest(Vehicle *v, const Order *order, int conditional_depth, bool
 				if (!Depot::IsValidID(depot_id)) return false;
 				v->SetDestTile(Depot::Get(depot_id)->xy);
 			} else {
-				const TileIndex station_dest = v->GetOrderStationLocation(order->GetDestination().ToStationID());
 				/* R3R (KI-446): keep the travel target on the platform of the paired consist,
-				 * so that the PBS destination and the couple pathfinder agree. */
-				const TileIndex couple_dest = (station_dest != INVALID_TILE) ? R3RGetCoupleOrderDestination(v) : INVALID_TILE;
+				 * so that the PBS destination and the couple pathfinder agree.
+				 * R3R (第 345 轮): the pair wins over the station anchor unconditionally;
+				 * the anchor is only the fallback while no pair is resolved. */
+				const TileIndex couple_dest = R3RGetCoupleOrderDestination(v);
+				const TileIndex station_dest = v->GetOrderStationLocation(order->GetDestination().ToStationID());
 				v->SetDestTile(couple_dest != INVALID_TILE ? couple_dest : station_dest);
 			}
 			return true;
@@ -5022,8 +5220,20 @@ bool Order::ShouldStopAtStation(const Vehicle *v, StationID station, bool waypoi
 {
 	/* R3R: a train whose next order is a GOTO_COUPLE stops with its front at this waypoint.
 	 * `this` must be the order being executed, so that only that train is affected; other
-	 * trains using the same order still pass the waypoint as usual. */
-	if (waypoint && v->type == VehicleType::Train && this == &v->current_order && R3RTrainStopsAtWaypoint(static_cast<const Train *>(v))) return true;
+	 * trains using the same order still pass the waypoint as usual.
+	 *
+	 * R3R (KI-538, 第 373 轮续): the destination check is mandatory. Without it the
+	 * "wait at the waypoint before coupling" rule fires at *every* waypoint tile the
+	 * train happens to enter while the current order is the waypoint order, not only
+	 * at the waypoint that order actually points at. In the reported case the train
+	 * was parked on a different waypoint tile (42,13) after decoupling, the order
+	 * aiming at (21,7) was treated as reached, MakeWaiting() kept that order's
+	 * destination, and HandleWaiting() then advanced the index because a waypoint
+	 * has no timetabled wait time -- the train never drove to (21,7) at all.
+	 * The native branch below has the same `dest == station` requirement. */
+	if (waypoint && v->type == VehicleType::Train && this == &v->current_order &&
+			this->GetDestination().ToStationID() == station &&
+			R3RTrainStopsAtWaypoint(static_cast<const Train *>(v))) return true;
 
 	return this->ShouldStopAtStation(v->last_station_visited, station, waypoint);
 }
@@ -5111,6 +5321,7 @@ const char *GetOrderTypeName(OrderType order_type)
 		"OT_DECOUPLE",
 		"OT_GOTO_COUPLE",
 		"OT_WAIT_COUPLE",
+		"OT_COUPLE_END",
 	};
 	static_assert(lengthof(names) == OT_END);
 	if (order_type < OT_END) return names[order_type];

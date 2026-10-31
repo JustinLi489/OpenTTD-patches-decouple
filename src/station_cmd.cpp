@@ -4586,6 +4586,12 @@ static bool ClickTile_Station(TileIndex tile)
 /* R3R: defined in train_cmd.cpp. */
 bool R3RTrainStopsAtWaypoint(const Train *v);
 
+/* R3R (KI-538, 第 373 轮续三): WP-ENTER 探针的全局行数上限。
+ * KI-217 的教训是无上限探针能把日志刷到 GB 级并拖死游戏，这里给个硬上限；
+ * 正常场景「每车头每次进入路点格一行」，几十行量级。 */
+static const uint R3R_WP_ENTER_MAX_LINES = 4000;
+static uint _r3r_wp_enter_lines = 0;
+
 /** @copydoc VehicleEnterTileProc */
 static VehicleEnterTileStates VehicleEnterTile_Station(Vehicle *v, TileIndex tile, int x, int y)
 {
@@ -4615,6 +4621,44 @@ static VehicleEnterTileStates VehicleEnterTile_Station(Vehicle *v, TileIndex til
 			if (!(prev == nullptr || prev->flags.Test(VehicleRailFlag::BeyondPlatformEnd))) return {};
 		}
 		if (!HasStationTileRail(tile)) return {};
+
+		/* R3R (KI-538, 第 373 轮续三): 只读探针 WP-ENTER。
+		 *
+		 * 为什么需要：第 373 轮续二的复测日志里 WP-WAIT-ADV/WP-WAITHOLD/WP-EXIT 全为 0，
+		 * 于是「列车根本没进路点分支」与「进了但被某道门禁拦下」在日志里完全同形，
+		 * 无法判断解挂后停车的 35,12 到底是不是路点格。本探针打在最后一道判据之前，
+		 * 把每道门禁的读数一次列出，直接回答：
+		 *   eq=1  -> 这个格子就是 current_order 指定的那个路点；
+		 *   eq=0  -> 不是，那 stop 必须为 0 才算 KI-538 的修复生效；
+		 *   整场没有 WP-ENTER -> 列车根本没进路点格，说明复测场景没覆盖修复路径。
+		 *
+		 * 只读，不改任何状态（ShouldStopAtStation / R3RTrainStopsAtWaypoint 都是纯读）。
+		 * 只记车头（t == consist）进入的路点格，避免同一列车每节各打一行。
+		 * 行数上限见 R3R_WP_ENTER_MAX_LINES。 */
+		if (IsRailWaypoint(tile) && t == consist && R3RDbgOn()) {
+			if (_r3r_wp_enter_lines < R3R_WP_ENTER_MAX_LINES) {
+				++_r3r_wp_enter_lines;
+				const Train *const wp_prev = t->GetMovingPrev();
+				const StationID wp_dest = consist->current_order.GetDestination().ToStationID();
+				R3RDbgWrite("WP-ENTER veh=%d tile=%d,%d wp=1 ord=%d real=%d impl=%d n=%d dest=%u eq=%d stop=%d headstop=%d bpe=%d prev=%d rail=%d spd=%d revdist=%d x=%d y=%d\n",
+						(int)consist->index.base(), (int)TileX(tile), (int)TileY(tile),
+						(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
+						(int)consist->cur_implicit_order_index, (int)consist->GetNumOrders(),
+						(unsigned)wp_dest.base(), (int)(wp_dest == station_id),
+						(int)consist->current_order.ShouldStopAtStation(consist, station_id, true),
+						(int)R3RTrainStopsAtWaypoint(consist),
+						(int)t->flags.Test(VehicleRailFlag::BeyondPlatformEnd),
+						(int)(wp_prev == nullptr || wp_prev->flags.Test(VehicleRailFlag::BeyondPlatformEnd)),
+						(int)HasStationTileRail(tile),
+						(int)consist->cur_speed, (int)consist->reverse_distance,
+						(int)(x & 0xF), (int)(y & 0xF));
+			} else if (_r3r_wp_enter_lines == R3R_WP_ENTER_MAX_LINES) {
+				++_r3r_wp_enter_lines;
+				R3RDbgWrite("WP-ENTER-CAP lines=%d veh=%d tile=%d,%d\n", (int)R3R_WP_ENTER_MAX_LINES,
+						(int)consist->index.base(), (int)TileX(tile), (int)TileY(tile));
+			}
+		}
+
 		if (!consist->current_order.ShouldStopAtStation(consist, station_id, IsRailWaypoint(tile))) return {};
 
 		int station_ahead;

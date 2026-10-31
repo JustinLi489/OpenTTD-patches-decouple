@@ -22,6 +22,7 @@
 #include "../../r3r_perf.h"
 #include "../../couple_group.h"
 #include "../../pbs.h"
+#include "../../rail_map.h" // R3R (KI-504 探针): GetRailReservationTrackBits, to log the reservation already on a tile
 #include "../../date_func.h" // R3R (第 246 轮): _tick_counter, for the synchronized couple-scan throttle
 #include <map> // R3R (KI-190): per-vehicle couple scan throttle state
 
@@ -35,6 +36,68 @@
  * 函数原型去改头文件（改 .h 会触发全量重编）。语义见 src\train_cmd.cpp 的定义处注释。
  * 返回值：0 = 不截断；1 = 截断且终点 = 等待区路点；2 = 已在路点上但未放行。 */
 int R3RShouldCutCoupleAtWaitPoint(const Train *v, uint32_t *wait_wp);
+
+/* R3R (第 346 轮续, KI-516): "挂接路径已经算出来了，但被第三方车占位否决"这一情形。
+ *
+ * 现场（build\R3R_debug.log, 2026-10-28）：
+ *   CPL-PATHFOUND veh=57 found=1
+ *   CPL-BACK      pPrev=5,15 td=0 parent=15,15 ptd=2
+ *   FSCP          tile=13,15 fail=notSeg best=54 ord=6 sf=1
+ *   CPL-SAFE-FAIL veh=57 tile=5,15
+ *   CPL-PF-FALLBACK veh=57 ret=0x0 dest=5,14 final=12,15
+ * 挂接路径本身是对的（(15,15) 沿 y=15 股道直达车底），只是回溯经过的 (13,15) 上停着
+ * 过路车 54。安全位判据把它当硬否决 ⇒ 整条路径作废 ⇒ train_cmd.cpp 降级普通寻路 ⇒
+ * 目标 (12,15) 被车底自己占着永远到不了 ⇒ 只订到 (5,14)，而那是 y=14 的另一条股道
+ * ⇒ 玩家看到的"走错股道"。
+ *
+ * 玩家口径（2026-10-28 原话）：「它自己的路径被挡住了那就等待啊，等到路径被放出来啊」。
+ * 故此处只记录"本次 INVALID_TRACK 属于被别的车挡"，由 train_cmd.cpp 据此**不降级**、
+ * 原地等待下一 tick 重算。found=0（真的没路）不置位，降级行为逐字不变。
+ */
+static bool _r3r_couple_path_blocked = false;
+
+bool R3RCouplePathBlockedByThirdParty()
+{
+	return _r3r_couple_path_blocked;
+}
+
+/* R3R (第 342 轮, 方案 ε-A): 把"自锁交叉"这个失败原因交回调用方。
+ *
+ * 背景（§37/§38 定案）：挂接寻路在某一格失败，可能是**自己的车节占住了交叉位**
+ * （现场 15,14：veh=59 占 TRACK_X，57 想订 TRACK_LOWER）。这种路线物理上不可达——
+ * 道岔位已锁在 X，计划里的 LOWER 永远等不到。而 ChooseTrainTrack 的
+ * "cpl-partial-res" 出口会保留半截预留让车继续开，车于是沿被锁的 X 位直行，
+ * 与计划方向矛盾（玩家实测的"走错岔道"）。
+ *
+ * yapf 对外只返回 PBSTileInfo，没有失败原因位，又不能为了一个标志去改 .h
+ * （会触发全量重编），故沿用本文件既有的"手写前向声明"做法：这里定义，
+ * src\train_cmd.cpp 侧手写 extern 声明并读取。语义是"最近一次预留尝试里，
+ * 是否有格因自锁而订不上"，取走即清，且每次 TryReservePath 入口清零，
+ * 不可能跨调用陈旧。 */
+static TileIndex _r3r_selflock_tile = INVALID_TILE;
+static uint32_t _r3r_selflock_veh = UINT32_MAX;
+
+void R3RNoteSelfLock(TileIndex tile, VehicleID veh)
+{
+	_r3r_selflock_tile = tile;
+	_r3r_selflock_veh = veh.base();
+}
+
+bool R3RTakeSelfLock(VehicleID veh, TileIndex *tile)
+{
+	if (_r3r_selflock_veh != veh.base()) return false;
+	const TileIndex t = _r3r_selflock_tile;
+	_r3r_selflock_veh = UINT32_MAX;
+	_r3r_selflock_tile = INVALID_TILE;
+	if (tile != nullptr) *tile = t;
+	return true;
+}
+
+void R3RClearSelfLock()
+{
+	_r3r_selflock_veh = UINT32_MAX;
+	_r3r_selflock_tile = INVALID_TILE;
+}
 
 template <typename Tpf> void DumpState(Tpf &pf1, Tpf &pf2)
 {
@@ -130,6 +193,37 @@ private:
 		if (HasReservedTracks(tile, tracks)) {
 			Train *best = nullptr;
 			Train *second_best = nullptr;
+			/* R3R (REG-359-I): 整个格的链头集合，**故意不套 :199 的轨道筛选**。
+			 * 同格可能停着两列车的链头（解挂后机车半与车底半被摆在同一格的不同轨上），
+			 * 而 check_train_on_tile() 的轨道位筛选会让其中一台完全不可见 —— 于是 best
+			 * 只剩一台，判据看起来是"这格只有一辆车"，实际是"看不见的那辆决定了结论"
+			 * （现场：best=57 而 index 更小的 veh0 在同一格却未计入）。
+			 * 这类格本帧无法判定 ⇒ 暂存（视为可通行、但**不当作终点**），下一 tick 寻路
+			 * 重入时再扫；等那台车开走、格上只剩一个链头，判据自然恢复。 */
+			static const uint MAX_TILE_HEADS = 4;
+			Train *tile_heads[MAX_TILE_HEADS] = {};
+			uint n_tile_heads = 0;
+			bool tile_heads_have_target = false;
+			auto note_tile_head = [&](TileIndex t) {
+				for (Train *tr : VehiclesOnTile<VehicleType::Train>(t)) {
+					if (tr->vehstatus.Test(VehState::Crashed)) continue;
+					Train *head = tr->First();
+					bool seen = false;
+					for (uint i = 0; i < n_tile_heads; i++) {
+						if (tile_heads[i]->index == head->index) {
+							seen = true;
+							break;
+						}
+					}
+					if (seen) continue;
+					if (n_tile_heads < MAX_TILE_HEADS) tile_heads[n_tile_heads++] = head;
+					/* 只对"格上确实存在合法挂接目标"的多链头格暂存：整格全是无关车
+					 * （都进不了配对）时仍按障碍处理，不放松对普通占位列的判别。 */
+					if (R3RIsCoupleTarget(head) && R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), head)) {
+						tile_heads_have_target = true;
+					}
+				}
+			};
 			auto check_train_on_tile = [&](TileIndex t) {
 				for (Train *tr : VehiclesOnTile<VehicleType::Train>(t)) {
 					if (tr->vehstatus.Test(VehState::Crashed)) continue;
@@ -144,9 +238,27 @@ private:
 				TileIndexDiff diff = TileOffsByDiagDir(TrackdirToExitdir(ReverseTrackdir(td)));
 				for (TileIndex st_tile = tile + diff; IsCompatibleTrainStationTile(st_tile, tile); st_tile += diff) {
 					check_train_on_tile(st_tile);
+					note_tile_head(st_tile);
 				}
 			}
 			check_train_on_tile(tile);
+			note_tile_head(tile);
+			if (n_tile_heads >= 2 && tile_heads_have_target) {
+				/* 按"格 + 最小两个车号"变化各打一行，避免每 tick 刷屏。 */
+				static uint32_t last_key = 0xFFFFFFFF;
+				uint32_t key = (tile.base() << 8) ^ (tile_heads[0]->index.base() << 4) ^ tile_heads[1]->index.base();
+				if (key != last_key) {
+					last_key = key;
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "FSCP tile=%d,%d skip=multihead n=%u h=%d,%d\n",
+								(int)TileX(tile), (int)TileY(tile), (uint)n_tile_heads,
+								(int)tile_heads[0]->index.base(), (int)tile_heads[1]->index.base());
+						fclose(dbg);
+					}
+				}
+				return true;
+			}
 			if (best != nullptr) {
 				/* R3R: the tile may be occupied by the pathfinding locomotive's
 				 * own consist (it is still standing on the first segment of its
@@ -186,7 +298,21 @@ private:
 				}
 				Vehicle *other_train = nullptr;
 				FollowTrainReservation(best, &other_train);
-				if (other_train != nullptr && other_train != best) {
+				/* R3R (S2 后续, 走错岔道真因): 若这里的"第三人"就是询路车**自己**，
+				 * 说明两边的预留已经对接（本车的挂接预留接到了车底平台上），
+				 * 这不是第三方冲突，不该否决整条挂接路径。
+				 *
+				 * 现场（build\R3R_debug.log:1769-1776，S2 版 exe）：
+				 *   CPL-PATHFOUND veh=57 found=1          ← 路径找到了
+				 *   FSCP tile=5,15 fail=other best=0 other=57   ← 占位者是自己
+				 *   CPL-SAFE-FAIL veh=57 tile=5,15        ← 整条路径作废
+				 *   CPL-RET ... ret=0x1 why=cpl-moving-keep   ← 退回普通寻路方向(X)
+				 *   LOCO-MOVE veh=57 tile=15,14 track=01  ← 于是沿 X 直行
+				 * 而上一 tick 的挂接预留明明成功订到了 LOWER
+				 *   （CPL-RESERVE reserved=1 next=3 path=4 booked=4, res=0x8）。
+				 * 结果就是"预留成功却走错道岔"。豁免本车与 :222 的既有豁免同源：
+				 * 自己手里的预留不是障碍。 */
+				if (other_train != nullptr && other_train != best && other_train->index != Yapf().GetVehicle()->index) {
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
 						fprintf(dbg, "FSCP tile=%d,%d fail=other best=%d other=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)other_train->index.base());
@@ -196,15 +322,59 @@ private:
 				}
 			}
 		} else if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
+			/* R3R (第 340 轮, 定案 R338-A + 方案 δ): 该格已有预留位，但占位者可能是
+			 * 询路车**自己**——自己编组的某一节就站在该格上（现场：15,14 上
+			 * veh=59 占 TRACK_X，而 57 想订交叉位 TRACK_LOWER）。TryReserveRailTrack
+			 * 的交叉互斥只看位、不看 owner，于是"自己挡自己"被误判成阻塞，
+			 * FindSafeCouplePositionProc 在这个格硬失败，挂接寻路永远出不来
+			 * （KI-510/KI-358 的真因，见备忘 §37）。这里只做一件事：若占位者是
+			 * 本链车头，则本车已持有该格，视为不阻塞，让 back-walk 继续。
+			 * **不放宽**任何位级互斥——TryReserveRailTrack 本身一个字没改。 */
+			Train *const coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
+			bool self_held = false;
+			{
+				const uint8_t reserved = (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK);
+				for (Track tk = TRACK_BEGIN; tk != TRACK_END; tk++) {
+					if (!HasBit(reserved, tk)) continue;
+					const Train *const holder = GetTrainForReservation(tile, tk);
+					if (holder == nullptr || holder->First() != coupler->First()) continue;
+					/* 二次确认：GetTrainForReservation 在站台会整板扫描，可能指到
+					 * 本链车头但实际占位属于别人；该格上必须真有本链车节才豁免。 */
+					bool on_tile = false;
+					for (Train *t : VehiclesOnTile<VehicleType::Train>(tile)) {
+						if (t->First() == coupler->First()) { on_tile = true; break; }
+					}
+					if (!on_tile) continue;
+					self_held = true;
+					FILE *sdbg = R3RFopenDbg("a");
+					if (sdbg != nullptr) {
+						fprintf(sdbg, "FSCP-SELFHELD tile=%d,%d veh=%d tk=%d want=%d res=0x%X\n",
+							(int)TileX(tile), (int)TileY(tile), (int)coupler->index.base(),
+							(int)tk, (int)TrackdirToTrack(td), (unsigned)reserved);
+						fclose(sdbg);
+					}
+					break;
+				}
+			}
+			/* R3R (第 341 轮, 方案 δ 已被实测证伪, 见备忘 §38): "本车已持有该格"
+			 * **不等于** "本车能通过该格"。该格的位锁在 X 时，道岔物理上只能沿 X
+			 * 走，而 yapf 计划写的是交叉位 LOWER —— δ 放行后列车就在该格沿 X 直行，
+			 * 与计划方向不符，表现为"走错岔道"。所以 self_held 只做诊断（FSCP 行的
+			 * self=%d / FSCP-SELFHELD），**不参与判定**，该格照旧以
+			 * TryReserveRailTrack 的结果为准：拒绝即拒绝，这正是道岔位的真实状态。
+			 * 真正的修法在上层（计划层判该机动不可达 / 先退车释放 X 位），见备忘 §38.4。 */
 			if (!TryReserveRailTrack(tile, TrackdirToTrack(td))) {
+				/* R3R (第 342 轮, 方案 ε-A): 只有"失败 + 占位者是本链"才是自锁。
+				 * 若 self_held 但 TryReserveRailTrack 成功（两位不交叉），不算自锁。 */
+				if (self_held) R3RNoteSelfLock(tile, coupler->index);
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d want=%d type=%d tbits=0x%X res=0x%X plain=%d depot=%d st=%d\n",
+					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d want=%d type=%d tbits=0x%X res=0x%X plain=%d depot=%d st=%d self=%d\n",
 						(int)TileX(tile), (int)TileY(tile), (int)td, (int)TrackdirToTrack(td),
 						(int)GetTileType(tile), (unsigned)GetTrackBits(tile), (unsigned)GetReservedTrackbits(tile),
-						(int)IsPlainRail(tile), (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile));
+						(int)IsPlainRail(tile), (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile),
+						(int)self_held);
 					const uint8_t rb = (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK);
-					Train *coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
 					for (Track tk = TRACK_BEGIN; tk != TRACK_END; tk++) {
 						if (!HasBit(rb, tk)) continue;
 						Train *owner = GetTrainForReservation(tile, tk);
@@ -297,14 +467,42 @@ private:
 							(unsigned)tr->track, (int)tr->direction, (int)tr->IsFrontEngine(),
 							(int)tr->current_order.GetType());
 					}
+					/* R3R (第 339 轮, 疑点 R338-A): 上三条探针都答不出"这格的预留是谁的"
+					 * （FSCP-RES 顺预留找端点、FSCP-REACH 只在"预留可达"意义上成立、
+					 * FSCP-VEH 只报格上站着谁）。这里补一条能直接判定「自交叉」的读数：
+					 * 询路车**自己的链**上有哪一节压在这格上、它的 track 与被占位是否
+					 * 重叠。若 overlap != 0 ⇒ 是询路车自己的后半节占住了交叉轨，
+					 * TryReserveRailTrack 必然失败（PBS 铁律：交叉轨不能同时预留），
+					 * 与谁先订无关；此时 KI-510 方案 γ 的截断点会退化到 origin
+					 * （等于原地不动），修法必须改成"询路前先收缩本车预留"或
+					 * "禁止挂接寻路规划出自交叉机动"。overlap == 0 则说明占位者
+					 * 是别的车/别的链，γ 的截断路径成立。 */
+					{
+						Train *const cpl_first = coupler->First();
+						const PBSTileInfo cpl_end = FollowTrainReservation(cpl_first, nullptr);
+						fprintf(dbg, "FSCP-CPL tile=%d,%d veh=%d pos=%d,%d dir=%d spd=%d end=%d,%d endtd=%d look=%d real=%d\n",
+							(int)TileX(tile), (int)TileY(tile), (int)cpl_first->index.base(),
+							(int)TileX(cpl_first->tile), (int)TileY(cpl_first->tile),
+							(int)cpl_first->direction, (int)cpl_first->cur_speed,
+							(int)TileX(cpl_end.tile), (int)TileY(cpl_end.tile), (int)cpl_end.trackdir,
+							(cpl_first->lookahead != nullptr) ? 1 : 0,
+							(int)cpl_first->cur_real_order_index);
+						for (Train *c = cpl_first; c != nullptr; c = c->Next()) {
+							if (c->tile != tile) continue;
+							fprintf(dbg, "FSCP-SELF tile=%d,%d veh=%d track=0x%X dir=%d front=%d overlap=0x%X\n",
+								(int)TileX(tile), (int)TileY(tile), (int)c->index.base(),
+								(unsigned)c->track, (int)c->direction, (int)c->IsFrontEngine(),
+								(unsigned)((c->track & rb) & TRACK_BIT_MASK));
+						}
+					}
 					fclose(dbg);
 				}
 				return false;
 			}
 			/* R3R (第 243 轮, REG-243-O): name this release (the couple pathfinder's
 			 * own rollback of a half-reserved safe tile) so the UNRES-RAIL line says
-			 * "yapf-fscp" instead of inheriting the caller's phase. "yapf-fscp" is not
-			 * in R3RResvLedgerPurpose()'s consist_phases[]: log only, no behaviour. */
+			 * "yapf-fscp" instead of inheriting the caller's phase. Log only, no
+			 * behaviour. */
 			R3RResvPhaseGuard r3r_phase_fscp("yapf-fscp", R3RResvActorID(Yapf().GetVehicle()));
 			UnreserveRailTrack(tile, TrackdirToTrack(td));
 		}
@@ -394,6 +592,93 @@ public:
 	 * @param tile The destination tile.
 	 * @param td The destination track direction.
 	 */
+	/**
+	 * R3R (修法第三档 S2): 按"物理格序"逐格预订 —— 两遍法的第二遍。
+	 *
+	 * 与 TryReservePath 的区别：后者按 YAPF 节点链订，而节点 segment 是跨站台
+	 * 合并的，按它订会把车底整段一起订进去；本函数只订摸路(rp)实际走过的那几格，
+	 * 止于会合点。失败时回滚本次已订的格，由调用方如实返回失败。
+	 *
+	 * @param steps 摸路产出的 (格, 轨) 序列。
+	 * @param booked 出参：已成功预订的格数。
+	 * @return 全部成功为 true。
+	 */
+	bool R3RReservePathSequence(const std::vector<std::pair<TileIndex, Trackdir>> &steps, size_t &booked)
+	{
+		booked = 0;
+		this->res_fail_tile = INVALID_TILE;
+		/* R3R (REG-359-L 探针, 只读): 以前失败只把格写进 res_fail_tile，不打日志，
+		 * 于是 CPL-RESERVE 只报 booked=0，"哪一格 / 第几个 / 被谁挡"全靠猜。
+		 * 判读:
+		 *   nth/total      —— 第几格失败(0 基) / 共几格待订(等于 path)
+		 *   booked-before  —— 失败前已订上的格数；整批回滚后 CPL-RESERVE 必报 booked=0
+		 *   owner/otile/ospd/ord —— 该格现有预留的归属者(Arbitrated 版，KI-350 口径)
+		 *   selfheld       —— 归属者与询路车同链(自锁)；0 表示第三方
+		 *   type/plain/st/depot —— 格型，区分"站台整格位冲突"与"普通轨位冲突"
+		 * 本探针不改控制流: 失败仍然整批回滚。 */
+		for (size_t i = 0; i < steps.size(); ++i) {
+			const TileIndex stile = steps[i].first;
+			const Trackdir stdir = steps[i].second;
+			this->ReserveSingleTrack(stile, stdir);
+			if (this->res_fail_tile != INVALID_TILE) {
+				{
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						Train *const coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
+						const TileIndex ftile = this->res_fail_tile;
+						const Track want = TrackdirToTrack(stdir);
+						Train *owner = IsRailStationTile(ftile)
+								? GetTrainForWholeTileReservationArbitrated(ftile)
+								: GetTrainForReservationArbitrated(ftile, want);
+						if (owner == nullptr && IsRailStationTile(ftile)) owner = GetTrainForReservationArbitrated(ftile, want);
+						const bool selfheld = (owner != nullptr && (owner == coupler || owner->First() == coupler->First()));
+						/* 位读数必须先自证 plain rail: GetTrackBits/GetReservedTrackbits
+						 * 在非 plain rail 上是 dbg_assert(KI-207c 附记 7b 的教训)。 */
+						const bool plain = IsPlainRail(ftile);
+						fprintf(dbg, "CPL-RES-FAIL veh=%d nth=%u/%u tile=%d,%d td=%d want=%d booked-before=%u failtd=%d type=%d tbits=%d res=%d plain=%d st=%d depot=%d owner=%d selfheld=%d otile=%d,%d ospd=%d ord=%d\n",
+								(int)coupler->index.base(), (unsigned)i, (unsigned)steps.size(),
+								(int)TileX(ftile), (int)TileY(ftile), (int)stdir, (int)want,
+								(unsigned)booked, (int)this->res_fail_td,
+								(int)GetTileType(ftile),
+								plain ? (int)GetTrackBits(ftile) : -1,
+								plain ? (int)GetReservedTrackbits(ftile) : -1,
+								(int)plain, (int)IsRailStationTile(ftile), (int)IsRailDepotTile(ftile),
+								(owner == nullptr) ? -1 : (int)owner->index.base(), (int)selfheld,
+								(owner == nullptr) ? -1 : (int)TileX(owner->tile),
+								(owner == nullptr) ? -1 : (int)TileY(owner->tile),
+								(owner == nullptr) ? -1 : (int)owner->cur_speed,
+								(owner == nullptr) ? -1 : (int)owner->current_order.GetType());
+						fclose(dbg);
+					}
+				}
+				for (size_t k = booked; k > 0; --k) {
+					UnreserveRailTrackdir(steps[k - 1].first, steps[k - 1].second);
+				}
+				booked = 0;
+				return false;
+			}
+			++booked;
+		}
+		/* R3R (REG-359-K 探针, 只读): 成功时列出本次实际订下的格序，用来回答
+		 * "第 5 次 booked=6 究竟订了哪 6 格、有没有覆盖 36,12/37,12"。 */
+		if (!steps.empty()) {
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-RES-OK veh=%d total=%u tiles=",
+						(int)Train::From(Yapf().GetVehicle())->index.base(), (unsigned)steps.size());
+				for (size_t i = 0; i < steps.size() && i < 16; ++i) {
+					fprintf(dbg, "%s%d,%d/%d", (i == 0) ? "" : ";",
+							(int)TileX(steps[i].first), (int)TileY(steps[i].first), (int)TrackdirToTrack(steps[i].second));
+				}
+				if (steps.size() > 16) fprintf(dbg, ";...(truncated)");
+				fprintf(dbg, "\n");
+				fclose(dbg);
+			}
+		}
+		if (!steps.empty()) YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
+		return true;
+	}
+
 	inline void SetReservationTarget(Node *node, TileIndex tile, Trackdir td)
 	{
 		this->res_dest_node = node;
@@ -455,12 +740,12 @@ public:
 		 * caller's phase ("choose-track"), which made a release made *inside* YAPF
 		 * indistinguishable from one made by the caller *after* YAPF returned -- both
 		 * printed the same phase. It now names its own phase so the two separate.
-		 * "yapf-resv" is not listed in R3RResvLedgerPurpose()'s consist_phases[], so
-		 * the ledger still classifies these bits as *path* bits: no behaviour change,
-		 * only a new log tag. */
+		 * No behaviour change, only a new log tag. */
 		R3RResvPhaseGuard r3r_phase("yapf-resv", R3RResvActorID(Yapf().GetVehicle()));
 		this->res_fail_tile = INVALID_TILE;
 		this->origin_tile = origin;
+		/* R3R (第 342 轮, ε-A): 每次预留尝试从"无自锁"开始，避免陈旧记录 */
+		R3RClearSelfLock();
 
 		if (target != nullptr) {
 			target->tile = this->res_dest_tile;
@@ -489,6 +774,16 @@ public:
 		static std::vector<IntermediaryTraceRestrictSignalInfo> intermediary_restricted_signals;
 		intermediary_restricted_signals.clear();
 
+		/* R3R 探针 (第 343 轮, KI-505): 只数"真正置位成功了多少格"。
+		 * 动机：同一 tick 出现 CPL-RESERVE reserved=1 与 CPL-RET res=0x0 并存
+		 * （build\R3R_debug.log:1406-1407），而 unsafe_pos=true 的调用路径
+		 * （本文件 :1380 挂接寻路）在格级失败时既不回滚也不早退 ——
+		 * 见下方 `if (!unsafe_pos && this->res_fail_tile != INVALID_TILE)`，
+		 * 于是"reserved=1"可能是空心的（一格都没订上却返回成功）。
+		 * 这两个计数器是该判断的唯一依据，零行为改动。 */
+		int r3r_ntry = 0;
+		int r3r_nok = 0;
+
 		for (Node *node = this->res_dest_node; node->parent != nullptr; node = node->parent) {
 			const size_t intermediary_restricted_signals_current_size = intermediary_restricted_signals.size();
 			node->template IterateTiles<CYapfReserveTrack>(Yapf().GetVehicle(), Yapf(), [&](TileIndex tile, Trackdir td) -> bool {
@@ -509,7 +804,31 @@ public:
 					}
 				}
 
-				return this->ReserveSingleTrack(tile, td);
+				const bool r3r_tok = this->ReserveSingleTrack(tile, td);
+				++r3r_ntry;
+				if (r3r_tok) {
+					++r3r_nok;
+				} else {
+					/* 失败格：(veh, tile, td, 已成功格数) 去重，避免每 tick 刷屏 */
+					static std::map<uint32_t, uint64_t> r3r_rpf_seen;
+					const uint32_t r3r_vid = Yapf().GetVehicle()->index.base();
+					const uint64_t r3r_sig = ((uint64_t)r3r_nok << 48) ^ ((uint64_t)tile.base() << 16)
+							^ ((uint64_t)td << 8) ^ (uint64_t)r3r_ntry;
+					uint64_t &r3r_prev = r3r_rpf_seen[r3r_vid];
+					if (r3r_prev != r3r_sig) {
+						r3r_prev = r3r_sig;
+						FILE *dbg = R3RFopenDbg("a");
+						if (dbg != nullptr) {
+							fprintf(dbg, "RPFAIL veh=%d tick=%u origin=%d,%d tile=%d,%d td=%d unsafe=%d nTry=%d nOK=%d\n",
+									(int)r3r_vid, (uint)_tick_counter,
+									(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
+									(int)TileX(tile), (int)TileY(tile), (int)td,
+									(int)unsafe_pos, r3r_ntry, r3r_nok);
+							fclose(dbg);
+						}
+					}
+				}
+				return r3r_tok;
 			});
 			if (!unsafe_pos && this->res_fail_tile != INVALID_TILE) {
 				/* Reservation failed, undo. */
@@ -569,6 +888,41 @@ public:
 		TraceRestrictSlotTemporaryState::ClearChangeStackApplyAllTemporaryChanges(Yapf().GetVehicle());
 
 		restricted_signal_state.TraceRestrictExecuteResEndSlot(Yapf().GetVehicle());
+
+		/* R3R 探针 (第 344 轮, 修法第三档 S1): 无条件汇总，取代原先只在失败时
+		 * 打印的 RPSUM —— 探针总数不增。
+		 *
+		 * 目的：把「挂接订路是不是从一开头就 nTry==0」从推断变成可统计。nTry==0
+		 * 只有一种成因：:637 的循环体一次都没进，而循环门槛是 node->parent != nullptr，
+		 * 所以它等价于 **res_dest_node 就是根节点**。故直接打印 node 的格与 root 标志，
+		 * 一眼可判 —— 现场（build\R3R_debug.log:1757-1758）正是
+		 *   CPL-RESERVE reserved=1 与 CPL-RET res=0x0 并存。
+		 * 签名去重，零行为改动。 */
+		{
+			static std::map<uint32_t, uint64_t> r3r_cplres_seen;
+			const uint32_t r3r_vid = Yapf().GetVehicle()->index.base();
+			const TileIndex r3r_node_tile = this->res_dest_node->GetLastTile();
+			const uint64_t r3r_cplres_sig = ((uint64_t)(uint32_t)r3r_node_tile.base() << 40)
+					^ ((uint64_t)(uint32_t)this->origin_tile.base() << 16)
+					^ ((uint64_t)(uint32_t)r3r_ntry << 8)
+					^ ((uint64_t)(uint32_t)r3r_nok << 4)
+					^ (uint64_t)(uint32_t)this->res_dest_td;
+			uint64_t &r3r_cplres_prev = r3r_cplres_seen[r3r_vid];
+			if (r3r_cplres_prev != r3r_cplres_sig) {
+				r3r_cplres_prev = r3r_cplres_sig;
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPLRES veh=%d tick=%u origin=%d,%d destTile=%d,%d destTd=%d node=%d,%d root=%d unsafe=%d nTry=%d nOK=%d empty=%d\n",
+							(int)r3r_vid, (uint)_tick_counter,
+							(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
+							(int)TileX(this->res_dest_tile), (int)TileY(this->res_dest_tile), (int)this->res_dest_td,
+							(int)TileX(r3r_node_tile), (int)TileY(r3r_node_tile),
+							(this->res_dest_node->parent == nullptr) ? 1 : 0,
+							(int)unsafe_pos, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0);
+					fclose(dbg);
+				}
+			}
+		}
 
 		if (target != nullptr) target->okay = true;
 
@@ -825,6 +1179,36 @@ public:
 				fclose(dbg);
 			}
 		}
+		/* R3R（第 330 轮取证，只读，KI-446）：起点格到底能往哪些方向走。
+		 *
+		 * 27-G 断言"YAPF 起点只用单一 trackdir、起点格不能换轨"，这需要先证明
+		 * 起点格的其它出口在地图上确实存在、且通向哪里。这里只 Follow 一步，
+		 * 不预订、不改列车状态。注意 tdb 打的是 GetTileTrackdirBits 原值
+		 * （REACH 里的 bits= 经 TrackdirBitsToTrackBits 压缩过，正是 REG-330-B
+		 * 里 16,14 显示 bits=0x1 与 CPL-TRACE tdb=0x101 对不上的来源）。 */
+		{
+			const TrackdirBits r3r_ob = GetTileTrackdirBits(v->tile, ::TransportType::TRANSPORT_RAIL, 0);
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-ORIGIN-TD veh=%d tile=%d,%d tdb=0x%x tbits=0x%x\n",
+						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+						(unsigned)r3r_ob, (unsigned)TrackdirBitsToTrackBits(r3r_ob));
+				fclose(dbg);
+			}
+			for (TrackdirBits tb = r3r_ob; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
+				const Trackdir d = (Trackdir)FindFirstBit(tb);
+				TrackFollower fx(v, Yapf().GetCompatibleRailTypes());
+				const bool ok = fx.Follow(v->tile, d);
+				dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-ORIGIN-FOLLOW veh=%d td=%d trk=%d ok=%d nt=%d,%d nbits=0x%x st=%d skip=%d\n",
+							(int)v->index.base(), (int)d, (int)TrackdirToTrack(d), (int)ok,
+							ok ? (int)TileX(fx.new_tile) : -1, ok ? (int)TileY(fx.new_tile) : -1,
+							(unsigned)fx.new_td_bits, (int)fx.is_station, (int)fx.tiles_skipped);
+					fclose(dbg);
+				}
+			}
+		}
 		/* Set origin and destination. */
 		Yapf().SetOrigin(origin.tile, origin.trackdir);
 
@@ -858,6 +1242,10 @@ public:
 				}
 			}
 		}
+
+		/* R3R (第 346 轮续, KI-516): 每次挂接寻路先清"被第三方车挡"标志，
+		 * 只有下面回溯阶段的 CPL-SAFE-FAIL 才会重新置位。 */
+		_r3r_couple_path_blocked = false;
 
 		if (r3r_wait_cut == 2) {
 			/* 已经停在等待区路点上、只是还没放行：本次寻路没有合法终点。
@@ -984,14 +1372,32 @@ public:
 		Trackdir next_trackdir = INVALID_TRACKDIR;
 		Node *pPrev = nullptr;
 		TileIndex rp_last_tile = INVALID_TILE;
+		/* R3R (修法第三档 S2): 摸路两遍法所需的状态。
+		 *
+		 * 病根：单段分支最后用 SetReservationTarget(pNode, rp_last_tile, ...)
+		 * 把预留目标挂到了**根节点**（= 起点格）上，而 TryReservePath 的循环门槛是
+		 * node->parent != nullptr ⇒ 循环零次、返回 true ⇒ "空手报成功"。
+		 * 现场证据（build\R3R_debug.log:1631）：
+		 *   CPLRES veh=57 origin=16,14 destTile=13,15 node=16,14 root=1 nTry=0 empty=1
+		 *
+		 * 治法是让"路径"和"目标"同源：rp() 摸路时只记录走过的格（第一遍，只读），
+		 * 摸完之后按这份序列逐格预订（第二遍），不再依赖节点链 —— 节点链的 segment
+		 * 是跨站台合并的，按它订会把车底整段一起订进去。
+		 * 这也顺带避开 KI-504 的陷阱：边摸边订会被自己刚订的轨挡住，现在订的动作
+		 * 全部挪到摸完之后。 */
+		using R3RCoupleStep = std::pair<TileIndex, Trackdir>;
+		std::vector<R3RCoupleStep> r3r_resv_path;
+		bool r3r_single_seg = false;   ///< 走的是单段分支（rp() 摸路的那一支）
+		uint r3r_hops = 0;
 		while (pNode->parent != nullptr) {
 			pPrev = pNode;
 			pNode = pNode->parent;
+			++r3r_hops;
 
 			{
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()));
+					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d ptd=%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()), (int)pNode->GetLastTrackdir());
 					fclose(dbg);
 				}
 			}
@@ -1004,6 +1410,10 @@ public:
 						fclose(dbg);
 					}
 				}
+				/* R3R (第 346 轮续, KI-516): 路径算出来了、只是回溯的安全位判据被别的
+				 * 车否决 ⇒ 标记"被挡"，让 train_cmd.cpp 不要降级去绕别的股道，
+				 * 而是原地等障碍离开后重算（玩家 2026-10-28 口径）。 */
+				_r3r_couple_path_blocked = true;
 				return INVALID_TRACKDIR;
 			}
 		}
@@ -1014,12 +1424,16 @@ public:
 		 * the consist platform direction (points away from the loco), so the
 		 * departure trackdir would send the loco the wrong way. Trace the rail
 		 * network from the start tile to the consist to get the true departure
-		 * direction, and reserve the tiles along that path (they are not part
-		 * of any node segment, so TryReservePath does not cover them). */
+		 * direction. The walk is read-only since KI-504 / E1b: it no longer books
+		 * any track of the path (booking from inside the pathfinder made the loco
+		 * mask its own continuation on the next tick - see the note inside rp()). */
 		TrackFollower ft(v, Yapf().GetCompatibleRailTypes());
 		TileIndex st = pNode->GetLastTile();
 		TileIndex tg = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pPrev->GetLastTile();
 		Trackdir best_td = INVALID_TRACKDIR;
+		/* R3R (第 332 轮): best_td 属于哪一格。贪婪扫描取 st（机车自身格），
+		 * 采纳 YAPF 首步时取首步格 —— 后者才是 new_tile。 */
+		TileIndex best_start = st;
 		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
 			if (depth <= 15) {
 				FILE *dbg = R3RFopenDbg("a");
@@ -1034,6 +1448,13 @@ public:
 			 * start tile, which may itself be the depot the loco is leaving
 			 * (cur == st only occurs at the first call, at depth 0). */
 			if (IsRailDepotTile(cur) && cur != st) return false;
+			/* R3R (第 333 轮): 递进前自证 (cur, cur_td) 属于同一格 ——
+			 * follow_track.hpp:140 的 dbg_assert_tile 对跨格的一对会直接断言崩溃，
+			 * 任何调用方（含将来的）都不该把这种对子喂进来。 */
+			if (cur_td == INVALID_TRACKDIR ||
+					!HasBit(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0), cur_td)) {
+				return false;
+			}
 			TrackFollower f2(v, Yapf().GetCompatibleRailTypes());
 			if (!f2.Follow(cur, cur_td)) return false;
 			/* R3R: TrackFollower leaps a whole platform in one step, so the
@@ -1066,9 +1487,54 @@ public:
 			}
 		}
 
-		for (; tdb != TRACKDIR_BIT_NONE; tdb = KillFirstBit(tdb)) {
-			Trackdir td = (Trackdir)FindFirstBit(tdb);
-			if (reach(st, td, 0)) { best_td = td; break; }
+		/* R3R (第 332/333 轮, KI-446 续): ChooseTrainTrack 要的是 new_tile 上的轨，
+		 * 也就是 YAPF 路径的**首步**。取首步必须按格配对 —— yapf_node_rail.hpp 的
+		 * 两套访问器属于两个不同的格：
+		 *   GetTile()     / GetTrackdir()      —— 节点自己那一格（key，同格，见 :85/:88）
+		 *   GetLastTile() / GetLastTrackdir()  —— 本节点 segment 被截断的那一格（:157/:163）
+		 * 第 332 轮把 GetLastTile() 与 GetTrackdir() 拼在一起，segment 跨多格时等于
+		 * 拿 A 格的 trackdir 去 Follow B 格 ⇒ follow_track.hpp:140 的 dbg_assert_tile
+		 * 直接崩（玩家 2026-10-27 报的崩溃）；本轮改成 GetTile()，并在交给
+		 * TrackFollower 之前自证该格确有这根轨。
+		 *
+		 * 现场（build\R3R_debug.log）：CPL-BACK pPrev=15,15 td=2 parent=16,14 ptd=0
+		 * —— 15,15/td=2 是 pPrev 的 segment **末端**那一对，不是它的 key；而贪婪扫描
+		 * 的起点 st=16,14 只有 X（CPL-ORIGIN-TD tdb=0x101 tbits=0x1），能选到的只有
+		 * td=0/8 ⇒ TrackdirToTrack=TRACK_X，交回 ChooseTrainTrack 后列车在岔口恒走直行。
+		 *
+		 * 所以：只要 pPrev 不是目标节点本身（r3r_hops > 1），直接采纳 YAPF 的首步，
+		 * 并让 rp() 从首步格起走；只有单跳路径（pPrev 就是目标节点）时，它的
+		 * trackdir 是车底的站台方向（背向机车，见下面 R3R 注释），才回落到原来的
+		 * 贪婪扫描。校验 reach(first_tile, ...) 失败（例如首步格是车库、被 reach 的
+		 * 车库守卫拒掉）时同样回落，保证该分支与改动前逐字一致。 */
+		const TileIndex first_tile = pPrev->GetTile();
+		const Trackdir yapf_first_td = pPrev->GetTrackdir();
+		const TrackdirBits first_tdb = GetTileTrackdirBits(first_tile, ::TransportType::TRANSPORT_RAIL, 0);
+		const bool first_td_on_tile = (yapf_first_td != INVALID_TRACKDIR) && HasBit(first_tdb, yapf_first_td);
+		const bool yapf_first_ok = (r3r_hops > 1) && first_td_on_tile &&
+				(first_tile != st) && reach(first_tile, yapf_first_td, 0);
+		if (yapf_first_ok) {
+			best_td = yapf_first_td;
+			best_start = first_tile;
+		} else {
+			for (; tdb != TRACKDIR_BIT_NONE; tdb = KillFirstBit(tdb)) {
+				Trackdir td = (Trackdir)FindFirstBit(tdb);
+				if (reach(st, td, 0)) { best_td = td; break; }
+			}
+		}
+		{
+			/* R3R (第 332 轮, 只读): 本次采纳的是 YAPF 首步还是贪婪扫描结果，
+			 * 以及该 trackdir 属于哪一格（应按 new_tile 解读）。 */
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "CPL-FIRST-TD st=%d,%d hops=%u yapf=%d at=%d,%d tdb=0x%x ok=%d best=%d start=%d,%d trk=%d\n",
+						(int)TileX(st), (int)TileY(st), (unsigned)r3r_hops,
+						(int)yapf_first_td, (int)TileX(first_tile), (int)TileY(first_tile),
+						(unsigned)first_tdb, yapf_first_ok ? 1 : 0, (int)best_td,
+						(int)TileX(best_start), (int)TileY(best_start),
+						(best_td == INVALID_TRACKDIR) ? -1 : (int)TrackdirToTrack(best_td));
+				fclose(dbg);
+			}
 		}
 		{
 			FILE *dbg = R3RFopenDbg("a");
@@ -1080,7 +1546,9 @@ public:
 		if (best_td != INVALID_TRACKDIR) {
 			next_trackdir = best_td;
 			if (!dont_reserve) {
-				std::function<bool(TileIndex, Trackdir, int)> rp = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+				std::function<bool(TileIndex, Trackdir, int)> rp;
+				/* rp_impl = 原来的 rp() 本体；递归调用一律走 rp（带标记回滚的外壳）。 */
+				std::function<bool(TileIndex, Trackdir, int)> rp_impl = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
 					if (depth <= 15) {
 						FILE *dbg = R3RFopenDbg("a");
 						if (dbg != nullptr) {
@@ -1088,59 +1556,37 @@ public:
 							fclose(dbg);
 						}
 					}
-					/* R3R: reserve a track only when the tile really carries it. Some of
-					 * the tracks collected below are derived from the platform axis or
-					 * from the trackdir the loco leaves with, which can land on tiles
-					 * that do not carry that track at all (platform end, rail removed,
-					 * tile of another axis). Reserving there would trip the assertion
-					 * in TryReserveRailTrack (pbs.cpp:144/145), so look at the tile's
-					 * track bits first and skip tiles that cannot hold the track. */
-					auto reserve_if_present = [](TileIndex t, Track trk) {
-						const TrackBits bits = TrackdirBitsToTrackBits(GetTileTrackdirBits(t, ::TransportType::TRANSPORT_RAIL, 0));
-						if ((bits & TrackToTrackBits(trk)) != 0) TryReserveRailTrack(t, trk);
-					};
-					/* R3R: same guard, but for the tiles the loco drives through in a
-					 * known direction. Those must be booked at trackdir level: only
-					 * TryReserveRailTrackdir() also sets a facing PBS signal to green
-					 * (pbs.cpp:723-725), and that green is the right of way the loco
-					 * needs to actually drive over the tile it just had reserved.
-					 * Booking them at track level (as this lambda did before) left the
-					 * reservation without the green: the tile was booked, the next hop
-					 * itself faced a red PBS signal, and the loco stopped in front of it
-					 * while holding the reservation. See KI-349 / this file's rp(). */
-					auto reserve_dir_if_present = [&](TileIndex t, Trackdir td) {
-						const TrackBits bits = TrackdirBitsToTrackBits(GetTileTrackdirBits(t, ::TransportType::TRANSPORT_RAIL, 0));
-						if ((bits & TrackToTrackBits(TrackdirToTrack(td))) != 0) TryReserveRailTrackdir(v, t, td);
-					};
+					/* R3R (KI-504, E1b): rp() is read-only - it deliberately books NOTHING.
+					 * Booking from inside the pathfinder turns the loco's own reservation
+					 * into its next obstacle: TrackFollower::CanEnterNewTile() removes every
+					 * already-reserved track from the enterable set and does not exempt the
+					 * booking train itself (follow_track.hpp), so the correct continuation
+					 * gets masked and only the wrong branch stays enterable. Live case:
+					 * 15,14 had TRACK_X booked, so the loco could no longer go straight on
+					 * into 15,15 and was pushed onto the other branch. rp() now only walks
+					 * the path to find rp_last_tile; the consist's whole-tile reservation
+					 * plus the loco's normal PBS reservation protect the route. E2 replaces
+					 * this with ExtendTrainReservation, E4 deletes rp() altogether. */
 					if (depth > 512) return false;
 					if (cur == tg) return true;
-					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) rp_last_tile = cur;
-					/* R3R: do not reserve through a depot - but allow the start tile,
+					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+						/* 只记录物理走过、且需要预订的格：站台/车库不订（与 rp_last_tile
+						 * 的口径一致——预留止于会合点，不越过车底）；起点格也不订
+						 * （TryReservePath 的节点链同样跳过根节点）。 */
+						if (cur != st || depth != 0) r3r_resv_path.push_back(R3RCoupleStep{cur, cur_td});
+					}
+					/* R3R: do not walk the path through a depot - but allow the start tile,
 					 * which may itself be the depot the loco is leaving (cur == st
 					 * only occurs at the first call, at depth 0). */
 					if (IsRailDepotTile(cur) && cur != st) return false;
+					/* R3R (第 333 轮): 同 reach()，Follow 之前自证 (cur, cur_td) 同格。 */
+					if (cur_td == INVALID_TRACKDIR ||
+							!HasBit(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0), cur_td)) {
+						return false;
+					}
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
 					if (f3.is_station && f3.tiles_skipped > 0 && R3RSkippedStationStretchContains(cur, f3.new_tile, f3.exitdir, f3.tiles_skipped, tg)) {
-						const Axis axis = GetRailStationAxis(f3.new_tile);
-						const TileIndexDiff step = TileOffsByDiagDir(f3.exitdir);
-						const Track plat_track = AxisToTrack(axis);
-						if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-							reserve_dir_if_present(cur, cur_td);
-						}
-						/* R3R: also reserve the platform tiles between the loco and
-						 * the consist - the loco must drive over them to reach the
-						 * coupling point. Normally the consist holds a
-						 * whole-platform reservation, in which case these tiles are
-						 * already reserved (TryReserveRailTrack fails harmlessly);
-						 * when it does not, this keeps the loco's own path
-						 * contiguous so it can still reach the consist. */
-						TileIndex p = cur;
-						p += step;
-						for (; p != tg; p += step) {
-							if (!IsRailStationTile(p)) break;
-							reserve_if_present(p, plat_track);
-						}
 						return true;
 					}
 					TrackdirBits tdb3 = f3.new_td_bits;
@@ -1148,25 +1594,6 @@ public:
 					if (KillFirstBit(tdb3) == TRACKDIR_BIT_NONE) {
 						const Trackdir nd = FindFirstTrackdir(tdb3);
 						if (rp(f3.new_tile, nd, depth + 1)) {
-							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								reserve_dir_if_present(cur, cur_td);
-							}
-							/* R3R: also reserve the entry track of the next tile - the loco needs the
-							 * track it drives INTO, not just the one it leaves.
-							 * The track entered with is the track of the trackdir the follower really
-							 * continues with there (nd). Deriving it from ReverseTrackdir(cur_td) is
-							 * only correct while the next tile carries the same track as cur (the two
-							 * expressions are identical: ReverseTrackdir never changes the track), so
-							 * on a connection which switches slots - the next tile runs on a different
-							 * track than cur - that guess books a track the loco never touches. Such a
-							 * bit has no owner at all (the train releases only the tracks of its own
-							 * path), it is never freed, it blocks other trains on that track and it is
-							 * saved with the map (see KI-346, the 20 tile `track=4` corridor of KI-345).
-							 * reserve_dir_if_present() keeps the pbs.cpp:144 safety: it only books a track
-							 * the tile really has, which is always true for nd. */
-							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
-								reserve_dir_if_present(f3.new_tile, nd);
-							}
 							return true;
 						}
 						return false;
@@ -1174,31 +1601,25 @@ public:
 					for (TrackdirBits tb = tdb3; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
 						const Trackdir nd = (Trackdir)FindFirstBit(tb);
 						if (rp(f3.new_tile, nd, depth + 1)) {
-							if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
-								reserve_dir_if_present(cur, cur_td);
-							}
-							/* R3R: also reserve the entry track of the next tile - the loco needs the
-							 * track it drives INTO, not just the one it leaves.
-							 * The track entered with is the track of the trackdir the follower really
-							 * continues with there (nd). Deriving it from ReverseTrackdir(cur_td) is
-							 * only correct while the next tile carries the same track as cur (the two
-							 * expressions are identical: ReverseTrackdir never changes the track), so
-							 * on a connection which switches slots - the next tile runs on a different
-							 * track than cur - that guess books a track the loco never touches. Such a
-							 * bit has no owner at all (the train releases only the tracks of its own
-							 * path), it is never freed, it blocks other trains on that track and it is
-							 * saved with the map (see KI-346, the 20 tile `track=4` corridor of KI-345).
-							 * reserve_dir_if_present() keeps the pbs.cpp:144 safety: it only books a track
-							 * the tile really has, which is always true for nd. */
-							if (!IsRailStationTile(f3.new_tile) && !IsRailDepotTile(f3.new_tile)) {
-								reserve_dir_if_present(f3.new_tile, nd);
-							}
 							return true;
 						}
 					}
 					return false;
 				};
-				rp(st, best_td, 0);
+				/* R3R (第 332 轮): 从 best_td 真正所属的那一格开始走，否则
+				 * Follow(first_tile 上的 trackdir) 会在 st 上直接失败，白走一趟。 */
+				rp = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
+					/* 失败即回滚本次尝试记录下来的格，保证 r3r_resv_path 里只剩
+					 * "最终成功的那条路线" —— 否则失败分支的格会被一起预订。 */
+					const size_t r3r_mark = r3r_resv_path.size();
+					if (!rp_impl(cur, cur_td, depth)) {
+						r3r_resv_path.resize(r3r_mark);
+						return false;
+					}
+					return true;
+				};
+				r3r_single_seg = true;
+				rp(best_start, best_td, 0);
 				if (rp_last_tile != INVALID_TILE) {
 					this->SetReservationTarget(pNode, rp_last_tile, pNode->GetLastTrackdir());
 				}
@@ -1209,12 +1630,31 @@ public:
 		}
 	}
 		if (!dont_reserve) {
-			bool reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
+			bool reserved = false;
+		size_t r3r_booked = 0;
+		if (r3r_single_seg) {
+			/* R3R (修法第三档 S2): 单段分支改走"两遍法" —— 目标与路径同源。
+			 *
+			 * 摸路（第一遍，只读）已经给出物理路线 r3r_resv_path，例如
+			 *   15,14 → 15,15 → 14,15 → 13,15（止于会合点，不越过车底）。
+			 * 这里按序逐格预订（第二遍）。失败则回滚已订格并如实返回失败，
+			 * 交 train_cmd.cpp 的 KI-316 路径（FreeTrainTrackReservation +
+			 * MarkTrainAsStuck）处置；绝不再出现 "reserved=1 而 nTry=0" 的空真。
+			 */
+			if (!r3r_resv_path.empty()) {
+				const R3RCoupleStep &r3r_last = r3r_resv_path.back();
+				this->SetReservationTarget(pNode, r3r_last.first, r3r_last.second);
+				reserved = this->R3RReservePathSequence(r3r_resv_path, r3r_booked);
+			}
+			/* 摸路一格都没给出 ⇒ 没有可订的东西，直接报失败（不许空手成功）。 */
+		} else {
+			reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
+		}
 			{
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d\n",
-							(int)v->index.base(), (int)reserved, (int)next_trackdir);
+					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d path=%d booked=%d\n",
+							(int)v->index.base(), (int)reserved, (int)next_trackdir, (int)r3r_resv_path.size(), (int)r3r_booked);
 							fclose(dbg);
 				}
 			}

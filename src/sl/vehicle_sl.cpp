@@ -11,6 +11,7 @@
 #include "../debug.h"
 #include "../vehicle_func.h"
 #include "../train.h"
+#include "../order_base.h"
 #include "../roadveh.h"
 #include "../ship.h"
 #include "../aircraft.h"
@@ -490,6 +491,32 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 	const Vehicle *si_v = nullptr;
 	SCOPE_INFO_FMT([&si_v], "AfterLoadVehiclesPhase2: {}", VehicleInfoDumper(si_v));
 
+	/* R3R (第 304 轮 / vehicle.cpp:3094 断言): claim every unit number BEFORE
+	 * anything else touches a company's number pool.
+	 *
+	 * FreeUnitIDGenerator::used_bitmap only grows inside UseID(); ReleaseID()
+	 * asserts that the slot already exists. The per-vehicle claim further down
+	 * (the `unitnumber`/`unitnumber_backup` block after the type switch) runs
+	 * far too late: R3RRebuildCouplePriorities() is called earlier in this very
+	 * loop and its "recycle the ghost numbers that old builds froze on non
+	 * segment cars" step releases straight into a pool whose bitmap is still
+	 * empty -> assert. The same hazard applies to every `delete v` on the load
+	 * path (Vehicle::PreDestructor releases both numbers).
+	 *
+	 * UseID() is a plain SetBit, so claiming here is idempotent with respect to
+	 * the later block, which is deliberately left untouched. */
+	if (part_of_load) {
+		for (Vehicle *v : Vehicle::Iterate()) {
+			if (v->owner >= MAX_COMPANIES) continue;
+			if (v->unitnumber != 0 && v->IsPrimaryVehicle()) {
+				Company::Get(v->owner)->freeunits[v->type].UseID(v->unitnumber);
+			}
+			if (v->unitnumber_backup != 0) {
+				Company::Get(v->owner)->freeunits[v->type].UseID(v->unitnumber_backup);
+			}
+		}
+	}
+
 	/* R3R (KI-169a): a schedule parked in orders_backup (route A borrow, depot drag)
 	 * is written out as a plain OrderList reference, so the list comes back with
 	 * its runtime bookkeeping still empty. Rebuild it exactly the way
@@ -526,7 +553,14 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 					 * otherwise take the legacy hand-over path (KI-02/KI-05). Only on
 					 * a real load: a NewGRF reload runs this same pass with live state
 					 * that must not be disturbed. */
-					if (part_of_load) R3RRebuildCouplePriorities(t);
+					if (part_of_load) {
+						/* R3R (KI-541): a savegame written before the air ranges moved
+						 * into the list has no #OT_COUPLE_END markers at all. Repair
+						 * the pairing first, so the settle pass below already sees
+						 * "this span is a reference, never execute it". */
+						R3REnsureCoupleEndOrders(t);
+						R3RRebuildCouplePriorities(t);
+					}
 				}
 				break;
 			}

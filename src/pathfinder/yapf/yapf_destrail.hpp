@@ -43,6 +43,13 @@ inline uint32_t _r3r_cpl_scan_accwp = 0;      ///< R3R 第 276 轮：等待区�
 inline uint32_t _r3r_cpl_scan_last_tile = 0;  ///< 最近扫到的车底所在格（TileIndex::base()）
 inline int _r3r_cpl_scan_last_veh = -1;       ///< 最近扫到的车底链头车号（-1=无）
 inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait / 6=cut-wp
+/* R3R（第 330 轮取证，只读，KI-446）：noconsist 早退的格坐标 dump 配额。
+ * noconsist 是"搜索走到了合格站台/车库格、但格上扫不出车底"，它的坐标集合就是
+ * 搜索树的**落点分布**——用来判定第二次搜索到底有没有进入 y=15 那一行（27-G）。
+ * 每次扫描最多 8 行（`_nocdump`，随 Reset 清零），全局最多 240 行（`_nocdump_total`，
+ * 跨扫描累计、不随 Reset 清零），避免每 tick found=0 时刷屏。 */
+inline uint32_t _r3r_cpl_scan_nocdump = 0;
+inline uint32_t _r3r_cpl_scan_nocdump_total = 0;
 
 /** 每次挂接寻路开始前清零（调用点：CYapfTrainRailT::FindNearestCoupleTrain）。 */
 inline void R3RCoupleScanReset()
@@ -58,6 +65,7 @@ inline void R3RCoupleScanReset()
 	_r3r_cpl_scan_last_tile = 0;
 	_r3r_cpl_scan_last_veh = -1;
 	_r3r_cpl_scan_last_why = -1;
+	_r3r_cpl_scan_nocdump = 0;
 }
 
 /** 每次挂接寻路结束后无条件打一行（found 为 YAPF 的最终结果）。
@@ -538,6 +546,21 @@ public:
 			/* R3R (第 236 轮, KI-344): 站台格上没有任何合法车底 —— 这是"等待链不在场"
 			 * 的第一个可辨形态（另有 noplat / nores 两种更早的早退）。 */
 			++_r3r_cpl_scan_noconsist;
+			/* R3R（第 330 轮取证，只读，KI-446）：把"走到了合格格但扫不出车底"的
+			 * 坐标记下来。这一组坐标 = 搜索树在站台/车库上的落点分布，用来判定
+			 * 第二次搜索（found=0）是否真的没进入 y=15 那一行（27-G）。
+			 * 配额见 _r3r_cpl_scan_nocdump 的声明处。 */
+			if (_r3r_cpl_scan_nocdump < 8 && _r3r_cpl_scan_nocdump_total < 240) {
+				++_r3r_cpl_scan_nocdump;
+				++_r3r_cpl_scan_nocdump_total;
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFD-NOCONSIST tile=%d,%d td=%d res=%d n=%u\n",
+							(int)TileX(tile), (int)TileY(tile), (int)td, (int)has_res,
+							(unsigned)_r3r_cpl_scan_noconsist);
+					fclose(dbg);
+				}
+			}
 			return false;
 		}
 		++_r3r_cpl_scan_consist;
