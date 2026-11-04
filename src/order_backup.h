@@ -60,6 +60,16 @@ private:
 
 	std::vector<DispatchSchedule> dispatch_schedules; ///< Scheduled dispatch schedules
 
+	/* R3R (AUD-390-1): the backed up vehicle may be executing another vehicle's
+	 * order list (a control segment's table). Copying that table would fork the
+	 * schedule -- the restored vehicle would own a duplicate which never syncs
+	 * again -- so the follow relationship is remembered and rebuilt instead.
+	 * Not saved: the BKOR chunk only exists for network games and the borrow
+	 * state is a transient, in-memory relationship. */
+	VehicleID follow_owner = VehicleID::Invalid(); ///< Vehicle whose order list was being followed.
+	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;       ///< Bookmark: real index in the vehicle's own list.
+	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID;   ///< Bookmark: implicit index in the vehicle's own list.
+
 	static uint update_counter;
 
 	void DoRestore(Vehicle *v);

@@ -54,6 +54,7 @@ enum class VehicleRailFlag : uint8_t {
 	SegmentFlipped            = 26, ///< R3R: the segment this vehicle belongs to was logically reversed (R3RFlipChainBySegments); in-segment / in-group position variables are mirrored so NewGRF keeps the pre-flip values.
 	ForceReserveOnce          = 27, ///< R3R (KI-179): one-shot "reserve independently of the signals" ability, granted to the merged train when a coupling completes. Consumed by the first successful path reservation (whether or not it needed the red-signal bypass), kept while every reservation attempt fails (the train then takes the ordinary "waiting for free track" punishment). Saved with the rest of the rail flags (Train::flags).
 	FakeDualHead              = 28, ///< R3R (KI-343): this is the rear half of a multiheaded engine whose engine bit was granted *deliberately* (so it can be a segment tail / a legal chain head) -- see Train::IsDualHeadRear(). Saved with the rest of the rail flags (Train::flags). NOTE: bit 23 (ForceFlipReverse) is a retired-but-reserved slot, so the next free bit is 28.
+	ArticGroupFlipped         = 29, ///< R3R (第 391 轮, KI-558): the articulated group this vehicle belongs to was flipped as a unit by the depot "flip single unit" command. The group's chain order is unchanged (only each section's Flipped bit is toggled), so NewGRF var 0x4D must be mirrored from this marker -- see the 0x4D branch in newgrf_engine.cpp. Only meaningful together with ArticGroupHead/ArticGroupMember (a de-articulated group role). Saved with the rest of the rail flags (Train::flags), so the mirror survives a save/load round trip.
 };
 using VehicleRailFlags = EnumBitSet<VehicleRailFlag, uint32_t>;
 
@@ -257,6 +258,21 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void ClearSegmentFlipped() { this->flags.Reset(VehicleRailFlag::SegmentFlipped); }
 	/** Toggle the segment-reversed marker (self-inverse: flipping back clears it). */
 	void FlipSegmentFlipped() { this->flags.Flip(VehicleRailFlag::SegmentFlipped); }
+
+	/**
+	 * R3R (第 391 轮, KI-558): whether this vehicle's articulated group was
+	 * flipped as a whole by the depot "flip single unit" command.
+	 * The group keeps its chain order (every section's Flipped bit is toggled
+	 * instead), so NewGRF var 0x4D has to be mirrored from this marker to keep
+	 * selecting the same face for each section.
+	 */
+	bool IsArticGroupFlipped() const { return this->flags.Test(VehicleRailFlag::ArticGroupFlipped); }
+	/** Mark the vehicle's articulated group as flipped as a whole. */
+	void SetArticGroupFlipped() { this->flags.Set(VehicleRailFlag::ArticGroupFlipped); }
+	/** Clear the group-flipped marker (done when the group becomes a real artic group again). */
+	void ClearArticGroupFlipped() { this->flags.Reset(VehicleRailFlag::ArticGroupFlipped); }
+	/** Toggle the group-flipped marker (self-inverse: flipping the group again clears it). */
+	void FlipArticGroupFlipped() { this->flags.Flip(VehicleRailFlag::ArticGroupFlipped); }
 
 	/**
 	 * R3R (KI-179): whether the one-shot "independent reservation" ability is pending.

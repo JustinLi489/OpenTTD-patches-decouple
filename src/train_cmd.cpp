@@ -2577,6 +2577,13 @@ void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag)
  * the KI-183 build guard does not drop every object file. */
 void DearticulateChainWithSnapshot(Train *head);
 
+/* R3R (第 391 轮, KI-558): defined in vehicle_cmd.cpp next to
+ * #DearticulateChainWithSnapshot. The depot "flip single unit" command must
+ * split exactly the clicked articulated group, not every group of the chain.
+ * Declared by hand so this round stays a .cpp-only change (no header, no
+ * KI-183 full rebuild). */
+Train *R3RDearticulateOneGroup(Train *v);
+
 /* R3R (第 243 轮续四十七, REG-243-S): defined in pbs.cpp; it answers "did we really
  * release it", which ExtendTrainReservation() needs. Declared here by hand so this
  * round stays a .cpp-only change (no header, no KI-183 full rebuild). */
@@ -5680,7 +5687,15 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 	if (reverse_single_veh) {
 		/* turn a single unit around */
 
-		if (v->IsMultiheaded() || EngInfo(v->engine_type)->callback_mask.Test(VehicleCallbackMask::ArticEngine)) {
+		/* R3R (第 391 轮, KI-558): an articulated group is flipped as a *unit*
+		 * instead of being refused. Upstream refuses the whole vehicle when the
+		 * engine has the ArticEngine callback, because a single Flipped bit on
+		 * the parent cannot flip the sections that follow it. We split the group
+		 * into real vehicles (each with its own Flipped bit) and flip all of
+		 * them; the group marker keeps NewGRF var 0x4D on the pre-flip face.
+		 * A multiheaded engine is still refused: its two halves are a different
+		 * kind of unit (see VehicleRailFlag::FakeDualHead / IsDualHeadRear). */
+		if (v->IsMultiheaded()) {
 			return CommandCost(STR_ERROR_CAN_T_REVERSE_DIRECTION_RAIL_VEHICLE_MULTIPLE_UNITS);
 		}
 
@@ -5691,7 +5706,46 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 		}
 
 		if (flags.Test(DoCommandFlag::Execute)) {
-			v->flags.Flip(VehicleRailFlag::Flipped);
+			/* Walk back to the head (parent) of the articulated group. Works for
+			 * both forms: a genuine part derives the member role from its subtype
+			 * bit, a de-articulated one carries the explicit role flag. */
+			Train *group_head = v;
+			while (group_head->Previous() != nullptr && group_head->Previous()->IsArticGroupMember()) {
+				group_head = group_head->Previous();
+			}
+
+			/* An articulated group is more than one section. */
+			const bool is_group = group_head->Next() != nullptr && group_head->Next()->IsArticGroupMember();
+			/* Only a genuine (subtype-bit) group has to be de-articulated first. */
+			const bool real_artic = group_head->Next() != nullptr && group_head->Next()->IsArticulatedPart();
+
+			if (!is_group) {
+				/* Plain single unit: exactly the upstream behaviour. */
+				v->flags.Flip(VehicleRailFlag::Flipped);
+			} else {
+				if (real_artic) {
+					/* Split *only this* group. DearticulateChainWithSnapshot() would
+					 * rewrite every other articulated group of the chain as well,
+					 * which a purely cosmetic flip must not do. */
+					R3RDearticulateOneGroup(group_head);
+				}
+
+				/* Flip every section of the group (and mirror its in-group rank).
+				 * The chain order itself is untouched: the mirror is what keeps
+				 * the NewGRF faces in their pre-flip order. */
+				uint n_flipped = 0;
+				for (Train *w = group_head; w != nullptr; w = w->Next()) {
+					if (w != group_head && !w->IsArticGroupMember()) break;
+					w->flags.Flip(VehicleRailFlag::Flipped);
+					w->FlipArticGroupFlipped();
+					n_flipped++;
+				}
+
+				R3RDbgWrite("ARTIC-FLIP head=%d n=%u real_artic=%d flipped=%d seg=%d\n",
+						(int)group_head->index.base(), n_flipped, real_artic ? 1 : 0,
+						group_head->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
+						group_head->IsSegmentFlipped() ? 1 : 0);
+			}
 
 			front->ConsistChanged(CCF_ARRANGE);
 			SetWindowDirty(WindowClass::VehicleDepot, front->tile.base());
@@ -16034,12 +16088,12 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			return PBSTileInfo(tile, ft.old_td, false);
 		}
 
-		/* R3R (第 284 轮): treat a waypoint tile as a safe stopping position here as
-		 * well, so this follower walk and the ChooseTrainTrack safety backtrack above
-		 * agree on where the reservation ends. If only one of the two said "safe" the
-		 * reservation would be booked to the waypoint and then be judged un-okay (or
-		 * vice versa), which is what re-triggered the repeated reserve/clear cycle. */
-		if (IsSafeWaitingPosition(v, tile, cur_td, true, _settings_game.pf.forbid_90_deg, true)) {
+		/* R3R (第 386 轮续之四): a waypoint tile is NOT a safe stopping position for
+		 * the reservation end -- that is upstream behaviour (see the removal note in
+		 * pbs.cpp). Waypoints are still valid *pathfinding* destinations, the two
+		 * notions are independent. Keep this walk and the ChooseTrainTrack safety
+		 * backtrack agreeing by both using the upstream predicate. */
+		if (IsSafeWaitingPosition(v, tile, cur_td, true, _settings_game.pf.forbid_90_deg)) {
 			PBSWaitingPositionRestrictedSignalState restricted_signal_state;
 			bool wp_free = IsWaitingPositionFree(v, tile, cur_td, _settings_game.pf.forbid_90_deg, &restricted_signal_state);
 			if (!(wp_free && TryReserveRailTrackdir(v, tile, cur_td))) { r3r_backout_reason = wp_free ? "safe-reserve-fail" : "safe-not-free"; break; }
@@ -17369,52 +17423,17 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	}
 
 	if (consist->current_order.IsType(OT_GOTO_COUPLE) && !r3r_couple_depot) {
-		/* R3R (第 276 轮续三, KI-433): 等待区路点截断一旦激活，"走完手上的预留"
-		 * 的老口径必须让位。
+		/* R3R (第 386 轮, KI-551): 「等待区路点预留截断」已整机制删除。
 		 *
-		 * 现场（玩家 2026-10-22）：预留根本没有被截断，而且是在前车到位、甚至
-		 * 进咽喉区之前就伸出去的。原因是截断只改 YAPF 的**终点**，只能拦住
-		 * "继续往前铺"；此前（还在 GOTO_WAYPOINT 订单上时）已经铺出去的那段长
-		 * 预留没有任何收缩路径 —— 引擎唯一自动清预留的地方是"车尾已离开某格"
-		 * （TrainController），对"车还没走到"的前方格从不回收。
+		 * 原先这里会在 r3r_wait_cut != 0 时：
+		 *   ① 打 CPL-WAITCUT 探针；
+		 *   ② 在进入截断的第一 tick 调 FreeTrainTrackReservation() 把已经铺出去的
+		 *      长预留整条清掉（KI-433），再让截断寻路只重铺到路点。
+		 * 玩家 2026-11-02 拍板该机制整删 —— 现场表现为"无条件把预留在路点截止"。
+		 * 现在挂接寻路照常铺到目标车底，也不再主动清预留。
 		 *
-		 * 所以进入截断的第一 tick 就把旧预留整条清掉，让本 tick 的截断寻路
-		 * 重新只铺到路点。按 (veh, cur_real_order_index) 记账，同一订单只清一次，
-		 * 不会每 tick 清（否则就是 KI-271 那种"铺→清→铺"的抖车）。 */
-		const int r3r_wait_cut = R3RShouldCutCoupleAtWaitPoint(consist, nullptr);
-		if (r3r_wait_cut != 0) {
-			/* R3R (第 289 轮, 只读取证): 截断状态必须留痕。旧日志里 `CPL-WAITCUT
-			 * state=?` 只出现在注释里，实测一条都没有，于是"车还没到路点(1)"与
-			 * "已停在路点等配对(2)"在日志上无法区分 —— 而这两者的修法完全相反。
-			 * 签名变化才写，零行为改动。 */
-			if (R3RDbgOn()) {
-				static std::map<uint32_t, uint64_t> r3r_wait_cut_seen;
-				const uint64_t wc_sig = (uint64_t)r3r_wait_cut
-						| ((uint64_t)(uint32_t)consist->tile.base() << 4)
-						| ((uint64_t)(uint32_t)consist->cur_real_order_index << 32)
-						| ((uint64_t)(consist->cur_speed == 0 ? 1 : 0) << 40);
-				uint64_t &wc_seen = r3r_wait_cut_seen[consist->index.base()];
-				if (wc_seen != wc_sig) {
-					wc_seen = wc_sig;
-					const Train *wc_mf = consist->GetMovingFront();
-					R3RDbgWrite("CPL-WAITCUT veh=%d tile=%d,%d state=%d real=%d spd=%d mf=%d,%d\n",
-							consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-							r3r_wait_cut, (int)consist->cur_real_order_index, (int)consist->cur_speed,
-							wc_mf != nullptr ? (int)TileX(wc_mf->tile) : -1,
-							wc_mf != nullptr ? (int)TileY(wc_mf->tile) : -1);
-				}
-			}
-			static std::map<uint32_t, uint16_t> r3r_wait_cut_cleared;
-			uint16_t &cleared = r3r_wait_cut_cleared[consist->index.base()];
-			const uint16_t cut_key = static_cast<uint16_t>(consist->cur_real_order_index) + 1;
-			if (cleared != cut_key) {
-				cleared = cut_key;
-				FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
-				R3RDbgWrite("CPL-WAITCUT-CLEAR veh=%d tile=%d,%d state=%d order=%d\n",
-						consist->index.base(), TileX(consist->tile), TileY(consist->tile),
-						r3r_wait_cut, (int)consist->cur_real_order_index);
-			}
-		}
+		 * 注意：等待区路点的头停车（R3RTrainStopsAtWaypoint）与越墙判定不在此处，
+		 * 保持原样。 */
 
 		/* R3R: always reserve the couple path - the loco needs a reservation
 		 * to move, and it must extend right up to the consist. Without this the
@@ -17437,11 +17456,12 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		 *
 		 * 只在**真失败**时才走这里：
 		 *   - 节流跳过（R3RCoupleSearchSkipped）不是失败，保持现状；
-		 *   - 等待区截断态（r3r_wait_cut != 0）必须停在路点，不许再往前铺；
 		 *   - 车库格走 depot 自己的寻路，不适用。
-		 * 普通寻路也失败时一切照旧落回 KI-316，与改前逐字相同。 */
+		 * 普通寻路也失败时一切照旧落回 KI-316，与改前逐字相同。
+		 *
+		 * R3R (第 386 轮, KI-551): 原「等待区截断态不许再往前铺」一项随截断机制
+		 * 一并删除，判据里不再有 r3r_wait_cut。 */
 		if (path_found == INVALID_TRACK
-				&& r3r_wait_cut == 0
 				&& !R3RCoupleSearchSkipped(consist)
 				&& !IsRailDepotTile(consist->tile)
 				&& !R3RCouplePathBlockedByThirdParty()
@@ -17469,7 +17489,6 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				}
 			}
 		} else if (path_found == INVALID_TRACK
-				&& r3r_wait_cut == 0
 				&& R3RCouplePathBlockedByThirdParty()
 				&& consist->current_order.IsType(OT_GOTO_COUPLE)) {
 			/* R3R (第 346 轮续, KI-516): 挂接路径已经算出来了，只是回溯的安全位判据被
@@ -17568,7 +17587,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			 * 节流跳过没有改变任何地图状态，所以保持现状：不撤销预留、不标 stuck、
 			 * 不改 best_track（此时它仍是 FindFirstTrack(tracks)，与下面的失败返回一致），
 			 * 下一 tick 节流窗口一过，正常的 search 会自己把结果定下来。 */
-			if (keep_track != INVALID_TRACK && R3RCoupleSearchSkipped(consist) && r3r_wait_cut == 0) return r3r_chosen_ret(keep_track, result_flags, "cpl-search-skip");
+			if (keep_track != INVALID_TRACK && R3RCoupleSearchSkipped(consist)) return r3r_chosen_ret(keep_track, result_flags, "cpl-search-skip");
 
 			/* R3R (第 271 轮): 车还在动的时候，也不许拿"没找到可挂车底"当理由拆预留。
 			 *
@@ -17595,13 +17614,9 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			 * "暂时不可达"完全相同（决策 C-5：绝不回滚订单、绝不报错给玩家），只额外打
 			 * 一行 CPL-PATHBUG 供事后定位 —— 即使判据误判，最坏后果也只是多一行日志。 */
 			const bool pair_ready = R3RHasCouplePair(consist);
-			/* R3R (第 276 轮续三, KI-433): 截断态下"行驶中保持现状"不成立。
-			 *
-			 * 第 271/272 轮的"车还在动就别撤预留"是为了避免"铺→清→铺"的抖车，
-			 * 前提是它手上的预留指向正确的会合点。等待区路点截断的前提恰好相反：
-			 * 预留必须止于路点，车必须**停在路点上等**。此时若还早退，返回给
-			 * 调用方的 keep_track 会让列车按旧预留继续跑 —— 这正是玩家看到的
-			 * "预留没被截断、在前车到位之前就超出去"。 */
+			/* R3R (第 276 轮续三, KI-433 → 第 386 轮 KI-551 删除): 这里原有一段
+			 * "等待区路点截断态下『行驶中保持现状』不成立"的说明，随截断机制
+			 * 一并删除。 */
 			/* R3R (第 330 轮, KI-479): 「行驶中保持现状」成立的前提是**它手上真有一段
 			 * 指向会合点的预留可走**。现场推翻了这个前提：
 			 *   tick=12551  CPL-RET why=nores-final ... spd=5
@@ -17621,7 +17636,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			 * 之所以在这里自己查一次、而不是复用上面的 origin：origin 已被
 			 * ExtendTrainReservation() 当入参/出参用过，其 tile 不再等于
 			 * 「本车现有预留的起点」，不能当判据。 */
-			if (keep_track != INVALID_TRACK && consist->cur_speed != 0 && pair_ready && r3r_wait_cut == 0) {
+			if (keep_track != INVALID_TRACK && consist->cur_speed != 0 && pair_ready) {
 				/* R3R (第 330 轮续, KI-479 复测修正): 上一版判据是**恒真**的接线错误。
 				 *
 				 * 它写成 `FollowTrainReservation(...).tile != INVALID_TILE`，但该函数
@@ -17669,38 +17684,14 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				 * 掉头风险由 KI-289 的 R3R_COUPLE_WAIT_HEAL_LIMIT 抑制。 */
 				MarkTrainAsStuck(consist);
 			}
-			if (!pair_ready || r3r_wait_cut != 0) {
-				/* 未就绪或已进入等待区截断：不再强制写零速度（KI-445，2026-10-23
-				 * 玩家口径"强制写 0 没有必要，原生刹车机制已经很好"）。 */
-				if (r3r_wait_cut != 0) {
-					/* 只读探针（KI-433 复测判据 ⑦）：截断态确实把车按住了。
-					 * 同一 (veh, state) 连续只报一次，避免每 tick 刷屏。 */
-					static std::map<uint32_t, uint8_t> r3r_wait_hold_seen;
-					uint8_t &seen = r3r_wait_hold_seen[consist->index.base()];
-					if (seen != static_cast<uint8_t>(r3r_wait_cut)) {
-						seen = static_cast<uint8_t>(r3r_wait_cut);
-						R3RDbgWrite("CPL-WAITHOLD veh=%d tile=%d,%d speed=%d state=%d\n",
-								consist->index.base(), TileX(consist->tile), TileY(consist->tile),
-								consist->cur_speed, r3r_wait_cut);
-					}
-				}
-				/* R3R (KI-445, 2026-10-23 玩家口径): 这里原本把 cur_speed/subspeed
-				 * 硬写 0（配一条 R3RSpdCtx 探针）。玩家裁定"强制写 0 没有必要，
-				 * 原生刹车机制已经很好"，所以整段删除、不做替代：列车按原生
-				 * 制动朝 PBS 目标（止于等待路点）减速停下。 */
-
-				/* R3R (轮 2026-10-23 第二轮, KI-444): state 2 表示运动前端已经停在
-				 * 等待区路点格上、只等配对就绪。这是本机制的正常等待形态，不是
-				 * "找不到可挂车底"：YAPF 每 tick 都会因为"没有合法终点"返回
-				 * INVALID_TRACK。若继续落到下面的 KI-316 处置
-				 * （FreeTrainTrackReservation + MarkTrainAsStuck），就会把刚刚铺到
-				 * 路点的整条预留撤掉、下一 tick 再重铺 —— 玩家看到的"预留一会儿
-				 * 有一会儿没有"正是这个循环。原地等，预留与 Stuck 都保持不动。
-				 * state 1（尚未到位、需要截断重铺）仍走 KI-316，行为不变。 */
-				if (r3r_wait_cut == 2) {
-					return r3r_chosen_ret(keep_track != INVALID_TRACK ? keep_track : FindFirstTrack(tracks), result_flags, "cpl-wait-state2");
-				}
-			}
+			/* R3R (KI-445, 2026-10-23 玩家口径): 这里原本把 cur_speed/subspeed
+			 * 硬写 0（配一条 R3RSpdCtx 探针）。玩家裁定"强制写 0 没有必要，
+			 * 原生刹车机制已经很好"，所以整段删除、不做替代：列车按原生
+			 * 制动朝 PBS 目标减速停下。
+			 *
+			 * R3R (第 386 轮, KI-551): 原「等待区路点截断」的 CPL-WAITHOLD 探针
+			 * 与 state 2 早退（KI-433/KI-444）随截断机制一并删除；`!pair_ready`
+			 * 分支本身已无代码，只剩上面这条说明。 */
 
 			/* R3R (KI-316, round 214): the round-212 fallback to the ordinary
 			 * pathfinder ("no couplable consist anywhere -> drive to the
@@ -17924,16 +17915,16 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	check_destination_seen(res_dest.tile);
 
 	/* Reservation target found and free, check if it is safe.
-	 * R3R (第 284 轮): the last argument treats a waypoint tile as a safe stopping
-	 * position. Without it this loop below never stops at a waypoint, switches to
-	 * the next order and extends the reservation to the following destination --
-	 * which made reservations span waypoints and the signals behind them, and made
-	 * the reservation flip back and forth against other trains (the "whack-a-mole"
-	 * behaviour). YAPF cost / destination detection still pass false. */
+	 * R3R (第 386 轮续之四): the 第 284 轮 "treat a waypoint tile as a safe stopping
+	 * position" flag has been removed. A waypoint is a legitimate *pathfinding*
+	 * destination but never a safe place to END a reservation -- the reservation
+	 * must be extended past it to the first real safe position, exactly like
+	 * upstream. The order-level "stop at this waypoint" semantics live in
+	 * R3RTrainStopsAtWaypoint() and are unaffected. */
 	/* R3R (第 354 轮 V-2, 只读): set when the extend-until-safe loop gave up and
 	 * fell through to the "try any position" fallback below. Read by RESV-TERM. */
 	bool r3r_unsafe_tail = false;
-	while (!IsSafeWaitingPosition(consist, res_dest.tile, res_dest.trackdir, true, _settings_game.pf.forbid_90_deg, true)) {
+	while (!IsSafeWaitingPosition(consist, res_dest.tile, res_dest.trackdir, true, _settings_game.pf.forbid_90_deg)) {
 		/* Extend reservation until we have found a safe position. */
 		DiagDirection exitdir = TrackdirToExitdir(res_dest.trackdir);
 		TileIndex     next_tile = TileAddByDiagDir(res_dest.tile, exitdir);
@@ -17999,7 +17990,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				(int)consist->current_order.GetType(),
 				(int)TileX(res_dest.tile), (int)TileY(res_dest.tile), (int)res_dest.trackdir,
 				(IsPlainRailTile(res_dest.tile) ? (int)CountBits((uint)GetTrackBits(res_dest.tile)) : -2),
-				(int)IsSafeWaitingPosition(consist, res_dest.tile, res_dest.trackdir, true, _settings_game.pf.forbid_90_deg, true),
+				(int)IsSafeWaitingPosition(consist, res_dest.tile, res_dest.trackdir, true, _settings_game.pf.forbid_90_deg),
 				(int)r3r_unsafe_tail, (int)consist->cur_speed,
 				(int)TileX(consist->tile), (int)TileY(consist->tile));
 		if (temporary_slot_state.IsActive()) temporary_slot_state.PopFromChangeStackApplyTemporaryChanges(consist);
@@ -19243,6 +19234,19 @@ static void TrainEnterStation(Train *consist, StationID station)
 	BaseStation *bst = BaseStation::Get(station);
 
 	if (Waypoint::IsExpected(bst)) {
+		/* R3R KI-553 (第 386 轮): only a *waiting-area* waypoint (current order is
+		 * GOTO_WAYPOINT and the next order is GOTO_COUPLE) may stop the train with
+		 * its front at the waypoint. A plain through waypoint must be passed at the
+		 * current speed, exactly like upstream: stopping here drives cur_speed to 0,
+		 * the residual speed then falls into the "j < adv_spd" idle branch of
+		 * TrainLocoHandler, which never calls TrainController()/TrainCheckIfLineEnds()
+		 * again => the train is frozen on the waypoint tile and no new path
+		 * reservation is ever made (KI-553: "stopped on a through waypoint").
+		 *
+		 * The flag must be sampled *before* MakeWaiting() rewrites current_order to
+		 * OT_WAITING, because the predicate requires OT_GOTO_WAYPOINT.
+		 * No speed clamping is introduced: the through path touches no speed field. */
+		const bool r3r_stop_here = R3RTrainStopsAtWaypoint(consist);
 		consist->DeleteUnreachedImplicitOrders();
 		UpdateVehicleTimetable(consist, true);
 		consist->last_station_visited = station;
@@ -19250,9 +19254,11 @@ static void TrainEnterStation(Train *consist, StationID station)
 		SetWindowDirty(WindowClass::VehicleView, consist->index);
 		consist->current_order.MakeWaiting();
 		consist->current_order.SetNonStopType(ONSF_NO_STOP_AT_ANY_STATION);
-		R3RSpdCtx(consist, "wp-arrive", consist->cur_speed, 0);
-		consist->cur_speed = 0;
-		consist->UpdateTrainSpeedAdaptationLimit(0);
+		if (r3r_stop_here) {
+			R3RSpdCtx(consist, "wp-arrive", consist->cur_speed, 0);
+			consist->cur_speed = 0;
+			consist->UpdateTrainSpeedAdaptationLimit(0);
+		}
 		return;
 	}
 

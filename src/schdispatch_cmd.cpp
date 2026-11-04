@@ -30,6 +30,33 @@
 #include "safeguards.h"
 
 /**
+ * R3R (AUD-390-4): apply a scheduled dispatch operation to every vehicle which
+ * actually drives the same order list as \a v_start.
+ *
+ * This is deliberately not FirstShared()/NextShared(): a vehicle following the
+ * order list of a control segment (R3R borrowed orders) runs the very same
+ * dispatch schedules and records, but is not a member of the shared order list
+ * ring, so a plain ring walk left its !Vehicle::dispatch_records out of sync.
+ *
+ * @param v_start Any vehicle of the schedule group; its effective order list decides the group.
+ * @param func    Callable applied to every vehicle in that group.
+ */
+template <typename Func>
+static void R3RForEachDispatchVehicle(Vehicle *v_start, Func func)
+{
+	const OrderList *const list = v_start->GetEffectiveOrders();
+	if (list == nullptr) {
+		func(v_start);
+		return;
+	}
+	for (Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle()) continue;
+		if (v->GetEffectiveOrders() != list) continue;
+		func(v);
+	}
+}
+
+/**
  * Enable or disable scheduled dispatch
  * @param flags Operation to perform.
  * @param veh Vehicle index.
@@ -47,9 +74,9 @@ CommandCost CmdSchDispatchSetEnabled(DoCommandFlags flags, VehicleID veh, bool e
 	if (enable && (v->vehicle_flags.Test(VehicleFlag::TimetableSeparation) || v->HasUnbunchingOrder())) return CommandCost(STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE);
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+		R3RForEachDispatchVehicle(v, [&](Vehicle *v2) {
 			v2->vehicle_flags.Set(VehicleFlag::ScheduledDispatch, enable);
-		}
+		});
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -391,8 +418,8 @@ CommandCost CmdSchDispatchRemoveSchedule(DoCommandFlags flags, VehicleID veh, ui
 			}
 		}
 		bool dispatch_records_changed = false;
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
-			if (v2->dispatch_records.empty()) continue;
+		R3RForEachDispatchVehicle(v, [&](Vehicle *v2) {
+			if (v2->dispatch_records.empty()) return;
 
 			btree::btree_map<uint16_t, LastDispatchRecord> new_records;
 			for (auto &iter : v2->dispatch_records) {
@@ -404,7 +431,7 @@ CommandCost CmdSchDispatchRemoveSchedule(DoCommandFlags flags, VehicleID veh, ui
 			}
 			v2->dispatch_records = std::move(new_records);
 			dispatch_records_changed = true;
-		}
+		});
 		SchdispatchInvalidateWindows(v);
 		if (dispatch_records_changed && _settings_client.gui.show_vehicle_route_id_vehicle_view) {
 			DirtySharedVehicleViewWindowTitles(v);
@@ -566,8 +593,8 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 						}
 					}
 				}
-				for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
-					if (u->dispatch_records.empty()) continue;
+				R3RForEachDispatchVehicle(v, [&](Vehicle *u) {
+					if (u->dispatch_records.empty()) return;
 
 					for (auto &iter : u->dispatch_records) {
 						if (iter.first == schedule_index && iter.second.route_id == route_id) {
@@ -575,7 +602,7 @@ CommandCost CmdSchDispatchEditRoute(DoCommandFlags flags, VehicleID veh, uint32_
 							update_windows = true;
 						}
 					}
-				}
+				});
 				if (update_windows) {
 					SchdispatchInvalidateWindows(v);
 				}
@@ -845,8 +872,8 @@ CommandCost CmdSchDispatchSwapSchedules(DoCommandFlags flags, VehicleID veh, uin
 				}
 			}
 		}
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
-			if (v2->dispatch_records.empty()) continue;
+		R3RForEachDispatchVehicle(v, [&](Vehicle *v2) {
+			if (v2->dispatch_records.empty()) return;
 
 			auto iter_1 = v2->dispatch_records.find(static_cast<uint16_t>(schedule_index_1));
 			auto iter_2 = v2->dispatch_records.find(static_cast<uint16_t>(schedule_index_2));
@@ -861,7 +888,7 @@ CommandCost CmdSchDispatchSwapSchedules(DoCommandFlags flags, VehicleID veh, uin
 				v2->dispatch_records.erase(iter_2);
 				v2->dispatch_records[static_cast<uint16_t>(schedule_index_1)] = std::move(r);
 			}
-		}
+		});
 		SchdispatchInvalidateWindows(v);
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}

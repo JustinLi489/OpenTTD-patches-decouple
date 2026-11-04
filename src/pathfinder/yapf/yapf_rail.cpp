@@ -32,11 +32,6 @@
 #include <unistd.h>
 #endif
 
-/* R3R (第 276 轮, KI-429): 定义在 src\train_cmd.cpp。这里手写前向声明，避免为了一个
- * 函数原型去改头文件（改 .h 会触发全量重编）。语义见 src\train_cmd.cpp 的定义处注释。
- * 返回值：0 = 不截断；1 = 截断且终点 = 等待区路点；2 = 已在路点上但未放行。 */
-int R3RShouldCutCoupleAtWaitPoint(const Train *v, uint32_t *wait_wp);
-
 /* R3R (第 346 轮续, KI-516): "挂接路径已经算出来了，但被第三方车占位否决"这一情形。
  *
  * 现场（build\R3R_debug.log, 2026-10-28）：
@@ -1212,49 +1207,20 @@ public:
 		/* Set origin and destination. */
 		Yapf().SetOrigin(origin.tile, origin.trackdir);
 
-		/* R3R (第 276 轮, KI-429): 等待区路点截断（玩家口径 Q-276-4 / §21.9）。
+		/* R3R (第 386 轮, KI-551): 「等待区路点预留截断」（KI-429）已整机制删除。
 		 *
-		 * 只要还没到"可以延伸预留"的状态（A 没有逐节停稳在同一站台区间，或者本车
-		 * 自己还没到等待区路点），本次寻路就只允许以等待区路点作终点 ⇒ 回溯/预留
-		 * 止于路点，不会再一路铺到目标车底、更不会铺进道岔区（KI-429 的
-		 * FSCP tile=258,233）。
+		 * 玩家 2026-11-02 拍板：该机制在现场表现为"无条件把预留在路点截止"，
+		 * 不再修补条件判断，直接删除。此处原先会调用
+		 * R3RShouldCutCoupleAtWaitPoint() 并用 SetCoupleWaitCut() 把 YAPF 的
+		 * 终点集合收窄到等待区路点；现在终点判定回到普通口径
+		 * （站台/车库 + 已有预留），挂接寻路可以一路铺到目标车底。
 		 *
-		 * 判定每 tick 由 train_cmd.cpp 的 R3RShouldCutCoupleAtWaitPoint() 重算：
-		 *   0 = 不截断（没有等待区路点，或本次挂接已放行）
-		 *   1 = 截断，终点 = 等待区路点
-		 *   2 = 本车已站在等待区路点上但还没放行 */
-		uint32_t r3r_cut_wp = 0;
-		const int r3r_wait_cut = R3RShouldCutCoupleAtWaitPoint(v, &r3r_cut_wp);
-
-		/* 边沿触发：状态变化才写一行，避免每 tick 刷屏。 */
-		{
-			static std::map<uint32_t, int> r3r_cut_state;
-			const uint32_t r3r_key = v->index.base();
-			auto it = r3r_cut_state.find(r3r_key);
-			if (it == r3r_cut_state.end() || it->second != r3r_wait_cut) {
-				r3r_cut_state[r3r_key] = r3r_wait_cut;
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-WAITCUT veh=%d state=%d wp=%u tile=%d,%d\n",
-							(int)v->index.base(), r3r_wait_cut, (unsigned int)r3r_cut_wp,
-							(int)TileX(v->tile), (int)TileY(v->tile));
-					fclose(dbg);
-				}
-			}
-		}
+		 * 注意：R3RShouldCutCoupleAtWaitPoint() 本体保留，它仍被"等待区路点
+		 * 头停车"与"越墙判定"使用，与预留无关。 */
 
 		/* R3R (第 346 轮续, KI-516): 每次挂接寻路先清"被第三方车挡"标志，
 		 * 只有下面回溯阶段的 CPL-SAFE-FAIL 才会重新置位。 */
 		_r3r_couple_path_blocked = false;
-
-		if (r3r_wait_cut == 2) {
-			/* 已经停在等待区路点上、只是还没放行：本次寻路没有合法终点。
-			 * 直接报"无路径"——不能放任 YAPF 去找终点，否则它会为了一条自己
-			 * 脚下的路点把整张图搜一遍（每 tick 一次）。 */
-			return INVALID_TRACKDIR;
-		}
-
-		Yapf().SetCoupleWaitCut(r3r_wait_cut == 1, r3r_cut_wp);
 
 		Yapf().SetDestination(v);
 

@@ -424,32 +424,10 @@ public:
 	 * 再加装货/货种/车数三条命令属性。机车自身路径的预留仍照常执行 tracerestrict
 	 * 程序（含 slot acquire/release），那属于寻路与信号系统，与挂接判定无关。 */
 
-	/* R3R (第 276 轮, KI-429): 等待区路点截断。
-	 *
-	 * 玩家口径（Q-276-4 拍板）：机车前往 GOTO_COUPLE 的途中，只要还没到"可以
-	 * 延伸预留"的状态，整条 PBS 预留就只允许订到**等待区路点**为止，绝不允许
-	 * 一路铺到（甚至越过）目标车底。截断点因此天然落在一个合法停车位上，不会
-	 * 再停在道岔格里（KI-429 的 FSCP tile=258,233）。
-	 *
-	 * 判定入口在 yapf_rail.cpp 的 FindNearestCoupleTrain()：由
-	 * R3RShouldCutCoupleAtWaitPoint()（train_cmd.cpp）决定本次寻路要不要截断，
-	 * 每 tick 重算 ⇒ A 停稳后自动解除，机车这才去订到 A 的那一段。
-	 *
-	 * 默认 false：非挂接寻路（其它 YAPF 用途不经过这里）与"已放行"的挂接寻路
-	 * 逐字不变。 */
-	bool couple_wait_cut = false;
-
-	/* 截断模式下唯一允许的终点：等待区路点的 StationID + 1（0 = 不限定）。
-	 *
-	 * 必须点名而不是"任一路点都算"：线路上可能还有别的路点（含刚驶过的那个），
-	 * 若一律接受，YAPF 的最小代价落点就可能变成身后的路点，把机车往回引。 */
-	uint32_t couple_wait_cut_wp = 0;
-
-	void SetCoupleWaitCut(bool cut, uint32_t wait_wp)
-	{
-		this->couple_wait_cut = cut;
-		this->couple_wait_cut_wp = wait_wp;
-	}
+	/* R3R (第 386 轮, KI-551): 原先这里是「等待区路点截断」的
+	 * couple_wait_cut / couple_wait_cut_wp 成员与 SetCoupleWaitCut()。玩家
+	 * 2026-11-02 拍板整机制删除（现场表现为无条件把预留在路点截止），故连同
+	 * PfDetectDestination() 里的截断分支一并移除；终点判定回到普通口径。 */
 
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
@@ -457,32 +435,10 @@ public:
 		/* R3R (第 236 轮, KI-344): 无条件清点本次扫描，见文件头的 census 说明。 */
 		++_r3r_cpl_scan_enter;
 
-		/* R3R (第 276 轮, KI-429): 截断模式——本次寻路只认等待区路点作终点。
-		 *
-		 * 其它格（含站台、车库、以及"别的路点"）一律否决，这样 YAPF 的落点
-		 * 必定是路点、回溯/预留必定止于路点。
-		 *
-		 * 路点格恒是单轴站台格（GetRailStationTrackBits() = AxisToTrackBits(axis)），
-		 * 所以这里不额外判"是否单轨"——多轨路点在游戏里不存在。 */
-		if (this->couple_wait_cut) {
-			if (!IsRailWaypointTile(tile) ||
-					(this->couple_wait_cut_wp != 0 && (uint32_t)GetStationIndex(tile).base() + 1 != this->couple_wait_cut_wp)) {
-				++_r3r_cpl_scan_noplat;
-				return false;
-			}
-			++_r3r_cpl_scan_accwp;
-			_r3r_cpl_scan_last_tile = tile.base();
-			_r3r_cpl_scan_last_why = 6;
-			/* 一次扫描里路点可能被反复探测（含多格路点），只在第一格打一行。 */
-			if (_r3r_cpl_scan_accwp == 1) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFD-ACCEPT kind=waitwp tile=%d,%d\n", TileX(tile), TileY(tile));
-					fclose(dbg);
-				}
-			}
-			return true;
-		}
+		/* R3R (第 386 轮, KI-551): 「等待区路点截断」分支已删除。原先
+		 * couple_wait_cut 为真时这里只接受等待区路点作终点（并打
+		 * PFD-ACCEPT kind=waitwp），使回溯/预留止于路点。现在一律走下面的
+		 * 普通终点判定。 */
 
 		/* Only platform or depot tiles qualify. */
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) {

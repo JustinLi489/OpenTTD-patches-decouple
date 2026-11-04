@@ -31,9 +31,20 @@ void BaseConsist::CopyConsistPropertiesFrom(const BaseConsist *src)
 
 	this->service_interval = src->service_interval;
 
-	this->cur_real_order_index = src->cur_real_order_index;
-	this->cur_implicit_order_index = src->cur_implicit_order_index;
-	this->cur_timetable_order_index = src->cur_timetable_order_index;
+	/* R3R (AUD-390-2): an order position only means something relative to the order
+	 * list it indexes. When the two consists do not run the same table (a vehicle
+	 * acquiring or losing a borrowed schedule), copying these three would drop the
+	 * destination onto an arbitrary order of its list. So only copy them when both
+	 * sides run the same effective order list; a non-vehicle counterpart (an
+	 * OrderBackup) keeps the old unconditional copy. */
+	const Vehicle *const src_vehicle = dynamic_cast<const Vehicle *>(src);
+	const Vehicle *const dst_vehicle = dynamic_cast<const Vehicle *>(this);
+	if (src_vehicle == nullptr || dst_vehicle == nullptr ||
+			src_vehicle->GetEffectiveOrders() == dst_vehicle->GetEffectiveOrders()) {
+		this->cur_real_order_index = src->cur_real_order_index;
+		this->cur_implicit_order_index = src->cur_implicit_order_index;
+		this->cur_timetable_order_index = src->cur_timetable_order_index;
+	}
 
 	if (src->vehicle_flags.Test(VehicleFlag::TimetableStarted)) this->vehicle_flags.Set(VehicleFlag::TimetableStarted);
 	if (src->vehicle_flags.Test(VehicleFlag::AutofillTimetable)) this->vehicle_flags.Set(VehicleFlag::AutofillTimetable);

@@ -48,8 +48,38 @@ OrderBackup::OrderBackup(OrderBackupID index, const Vehicle *v, uint32_t user) :
 {
 	this->CopyConsistPropertiesFrom(v);
 
-	/* If we have shared orders, store the vehicle we share the order with. */
-	if (v->IsOrderListShared()) {
+	/* R3R (AUD-390-1): a vehicle which executes another vehicle's order list (a
+	 * control segment's table) must not get a private *copy* of it here: the copy
+	 * would fork the schedule, because the restored vehicle owns a duplicate which
+	 * is never synchronised with the control table again. Remember who owns the
+	 * table instead, so DoRestore() can re-attach this vehicle to it.
+	 * The orders are still copied as a fallback, for the case where the control
+	 * table is gone by the time the vehicle is restored. */
+	if (v->IsR3RFollower()) {
+		this->follow_owner = v->r3r_follow_owner;
+		if (this->follow_owner == VehicleID::Invalid()) {
+			/* No recorded owner: fall back to any other vehicle which really runs
+			 * the same table (a follower is skipped -- CO_SHARE refuses those). */
+			const OrderList *const effective = v->GetEffectiveOrders();
+			if (effective != nullptr) {
+				for (const Vehicle *w : Vehicle::Iterate()) {
+					if (w == v || !w->IsPrimaryVehicle() || w->IsR3RFollower()) continue;
+					if (w->GetEffectiveOrders() != effective) continue;
+					this->follow_owner = w->index;
+					break;
+				}
+			}
+		}
+		this->orders_backup_real_index = v->orders_backup_real_index;
+		this->orders_backup_implicit_index = v->orders_backup_implicit_index;
+
+		for (const Order *order : v->Orders()) {
+			this->orders.emplace_back(*order);
+		}
+		if (v->GetEffectiveOrders() != nullptr) {
+			this->dispatch_schedules = v->GetEffectiveOrders()->GetScheduledDispatchScheduleSet();
+		}
+	} else if (v->IsOrderListShared()) {
 		this->clone = (v->FirstShared() == v) ? v->NextShared() : v->FirstShared();
 	} else {
 		/* Else copy the orders */
@@ -72,8 +102,30 @@ OrderBackup::OrderBackup(OrderBackupID index, const Vehicle *v, uint32_t user) :
  */
 void OrderBackup::DoRestore(Vehicle *v)
 {
+	/* R3R (AUD-390-1): if this vehicle was executing another vehicle's order list,
+	 * re-attach it to that table instead of handing it a private copy. Only done
+	 * when the control table is still alive; otherwise fall through to the copy. */
+	bool follow_restored = false;
+	if (this->follow_owner != VehicleID::Invalid()) {
+		Vehicle *const owner = Vehicle::GetIfValid(this->follow_owner);
+		/* The control segment must still be alive and sitting where the vehicle is
+		 * being restored (the backup is matched by depot tile), otherwise the two
+		 * would be unrelated trains and following it would be wrong. */
+		if (owner != nullptr && owner != v && owner->IsPrimaryVehicle() &&
+				owner->GetEffectiveOrders() != nullptr && owner->tile == v->tile) {
+			v->r3r_follow_orders = owner->GetEffectiveOrders();
+			v->r3r_follow_owner = owner->index;
+			v->r3r_orders_borrowed = true;
+			v->orders_backup_real_index = this->orders_backup_real_index;
+			v->orders_backup_implicit_index = this->orders_backup_implicit_index;
+			follow_restored = true;
+		}
+	}
+
 	/* If we had shared orders, recover that */
-	if (this->clone != nullptr) {
+	if (follow_restored) {
+		/* Nothing to create: the vehicle follows the control table again. */
+	} else if (this->clone != nullptr) {
 		Command<Commands::CloneOrder>::Do(DoCommandFlag::Execute, CO_SHARE, v->index, this->clone->index);
 	} else if (!this->orders.empty() && OrderList::CanAllocateItem()) {
 		/* R3R (KI-465 修法 D): the restored list only takes effect once the vehicle

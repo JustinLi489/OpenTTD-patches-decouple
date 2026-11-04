@@ -1431,6 +1431,25 @@ void TrainReservationLookAhead::SetNextExtendPosition()
 	for (const TrainReservationLookAheadItem &item : this->items) {
 		if (item.type == TRLIT_SIGNAL && item.start > threshold) {
 			this->next_extend_position = item.start - 24;
+			/* R3R (第 386 轮, REG-386-E): 延伸点不得晚于预留终点前 8 单位。
+			 *
+			 * 现场（build\R3R_debug.log, veh=15644, 第 386 轮）：通过式路点订单到达后，
+			 * 预留终点就是路点格（RESV-END endTile=4518,1466 endPos=199），而下一个
+			 * 信号机在更远处 ⇒ next_extend_position = 信号机 - 24 > endPos。
+			 *
+			 * AdvanceLookAheadPosition()（train_cmd.cpp:1442-1493）里，:1447 的
+			 * "current_position > reservation_end_position + 8 ⇒ lookahead.reset(); return;"
+			 * 排在 :1484 的 "current_position == next_extend_position ⇒ 延伸" 之前，
+			 * 于是延伸一次都等不到，lookahead 被丢弃后永无重建路径
+			 * （TrainController 的自动延伸要求 lookahead != nullptr；CheckNextTrainTile()
+			 * 只在下一格是 PBS 信号机时才真的订预留；停驶分支没有任何寻路调用）
+			 * ⇒ 列车以 5 km/h 蠕动后再也不续订，黑色预览停在路点。
+			 *
+			 * 该上限只在「信号机 - 24 落在预留终点之后」（本来永远等不到延伸）时改道，
+			 * 正常列车（终点＝信号机前）逐字不变。 */
+			if (this->next_extend_position > this->reservation_end_position - 8) {
+				this->next_extend_position = this->current_position;
+			}
 			return;
 		}
 	}
@@ -1491,7 +1510,7 @@ PBSTileInfo FollowTrainReservation(const Train *v, Vehicle **train_on_res, Follo
 
 	FindTrainOnTrackInfo ftoti;
 	ftoti.res = FollowReservation(v->owner, v->GetIndirectCompatibleRailTypes(), tile, trackdir, FRF_NONE, v, nullptr);
-	ftoti.res.okay = flags.Test(FollowTrainReservationFlag::OkayUnused) ? false : IsSafeWaitingPosition(v, ftoti.res.tile, ftoti.res.trackdir, true, _settings_game.pf.forbid_90_deg, true);
+	ftoti.res.okay = flags.Test(FollowTrainReservationFlag::OkayUnused) ? false : IsSafeWaitingPosition(v, ftoti.res.tile, ftoti.res.trackdir, true, _settings_game.pf.forbid_90_deg);
 	if (train_on_res != nullptr) {
 		CheckTrainsOnTrack(ftoti, ftoti.res.tile);
 		if (ftoti.best != nullptr) *train_on_res = ftoti.best->First();
@@ -2664,25 +2683,11 @@ void R3RCollectReservedPathTiles(const Train *v, R3RResvTileHandler handler, voi
  * @param trackdir The trackdir to test
  * @param include_line_end Should end-of-line tiles be considered safe?
  * @param forbid_90deg Don't allow trains to make 90 degree turns
- * @param treat_waypoint_as_safe Treat a waypoint tile as a safe stopping position.
- *        Only the reservation-end call chain passes true (see R3R 第 284 轮):
- *        a waypoint is a legitimate place to stop when it is the order the train
- *        is currently driving to, and stopping there keeps the reservation from
- *        being extended into the *next* order (which is what made reservations
- *        span waypoints and the signals behind them). YAPF cost / destination
- *        detection and the track-removal protection pass false, so pathfinding
- *        behaviour is unchanged.
  * @return True if it is a safe position
  */
-bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg, bool treat_waypoint_as_safe)
+bool IsSafeWaitingPosition(const Train *v, TileIndex tile, Trackdir trackdir, bool include_line_end, bool forbid_90deg)
 {
 	if (IsRailDepotTile(tile)) return true;
-
-	/* R3R (第 284 轮): a waypoint the train is currently heading for is a valid
-	 * place to end the reservation. Checked first so that the "next tile" rules
-	 * below (which usually do not see a signal on a waypoint tile) cannot push
-	 * the reservation past it. See the parameter documentation above. */
-	if (treat_waypoint_as_safe && IsRailWaypointTile(tile)) return true;
 
 	/* For non-pbs signals, stop on the signal tile. */
 	if (HasBlockSignalOnTrackdir(tile, trackdir)) return true;

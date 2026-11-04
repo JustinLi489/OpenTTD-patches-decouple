@@ -469,6 +469,13 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive, bool whole_ch
 			w = w->Previous();
 		}
 		seg_front = w;
+	} else {
+		/* R3R (G-387-6): segments only exist for trains. Every other vehicle type
+		 * (road vehicles, ships, aircraft) must keep the vanilla reading, i.e.
+		 * count "position in consist" from the physical chain head. Without this
+		 * branch seg_front stayed at v, so chain_before was always 0 and NewGRF
+		 * variables 0x40/0x41 reported position 0 for every articulated part. */
+		seg_front = v->First();
 	}
 
 	for (u = seg_front; u != v; u = u->Next()) {
@@ -886,7 +893,14 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 				 * its 0x4D is already the pre-flip value. */
 				if (v->type == VehicleType::Train) {
 					const Train *t = static_cast<const Train *>(v);
-					if (t->IsSegmentFlipped() && t->HasDearticulatedGroupRole()) {
+					/* R3R (第 391 轮, KI-558): the depot "flip single unit" command
+					 * flips a whole articulated group without touching the chain
+					 * order, so the rank has to be mirrored from the group marker
+					 * too. A segment flip and a group flip are two independent
+					 * self-inverse mirrors, hence XOR: both set means the group was
+					 * mirrored twice, i.e. it is back to the plain chain order.
+					 * (Before this bit existed only the segment case could be set.) */
+					if (t->HasDearticulatedGroupRole() && (t->IsSegmentFlipped() != t->IsArticGroupFlipped())) {
 						const uint8_t tmp = artic_before;
 						artic_before = artic_after;
 						artic_after = tmp;

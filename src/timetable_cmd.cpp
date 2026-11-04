@@ -32,6 +32,34 @@
 #include "safeguards.h"
 
 /**
+ * R3R (AUD-390-4): apply a timetable operation to every vehicle which actually
+ * drives the same order list as \a v_start.
+ *
+ * This is deliberately not FirstShared()/NextShared(): a vehicle which follows
+ * the order list of a control segment (R3R borrowed orders) runs exactly the same
+ * timetable but is not a member of the shared order list ring, so a plain ring
+ * walk left it with a different view of that timetable - the switch flipped on
+ * some vehicles of a timetable but not on all of them.
+ *
+ * @param v_start Any vehicle of the timetable; its effective order list decides the group.
+ * @param func    Callable applied to every vehicle in that group.
+ */
+template <typename Func>
+static void R3RForEachTimetableVehicle(Vehicle *v_start, Func func)
+{
+	const OrderList *const list = v_start->GetEffectiveOrders();
+	if (list == nullptr) {
+		func(v_start);
+		return;
+	}
+	for (Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle()) continue;
+		if (v->GetEffectiveOrders() != list) continue;
+		func(v);
+	}
+}
+
+/**
  * Change/update a particular timetable entry.
  * @param v            The vehicle to change the timetable of.
  * @param order_number The index of the timetable in the order list.
@@ -70,11 +98,13 @@ static void ChangeTimetable(Vehicle *v, VehicleOrderID order_number, uint32_t va
 			order->SetWaitTime(val);
 			order->SetWaitTimetabled(timetabled);
 			if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) && timetabled && order->IsScheduledDispatchOrder(true)) {
-				for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
+				/* R3R (AUD-390-4): the dispatch lateness bookkeeping of a timetable
+				 * also covers the vehicles following its order list. */
+				R3RForEachTimetableVehicle(v, [&](Vehicle *u) {
 					if (u->cur_implicit_order_index == order_number && order->IsBaseStationOrder() && u->last_station_visited == order->GetDestination()) {
 						u->lateness_counter += timetable_delta;
 					}
-				}
+				});
 			}
 			break;
 
@@ -125,44 +155,46 @@ static void ChangeTimetable(Vehicle *v, VehicleOrderID order_number, uint32_t va
 
 	SetTimetableWindowsDirty(v, (mtf == MTF_ASSIGN_SCHEDULE) ? STWDF_SCHEDULED_DISPATCH : STWDF_NONE);
 
-	for (v = v->FirstShared(); v != nullptr; v = v->NextShared()) {
-		if (v->cur_real_order_index == order_number && v->current_order.IsDerivedFrom(*order)) {
+	/* R3R (AUD-390-4): the in-flight order of every vehicle running this timetable
+	 * has to follow the change, including the followers of a control segment. */
+	R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
+		if (v2->cur_real_order_index == order_number && v2->current_order.IsDerivedFrom(*order)) {
 			switch (mtf) {
 				case MTF_WAIT_TIME:
-					v->current_order.SetWaitTime(val);
-					v->current_order.SetWaitTimetabled(timetabled);
+					v2->current_order.SetWaitTime(val);
+					v2->current_order.SetWaitTimetabled(timetabled);
 					break;
 
 				case MTF_TRAVEL_TIME:
-					v->current_order.SetTravelTime(val);
-					v->current_order.SetTravelTimetabled(timetabled);
+					v2->current_order.SetTravelTime(val);
+					v2->current_order.SetTravelTimetabled(timetabled);
 					break;
 
 				case MTF_TRAVEL_SPEED:
-					v->current_order.SetMaxSpeed(val);
+					v2->current_order.SetMaxSpeed(val);
 					break;
 
 				case MTF_SET_WAIT_FIXED:
-					v->current_order.SetWaitFixed(val != 0);
+					v2->current_order.SetWaitFixed(val != 0);
 					break;
 
 				case MTF_SET_TRAVEL_FIXED:
-					v->current_order.SetTravelFixed(val != 0);
+					v2->current_order.SetTravelFixed(val != 0);
 					break;
 
 				case MTF_SET_LEAVE_TYPE:
-					v->current_order.SetLeaveType((OrderLeaveType)val);
+					v2->current_order.SetLeaveType((OrderLeaveType)val);
 					break;
 
 				case MTF_ASSIGN_SCHEDULE:
-					v->current_order.SetDispatchScheduleIndex((int)val);
+					v2->current_order.SetDispatchScheduleIndex((int)val);
 					break;
 
 				default:
 					NOT_REACHED();
 			}
 		}
-	}
+	});
 }
 
 /**
@@ -344,11 +376,11 @@ CommandCost CmdChangeTimetable(DoCommandFlags flags, VehicleID veh, VehicleOrder
 				break;
 		}
 
-		/* Unbunching data is no longer valid for any vehicle in this shared order group. */
-		Vehicle *u = v->FirstShared();
-		for (; u != nullptr; u = u->NextShared()) {
+		/* R3R (AUD-390-4): unbunching data is no longer valid for any vehicle in this
+		 * timetable, including the followers of a control segment. */
+		R3RForEachTimetableVehicle(v, [&](Vehicle *u) {
 			u->ResetDepotUnbunching();
-		}
+		});
 	}
 
 	return CommandCost();
@@ -452,10 +484,13 @@ CommandCost CmdSetVehicleOnTime(DoCommandFlags flags, VehicleID veh, bool apply_
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		if (apply_to_group) {
+			/* R3R (AUD-390-4): "the group" is every vehicle which drives this
+			 * timetable, which also covers vehicles following a control segment's
+			 * order list (they are not members of the shared order ring). */
 			int32_t most_late = 0;
-			for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
+			R3RForEachTimetableVehicle(v, [&](Vehicle *u) {
 				/* A vehicle can't be late if its timetable hasn't started. */
-				if (!v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) continue;
+				if (!v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) return;
 
 				if (u->lateness_counter > most_late) {
 					most_late = u->lateness_counter;
@@ -463,15 +498,15 @@ CommandCost CmdSetVehicleOnTime(DoCommandFlags flags, VehicleID veh, bool apply_
 
 				/* Unbunching data is no longer valid. */
 				u->ResetDepotUnbunching();
-			}
+			});
 			if (most_late > 0) {
-				for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
+				R3RForEachTimetableVehicle(v, [&](Vehicle *u) {
 					/* A vehicle can't be late if its timetable hasn't started. */
-					if (!v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) continue;
+					if (!v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) return;
 
 					u->lateness_counter -= most_late;
 					SetWindowDirty(WindowClass::VehicleTimetable, u->index);
-				}
+				});
 			}
 		} else {
 			v->lateness_counter = 0;
@@ -549,9 +584,11 @@ CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timet
 		std::vector<Vehicle *> vehs;
 
 		if (timetable_all) {
-			for (Vehicle *w = v->GetEffectiveOrders()->GetFirstSharedVehicle(); w != nullptr; w = w->NextShared()) {
+			/* R3R (AUD-390-4): "all vehicles of this timetable" includes the vehicles
+			 * following the order list of a control segment. */
+			R3RForEachTimetableVehicle(v, [&](Vehicle *w) {
 				vehs.push_back(w);
-			}
+			});
 			SetTimetableWindowsDirty(v);
 		} else {
 			vehs.push_back(v);
@@ -622,13 +659,15 @@ CommandCost CmdAutofillTimetable(DoCommandFlags flags, VehicleID veh, bool autof
 			v->vehicle_flags.Reset(VehicleFlag::AutofillPreserveWaitTime);
 		}
 
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+		/* R3R (AUD-390-4): only one vehicle of a timetable may autofill, and that
+		 * includes followers which are not members of the shared order list ring. */
+		R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
 			if (v2 != v) {
 				/* Stop autofilling; only one vehicle at a time can perform autofill */
 				v2->vehicle_flags.Reset(VehicleFlag::AutofillTimetable);
 				v2->vehicle_flags.Reset(VehicleFlag::AutofillPreserveWaitTime);
 			}
-		}
+		});
 		SetTimetableWindowsDirty(v);
 	}
 
@@ -652,7 +691,9 @@ CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool autom
 	if (ret.Failed()) return ret;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+		/* R3R (AUD-390-4): automation is a property of the timetable, so it has to be
+		 * switched for followers as well, not only for the shared ring members. */
+		R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
 			if (automate) {
 				/* Automated timetable. Set flags and clear current times if also auto-separating. */
 				v2->vehicle_flags.Set(VehicleFlag::AutomateTimetable);
@@ -667,7 +708,7 @@ CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool autom
 				v2->vehicle_flags.Reset(VehicleFlag::AutofillPreserveWaitTime);
 				v2->vehicle_flags.Reset(VehicleFlag::SeparationActive);
 			}
-		}
+		});
 		SetTimetableWindowsDirty(v);
 	}
 
@@ -690,17 +731,26 @@ CommandCost CmdTimetableSeparation(DoCommandFlags flags, VehicleID veh, bool sep
 	CommandCost ret = CheckOwnership(v->owner);
 	if (ret.Failed()) return ret;
 
-	if (separation && (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) || v->HasUnbunchingOrder())) return CommandCost(STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE);
+	if (separation) {
+		/* R3R (AUD-390-4): the mutual exclusion with scheduled dispatch has to hold
+		 * for the whole timetable, not just for the vehicle the player clicked on,
+		 * otherwise a follower could keep a combination which is forbidden. */
+		bool conflict = false;
+		R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
+			if (v2->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) || v2->HasUnbunchingOrder()) conflict = true;
+		});
+		if (conflict) return CommandCost(STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE);
+	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+		R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
 			if (separation) {
 				v2->vehicle_flags.Set(VehicleFlag::TimetableSeparation);
 			} else {
 				v2->vehicle_flags.Reset(VehicleFlag::TimetableSeparation);
 			}
 			v2->vehicle_flags.Reset(VehicleFlag::SeparationActive);
-		}
+		});
 		SetTimetableWindowsDirty(v, STWDF_SCHEDULED_DISPATCH);
 	}
 
@@ -733,17 +783,35 @@ static inline bool IsOrderUsableForSeparation(const Order *order)
 std::vector<TimetableProgress> PopulateSeparationState(const Vehicle *v_start)
 {
 	std::vector<TimetableProgress> out;
-	if (v_start->GetNumOrders() == 0) return out;
-	for (const Vehicle *v = v_start->FirstShared(); v != nullptr; v = v->NextShared()) {
+
+	/* R3R (AUD-390-3): the separation group is "every vehicle which actually
+	 * drives this order list", not "every vehicle on the shared order list ring".
+	 * A vehicle which follows the order list of a control segment (borrowed
+	 * orders) runs the same timetable but is not a ring member, so it used to be
+	 * silently dropped from the ordering and the others computed their gap
+	 * against a neighbour which was never in the array. */
+	Vehicle *const start = Vehicle::Get(v_start->index);
+	if (start == nullptr) return out;
+	const OrderList *const list = start->GetEffectiveOrders();
+	if (list == nullptr || list->GetNumOrders() == 0) return out;
+
+	for (Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle()) continue;
+		if (v->GetEffectiveOrders() != list) continue;
 		if (!v->vehicle_flags.Test(VehicleFlag::SeparationActive)) continue;
 		bool separation_valid = true;
 		const int n = v->cur_real_order_index;
 		int cumulative_ticks = 0;
 		bool vehicle_ok = true;
 		int order_count = n * 2;
+		/* R3R (AUD-390-3): the stored progress may point past the end of the order
+		 * list (see KI-555) or still be INVALID_VEH_ORDER_ID. Taking the order at
+		 * that index yielded a null pointer which was dereferenced immediately
+		 * below, so skip such a vehicle instead of crashing. */
+		if (n < 0 || n >= (int)list->GetNumOrders()) continue;
 		for (int i = 0; i < n; i++) {
 			const Order *order = v->GetOrder(i);
-			if (order->IsType(OT_CONDITIONAL)) {
+			if (order == nullptr || order->IsType(OT_CONDITIONAL)) {
 				vehicle_ok = false;
 				break;
 			}
@@ -753,7 +821,7 @@ std::vector<TimetableProgress> PopulateSeparationState(const Vehicle *v_start)
 		if (!vehicle_ok) continue;
 
 		const Order *order = v->GetOrder(n);
-		if (order->IsType(OT_CONDITIONAL)) continue;
+		if (order == nullptr || order->IsType(OT_CONDITIONAL)) continue;
 		if (!IsOrderUsableForSeparation(order)) separation_valid = false;
 		if (order->IsType(OT_GOTO_DEPOT) && (order->GetDepotOrderType().Test(OrderDepotTypeFlag::Service) || order->GetDepotActionType() & ODATFB_HALT)) {
 			// Do not try to separate vehicles on depot service or halt orders
@@ -1120,11 +1188,13 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 				 * Otherwise we risk trains blocking 1-lane stations for long times. */
 				ChangeTimetable(v, v->cur_timetable_order_index, 0, travel_field ? MTF_TRAVEL_TIME : MTF_WAIT_TIME, false);
 				if (!v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch)) {
-					for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+					/* R3R (AUD-390-4): restart the timetable for every vehicle which
+					 * actually drives it, followers of a control segment included. */
+					R3RForEachTimetableVehicle(v, [&](Vehicle *v2) {
 						/* Clear VehicleFlag::TimetableStarted but do not clear VehicleFlag::SeparationActive */
 						v2->vehicle_flags.Reset(VehicleFlag::TimetableStarted);
 						v2->lateness_counter = 0;
-					}
+					});
 				}
 				SetTimetableWindowsDirty(v);
 				return;

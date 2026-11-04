@@ -519,7 +519,13 @@ static void R3RDbgCloneTraits(const Train *src, const Train *dst)
  * @param v Group parent (the former articulated head).
  * @return First vehicle after the group (nullptr if the group is at the tail).
  */
-static Train *R3RDearticulateOneGroup(Train *v)
+/* R3R (第 391 轮, KI-558): no longer file-local. train_cmd.cpp calls it from the
+ * depot "flip single unit" command (CmdReverseTrainDirection), which must split
+ * exactly the clicked articulated group and nothing else -- unlike
+ * #DearticulateChainWithSnapshot, which splits every group of the chain. It is
+ * declared there by hand rather than in vehicle_cmd.h, so that this change stays
+ * .cpp-only and the KI-183 build guard does not drop every object file. */
+Train *R3RDearticulateOneGroup(Train *v)
 {
 	/* Snapshot the group statistics while the chain is still articulated. */
 	const uint16_t total_weight = v->GetWeightWithoutCargo();
@@ -707,6 +713,11 @@ static void RearticulateChain(Train *head)
 		v->weight_override = UINT16_MAX;
 		v->power_override = UINT16_MAX;
 		v->max_speed_override = UINT16_MAX;
+		/* R3R (第 391 轮, KI-558): the group is a genuine articulated group
+		 * again, so it is no longer "flipped as a unit" (there is no per-section
+		 * Flipped/mirror to keep). A stale marker would mirror 0x4D the wrong way
+		 * the next time this group is de-articulated. */
+		v->ClearArticGroupFlipped();
 	}
 }
 

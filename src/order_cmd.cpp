@@ -1717,6 +1717,64 @@ static CommandCost CmdInsertOrderIntl(DoCommandFlags flags, Vehicle *v, VehicleO
 }
 
 /**
+ * R3R (KI-465 修法 D): 遍历"以 \a list 为坐标系的排程索引持有者"全集。
+ *
+ * 原生只有一张表（Vehicle::orders），共享环就是全集，所以原生代码用
+ * `v->FirstShared()` 环遍历就够了。修法 D 把"自己拥有的表"和"当前指向的表"
+ * 拆成两张之后，索引的持有者变成三类：
+ *   - 环成员：orders == list，且没有在跟别人的表；
+ *   - 跟随者：orders != list 但 r3r_follow_orders == list（车组里非控制段的段）；
+ *   - 停放者：orders_backup == list（书签上的"自己表进度"，解挂时归还）。
+ * 前两类都满足 GetEffectiveOrders() == list，第三类只看书签，所以一次遍历即可。
+ *
+ * 插入/删除/移动/反转订单时必须一次把这三类全部调整。漏掉环成员或跟随者，
+ * ③ 会停在旧坐标并越界（timetable 里解引用空订单）；漏掉停放者，④ 只会在
+ * 归还时跳到错误位置。历史 bug（KI-555）就是因为各处自己算集合，算漏了。
+ *
+ * @param list 被编辑的订单表。
+ * @param fn   回调 fn(Vehicle *u, bool live, bool parked)；两种身份可同时成立。
+ */
+template <typename Fn>
+static void R3RForEachOrderListHolder(OrderList *list, Fn &&fn)
+{
+	if (list == nullptr) return;
+	for (Vehicle *u : Vehicle::Iterate()) {
+		const bool live = (u->GetEffectiveOrders() == list);
+		const bool parked = (u->orders_backup == list);
+		if (live || parked) fn(u, live, parked);
+	}
+}
+
+/** R3R (KI-465 修法 D): 往 \a at 位插入一条订单后，右移停放的自己表进度（书签 ④）。 */
+static void R3RAdjustBookmarkForInsert(Vehicle *u, VehicleOrderID at)
+{
+	if (u->orders_backup == nullptr) return;
+	const VehicleOrderID num = u->orders_backup->GetNumOrders();
+	if (u->orders_backup_real_index != INVALID_VEH_ORDER_ID && at <= u->orders_backup_real_index) {
+		if (u->orders_backup_real_index + 1 < num) u->orders_backup_real_index++;
+	}
+	if (u->orders_backup_implicit_index != INVALID_VEH_ORDER_ID && at <= u->orders_backup_implicit_index) {
+		if (u->orders_backup_implicit_index + 1 < num) u->orders_backup_implicit_index++;
+	}
+}
+
+/** R3R (KI-465 修法 D): 删掉 \a sel 这一条后，左移停放的自己表进度（书签 ④）。
+ * 删掉的正是书签指向的那条时留在原位（等于后一条），越界则钳到表尾。 */
+static void R3RAdjustBookmarkForDelete(Vehicle *u, VehicleOrderID sel)
+{
+	if (u->orders_backup == nullptr) return;
+	const VehicleOrderID num = u->orders_backup->GetNumOrders();
+	if (u->orders_backup_real_index != INVALID_VEH_ORDER_ID) {
+		if (u->orders_backup_real_index > sel) u->orders_backup_real_index--;
+		if (u->orders_backup_real_index >= num) u->orders_backup_real_index = (num > 0) ? num - 1 : 0;
+	}
+	if (u->orders_backup_implicit_index != INVALID_VEH_ORDER_ID) {
+		if (u->orders_backup_implicit_index > sel) u->orders_backup_implicit_index--;
+		if (u->orders_backup_implicit_index >= num) u->orders_backup_implicit_index = (num > 0) ? num - 1 : 0;
+	}
+}
+
+/**
  * Insert a new order but skip the validation.
  * @param v       The vehicle to insert the order to.
  * @param new_o   The new order.
@@ -1741,16 +1799,14 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 		initial_orders->InsertOrderAt(std::move(new_o), sel_ord);
 	}
 
-	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的实际持有者环"。
-	 * 跟随者(v->orders != eff_orders)不在被跟随表的共享环里，所以环要从
-	 * eff_orders->first_shared 起步，并且单独补一次自己。
-	 * 注意不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者
-	 * 自己的（闲置）表环当成被编辑的表环，导致它被调整两次。 */
+	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的全部索引持有者"。
+	 * 旧实现只算共享环 + 自己：跟随者(v->orders != eff_orders)不在被跟随表
+	 * 的共享环里，同表的**其他**跟随者既不等于 v 也不在环里，于是被漏掉；
+	 * 停放书签(orders_backup)更是从来没进过维护范围。现在统一走
+	 * R3RForEachOrderListHolder()，见该函数的说明。 */
 	OrderList *const eff_orders = v->GetEffectiveOrders();
-	OrderList *const owned_orders = v->orders;
-	const bool follower = (eff_orders != nullptr && eff_orders != owned_orders);
-	Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
-	DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
+	Vehicle *const ring_head = (eff_orders != nullptr) ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
+	DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
 
 	auto adjust_indices = [&](Vehicle *u) {
 		if (u->GetEffectiveOrders() != eff_orders) return;
@@ -1796,15 +1852,10 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 		InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (sel_ord << 16));
 	};
 
-	if (shared_ring != nullptr) {
-		/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
-		uint ring_guard = 0;
-		for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
-			adjust_indices(u);
-		}
-	}
-	/* 跟随者自己不在被跟随表的共享环里，补一次。 */
-	if (follower && shared_ring != v) adjust_indices(v);
+	R3RForEachOrderListHolder(eff_orders, [&](Vehicle *u, bool live, bool parked) {
+		if (live) adjust_indices(u);
+		if (parked) R3RAdjustBookmarkForInsert(u, sel_ord);
+	});
 
 	/* As we insert an order, the order to skip to will be 'wrong'. */
 	VehicleOrderID cur_order_id = 0;
@@ -1843,11 +1894,10 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
 			u->ResetDepotUnbunching();
 			InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (at << 16));
 		};
-		uint marker_guard = 0;
-		for (Vehicle *u = shared_ring; u != nullptr && marker_guard < 1000; u = u->NextShared(), ++marker_guard) {
-			adjust_for_marker(u);
-		}
-		if (follower && shared_ring != v) adjust_for_marker(v);
+		R3RForEachOrderListHolder(couple_list, [&](Vehicle *u, bool live, bool parked) {
+			if (live) adjust_for_marker(u);
+			if (parked) R3RAdjustBookmarkForInsert(u, at);
+		});
 
 		for (Order *order : v->Orders()) {
 			if (order->IsType(OT_CONDITIONAL)) {
@@ -1905,16 +1955,16 @@ void R3REnsureCoupleEndOrders(Vehicle *v)
 		end_order.MakeCoupleEnd();
 		list->InsertOrderAt(std::move(end_order), at);
 
-		Vehicle *const ring = list->GetFirstSharedVehicle();
-		uint guard = 0;
-		for (Vehicle *u = ring; u != nullptr && guard < 1000; u = u->NextShared(), ++guard) {
-			if (u->GetEffectiveOrders() != list) continue;
-			if (at <= u->cur_real_order_index && u->cur_real_order_index + 1 < u->GetNumOrders()) u->cur_real_order_index++;
-			if (at <= u->cur_implicit_order_index && u->cur_implicit_order_index + 1 < u->GetNumOrders()) u->cur_implicit_order_index++;
-			if (u->cur_timetable_order_index != INVALID_VEH_ORDER_ID && at <= u->cur_timetable_order_index && u->cur_timetable_order_index + 1 < u->GetNumOrders()) u->cur_timetable_order_index++;
-			u->ResetDepotUnbunching();
-			InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (at << 16));
-		}
+		R3RForEachOrderListHolder(list, [&](Vehicle *u, bool live, bool parked) {
+			if (live) {
+				if (at <= u->cur_real_order_index && u->cur_real_order_index + 1 < u->GetNumOrders()) u->cur_real_order_index++;
+				if (at <= u->cur_implicit_order_index && u->cur_implicit_order_index + 1 < u->GetNumOrders()) u->cur_implicit_order_index++;
+				if (u->cur_timetable_order_index != INVALID_VEH_ORDER_ID && at <= u->cur_timetable_order_index && u->cur_timetable_order_index + 1 < u->GetNumOrders()) u->cur_timetable_order_index++;
+				u->ResetDepotUnbunching();
+				InvalidateVehicleOrder(u, INVALID_VEH_ORDER_ID | (at << 16));
+			}
+			if (parked) R3RAdjustBookmarkForInsert(u, at);
+		});
 
 		for (Order *order : v->Orders()) {
 			if (order->IsType(OT_CONDITIONAL)) {
@@ -2032,13 +2082,10 @@ void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord)
 	if (eff_orders == nullptr) return;
 	eff_orders->DeleteOrderAt(sel_ord);
 
-	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的实际持有者环"。跟随者不在被跟随表的
-	 * 共享环里，所以环从 eff_orders->first_shared 起步，并且单独补一次自己。
-	 * 注意不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者自己的
-	 * （闲置）表环当成被编辑的表环，导致它被调整两次。 */
-	OrderList *const owned_orders = v->orders;
-	const bool follower = (eff_orders != owned_orders);
-	Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
+	/* R3R (KI-465 修法 D): 索引调整必须覆盖"这张表的全部索引持有者"（环成员 + 跟随者 +
+	 * 停放书签），见 R3RForEachOrderListHolder()。旧实现只算环 + 自己，同表的其他跟随者
+	 * 被漏掉 —— 它们的 ③ 会停在旧值直到等于新表长，随后 GetOrder(n) 返回 nullptr。 */
+	Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
 
 	auto adjust_indices = [&](Vehicle *u) {
 		if (u->GetEffectiveOrders() != eff_orders) return;
@@ -2080,16 +2127,11 @@ void DeleteOrder(Vehicle *v, VehicleOrderID sel_ord)
 		InvalidateVehicleOrder(u, sel_ord | (INVALID_VEH_ORDER_ID << 16));
 	};
 
-	DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
-	if (shared_ring != nullptr) {
-		/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
-		uint ring_guard = 0;
-		for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
-			adjust_indices(u);
-		}
-	}
-	/* 跟随者自己不在被跟随表的共享环里，补一次。 */
-	if (follower && shared_ring != v) adjust_indices(v);
+	DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+	R3RForEachOrderListHolder(eff_orders, [&](Vehicle *u, bool live, bool parked) {
+		if (live) adjust_indices(u);
+		if (parked) R3RAdjustBookmarkForDelete(u, sel_ord);
+	});
 
 	/* As we delete an order, the order to skip to will be 'wrong'. */
 	VehicleOrderID cur_order_id = 0;
@@ -2224,15 +2266,11 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 		OrderList *const eff_orders = v->GetEffectiveOrders();
 		eff_orders->MoveOrders(moving_order, target_order, count);
 
-		/* R3R (KI-465 修法 D): 索引调整覆盖"这张表的实际持有者环"；跟随者不在环里，
-		 * 环从 eff_orders->first_shared 起步，之后单独补一次跟随者自己。
-		 * 不能因为 first_shared 为空就退回 v->FirstShared()：那会把跟随者自己的
-		 * （闲置）表环当成被编辑的表环，导致它被调整两次。 */
-		OrderList *const owned_orders = v->orders;
-		const bool follower = (eff_orders != owned_orders);
-		Vehicle *const shared_ring = follower ? eff_orders->GetFirstSharedVehicle() : v->FirstShared();
+		/* R3R (KI-465 修法 D): 索引调整覆盖这张表的全部索引持有者（环 + 跟随者 + 停放书签），
+		 * 见 R3RForEachOrderListHolder()。 */
+		Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
 
-		DeleteOrderWarnings(shared_ring != nullptr ? shared_ring : v);
+		DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
 
 		auto adjust_order_idx = [&](VehicleOrderID idx) -> VehicleOrderID {
 			if (idx >= order_count) return idx;
@@ -2274,15 +2312,18 @@ CommandCost CmdMoveOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID mov
 			InvalidateVehicleOrderOnMove(u, moving_order, target_order, count);
 		};
 
-		if (shared_ring != nullptr) {
-			/* 环理论上有限，但防一手损坏的共享环把它变成死循环。 */
-			uint ring_guard = 0;
-			for (Vehicle *u = shared_ring; u != nullptr && ring_guard < 1000; u = u->NextShared(), ++ring_guard) {
-				adjust_vehicle(u);
+		R3RForEachOrderListHolder(eff_orders, [&](Vehicle *u, bool live, bool parked) {
+			if (live) adjust_vehicle(u);
+			if (parked) {
+				/* R3R (KI-465 修法 D): 停放的自己表进度同样是这张表的坐标系，一起重映射。 */
+				if (u->orders_backup_real_index != INVALID_VEH_ORDER_ID) {
+					u->orders_backup_real_index = adjust_order_idx(u->orders_backup_real_index);
+				}
+				if (u->orders_backup_implicit_index != INVALID_VEH_ORDER_ID) {
+					u->orders_backup_implicit_index = adjust_order_idx(u->orders_backup_implicit_index);
+				}
 			}
-		}
-		/* 跟随者自己不在被跟随表的共享环里，补一次。 */
-		if (follower && shared_ring != v) adjust_vehicle(v);
+		});
 
 		/* As we move an order, the order to skip to will be 'wrong'. */
 		for (Order *order : v->Orders()) {
@@ -2402,16 +2443,26 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 					}
 				}
 
-				/* Update shared list */
-				Vehicle *u = v->FirstShared();
-				DeleteOrderWarnings(u);
-				for (; u != nullptr; u = u->NextShared()) {
-					u->cur_real_order_index = map_order_id(u->cur_real_order_index);
-					u->cur_implicit_order_index = map_order_id(u->cur_implicit_order_index);
-					u->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
-					u->ResetDepotUnbunching();
-					InvalidateVehicleOrder(u, VIWD_REMOVE_ALL_ORDERS); // All orders have moved/been modified, deselect
-				}
+				/* Update all holders of the reversed list.
+				 * R3R (KI-465 修法 D): 反转的是 GetEffectiveOrders()（可能是被跟随的表），
+				 * 而旧代码从 v->FirstShared() 起步 —— 跟随者身上那是**自己那张闲置表**的环，
+				 * 于是调整了错误的列车、并且完全漏掉被跟随表的真正持有者。 */
+				OrderList *const eff_orders = v->GetEffectiveOrders();
+				Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
+				DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+				R3RForEachOrderListHolder(eff_orders, [&](Vehicle *u, bool live, bool parked) {
+					if (live) {
+						u->cur_real_order_index = map_order_id(u->cur_real_order_index);
+						u->cur_implicit_order_index = map_order_id(u->cur_implicit_order_index);
+						u->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+						u->ResetDepotUnbunching();
+						InvalidateVehicleOrder(u, VIWD_REMOVE_ALL_ORDERS); // All orders have moved/been modified, deselect
+					}
+					if (parked) {
+						u->orders_backup_real_index = map_order_id(u->orders_backup_real_index);
+						u->orders_backup_implicit_index = map_order_id(u->orders_backup_implicit_index);
+					}
+				});
 			}
 			break;
 		}
@@ -2439,12 +2490,16 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 				std::vector<Order> &orders = v->GetEffectiveOrders()->GetOrderVector();
 				AdjustTravelAfterOrderReverse(std::span<Order>(orders).subspan(order_count));
 
-				Vehicle *u = v->FirstShared();
-				DeleteOrderWarnings(u);
-				for (; u != nullptr; u = u->NextShared()) {
+				/* R3R (KI-465 修法 D): 追加不改变任何已有索引，但整张表多了内容，
+				 * 跟随者（不在 v->FirstShared() 环里）同样要刷新 unbunch/窗口。 */
+				OrderList *const eff_orders = v->GetEffectiveOrders();
+				Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
+				DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+				R3RForEachOrderListHolder(eff_orders, [&](Vehicle *u, bool live, bool /*parked*/) {
+					if (!live) return;
 					u->ResetDepotUnbunching();
 					InvalidateVehicleOrder(u, VIWD_MODIFY_ORDERS);
-				}
+				});
 			}
 			break;
 		}
@@ -3262,10 +3317,15 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			default: NOT_REACHED();
 		}
 
-		/* Update the windows and full load flags, also for vehicles that share the same order list */
-		Vehicle *u = v->FirstShared();
-		DeleteOrderWarnings(u);
-		for (; u != nullptr; u = u->NextShared()) {
+		/* Update the windows and full load flags, also for every vehicle that uses the same order list.
+		 * R3R (KI-465 修法 D): 跟随者不在 v->FirstShared() 环里，所以用"索引持有者全集"代替环遍历，
+		 * 否则被跟随表上其他段列车的 current_order 装载标志不会跟着改。 */
+		OrderList *const eff_orders = v->GetEffectiveOrders();
+		Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
+		DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+		std::vector<Vehicle *> r3r_holders;
+		R3RForEachOrderListHolder(eff_orders, [&](Vehicle *w, bool live, bool /*parked*/) { if (live) r3r_holders.push_back(w); });
+		for (Vehicle *u : r3r_holders) {
 			/* Toggle u->current_order "Full load" flag if it changed.
 			 * However, as the same flag is used for depot orders, check
 			 * whether we are not going to a depot as there are three
@@ -3716,11 +3776,13 @@ CommandCost CmdInsertOrdersFromVehicle(DoCommandFlags flags, VehicleID veh_dst, 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		CmdMoveOrder(flags, veh_dst, new_orders_start, insert_pos, dst->GetNumOrders() - new_orders_start);
 
-		for (Vehicle *u = dst->FirstShared(); u != nullptr; u = u->NextShared()) {
+		/* R3R (KI-465 修法 D): 刷新每一辆使用这张表的列车，跟随者不在环里。 */
+		R3RForEachOrderListHolder(dst->GetEffectiveOrders(), [&](Vehicle *u, bool live, bool /*parked*/) {
+			if (!live) return;
 			u->ResetDepotUnbunching();
 
 			InvalidateVehicleOrder(u, VIWD_MODIFY_ORDERS);
-		}
+		});
 		InvalidateWindowClassesData(GetWindowClassForVehicleType(dst->type));
 		InvalidateWindowClassesData(WindowClass::DepartureBoard);
 	}
@@ -3771,7 +3833,9 @@ CommandCost CmdOrderRefit(DoCommandFlags flags, VehicleID veh, VehicleOrderID or
 			order->SetDepotActionType((OrderDepotActionFlags)(order->GetDepotActionType() & ~(ODATFB_HALT | ODATFB_SELL)));
 		}
 
-		for (Vehicle *u = v->FirstShared(); u != nullptr; u = u->NextShared()) {
+		/* R3R (KI-465 修法 D): refit 也是"表里某一条"的属性，跟随者同样要吃。 */
+		R3RForEachOrderListHolder(v->GetEffectiveOrders(), [&](Vehicle *u, bool live, bool /*parked*/) {
+			if (!live) return;
 			/* Update any possible open window of the vehicle */
 			InvalidateVehicleOrder(u, VIWD_MODIFY_ORDERS);
 
@@ -3779,7 +3843,7 @@ CommandCost CmdOrderRefit(DoCommandFlags flags, VehicleID veh, VehicleOrderID or
 			if (u->cur_real_order_index == order_number && (!order->IsType(OT_GOTO_DEPOT) || u->current_order.GetDepotOrderType().Test(OrderDepotTypeFlag::PartOfOrders))) {
 				u->current_order.SetRefit(cargo);
 			}
-		}
+		});
 	}
 
 	return CommandCost();
