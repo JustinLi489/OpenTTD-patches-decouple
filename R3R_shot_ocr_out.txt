@@ -1,32 +1,19 @@
-﻿========== 屏幕截图 2026-09-14 052502.png  (2026-09-14 05:25:03) ==========
+﻿========== 屏幕截图 2026-11-03 015323.png  (2026-11-03 01:53:23) ==========
+[01] ] dL 」 mp vehicle 39928
+[02] veh: 3992 & (Road Vehicle 16 ， c:0, stF, vs: D, vfFTzsa, \ ℃ f:ld ， gvf, rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO ] 〕
+[03] ] dL 」 mp vehicle 39929
+[04] veh: 39929 《 (Road Vehicle [N/A], c:0, st A, vs: D, ， \ ℃ f 《 d, gvf 、 rvf, rvs: 1 ， rvf A, [tile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO], front 3992 & (Road Vehicle 16 ， stF, vs: D,
+[05] vfFTzsa, \ ℃ f:ld ， gvf 、 rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO 切
+[06] ] dL 」 mp vehicle 39930
+[07] veh: 3993J (Road Vehicle [N/A], c:0, stA, vs: H D, ， \ ℃ f 《 ， gvf, rvf, rvs: F E, rvf B, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO], front 3992 & (Road Vehicle 16 ， stF, vs: D,
+[08] vfFTzsa, \ ℃ f:ld ， gvf, rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO 切
 
-========== 屏幕截图 2026-09-13 041032.png  (2026-09-13 04:10:32) ==========
-[01] 模 拟 速 率 ． 五 的 巾 s
-[02] 帧 率 ． 54 ． fps
-[03] 当 前 游 戏 速 度 ． 0 ， 99 ×
-[04] 内 存
-[05] 游 戏 周 期 总 计
-[06] 货 物 处 理
-[07] 列 车 耗 时
-[08] 道 路 车 辆 耗 时
-[09] 船 只 耗 时
-[10] 飞 机 耗 时
-[11] 世 界 耗 时
-[12] 辅 助 视 点
-[13] 视 频 输 出
-[14] 混 响
-[15] 数 据 基 于 512 个 采 样
-[16] 18.02 m S
-[17] 9 过 4 m S
-[18] 〔 } 44 S
-[19] 0 彐 4 rn S
-[20] 〔 } 47 rn S
-[21] 7 ． 34 rns
-[22] 3 ． 87 rns
-[23] 0 ℃ 4 rn S
-[24] 16.70 m S
-[25] 032 rns
-[26] 3.83 rns
-[27] 0 ， 40 rn S
-[28] 03 「 rlS
-[29] 0 ℃ I rn S
+========== 屏幕截图 2026-11-03 015158.png  (2026-11-03 01:51:59) ==========
+[01] ] dL 」 mp vehicle 39928
+[02] veh: 3992 & (Road Vehicle 16 ， c:0, stF, vs: D, vfFTzsa, \ ℃ f:ld ， gvf, rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO ] 〕
+[03] ] dL 」 mp vehicle 39929
+[04] veh: 39929 《 (Road Vehicle [N/A], c:0, stA, vs: D, ， \ ℃ f 《 d, gvf 、 rvf, rvs: 1 ， rvf A, [tile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO], front 3992 & (Road Vehicle 16 ， stF, vs: D,
+[05] vfFTzsa, \ ℃ f:ld ， gvf, rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO 切
+[06] ] dL 」 mp vehicle 39930
+[07] veh: 3993J (Road Vehicle [N/A], c:0, st A, vs: H D, ， vcf, gvf, rvf, rvs: F E, rvf B, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO], front 3992 & (Road Vehicle 16 ， stF, vs: D,
+[08] vfFTzsa, \ ℃ f:ld ， gvf, rvf, rvs: 1 ， rvf C, Ctile 78DB65 〔 7013 × 96 司 ， type 20 (Road), height 19 ， data: 00 0000 00 12 81 00 00 OFCO 切
