@@ -1962,7 +1962,7 @@ static void R3RResvWalkLog(TileIndex start, Trackdir start_td, TileIndex res_til
 }
 #endif /* R3R_PROBES */
 
-static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, RailTypes rts)
+static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, RailTypes rts, TileIndex *end_tile = nullptr)
 {
 	/* If the tile has a one-way block signal in the current trackdir, skip the
 	 * search in this direction as the reservation can't come from this side.*/
@@ -1975,6 +1975,11 @@ static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, Rai
 
 	FindTrainOnTrackInfo ftoti;
 	ftoti.res = FollowReservation(GetTileOwner(tile), rts, tile, trackdir, FRF_IGNORE_ONEWAY, nullptr, nullptr);
+	/* R3R (第 395 轮, KI-561): report where the walk stopped. A walk can only
+	 * enter plain rail, so the last tile of a booking laid down from inside a
+	 * depot is the depot's mouth tile; the caller uses that to recognise its own
+	 * bookings (see R3RReservationHeldBySelf()). */
+	if (end_tile != nullptr) *end_tile = ftoti.res.tile;
 
 	CheckTrainsOnTrack(ftoti, ftoti.res.tile);
 	if (ftoti.best != nullptr) {
@@ -2286,6 +2291,10 @@ Train *GetTrainForWholeTileReservationArbitrated(TileIndex tile)
  *  - plain rail: *both* walk directions are run and every end we run into must be our
  *    own chain. A single foreign end (pair partner or a third train) => not ours, so
  *    the regular conflict handling decides (conservative: keeps today's failure);
+ *  - plain rail booked from inside a depot (第 395 轮, KI-561): the walk can never
+ *    reach a train standing in a depot, so "nobody found in either direction" plus
+ *    "one walk stopped at the mouth of the depot our own chain stands in" is our own
+ *    booking (see the long comment in the Railway branch);
  *  - station / waypoint: the whole-tile owner must be our chain;
  *  - depot, level crossing, tunnel and bridge reservations are left alone.
  *
@@ -2310,9 +2319,37 @@ static bool R3RReservationHeldBySelf(TileIndex tile, Track track)
 
 			const Trackdir td0 = TrackToTrackdir(track);
 			const RailTypes rts = GetRailTypeInfo(GetTileRailTypeByTrack(tile, track))->indirect_compatible_railtypes;
-			const Train *const a = R3RFollowReservationToOwner(tile, td0, rts);
-			const Train *const b = R3RFollowReservationToOwner(tile, ReverseTrackdir(td0), rts);
-			if (a == nullptr && b == nullptr) return false;
+			TileIndex end_a = INVALID_TILE;
+			TileIndex end_b = INVALID_TILE;
+			const Train *const a = R3RFollowReservationToOwner(tile, td0, rts, &end_a);
+			const Train *const b = R3RFollowReservationToOwner(tile, ReverseTrackdir(td0), rts, &end_b);
+			if (a == nullptr && b == nullptr) {
+				/* R3R (第 395 轮, KI-561): a booking laid down *from inside a depot* can
+				 * never be traced back to its owner. FollowReservation() only walks plain
+				 * rail, so walking towards the depot stops on the depot's mouth tile (one
+				 * tile short of the train) and walking away stops at the far end of the
+				 * booking where nobody stands -- both directions report "no owner". The
+				 * caller then treats our own bit as a third party, the couple booking is
+				 * rejected and the locomotive stays stuck in the depot forever (KI-561).
+				 *
+				 * Recognise it by geometry instead: the bit is ours when our own chain
+				 * stands in a rail depot and one of the walks stopped at that depot's
+				 * mouth tile, i.e. the booked run is contiguous with the depot we stand
+				 * in. A third party parked at either end of the run is still found by the
+				 * walk, and a foreign bit on the mouth tile itself would have made the
+				 * preceding ExtendTrainReservation() fail (so we would not be here). */
+				if (head->track == TRACK_BIT_DEPOT && IsRailDepotTile(head->tile)) {
+					const TileIndex mouth = head->tile + TileOffsByDiagDir(GetRailDepotDirection(head->tile));
+					if (end_a == mouth || end_b == mouth) {
+						R3RDbgWrite("RESV-SELF-DEPOT-MOUTH veh=%u tile=%d,%d track=%u mouth=%d,%d end_a=%d,%d end_b=%d,%d\n",
+								(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track,
+								(int)TileX(mouth), (int)TileY(mouth),
+								(int)TileX(end_a), (int)TileY(end_a), (int)TileX(end_b), (int)TileY(end_b));
+						return true;
+					}
+				}
+				return false;
+			}
 			if (a != nullptr && a->First() != head) return false;
 			if (b != nullptr && b->First() != head) return false;
 			return true;

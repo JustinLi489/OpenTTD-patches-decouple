@@ -5710,7 +5710,14 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 			 * both forms: a genuine part derives the member role from its subtype
 			 * bit, a de-articulated one carries the explicit role flag. */
 			Train *group_head = v;
-			while (group_head->Previous() != nullptr && group_head->Previous()->IsArticGroupMember()) {
+			/* R3R (第 394 轮, KI-565): test *this* section, not the previous one.
+			 * The old predicate walked back whenever the PREVIOUS vehicle was a
+			 * group member, so a group *parent* whose predecessor happened to be
+			 * the last member of the previous group skipped over its own group and
+			 * stopped at the previous group's parent - i.e. the flip always hit a
+			 * group further towards the chain head. That is exactly the reported
+			 * "only ever the first articulated group of the chain" symptom. */
+			while (group_head->Previous() != nullptr && group_head->IsArticGroupMember()) {
 				group_head = group_head->Previous();
 			}
 
@@ -8325,6 +8332,7 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_TPRZERO,      ///< 第 336 轮: the early-exit was overruled because the reservation reached nowhere (zero usable path)
 	R3REDGE_RESVPROBE,    ///< 第 357 轮 (KI-533): a *whole* reservation attempt and the end it produced (R48-1..R48-3)
 	R3REDGE_JUNCCHOOSE,   ///< 第 357 轮 (KI-533): ChooseTrainTrack's per-tile verdict, tracked on *every* tile (R48-4)
+	R3REDGE_EXTGOALEXEMPT, ///< 第 406 轮 (REG-405-A): the choice refusal was waived -- the platform belongs to our locked couple partner
 	R3REDGE_COUNT,
 };
 
@@ -15245,6 +15253,136 @@ static bool R3RChainFullyInDepot(const Train *v)
 }
 
 /**
+ * R3R (U-396-1c, R-396-1): 「本车刚在这个库格放行过」的短期豁免。
+ *
+ * 现场（build\R3R_debug.log 的 DEPOT-STAY veh=27 resv=1 track=128）：出库放行一次后
+ * :15455 在本库格订下 SetDepotReservation(tile, true)，此后
+ *   - CheckTrainStayInDepot() 的 :15367 把这条自己的预留当成障碍 -> exit=11；
+ *   - 就算闯过 exit=11，TryPathReserve() 的 :18807 还有同一句「库内列车的库格预留
+ *     必不可能是自己的」-> TPRRF_NONE -> MarkTrainAsStuck -> exit=12。
+ * 而 wait_counter 在 :15364（判定之前）就被清零，于是每 37 tick 重来一次，一次都出不去。
+ *
+ * 上游 JGRPP 没有这两处判定，靠「每 37 tick 无条件再放行一次」自然把车推出去：放行 tick
+ * 把 moving_front->track 从 TRACK_BIT_DEPOT 改成普通位（:15463-15464），下一 tick 的
+ * :15318-15320 循环就 return false，整 tick 不再走库逻辑。
+ *
+ * 所以这里只做最小的一件事：记住「本车刚在这个库格放行过」，在此后
+ * R3R_DEPOT_SELF_RELEASE_TICKS 个 tick 内把自己的库格预留当成「不是障碍」。别人的预留照
+ * 旧阻塞（HasDepotReservation 的首次判断不变）；车离格后 tile 不再匹配，记录自然失效，
+ * 因此不需要跨文件清理、也不动存档格式。
+ */
+struct R3RDepotSelfReleaseRecord {
+	TileIndex tile;
+	uint32_t tick;
+};
+static std::unordered_map<uint32_t, R3RDepotSelfReleaseRecord> _r3r_depot_self_release;
+static const uint32_t R3R_DEPOT_SELF_RELEASE_TICKS = 256;
+
+static void R3RMarkDepotSelfRelease(const Train *v)
+{
+	const Train *head = v->First();
+	_r3r_depot_self_release[head->index.base()] = R3RDepotSelfReleaseRecord{ head->tile, (uint32_t)_tick_counter };
+	if (_r3r_depot_self_release.size() <= 1024) return;
+	for (auto it = _r3r_depot_self_release.begin(); it != _r3r_depot_self_release.end();) {
+		if ((uint32_t)_tick_counter - it->second.tick >= R3R_DEPOT_SELF_RELEASE_TICKS) {
+			it = _r3r_depot_self_release.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+/**
+ * R3R (第 399 轮, R-399-1'): 「挂车半截预留」记账。
+ *
+ * 现场（build\R3R_debug.log:570/572/573，tick=2177）：库内机车 27 的挂车寻路走
+ * cpl-partial-res 出口保留了 280,126/281,126/281,127 三格，路径终点 285,127（等待
+ * 车底 21 所在格）。18 tick 后本车从库里重新订出库路径，:18936 的库口闸门看见
+ * "库口下一格有预留"就返回 TPRRF_NONE ⇒ 每 37 tick 空转一次，永远出不了库
+ * （exit=12，40 条 DEPOT-EXIT-GATE 逐字同形）。
+ *
+ * 归属探针显示 nextOwner=21，但那只是 GetTrainForWholeTileReservation() 沿预留回溯
+ * 到终点格、把停在格上的等待车底当成主人；同一 tick 的 CPL-RES-OK booked=3 证明
+ * 真正的订主是本车自己。⇒ 与 exit=11 同族：**自订预留自锁**，只是锁在库口格。
+ *
+ * 因此这里只记一件事：本车刚在"当前车头格"上通过 cpl-partial-res 保留过半截路径。
+ * 下一次出库尝试遇到库口下一格被预留时，若这笔记账仍新鲜且车头没换格，就认定
+ * "库口那格是我自己的"并放行（继续走正常预留流程）。别人的预留不受影响（别人不会
+ * 写这条属于本车的记账）；车一离开原格或超时，记录自动失效，不需要跨文件清理。
+ */
+struct R3RCouplePartialReserveRecord {
+	TileIndex mf_tile; ///< 记录时本车的车头格
+	uint32_t tick;     ///< 记录时的 tick
+	bool logged;       ///< 是否已经打过放行探针
+};
+static std::unordered_map<uint32_t, R3RCouplePartialReserveRecord> _r3r_couple_partial_reserve;
+static const uint32_t R3R_COUPLE_PARTIAL_RESERVE_TICKS = 512;
+
+static void R3RMarkCouplePartialReserve(const Train *v)
+{
+	const Train *const mf = v->GetMovingFront();
+	if (mf == nullptr) return;
+	_r3r_couple_partial_reserve[v->index.base()] = R3RCouplePartialReserveRecord{ mf->tile, (uint32_t)_tick_counter, false };
+	if (_r3r_couple_partial_reserve.size() <= 1024) return;
+	for (auto it = _r3r_couple_partial_reserve.begin(); it != _r3r_couple_partial_reserve.end();) {
+		if ((uint32_t)_tick_counter - it->second.tick >= R3R_COUPLE_PARTIAL_RESERVE_TICKS) {
+			it = _r3r_couple_partial_reserve.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+static bool R3RCouplePartialReserved(const Train *v, TileIndex mf_tile, TileIndex next_tile)
+{
+	auto it = _r3r_couple_partial_reserve.find(v->index.base());
+	if (it == _r3r_couple_partial_reserve.end()) return false;
+	if ((uint32_t)_tick_counter - it->second.tick >= R3R_COUPLE_PARTIAL_RESERVE_TICKS ||
+			it->second.mf_tile != mf_tile) {
+		_r3r_couple_partial_reserve.erase(it);
+		return false;
+	}
+	if (!it->second.logged) {
+		it->second.logged = true;
+		R3RDbgWrite("DEPOT-EXIT-SELF-PARTIAL veh=%d mf=%d,%d next=%d,%d why=cpl-partial-res\n",
+				(int)v->index.base(), (int)TileX(mf_tile), (int)TileY(mf_tile),
+				(int)TileX(next_tile), (int)TileY(next_tile));
+	}
+	return true;
+}
+
+/**
+ * R3R (第 397 轮, R-397-1): 库格上的预留是不是"自己的"。
+ *
+ * 第 396 轮 R-396-1 首版把判据做成"本车在 256 tick 内曾在此库格放行过"，
+ * 种子写在 SetDepotReservation() 之后（:15518），但死锁态在 exit_blocked
+ * 处就 return 了（:15509），**放行码根本不可达** ⇒ 种子永不建立，豁免永不
+ * 触发（现场 DEPOT-SELF-RELEASE = 0，见 R3R_depot_selfrelease_round397_memo.md
+ * §三）。那是一个自我依赖的循环。
+ *
+ * 现在的判据与"是否曾经放行"解耦，只问**这个库格预留现在归谁**：
+ * GetTrainForWholeTileReservation() 的第一句就是"格上停着车即主人"，而库内
+ * 待发的整列车正压在这个库格上 ⇒ 返回本链；只有当格上没车、而走预留回溯
+ * 找到**另一列车**时才判为别人的预留（照旧阻塞）。这同时覆盖了"存档带入的
+ * 残留位"（无主 ⇒ 回溯失败 ⇒ 返回 nullptr，此时格上仍是本车，仍然豁免）。
+ *
+ * @param v 库内列车（任何一节）。
+ * @return true = 该库格预留属于本链（可以放行），false = 别人的预留。
+ */
+static bool R3RDepotSelfReleased(const Train *v)
+{
+	const Train *const head = v->First();
+	if (!IsRailDepotTile(head->tile)) return false;
+	if (!HasDepotReservation(head->tile)) return false;
+
+	/* Standing on the tile is ownership by definition; this also keeps the
+	 * answer stable for a reservation whose bookkeeping bit was carried over
+	 * in the savegame (a stray bit has no reachable booking train). */
+	const Train *const owner = GetTrainForWholeTileReservation(head->tile);
+	return owner != nullptr && owner->First() == head;
+}
+
+/**
  * Will the train stay in the depot the next tick?
  * @param v %Train to check.
  * @return True if it stays in the depot, false otherwise.
@@ -15255,6 +15393,36 @@ static bool CheckTrainStayInDepot(Train *v)
 	 * TrainLocoHandler 里被 Stopped 早退挡住，本函数根本不会跑 ⇒ "这里没有
 	 * 行"本身就说明该链走的不是这条路径。 */
 	R3RWatchOrderIndex(v, "depotstay-in");
+
+	/* R3R (第 394 轮, KI-561 只读探针): 库内列车"本 tick 拒绝放行"的出口编号。
+	 *
+	 * KI-561 现场：机车 + 车底都已完整进库、订单配对条件满足，却整列车一格都不动。
+	 * 静态代码能给出的三个嫌疑（都在这一个函数里，且都表现为"原地不动"）：
+	 *   11 = exit-blocked        -> seg_state==Full 或 HasDepotReservation()，库格上残留预留
+	 *   12 = no-path             -> TryPathReserve() 恒失败，被 MarkTrainAsStuck 钉住
+	 *    2 = no-power            -> cached_power==0 且非纯车底，被自动 Stop（与 KI-566 同源）
+	 * 三者无法从代码再收窄（取决于现场状态），故每个出口都留痕。
+	 * 同一列车同一出口只在**变化**时写一行，避免每 tick 刷屏。 */
+	static std::unordered_map<uint32_t, uint32_t> _r3r_depot_stay_tag;
+	auto r3r_depot_stay = [v](uint32_t tag, int seg = -1) -> bool {
+		if (R3RDbgOn()) {
+			/* R3R (第 397 轮, REG-397-A): exit=11 有两个 disjunct（seg_state==Full
+			 * 与库格预留），只打 resv= 分不清。把 seg 编进边沿 key 一起打出来。 */
+			const uint32_t key = tag * 16u + (uint32_t)(seg + 2);
+			uint32_t &last = _r3r_depot_stay_tag[v->index.base()];
+			if (last != key) {
+				last = key;
+				R3RDbgWrite("DEPOT-STAY veh=%d exit=%u power=%d speed=%d order=%d wait=%u resv=%d track=%d fully=%d stuck=%d seg=%d\n",
+						(int)v->index.base(), (unsigned)tag,
+						(int)v->gcache.cached_power, (int)v->cur_speed,
+						(int)v->current_order.GetType(), (unsigned)v->wait_counter,
+						IsRailDepotTile(v->tile) ? (int)HasDepotReservation(v->tile) : -1,
+						(int)v->track, (int)R3RChainFullyInDepot(v),
+						(int)v->flags.Test(VehicleRailFlag::Stuck), seg);
+			}
+		}
+		return true;
+	};
 
 	/* R3R: a GOTO_COUPLE locomotive stays inside its target depot ONLY when it
 	 * has actually reached that depot (GOTO_COUPLE has no arrival handling so
@@ -15278,7 +15446,7 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->current_order.IsType(OT_GOTO_COUPLE) && v->current_order.GetCoupleIsDepot() &&
 			IsRailDepotTile(v->tile) &&
 			v->current_order.GetDestination().ToDepotID() == GetDepotIndex(v->tile) &&
-			R3RChainFullyInDepot(v)) return true;
+			R3RChainFullyInDepot(v)) return r3r_depot_stay(1);
 
 	/* bail out if not all wagons are in the same depot or not in a depot at all */
 	for (const Train *u = v; u != nullptr; u = u->Next()) {
@@ -15292,30 +15460,30 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->gcache.cached_power == 0 && !R3RIsCarOnlyFormation(v)) {
 		v->vehstatus.Set(VehState::Stopped);
 		SetWindowDirty(WindowClass::VehicleDepot, v->tile.base());
-		return true;
+		return r3r_depot_stay(2);
 	}
 
 	if (v->current_order.IsWaitTimetabled()) {
 		v->HandleWaiting(false, true);
 	}
 	if (v->current_order.IsType(OT_WAITING)) {
-		return true;
+		return r3r_depot_stay(3);
 	}
 
 	/* R3R: a WAIT_COUPLE order parks the train in place (it declares "wait here
 	 * to be coupled"), like a normal wait order. Without this the consist would
 	 * keep creeping along (it has a minimal power to avoid the auto-stop check). */
 	if (v->current_order.IsType(OT_WAIT_COUPLE)) {
-		return true;
+		return r3r_depot_stay(4);
 	}
 
 	/* Check if we should wait here for unbunching. */
-	if (v->IsWaitingForUnbunching()) return true;
+	if (v->IsWaitingForUnbunching()) return r3r_depot_stay(5);
 
 	if (v->reverse_distance > 0) {
 		v->reverse_distance--;
 		if (v->reverse_distance == 0) SetWindowWidgetDirty(WindowClass::VehicleView, v->index, WID_VV_START_STOP);
-		return true;
+		return r3r_depot_stay(6);
 	}
 
 	SigSegState seg_state;
@@ -15324,13 +15492,33 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->force_proceed == TFP_NONE) {
 		/* force proceed was not pressed */
 		if (++v->wait_counter < 37) {
-			return true;
+			return r3r_depot_stay(7);
 		}
 
 		v->wait_counter = 0;
 
 		seg_state = _settings_game.pf.reserve_paths ? SigSegState::Path : UpdateSignalsOnSegment(v->tile, DiagDirection::Invalid, v->owner);
-		if (seg_state == SigSegState::Full || HasDepotReservation(v->tile)) {
+		/* R3R (第 397 轮, R-397-1): 库格上停着的就是本链 ⇒ 这一格的预留算"自有残留"，
+		 * 不再算障碍；别人的预留（回溯到另一列车）照旧阻塞。第一版依赖"曾经放行过"的
+		 * tick 快照，而放行码在 exit_blocked 之后不可达 ⇒ 恒不生效，见
+		 * R3RDepotSelfReleased() 的说明与 R3R_depot_selfrelease_round397_memo.md。 */
+		const bool depot_reserved = HasDepotReservation(v->tile);
+		const bool self_released = depot_reserved && R3RDepotSelfReleased(v);
+		if (self_released && R3RDbgOn()) {
+			static std::unordered_map<uint32_t, uint32_t> _r3r_self_release_logged;
+			uint32_t &last = _r3r_self_release_logged[v->index.base()];
+			if (last == 0 || (uint32_t)_tick_counter - last >= R3R_DEPOT_SELF_RELEASE_TICKS) {
+				last = (uint32_t)_tick_counter;
+				const Train *const r3r_owner = GetTrainForWholeTileReservation(v->tile);
+				R3RDbgWrite("DEPOT-SELF-RELEASE veh=%d tile=%d,%d wait=%u order=%d owner=%d booked=%d seg=%d\n",
+						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
+						(unsigned)v->wait_counter, (int)v->current_order.GetType(),
+						r3r_owner == nullptr ? -1 : (int)r3r_owner->First()->index.base(),
+						(int)_r3r_depot_self_release.count(v->First()->index.base()),
+						(int)seg_state);
+			}
+		}
+		if (seg_state == SigSegState::Full || (depot_reserved && !self_released)) {
 			/* Full and no PBS signal in block or depot reserved, can't exit. */
 			exit_blocked = true;
 		}
@@ -15340,10 +15528,10 @@ static bool CheckTrainStayInDepot(Train *v)
 
 	/* We are leaving a depot, but have to go to the exact same one; re-enter. */
 	if (v->current_order.IsType(OT_GOTO_DEPOT) && v->tile == v->dest_tile) {
-		if (exit_blocked) return true;
+		if (exit_blocked) return r3r_depot_stay(9);
 		/* Service when depot has no reservation. */
 		if (!HasDepotReservation(v->tile)) VehicleEnterDepot(v);
-		return true;
+		return r3r_depot_stay(10);
 	}
 
 	if (_settings_game.vehicle.drive_through_train_depot) {
@@ -15405,20 +15593,24 @@ static bool CheckTrainStayInDepot(Train *v)
 
 			InvalidateWindowData(WindowClass::VehicleDepot, depot_tile.base());
 			InvalidateWindowData(WindowClass::VehicleDepot, behind_depot_tile.base());
-			return true;
+			return r3r_depot_stay(8);
 		}
 	}
 
-	if (exit_blocked) return true;
+	/* R3R (第 397 轮, REG-397-A): 把 seg_state 一起打出来，才能分清 exit=11 到底是
+	 * "库外信号段占满(Full)"还是"库格预留"在拦 —— 两者的修法完全不同。 */
+	if (exit_blocked) return r3r_depot_stay(11, (int)seg_state);
 
 	/* Only leave when we can reserve a path to our destination. */
 	if (seg_state == SigSegState::Path && !TryPathReserve(v) && v->force_proceed == TFP_NONE) {
 		/* No path and no force proceed. */
 		MarkTrainAsStuck(v);
-		return true;
+		return r3r_depot_stay(12);
 	}
 
 	SetDepotReservation(v->tile, true);
+	/* R3R (U-396-1c, R-396-1): 记下「本车刚在此库格放行过」，供后续 tick / TryPathReserve 判自我预留。 */
+	R3RMarkDepotSelfRelease(v);
 	if (_settings_client.gui.show_track_reservation) MarkTileDirtyByTile(v->tile, VMDF_NOT_MAP_MODE);
 
 	VehicleServiceInDepot(v);
@@ -16025,19 +16217,49 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 					const Train *r3r_blame_owner = GetTrainForReservation(ft.new_tile, r3r_blame_track);
 					r3r_backout_ledger = (r3r_blame_owner != nullptr) ? (int)r3r_blame_owner->index.base() : -1;
 				}
-				/* R3R (第 243 轮续四十七, REG-243-S / REG-243-T): a chain can be stopped by a
-				 * bit of its own that its current path no longer uses. The booking was laid
-				 * down by an earlier path and left behind when the path was re-laid --
-				 * ExtendTrainReservation() only ever re-reserves the path it walks now, and
-				 * neither a chain edit nor a decouple walks the bits the chain abandons.
-				 * `led=` names that booker; `owner=` is only the walk's landing place and can
-				 * be another train entirely (REG-243-T = (i), KI-359). So when the blocking
-				 * bit is *ours*, drop it and retry the very same check once -- this is not a
-				 * "let the train through" rule. R3RReleaseReservationChecked() keeps a bit
-				 * that is still doing its job (a train stands on it, or the walk answered
-				 * somebody else), so only a stale booking of this very chain can go. */
+				/* R3R (第 406 轮, REG-405-A): the rendezvous exemption, driving side.
+				 *
+				 * A parked waiting consist books the *whole* station/waypoint tile it
+				 * stands on (SetRailStationReservation = one bit for the tile, see the
+				 * waiting-consist reservation rules). The pathfinder already treats that
+				 * booking as air for the paired locomotive (pbs.cpp's
+				 * R3RReservationHeldByCouplePartner / RESV-PAIR-AIR, 第 345 轮), but this
+				 * pre-check runs *before* any booking is attempted and knows nothing about
+				 * it: the platform is a possible target, HasReservedTracks() is true, and
+				 * the whole trial extension is rolled back -- including the bits laid down
+				 * before it (248,128 / 248,129 in the 405 log). The locomotive then stands
+				 * still for ever and re-lays the same trial on every tick (spd=2).
+				 *
+				 * Deliberately narrow, mirroring that helper:
+				 *  - the step lands on a station/waypoint tile (the whole-tile cases);
+				 *  - the order is still GOTO_COUPLE;
+				 *  - a live two-sided pair lock exists (R3RGetCouplePairPartner);
+				 *  - the whole-tile owner *is* that partner's chain.
+				 * Nothing is released and nothing is booked here: the partner's own
+				 * booking simply stops being a wall, and the rest of the path is handed to
+				 * the pathfinder exactly like the STALE-OWN-BIT case below. A train that is
+				 * not coupled, or a platform held by anybody else, still backs out. */
 				const uint32_t r3r_own_key = R3RResvActorID(v).base();
-				if (r3r_blame_track != INVALID_TRACK && r3r_backout_ledger == (int)r3r_own_key &&
+				const Train *r3r_goal_pair = nullptr;
+				if (ft.is_station && v->current_order.IsType(OT_GOTO_COUPLE)) {
+					const Train *const r3r_locked = R3RGetCouplePairPartner(v);
+					if (r3r_locked != nullptr && r3r_whole_owner != nullptr &&
+							r3r_whole_owner->First() == r3r_locked) {
+						r3r_goal_pair = r3r_locked;
+					}
+				}
+				if (r3r_goal_pair != nullptr) {
+					if (R3RDbgEdge(R3REDGE_EXTGOALEXEMPT,
+							((uint64_t)r3r_own_key << 32) | (uint64_t)ft.new_tile.base(),
+							(uint64_t)r3r_goal_pair->index.base())) {
+						R3RDbgWrite("EXTEND-GOAL-EXEMPT veh=%u tile=%d,%d pair=%u whole=%d track=%d need=0x%X resv=0x%X\n",
+								(uint)r3r_own_key, (int)TileX(ft.new_tile), (int)TileY(ft.new_tile),
+								(uint)r3r_goal_pair->index.base(), r3r_backout_owner_whole ? 1 : 0,
+								r3r_backout_owner_track, r3r_backout_need_bits, r3r_backout_resv_bits);
+					}
+					/* The tile is our pair partner's own platform: treat it as an ordinary
+					 * choice and let the pathfinder lay down the rest of the path. */
+				} else if (r3r_blame_track != INVALID_TRACK && r3r_backout_ledger == (int)r3r_own_key &&
 						R3RReleaseReservationChecked(r3r_own_key, ft.new_tile, r3r_blame_track, "stale-own-bit") &&
 						!HasReservedTracks(ft.new_tile, TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td)))) {
 					R3RDbgWrite("STALE-OWN-BIT veh=%u tile=%d,%d track=%d led=%d cleared=1\n",
@@ -17866,8 +18088,13 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				if (consist->lookahead != nullptr && consist->lookahead->reservation_end_position < 8) {
 					consist->lookahead.reset();
 				}
-			}
-			return r3r_chosen_ret(best_track, result_flags, "cpl-partial-res");
+				}
+				/* R3R (第 399 轮, R-399-1'): 这笔"半截预留"是本次为挂车保留的，下一 tick 从库里
+				* 重新订出库路径时它会挡住 :18936 的库口闸门（DEPOT-EXIT-GATE 的 nextOwner=21 是
+				* 回溯撞上等待车底造成的误判，CPL-RES-OK booked=3 才是真正的订主=本车）。记一笔，
+				* 让下一次出库尝试认得出"库口那格是我自己的"。 */
+				R3RMarkCouplePartialReserve(consist);
+				return r3r_chosen_ret(best_track, result_flags, "cpl-partial-res");
 		}
 		if (mark_stuck) MarkTrainAsStuck(consist);
 		FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
@@ -18138,6 +18365,50 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
  * @param reason  Receives a static reason string when true is returned.
  * @return True if the booking must be refused.
  */
+/**
+ * R3R (D-1g, 第 393 轮): 本库的“库内挂接块”会不会接管这条机车？
+ *
+ * CheckTrainStayInDepot() 的库内挂接块（`:22375` 起）是**唯一**把“已配对”的两条链
+ * 在库内吸附到一起的地方，所以它也是库内路线预留闸门（见 R3RIsParkedWaiting() 的
+ * `depot-paired` 支）**唯一**的正当理由：只有“本库马上要吸附”时，才允许把这条车的
+ * 路线关死。
+ *
+ * 历史教训（KI-561 现场 `build\R3R_debug.log:11741-11743`）：旧闸门只判
+ * `r3r_in_depot && r3r_partner != nullptr`，不看订单的挂接目的地
+ * ⇒ veh=51 在库 3（`62,117`）持 GOTO_COUPLE(车站 9) 的订单、配对目标是 18 格外的
+ * `44,116` 上的等待车底 veh=6，闸门每 tick 打 `RESV-NOBOOK reason=depot-paired`，
+ * 而出库口 `:18439` 是库内列车订路的**唯一**入口 ⇒ 永久卡库。
+ *
+ * 判据与库内挂接块**逐字同源**（两边都调本函数），避免“两本账”再次分叉。
+ *
+ * @param consist 库内的链头（调用方已保证 `IsRailDepotTile(consist->tile)`）。
+ * @return True 表示库内挂接块会接管这条车。
+ */
+static bool R3RDepotCoupleAppliesToThisDepot(const Train *consist)
+{
+	if (!IsRailDepotTile(consist->tile)) return false;
+	const DepotID this_depot = GetDepotIndex(consist->tile);
+
+	/* 支一（库内挂接块的 `couple_targets_this_depot`）：正在执行、且目的地就是本库的
+	 * 挂接命令。 */
+	if (consist->current_order.IsType(OT_GOTO_COUPLE) &&
+			consist->current_order.GetCoupleIsDepot() &&
+			consist->current_order.GetDestination().ToDepotID() == this_depot) {
+		return true;
+	}
+
+	/* 支二（库内挂接块的 `r3r_pending_depot_couple`）：被 R3R 自己的库内工具停放
+	 * （`r3r_parked`，R3RStopChainInDepot 置位）的机车从未跑过 ProcessOrders，当前
+	 * 命令仍是 OT_NOTHING，真正的挂接命令停在**有效表**里待落地（KI-182）。
+	 * 必须按有效表读——`current_order` 在这一支上恒为 OT_NOTHING。 */
+	if (!consist->IsEngine() || !consist->r3r_parked) return false;
+	const Order *pending = (consist->GetEffectiveOrders() != nullptr) ?
+			consist->GetOrder(consist->cur_real_order_index) : nullptr;
+	return pending != nullptr && pending->IsType(OT_GOTO_COUPLE) &&
+			pending->GetCoupleIsDepot() &&
+			pending->GetDestination().ToDepotID() == this_depot;
+}
+
 static bool R3RIsParkedWaiting(Train *consist, const char **reason)
 {
 	/* R3R (2026-10-26, 玩家硬要求「第 5 步：必须先有配对再起动」): 没有配对锁的
@@ -18248,8 +18519,21 @@ static bool R3RIsParkedWaiting(Train *consist, const char **reason)
 	 *
 	 * 旧版把整个库格豁免（`!IsRailDepotTile`）正是漏这条的原因：豁免本意是"库内
 	 * 还没配对的车别被提前停死"，一旦配对已落定，库内就不再需要任何路线预留。
-	 * 库内未配对的车仍走上面的 `parked-no-pair` 之外的旧逻辑（豁免保留），逐字不变。 */
-	if (r3r_goto_couple && r3r_in_depot && r3r_partner != nullptr) {
+	 * 库内未配对的车仍走上面的 `parked-no-pair` 之外的旧逻辑（豁免保留），逐字不变。
+	 *
+	 * R3R (D-1g, 第 393 轮, KI-561): 「配对已落定 ⇒ 库内马上吸附」这个前提**只在
+	 * 对端也在本库时才成立**。上面那段(第 306 轮)的现场是 P2 = COUPLE-DEPOT-DIRECT
+	 * （挂接目的地 = 本库）。但机车完全可能带着「库内整备 → 去车站/去别的库挂车」的
+	 * 订单停在自家库里：`build\R3R_debug.log:11738` 的 veh=51 就是
+	 * `DEPOT-ARR tile=62,117 dest=44,113 destDepot=0`（库 3 → 车站 9），配对目标是
+	 * 18 格外 `44,116`（`track=0x1` 普通轨道）上等挂的 veh=6。
+	 * 旧判据在这种情况下照样把出库路线关死，而出库口 `:18439` 是库内列车订路的
+	 * **唯一**入口 ⇒ 永久 `RESV-NOBOOK reason=depot-paired`（日志末行仍在打）。
+	 *
+	 * 因此追加 `R3RDepotCoupleAppliesToThisDepot()`：**与库内挂接块逐字同源的判据**。
+	 * 库内挂接块不接管 ⇒ 这条车必须开出去 ⇒ 本门不拦。 */
+	if (r3r_goto_couple && r3r_in_depot && r3r_partner != nullptr &&
+			R3RDepotCoupleAppliesToThisDepot(consist)) {
 		*reason = "depot-paired";
 		return true;
 	}
@@ -18713,13 +18997,43 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	 * at the depot tile itself but starts from the next tile. If we are still
 	 * inside the depot, a depot reservation can never be ours. */
 	if (moving_front->track == TRACK_BIT_DEPOT) {
-		if (HasDepotReservation(moving_front->tile)) {
+		/* R3R (U-396-1c, R-396-1): 自己刚放行时订下的库格预留不算障碍，否则即使闯过
+		 * CheckTrainStayInDepot() 的 exit=11，这里也会 MarkTrainAsStuck 成 exit=12。 */
+		/* R3R (第 398 轮, REG-398-A): 出库闸门总读数。
+		 *
+		 * 卡死态（exit=12 每 37 tick 一次、TPR-EXIT/TPR-WALK 全静默）证明 NONE 来自
+		 * :18974 之前，而本段只有两个出口：库格预留与库口下一格被预留。后者从来
+		 * 没有探针，是唯一的盲点 —— 它连 MarkTrainAsStuck 都不做，车却必须等满 37
+		 * tick 重试。把两者连同"预留归谁"一次打全（纯读，行为零改动）。 */
+		const bool r3r_depot_resv = HasDepotReservation(moving_front->tile);
+		const bool r3r_self_rel = r3r_depot_resv && R3RDepotSelfReleased(consist);
+		const DiagDirection r3r_depot_dir = GetRailDepotDirection(moving_front->tile);
+		const TileIndex r3r_next_tile = TileAddByDiagDir(moving_front->tile, r3r_depot_dir);
+		const bool r3r_next_resv = HasReservedTracks(r3r_next_tile, DiagdirReachesTracks(r3r_depot_dir));
+		if (R3RDbgOn() && (r3r_depot_resv || r3r_next_resv)) {
+			const Train *const r3r_next_owner = r3r_next_resv ? GetTrainForWholeTileReservation(r3r_next_tile) : nullptr;
+			const Train *const r3r_mf_owner = r3r_depot_resv ? GetTrainForWholeTileReservation(moving_front->tile) : nullptr;
+			R3RDbgWrite("DEPOT-EXIT-GATE veh=%d tick=%u mf=%d,%d next=%d,%d dir=%d depotResv=%d selfRel=%d mfOwner=%d nextResv=%d nextOwner=%d nextMf=%d,%d stuck=%d\n",
+					(int)consist->index.base(), (uint)_tick_counter,
+					(int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
+					(int)TileX(r3r_next_tile), (int)TileY(r3r_next_tile), (int)r3r_depot_dir,
+					(int)r3r_depot_resv, (int)r3r_self_rel,
+					r3r_mf_owner == nullptr ? -1 : (int)r3r_mf_owner->First()->index.base(),
+					(int)r3r_next_resv,
+					r3r_next_owner == nullptr ? -1 : (int)r3r_next_owner->First()->index.base(),
+					r3r_next_owner == nullptr ? -1 : (int)TileX(r3r_next_owner->tile),
+					r3r_next_owner == nullptr ? -1 : (int)TileY(r3r_next_owner->tile),
+					(int)consist->flags.Test(VehicleRailFlag::Stuck));
+		}
+		if (r3r_depot_resv && !r3r_self_rel) {
 			if (mark_as_stuck) MarkTrainAsStuck(consist);
 			return TPRRF_NONE;
-		} else {
-			/* Depot not reserved, but the next tile might be. */
-			TileIndex next_tile = TileAddByDiagDir(moving_front->tile, GetRailDepotDirection(moving_front->tile));
-			if (HasReservedTracks(next_tile, DiagdirReachesTracks(GetRailDepotDirection(moving_front->tile)))) return TPRRF_NONE;
+		} else if (r3r_next_resv && !R3RCouplePartialReserved(consist, moving_front->tile, r3r_next_tile)) {
+			/* Depot not reserved, but the next tile might be.
+			 * R3R (第 399 轮, R-399-1'): 只有当库口下一格的预留不属于本车时才拒绝。
+			 * 本车刚通过 cpl-partial-res 保留过半截路径的情形见记账函数注释 ——
+			 * 那笔预留正是出库要用的路径，拦下来就是自订预留自锁（exit=12）。 */
+			return TPRRF_NONE;
 		}
 	}
 
@@ -19100,18 +19414,35 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		const uint r3r_re_bits = IsValidTile(r3r_re_tile) ? (uint)GetTileTrackdirBits(r3r_re_tile, TRANSPORT_RAIL, 0) : 0u;
 		const TrackBits r3r_re_tb = TrackdirBitsToTrackBits((TrackdirBits)(r3r_re_bits & 0xFFFF));
 		const int r3r_re_junc = (KillFirstBit(r3r_re_tb) != TRACK_BIT_NONE) ? 1 : 0;
+		/* R3R（第 404 轮, REG-403-A/B）：把"预留终点在行进方向的前方还是后方"打出来。
+		 * `db=1` 的链是按 `GetMovingDirection()`（`direction` 的反向）行进的，若终点落在
+		 * 反方向，`j` 只会把车推离终点 —— 现场 `:1767 LOCO-MOVE ... j=256 spd=2 db=1`
+		 * 而 `tile` 恒 248,127、`x=15`（已顶格末），正是这一形态。
+		 * `fwd` = 沿行进方向的格数点积（正=在前方），`ahead` 是其符号（-9=无终点）。
+		 * 同时带出本次预留的结果位 `res` 与前进距离 `adv`，用于区分
+		 * "没订上"(res 无 OK) / "订上了但推不过去"(res 有 OK 且 ahead=+1)。
+		 * 纯读，零行为改动。 */
+		const Direction r3r_re_dir = consist->GetMovingDirection();
+		const TileIndexDiffC r3r_re_offs = TileIndexDiffCByDir(r3r_re_dir);
+		const int r3r_re_fwd = IsValidTile(r3r_re_tile)
+				? (((int)TileX(r3r_re_tile) - (int)TileX(consist->tile)) * (int)r3r_re_offs.x
+					+ ((int)TileY(r3r_re_tile) - (int)TileY(consist->tile)) * (int)r3r_re_offs.y)
+				: 0;
+		const int r3r_re_ahead = !IsValidTile(r3r_re_tile) ? -9 : (r3r_re_fwd > 0 ? 1 : (r3r_re_fwd < 0 ? -1 : 0));
 		const uint64_t r3r_re_pay = (uint64_t)r3r_re_tile.base() | ((uint64_t)(uint16_t)r3r_re_td << 24);
 		const uint64_t r3r_re_key = R3RDbgTagHash("RESV-END") | ((uint64_t)consist->index.base() << 32);
 		if (R3RDbgEdge(R3REDGE_RESVPROBE, r3r_re_key, r3r_re_pay)) {
 			FILE *const r3r_re = R3RFopenDbg("a");
 			if (r3r_re != nullptr) {
-				fprintf(r3r_re, "RESV-END veh=%d tick=%u from=%d,%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X junction=%d real=%d spd=%d\n",
+				fprintf(r3r_re, "RESV-END veh=%d tick=%u from=%d,%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X junction=%d real=%d spd=%d movdir=%d dir=%d ahead=%d fwd=%d res=%d adv=%d\n",
 						(int)consist->index.base(), (uint)_tick_counter,
 						(int)TileX(consist->tile), (int)TileY(consist->tile),
 						IsValidTile(r3r_re_tile) ? (int)TileX(r3r_re_tile) : -1,
 						IsValidTile(r3r_re_tile) ? (int)TileY(r3r_re_tile) : -1,
 						(int)r3r_re_td, r3r_re_pos, r3r_re_cur, r3r_re_bits, r3r_re_junc,
-						(int)consist->cur_real_order_index, (int)consist->cur_speed);
+						(int)consist->cur_real_order_index, (int)consist->cur_speed,
+						(int)r3r_re_dir, (int)consist->direction, r3r_re_ahead, r3r_re_fwd,
+						(int)(uint8_t)result_flags, (int)consist->GetMovingFront()->GetAdvanceDistance());
 				fclose(r3r_re);
 			}
 		}
@@ -22382,12 +22713,13 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * tick because the depot-internal couple scan only checks the depot tile and
 		 * the tile in front of the door, while the waiting consist sat elsewhere.
 		 * The destination check mirrors CheckTrainStayInDepot (IsRailDepotTile +
-		 * GetDepotIndex). */
-		const bool couple_targets_this_depot = r3r_pending_depot_couple ||
-				(consist->current_order.IsType(OT_GOTO_COUPLE) &&
-				consist->current_order.GetCoupleIsDepot() &&
-				IsRailDepotTile(consist->tile) &&
-				consist->current_order.GetDestination().ToDepotID() == GetDepotIndex(consist->tile));
+		 * GetDepotIndex).
+		 *
+		 * R3R (D-1g, 第 393 轮): the predicate now lives in
+		 * R3RDepotCoupleAppliesToThisDepot() because the depot exit reservation gate
+		 * (R3RIsParkedWaiting(), `depot-paired`) must use EXACTLY this condition --
+		 * "do not book a route" is only justified when this block will take over. */
+		const bool couple_targets_this_depot = R3RDepotCoupleAppliesToThisDepot(consist);
 		if (couple_targets_this_depot) {
 			/* R3R: a locomotive that was parked in its target depot (R3R's own
 			 * depot tools call R3RStopChainInDepot) never ran ProcessOrders, so it
@@ -23209,7 +23541,18 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					const int r3r_la_end = (r3r_la != nullptr) ? (int)r3r_la->reservation_end_position : -1;
 					const int r3r_la_cur = (r3r_la != nullptr) ? (int)r3r_la->current_position : -1;
 					const uint r3r_la_bits = IsValidTile(r3r_la_tile) ? (uint)GetTileTrackdirBits(r3r_la_tile, TRANSPORT_RAIL, 0) : 0u;
-					fprintf(r3r_dbg, "LOCO-MOVE veh=%d tick=%u tile=%d,%d j=%d spd=%d track=%02X dir=%d db=%d stuck=%d dtile=%u look=%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X\n",
+					/* R3R（第 404 轮, REG-403-A/B）：与 RESV-END 同口径补"终点在行进方向的哪一侧"。
+					 * 现场 `:1767` 这一行是 `tile=248,127 j=256 spd=2 db=1 curPos=0` 且此后
+					 * 不再出现（payload 只用 tile 去重），无法判断是"方向反"还是"物理顶住"。
+					 * `xp/yp` 是像素坐标（x=15 即已顶到格末），`adv` 是 AdvanceDistance。纯读。 */
+					const Direction r3r_la_dir = consist->GetMovingDirection();
+					const TileIndexDiffC r3r_la_offs = TileIndexDiffCByDir(r3r_la_dir);
+					const int r3r_la_fwd = IsValidTile(r3r_la_tile)
+							? (((int)TileX(r3r_la_tile) - (int)TileX(consist->tile)) * (int)r3r_la_offs.x
+								+ ((int)TileY(r3r_la_tile) - (int)TileY(consist->tile)) * (int)r3r_la_offs.y)
+							: 0;
+					const int r3r_la_ahead = !IsValidTile(r3r_la_tile) ? -9 : (r3r_la_fwd > 0 ? 1 : (r3r_la_fwd < 0 ? -1 : 0));
+					fprintf(r3r_dbg, "LOCO-MOVE veh=%d tick=%u tile=%d,%d j=%d spd=%d track=%02X dir=%d db=%d stuck=%d dtile=%u look=%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X movdir=%d ahead=%d fwd=%d xp=%d yp=%d adv=%d\n",
 							(int)consist->index.base(), (uint)_tick_counter, (int)TileX(consist->tile), (int)TileY(consist->tile),
 							j, (int)consist->cur_speed, (unsigned)consist->track,
 							(int)consist->direction, (int)(consist->IsDrivingBackwards() ? 1 : 0),
@@ -23218,8 +23561,66 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 							(r3r_la != nullptr) ? 1 : 0,
 							IsValidTile(r3r_la_tile) ? (int)TileX(r3r_la_tile) : -1,
 							IsValidTile(r3r_la_tile) ? (int)TileY(r3r_la_tile) : -1,
-							r3r_la_td, r3r_la_end, r3r_la_cur, r3r_la_bits);
+							r3r_la_td, r3r_la_end, r3r_la_cur, r3r_la_bits,
+							(int)r3r_la_dir, r3r_la_ahead, r3r_la_fwd,
+							(int)consist->x_pos, (int)consist->y_pos,
+							(int)consist->GetAdvanceDistance());
 					fclose(r3r_dbg);
+				}
+			}
+			/* R3R（第 404 轮, REG-403-B）：车自己"下一格"的真实状态。
+			 *
+			 * 现场（第 403 轮复测）：`TRP veh=0 ... => ok=1 res=1`（自身预留报成功）
+			 * 与 `curPos=0`、`tile` 恒 248,127 并存。两种解释无法用现有日志区分：
+			 *   (a) 方向反 —— 车朝远离终点的方向推（见 LOCO-MOVE 的 ahead=）；
+			 *   (b) 前方格进不去 —— 248,130/131/132 只被 `RESV-PAIR-AIR` 放行过
+			 *       （返回 true **不写地图位**），车自身寻路看的是"实际位"。
+			 * 本行直接给出车头所指下一格的原始事实：格类型、是否站台、站台整格位、
+			 * plain rail 的轨道位/预留位、以及整格位的归属车。判读方法：
+			 *   stn=1 且 stnRes=1 且 wholeOwner≠本车 ⇒ 自身被"自己人的整格位"挡住（b）；
+			 *   plain=1 且 bits 不含车头 trackdir 的去路 ⇒ 道岔方向不通（另一类 (b)）。
+			 * 每 32 tick 一行、仅 GOTO_COUPLE 车，纯读，零行为改动。 */
+			if (((_tick_counter + consist->index.base()) % 32) == 0) {
+				/* R3R (KI-108 家族, 必须先于 TrackdirToExitdir())：损毁中的车辆
+				 * GetVehicleTrackdir() 返回 INVALID_TRACKDIR，而 TrackdirToExitdir()
+				 * 对它断言（track_func.h:396）。本文件 :2819 与 :5639 已是同族防护
+				 * 口径，探针照抄：拿不到有效 trackdir 就一个铁路格查询都不做。 */
+				const Trackdir r3r_nb_td = moving_front->GetVehicleTrackdir();
+				const bool r3r_nb_td_ok = (r3r_nb_td != INVALID_TRACKDIR);
+				const DiagDirection r3r_nb_exit = r3r_nb_td_ok ? TrackdirToExitdir(r3r_nb_td) : DiagDirection::Invalid;
+				const TileIndex r3r_nb_to = r3r_nb_td_ok ? TileAdd(moving_front->tile, TileOffsByDiagDir(r3r_nb_exit)) : INVALID_TILE;
+				const bool r3r_nb_ok = r3r_nb_td_ok && IsValidTile(r3r_nb_to);
+				/* "下一格"只在隧道/桥梁口才有意义：车在洞内时 tile 是洞口，外推一格是洞外。
+				 * 打出 worm= 让读日志的人自己判断该行的语义，探针不替玩家下结论。 */
+				const bool r3r_nb_worm = (moving_front->track & TRACK_BIT_WORMHOLE) != TRACK_BIT_NONE;
+				const TileType r3r_nb_type = r3r_nb_ok ? GetTileType(r3r_nb_to) : TileType::Void;
+				/* 整格预留只可能出现在这四种格上（GetReservedTrackbits 的 switch
+				 * 分支，pbs.cpp:341 其余类型恒 TRACK_BIT_NONE）。收窄到它们既省一次
+				 * 哈希查询，也保证 GetTrainForWholeTileReservation() 只在有意义的格
+				 * 上被调用（该函数对任意格也安全，这里只是保守）。 */
+				const bool r3r_nb_rail = r3r_nb_ok &&
+						(r3r_nb_type == TileType::Railway || r3r_nb_type == TileType::Road ||
+						 r3r_nb_type == TileType::Station || r3r_nb_type == TileType::TunnelBridge);
+				const bool r3r_nb_stn = r3r_nb_ok && IsRailStationTile(r3r_nb_to);
+				const bool r3r_nb_stn_res = r3r_nb_stn && HasStationReservation(r3r_nb_to);
+				const bool r3r_nb_plain = r3r_nb_ok && IsPlainRailTile(r3r_nb_to);
+				const uint r3r_nb_bits = r3r_nb_plain ? (uint)GetTrackBits(r3r_nb_to) : 0u;
+				const uint r3r_nb_resv = r3r_nb_plain ? (uint)GetRailReservationTrackBits(r3r_nb_to) : 0u;
+				const Train *const r3r_nb_own = r3r_nb_rail ? GetTrainForWholeTileReservation(r3r_nb_to) : nullptr;
+				FILE *const r3r_nb = R3RFopenDbg("a");
+				if (r3r_nb != nullptr) {
+					fprintf(r3r_nb, "CPL-NEXT veh=%d tick=%u mf=%d,%d td=%d tdOk=%d exit=%d worm=%d to=%d,%d toType=%d rail=%d stn=%d stnRes=%d plain=%d bits=%04X resv=%04X wholeOwner=%d spd=%d xp=%d\n",
+							(int)consist->index.base(), (uint)_tick_counter,
+							(int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
+							(int)r3r_nb_td, (int)r3r_nb_td_ok, (int)r3r_nb_exit, (int)r3r_nb_worm,
+							r3r_nb_ok ? (int)TileX(r3r_nb_to) : -1,
+							r3r_nb_ok ? (int)TileY(r3r_nb_to) : -1,
+							r3r_nb_ok ? (int)r3r_nb_type : -1,
+							(int)r3r_nb_rail, (int)r3r_nb_stn, (int)r3r_nb_stn_res, (int)r3r_nb_plain,
+							r3r_nb_bits, r3r_nb_resv,
+							(r3r_nb_own != nullptr) ? (int)r3r_nb_own->index.base() : -1,
+							(int)consist->cur_speed, (int)consist->x_pos);
+					fclose(r3r_nb);
 				}
 			}
 		}

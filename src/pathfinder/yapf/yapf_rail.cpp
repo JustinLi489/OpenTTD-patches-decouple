@@ -238,7 +238,20 @@ private:
 			}
 			check_train_on_tile(tile);
 			note_tile_head(tile);
-			if (n_tile_heads >= 2 && tile_heads_have_target) {
+			/* KI-562（玩家拍板 C-562-D，2026-11-06）：**数到发线上的链头数，只有
+			 * 一个链头时才放行，多链头一律算卡住**。
+			 *
+			 * 旧判据（REG-359-I）是 `n_tile_heads >= 2 && tile_heads_have_target`
+			 * ⇒ return true：多链头格"暂存"（视为可通行、但不当终点），指望下一
+			 * tick 重入时另一台车已开走。KI-562 的现场恰恰相反 —— 解挂留下的前链
+			 * 未脱离、永远停在同一格（它自己也卡着），暂存于是变成**永久放行**：
+			 * 寻路把该格当可通行、把后链当终点，命中最小的那条链或直接拼上去，
+			 * 两列车体坐标重合。
+			 *
+			 * 按玩家口径收口：判不了就不放行。多链头 ⇒ 本格不是安全位置 ⇒ 挂接
+			 * 寻路摸不到终点 ⇒ 机车原地不动（玩家说的"算卡住"），等前链脱离、
+			 * 该到发线只剩一个链头时判据自然恢复。 */
+			if (n_tile_heads >= 2) {
 				/* 按"格 + 最小两个车号"变化各打一行，避免每 tick 刷屏。 */
 				static uint32_t last_key = 0xFFFFFFFF;
 				uint32_t key = (tile.base() << 8) ^ (tile_heads[0]->index.base() << 4) ^ tile_heads[1]->index.base();
@@ -246,13 +259,14 @@ private:
 					last_key = key;
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d skip=multihead n=%u h=%d,%d\n",
+						fprintf(dbg, "FSCP tile=%d,%d skip=multihead-blocked n=%u h=%d,%d hasT=%d\n",
 								(int)TileX(tile), (int)TileY(tile), (uint)n_tile_heads,
-								(int)tile_heads[0]->index.base(), (int)tile_heads[1]->index.base());
+								(int)tile_heads[0]->index.base(), (int)tile_heads[1]->index.base(),
+								(int)tile_heads_have_target);
 						fclose(dbg);
 					}
 				}
-				return true;
+				return false;
 			}
 			if (best != nullptr) {
 				/* R3R: the tile may be occupied by the pathfinding locomotive's
@@ -364,12 +378,17 @@ private:
 				if (self_held) R3RNoteSelfLock(tile, coupler->index);
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
+					/* R3R (第 401 轮, KI-570): tile 来源不受控（可能是站台/车库格），
+					 * IsPlainRail()/GetTrackBits()/GetReservedTrackbits() 都会先在
+					 * rail_map.h:40 的 IsTileType(Railway) 前置断言上炸（同族 KI-207c
+					 * 附记 7b），必须先短路 tile 类型再谈 plain。 */
+					const bool plain = IsTileType(tile, TileType::Railway) && IsPlainRail(tile);
 					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d want=%d type=%d tbits=0x%X res=0x%X plain=%d depot=%d st=%d self=%d\n",
 						(int)TileX(tile), (int)TileY(tile), (int)td, (int)TrackdirToTrack(td),
-						(int)GetTileType(tile), (unsigned)GetTrackBits(tile), (unsigned)GetReservedTrackbits(tile),
-						(int)IsPlainRail(tile), (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile),
+						(int)GetTileType(tile), plain ? (unsigned)GetTrackBits(tile) : 0u, plain ? (unsigned)GetReservedTrackbits(tile) : 0u,
+						(int)plain, (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile),
 						(int)self_held);
-					const uint8_t rb = (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK);
+					const uint8_t rb = plain ? (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK) : (uint8_t)0;
 					for (Track tk = TRACK_BEGIN; tk != TRACK_END; tk++) {
 						if (!HasBit(rb, tk)) continue;
 						Train *owner = GetTrainForReservation(tile, tk);
@@ -508,14 +527,25 @@ private:
 	 * @param dir The direction to reserve further tiles in.
 	 * @return \c true iff reservation succeeded.
 	 */
-	bool ReserveRailStationPlatform(TileIndex &tile, DiagDirection dir)
+	bool ReserveRailStationPlatform(TileIndex &tile, DiagDirection dir, Trackdir td)
 	{
 		TileIndex     start = tile;
 		TileIndexDiff diff = TileOffsByDiagDir(dir);
 
 		do {
-			if (HasStationReservation(tile)) return false;
-			SetRailStationReservation(tile, true);
+			/* R3R (第 402 轮, KI-571): 原来这里是硬判 `HasStationReservation(tile)`
+			 * ⇒ 只要整格位被任何人占着就整段失败。而 `TryReserveRailTrack()` 的
+			 * Station 分支早已有 RESV-PAIR-AIR / RESV-SELF-AIR 语义（第 345/368 轮）：
+			 * 归**配对伙伴**或**自己**的整格位是"空气"——不写、不失败。
+			 *
+			 * 站台段正是挂接的终点段，目标车底自己占着平台末端完全正常（物理事实）：
+			 * 现场 booked=2/3、`tile=248,133 owner=5 selfheld=0`，而 veh=5 就是配对
+			 * 目标链的一员 —— 硬判让整段平台一格都订不上，机车再也进不了站台。
+			 * 改走同一个入口后：空格照旧订上；伙伴/自己的位当空气继续推进
+			 * （于是 130/131/132 这些**没被车底压住**的格能被订到，机车才能开进去
+			 * 贴住车底）；别人的位仍然失败，不越权。
+			 * trigger_stations=false：随机化仍在末尾统一触发一次，与改动前一致。 */
+			if (!TryReserveRailTrack(tile, TrackdirToTrack(td), false)) return false;
 			MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 			tile = TileAdd(tile, diff);
 		} while (IsCompatibleTrainStationTile(tile, start) && tile != this->origin_tile);
@@ -536,7 +566,7 @@ private:
 	bool ReserveSingleTrack(TileIndex tile, Trackdir td)
 	{
 		if (IsRailStationTile(tile)) {
-			if (!ReserveRailStationPlatform(tile, TrackdirToExitdir(ReverseTrackdir(td)))) {
+			if (!ReserveRailStationPlatform(tile, TrackdirToExitdir(ReverseTrackdir(td)), td)) {
 				/* Platform could not be reserved, undo. */
 				this->res_fail_tile = tile;
 				this->res_fail_td = td;
@@ -592,11 +622,19 @@ public:
 	 *
 	 * 与 TryReservePath 的区别：后者按 YAPF 节点链订，而节点 segment 是跨站台
 	 * 合并的，按它订会把车底整段一起订进去；本函数只订摸路(rp)实际走过的那几格，
-	 * 止于会合点。失败时回滚本次已订的格，由调用方如实返回失败。
+	 * 止于会合点。
+	 *
+	 * KI-563（2026-11-06）：预留粒度按原生 PBS —— 遇到第一个订不上的格（信号 /
+	 * 他人预留）就停，已订上的格**保留**，下一个 tick 由 TryReservePath 重新摸路
+	 * 续订。只有一格都订不上才返回失败。
+	 *
+	 * KI-563 修法 D（2026-11-07，第 395 轮）：截断判据由「第一个信号格」改为
+	 * 「第一个安全停车位」（IsSafeWaitingPosition），与原生 PBS / 驾驶预留
+	 * （ExtendTrainReservation）用同一把尺子。
 	 *
 	 * @param steps 摸路产出的 (格, 轨) 序列。
 	 * @param booked 出参：已成功预订的格数。
-	 * @return 全部成功为 true。
+	 * @return booked > 0 为 true（可能是部分预留）。
 	 */
 	bool R3RReservePathSequence(const std::vector<std::pair<TileIndex, Trackdir>> &steps, size_t &booked)
 	{
@@ -611,6 +649,41 @@ public:
 		 *   selfheld       —— 归属者与询路车同链(自锁)；0 表示第三方
 		 *   type/plain/st/depot —— 格型，区分"站台整格位冲突"与"普通轨位冲突"
 		 * 本探针不改控制流: 失败仍然整批回滚。 */
+		bool stopped_at_safe = false;
+		Train *const r3r_coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
+		const bool r3r_forbid_90deg = _settings_game.pf.forbid_90_deg;
+		/* R3R (第 399 轮, REG-399-C 收口): 终点例外 —— 先找出**最后一个**安全位。
+		 *
+		 * 原生 PBS 的预留终止于「第一个安全停车位」，这把尺子对**路径中段**
+		 * 完全正确：列车在那里停下等下一个安全位空出来，下一 tick 从车头位置
+		 * 重算再往前顶一格（ExtendTrainReservation 每 tick 都重算）。
+		 *
+		 * 但**终点段**不成立。挂接的会合点常常就在线路末端（现场 248,133，
+		 * 248,134 已无铁轨），而 248,127 那个信号格是路径上最后一个安全位。
+		 * 按原生口径预留止于 248,127 ⇒ 248,128~248,133 六格无人订 ⇒ 机车最多
+		 * 开到 248,128 就再没有已订的格可进 ⇒ TrainController 无路 ⇒ 停住 ⇒
+		 * 下一次 TryReservePath 的起点仍是 248,128 ⇒ **自锁**，挂接永远不成立。
+		 * 这里没有"下一 tick 自己长出来"的可能：续订的驱动是机车往前开，而
+		 * 往前开的前提是前面已经订好。
+		 *
+		 * 口径：若安全位就是**最后一个**安全位（它之后直到会合点再无安全位），
+		 * 则不在它截断，继续订满到会合点。会合点不需要满足"安全停车位"——列车
+		 * 到达即结束，不在那里等待让行。路径中段有多个安全位时仍按第一个截断，
+		 * 不会因为本例外多占别人的轨道。 */
+		size_t r3r_last_safe = steps.size();
+		for (size_t k = steps.size(); k-- > 0; ) {
+			/* R3R (第 400 轮, KI-569): 站台跳格补压的 tg 落在平台末端，而
+			 * IsSafeWaitingPosition() 对"跟随失败"（含尽头站台的最后一格）按
+			 * include_line_end 判安全。若把它算进"最后一个安全位"，就会把真正的
+			 * 等待位（平台前那一格）退化成中段截断点 ⇒ 平台段又订不上。站台格
+			 * 只可能出现在终点段，故本扫描直接跳过。 */
+			if (IsRailStationTile(steps[k].first)) continue;
+			if (IsSafeWaitingPosition(r3r_coupler, steps[k].first, steps[k].second, true, r3r_forbid_90deg)) {
+				r3r_last_safe = k;
+				break;
+			}
+		}
+		bool term_exempt = false;
 		for (size_t i = 0; i < steps.size(); ++i) {
 			const TileIndex stile = steps[i].first;
 			const Trackdir stdir = steps[i].second;
@@ -628,8 +701,13 @@ public:
 						if (owner == nullptr && IsRailStationTile(ftile)) owner = GetTrainForReservationArbitrated(ftile, want);
 						const bool selfheld = (owner != nullptr && (owner == coupler || owner->First() == coupler->First()));
 						/* 位读数必须先自证 plain rail: GetTrackBits/GetReservedTrackbits
-						 * 在非 plain rail 上是 dbg_assert(KI-207c 附记 7b 的教训)。 */
-						const bool plain = IsPlainRail(ftile);
+						 * 在非 plain rail 上是 dbg_assert(KI-207c 附记 7b 的教训)。
+						 * R3R (第 401 轮, KI-570): ftile 由失败点回填，第 400 轮起可能是
+						 * 站台格（TileType::Station）——IsPlainRail() 第一句就是
+						 * GetRailTileType()，其入口 dbg_assert_tile(IsTileType(t,
+						 * TileType::Railway)) 正是 rail_map.h:40，比 GetTrackBits 更早炸。
+						 * 必须先短路 tile 类型，再谈 plain。 */
+						const bool plain = IsTileType(ftile, TileType::Railway) && IsPlainRail(ftile);
 						fprintf(dbg, "CPL-RES-FAIL veh=%d nth=%u/%u tile=%d,%d td=%d want=%d booked-before=%u failtd=%d type=%d tbits=%d res=%d plain=%d st=%d depot=%d owner=%d selfheld=%d otile=%d,%d ospd=%d ord=%d\n",
 								(int)coupler->index.base(), (unsigned)i, (unsigned)steps.size(),
 								(int)TileX(ftile), (int)TileY(ftile), (int)stdir, (int)want,
@@ -646,22 +724,121 @@ public:
 						fclose(dbg);
 					}
 				}
-				for (size_t k = booked; k > 0; --k) {
-					UnreserveRailTrackdir(steps[k - 1].first, steps[k - 1].second);
+				/* KI-563（玩家拍板 A，2026-11-06 第 393 轮）：预留粒度完全按原生 PBS
+				 * ——订到第一个失败格即停，**保留**已订上的格，不再整批回滚。
+				 *
+				 * 原生本来就是"订一段、走一段、在信号或他人预留前停、下一 tick 续订"；
+				 * 整批回滚会让列车在他人预留/信号前一动不动（第 392 轮现场 533 次
+				 * CPL-RES-FAIL、CPL-RESERVE found=0 booked=0），比原生更死。
+				 * 有格可走就算成功，剩余部分由下一次 TryReservePath 重新摸路续订
+				 * （已订格对自己视为成功，见 pbs.cpp 的 KI-361 自订豁免）。 */
+				if (booked > 0) {
+					FILE *dbg2 = R3RFopenDbg("a");
+					if (dbg2 != nullptr) {
+						fprintf(dbg2, "CPL-RES-PARTIAL veh=%d booked=%u/%u stop=%d,%d td=%d\n",
+								(int)Train::From(Yapf().GetVehicle())->index.base(),
+								(unsigned)booked, (unsigned)steps.size(),
+								(int)TileX(this->res_fail_tile), (int)TileY(this->res_fail_tile),
+								(int)this->res_fail_td);
+						/* R3R (第 402 轮, KI-571): 补打实际订到的格清单 —— 只报 booked 的
+						 * 数字看不出"能否走到最后一格已订"，第 402 轮现场正卡在这里
+						 * （booked=2 却不知道是哪两格、能否贴住车底）。
+						 * 每格单独一行：本文件禁用 snprintf（SAFEGUARD 宏），也不包含
+						 * string_func.h 的 seprintf，所以不拼串，直接逐行 fprintf。 */
+						for (size_t k = 0; k < booked && k < steps.size(); k++) {
+							fprintf(dbg2, "  CPL-RES-PARTIAL-TILE veh=%d k=%u/%u tile=%d,%d td=%d\n",
+									(int)Train::From(Yapf().GetVehicle())->index.base(),
+									(unsigned)k, (unsigned)booked,
+									(int)TileX(steps[k].first), (int)TileY(steps[k].first),
+									(int)steps[k].second);
+						}
+						fclose(dbg2);
+					}
+					/* 与全成功路径一致：已订的轨道要让 YAPF 缓存失效，否则下一 tick
+					 * 的寻路仍看见"未预留"。 */
+					YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
+					return true;
 				}
-				booked = 0;
 				return false;
 			}
 			++booked;
+			/* R3R (第 395 轮, KI-563 修法 D): 预留终点 = 第一个「安全停车位」，
+			 * 不是第一个「带信号的格」。
+			 *
+			 * 第 394 轮按"格上有信号"截断是**语法**判据：它不区分该信号是不是
+			 * 允许停车的位（PBS 信号本身并不安全，要看下一格 / NoEntry /
+			 * AlwaysReserveThrough / TRPRF_RESERVE_THROUGH），于是既能漏截一串
+			 * PBS 信号、也会在错的一侧早停。修法 D 换成**语义**判据，与原生 PBS
+			 * 一致：预留终止于下一个安全停车位；"带信号的格"只是它最常见的形态。
+			 *
+			 * IsSafeWaitingPosition() 就是这把尺子（pbs.cpp），驾驶预留
+			 * ExtendTrainReservation()（train_cmd.cpp:16130）与本文件
+			 * FindSafePositionProc()（:162）用的都是它 —— 挂接预留与驾驶预留
+			 * 从此在同一条边界上收尾。
+			 *
+			 * 判在**订成功之后**而不是之前，有两个原因：
+			 *  ① 安全位自己要被订下（车头可以停上去），而"已订"的判据只能由
+			 *     ReserveSingleTrack 给出 —— 上一次 tick 自己铺下的格会走
+			 *     KI-361 自订豁免而成功（IsWaitingPositionFree 不排除自己，先问
+			 *     它会把自有格误判成占用、把终点收到车尾后面）；
+			 *  ② 安全位被**第三方**占着时，ReserveSingleTrack 本就会失败，下面的
+			 *     KI-563 A 分支保留已订格并就地返回 —— 正是 V-D3 要的"停在它
+			 *     之前、保留已订"，与 ExtendTrainReservation 的整段 back-out 不同。
+			 *
+			 * 兜底：全程没有任何安全位（密信号/无岔口/纯弯）时循环照旧订满 ——
+			 * 最后一格是会合点，ChooseTrainTrack 已保证预留终点安全，所以不会比
+			 * 改动前订得更少。
+			 *
+			 * 停在第 i 格后，调用方把预留终点收到 booked-1（:1712-1715），
+			 * 终点即这个安全位。 */
+			/* R3R (第 400 轮, KI-569): 站台段是终点段（会合点必在其上），不是等待位。
+			 * 按"尽头站台 ⇒ 安全位"去截断恰好会把整段平台挡在预留之外，正是本轮
+			 * 机车自锁的直接原因；平台是否可用交由 ReserveSingleTrack() 的整段
+			 * 平台预订去判（被占则 PARTIAL，停在平台前，不越权）。 */
+			if (!IsRailStationTile(stile) && IsSafeWaitingPosition(r3r_coupler, stile, stdir, true, r3r_forbid_90deg)) {
+				if (i == r3r_last_safe) {
+					/* 终点例外（第 399 轮, REG-399-C）：这是路径上**最后一个**安全位，
+					 * 它之后直到会合点再无安全位。若仍在此截断，会合点那几格永远无人
+					 * 订，机车最多开到它前面一格就自锁（详见函数头的推导）。继续订满，
+					 * 预留终点因此留在会合点，调用方的收缩分支不会触发。 */
+					term_exempt = true;
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "CPL-RES-TERM-EXEMPT veh=%d nth=%u/%u tile=%d,%d td=%d booked=%u\n",
+								(int)r3r_coupler->index.base(),
+								(unsigned)i, (unsigned)steps.size(),
+								(int)TileX(stile), (int)TileY(stile), (int)stdir,
+								(unsigned)booked);
+						fclose(dbg);
+					}
+					continue;
+				}
+				stopped_at_safe = true;
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-RES-SAFE-STOP veh=%d nth=%u/%u tile=%d,%d td=%d sig=%d booked=%u\n",
+							(int)r3r_coupler->index.base(),
+							(unsigned)i, (unsigned)steps.size(),
+							(int)TileX(stile), (int)TileY(stile), (int)stdir,
+							(int)(IsTileType(stile, TileType::Railway) && HasSignals(stile) &&
+									HasSignalOnTrack(stile, TrackdirToTrack(stdir))),
+							(unsigned)booked);
+					fclose(dbg);
+				}
+				break;
+			}
 		}
 		/* R3R (REG-359-K 探针, 只读): 成功时列出本次实际订下的格序，用来回答
-		 * "第 5 次 booked=6 究竟订了哪 6 格、有没有覆盖 36,12/37,12"。 */
+		 * "第 5 次 booked=6 究竟订了哪 6 格、有没有覆盖 36,12/37,12"。
+		 * 第 394 轮起会被截断（第 395 轮起截断点是第一个安全停车位），故 total
+		 * 后面补 booked=/stop_safe=，tiles 只列真正订下的。 */
 		if (!steps.empty()) {
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-RES-OK veh=%d total=%u tiles=",
-						(int)Train::From(Yapf().GetVehicle())->index.base(), (unsigned)steps.size());
-				for (size_t i = 0; i < steps.size() && i < 16; ++i) {
+				fprintf(dbg, "CPL-RES-OK veh=%d total=%u booked=%u stop_safe=%d term_exempt=%d tiles=",
+						(int)Train::From(Yapf().GetVehicle())->index.base(), (unsigned)steps.size(),
+						(unsigned)booked, (int)stopped_at_safe, (int)term_exempt);
+				for (size_t i = 0; i < booked && i < 16; ++i) {
 					fprintf(dbg, "%s%d,%d/%d", (i == 0) ? "" : ";",
 							(int)TileX(steps[i].first), (int)TileY(steps[i].first), (int)TrackdirToTrack(steps[i].second));
 				}
@@ -671,7 +848,11 @@ public:
 			}
 		}
 		if (!steps.empty()) YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
-		return true;
+		/* 修法 D 起，"第一个安全位就被别人占着"会在**一格都没订**的情况下走到这里
+		 * （第 394 轮的写法总是先订再判，故 booked 必 >= 1）。此时必须如实报失败，
+		 * 否则调用方会把整条摸路当成已预留、只把终点收到会合点（r3r_booked=0 时
+		 * 连收缩都不做），再次出现 "reserved=1 而 booked=0" 的空真。 */
+		return booked > 0;
 	}
 
 	inline void SetReservationTarget(Node *node, TileIndex tile, Trackdir td)
@@ -1538,7 +1719,8 @@ public:
 					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 						/* 只记录物理走过、且需要预订的格：站台/车库不订（与 rp_last_tile
 						 * 的口径一致——预留止于会合点，不越过车底）；起点格也不订
-						 * （TryReservePath 的节点链同样跳过根节点）。 */
+						 * （TryReservePath 的节点链同样跳过根节点）。
+						 * 唯一例外是下面站台跳格分支补压的 tg 自己（KI-569）。 */
 						if (cur != st || depth != 0) r3r_resv_path.push_back(R3RCoupleStep{cur, cur_td});
 					}
 					/* R3R: do not walk the path through a depot - but allow the start tile,
@@ -1553,6 +1735,15 @@ public:
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());
 					if (!f3.Follow(cur, cur_td)) return false;
 					if (f3.is_station && f3.tiles_skipped > 0 && R3RSkippedStationStretchContains(cur, f3.new_tile, f3.exitdir, f3.tiles_skipped, tg)) {
+						/* R3R (第 400 轮, KI-569): 上面把站台格排除在清单之外，而这条跳格分支
+						 * 一旦命中就直接宣布"路线经过 tg"。只认路不铺路 ⇒ 第二遍
+						 * R3RReservePathSequence() 无格可订 ⇒ 站台段整段无人预订 ⇒ 机车开到
+						 * 站台前一格就无已订格可进，停车后每 tick 从原地重算 ⇒ 自锁
+						 * （现场：停在 248,127，248,130~248,133 全空，path=2 booked=2）。
+						 * 这里补压 tg 自己一格：ReserveSingleTrack() 对站台格走整段平台预订
+						 * （ReserveRailStationPlatform() 从 tg 沿回退方向逐格置位到平台头），
+						 * 一格即覆盖整段；若改成逐格压，第二格会撞上自己刚订的位而失败。 */
+						if (cur != tg) r3r_resv_path.push_back(R3RCoupleStep{tg, cur_td});
 						return true;
 					}
 					TrackdirBits tdb3 = f3.new_td_bits;
@@ -1603,14 +1794,22 @@ public:
 			 *
 			 * 摸路（第一遍，只读）已经给出物理路线 r3r_resv_path，例如
 			 *   15,14 → 15,15 → 14,15 → 13,15（止于会合点，不越过车底）。
-			 * 这里按序逐格预订（第二遍）。失败则回滚已订格并如实返回失败，
-			 * 交 train_cmd.cpp 的 KI-316 路径（FreeTrainTrackReservation +
+			 * 这里按序逐格预订（第二遍）。按 KI-563 的原生粒度口径：订到第一个
+			 * 失败格即停、保留已订格；只有一格都没订上时才如实返回失败，交
+			 * train_cmd.cpp 的 KI-316 路径（FreeTrainTrackReservation +
 			 * MarkTrainAsStuck）处置；绝不再出现 "reserved=1 而 nTry=0" 的空真。
 			 */
 			if (!r3r_resv_path.empty()) {
 				const R3RCoupleStep &r3r_last = r3r_resv_path.back();
 				this->SetReservationTarget(pNode, r3r_last.first, r3r_last.second);
 				reserved = this->R3RReservePathSequence(r3r_resv_path, r3r_booked);
+				/* KI-563：部分预留时把预留终点收到"最后一格已订"，否则后续逻辑
+				 * 以为整条到会合点都在自己名下。原生 PBS 的预留终点本来就是
+				 * 逐段推进的。 */
+				if (reserved && r3r_booked > 0 && r3r_booked < r3r_resv_path.size()) {
+					const R3RCoupleStep &r3r_stop = r3r_resv_path[r3r_booked - 1];
+					this->SetReservationTarget(pNode, r3r_stop.first, r3r_stop.second);
+				}
 			}
 			/* 摸路一格都没给出 ⇒ 没有可订的东西，直接报失败（不许空手成功）。 */
 		} else {

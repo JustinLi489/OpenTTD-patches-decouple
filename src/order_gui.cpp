@@ -2653,6 +2653,27 @@ public:
 		NWidgetStacked *row_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_TOP_ROW);
 		assert(row_sel != nullptr || (train_row_sel != nullptr && left_sel != nullptr && middle_sel != nullptr && right_sel != nullptr));
 
+		/* R3R (问题 2): controls that have no meaning for the selected order type are
+		 * hidden instead of only being greyed out. Hiding a slot removes it from the
+		 * container layout, so the window has to be re-initialised when a slot crosses
+		 * the "hidden" boundary. */
+		bool layout_changed = false;
+		auto set_top_plane = [&layout_changed](NWidgetStacked *sel, int plane) {
+			if (sel == nullptr) return;
+			const bool was_hidden = (sel->shown_plane == SZSP_NONE);
+			sel->SetDisplayedPlane(plane);
+			if (was_hidden != (plane == SZSP_NONE)) layout_changed = true;
+		};
+		/* A hidden widget is not registered in the window lookup, so the raised state
+		 * of the non-stop button must only be touched while the slot is displayed. */
+		NWidgetStacked *non_stop_sel = this->GetWidget<NWidgetStacked>(WID_O_SEL_NON_STOP);
+		auto show_non_stop = [&](bool show) {
+			set_top_plane(non_stop_sel, show ? 0 : SZSP_NONE);
+			if (!show) {
+				if (NWidgetCore *nwi = this->GetWidget<NWidgetCore>(WID_O_NON_STOP); nwi != nullptr) nwi->SetLowered(false);
+			}
+		};
+
 		/* R3R: the extra top-row dropdown is the destination yard for rail station
 		 * orders, and the coupling widgets for rail GOTO_COUPLE orders (never both).
 		 * The couple side is only offered when the coupling order targets a depot:
@@ -2714,12 +2735,12 @@ public:
 			if (row_sel != nullptr) {
 				row_sel->SetDisplayedPlane(DP_ROW_LOAD);
 			} else {
-				train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-				left_sel->SetDisplayedPlane(DP_LEFT_LOAD);
-				middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
-				right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
+				set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+				set_top_plane(left_sel, DP_LEFT_LOAD);
+				set_top_plane(middle_sel, DP_MIDDLE_UNLOAD);
+				set_top_plane(right_sel, DP_RIGHT_EMPTY);
 				this->DisableWidget(WID_O_NON_STOP);
-				this->RaiseWidget(WID_O_NON_STOP);
+				show_non_stop(false);
 			}
 			this->DisableWidget(WID_O_FULL_LOAD);
 			this->DisableWidget(WID_O_UNLOAD);
@@ -2740,13 +2761,15 @@ public:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_EMPTY);
 					} else {
-						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-						left_sel->SetDisplayedPlane(DP_LEFT_LOAD);
-						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
-						right_sel->SetDisplayedPlane(DP_RIGHT_REFIT);
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						/* R3R: a decouple order has neither a load nor an unload
+						 * setting, so those slots are removed instead of greyed out. */
+						set_top_plane(left_sel, SZSP_NONE);
+						set_top_plane(middle_sel, SZSP_NONE);
+						set_top_plane(right_sel, DP_RIGHT_REFIT);
 					}
-					this->RaiseWidget(WID_O_NON_STOP);
 					this->DisableWidget(WID_O_NON_STOP);
+					show_non_stop(false);
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT);
@@ -2757,7 +2780,19 @@ public:
 
 				case OT_GOTO_COUPLE:
 				case OT_WAIT_COUPLE:
+					/* R3R: a couple order only carries a target, none of the top-row
+					 * settings apply. Hide them so the couple group drop-down of the
+					 * yard slot gets the whole row (and can be read at a glance). */
+					if (row_sel != nullptr) {
+						row_sel->SetDisplayedPlane(DP_ROW_EMPTY);
+					} else {
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						set_top_plane(left_sel, SZSP_NONE);
+						set_top_plane(middle_sel, SZSP_NONE);
+						set_top_plane(right_sel, SZSP_NONE);
+					}
 					this->DisableWidget(WID_O_NON_STOP);
+					show_non_stop(false);
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
 					this->DisableWidget(WID_O_REFIT_DROPDOWN);
@@ -2769,10 +2804,11 @@ public:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_LOAD);
 					} else {
-						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-						left_sel->SetDisplayedPlane(DP_LEFT_LOAD);
-						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
-						right_sel->SetDisplayedPlane(DP_RIGHT_REFIT);
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						set_top_plane(left_sel, DP_LEFT_LOAD);
+						set_top_plane(middle_sel, DP_MIDDLE_UNLOAD);
+						set_top_plane(right_sel, DP_RIGHT_REFIT);
+						show_non_stop(true);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
 					}
@@ -2791,10 +2827,12 @@ public:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_LOAD);
 					} else {
-						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-						left_sel->SetDisplayedPlane(DP_LEFT_REVERSE);
-						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
-						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						set_top_plane(left_sel, DP_LEFT_REVERSE);
+						/* R3R: a waypoint order cannot unload, so drop the slot. */
+						set_top_plane(middle_sel, SZSP_NONE);
+						set_top_plane(right_sel, DP_RIGHT_EMPTY);
+						show_non_stop(true);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
 						this->EnableWidget(WID_O_REVERSE);
@@ -2808,10 +2846,11 @@ public:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_DEPOT);
 					} else {
-						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-						left_sel->SetDisplayedPlane(DP_LEFT_REFIT);
-						middle_sel->SetDisplayedPlane(DP_MIDDLE_SERVICE);
-						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						set_top_plane(left_sel, DP_LEFT_REFIT);
+						set_top_plane(middle_sel, DP_MIDDLE_SERVICE);
+						set_top_plane(right_sel, DP_RIGHT_EMPTY);
+						show_non_stop(true);
 						this->EnableWidget(WID_O_NON_STOP);
 						this->SetWidgetLoweredState(WID_O_NON_STOP, order->GetNonStopType() & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS);
 					}
@@ -2983,7 +3022,7 @@ public:
 					} else {
 						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_EMPTY);
 						this->DisableWidget(WID_O_NON_STOP);
-						this->RaiseWidget(WID_O_NON_STOP);
+						show_non_stop(false);
 					}
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
@@ -2995,11 +3034,12 @@ public:
 					if (row_sel != nullptr) {
 						row_sel->SetDisplayedPlane(DP_ROW_LOAD);
 					} else {
-						train_row_sel->SetDisplayedPlane(DP_GROUNDVEHICLE_ROW_NORMAL);
-						left_sel->SetDisplayedPlane(DP_LEFT_LOAD);
-						middle_sel->SetDisplayedPlane(DP_MIDDLE_UNLOAD);
-						right_sel->SetDisplayedPlane(DP_RIGHT_EMPTY);
+						set_top_plane(train_row_sel, DP_GROUNDVEHICLE_ROW_NORMAL);
+						set_top_plane(left_sel, DP_LEFT_LOAD);
+						set_top_plane(middle_sel, DP_MIDDLE_UNLOAD);
+						set_top_plane(right_sel, DP_RIGHT_EMPTY);
 						this->DisableWidget(WID_O_NON_STOP);
+						show_non_stop(false);
 					}
 					this->DisableWidget(WID_O_FULL_LOAD);
 					this->DisableWidget(WID_O_UNLOAD);
@@ -3023,6 +3063,10 @@ public:
 		this->SetWidgetDisabledState(WID_O_SHARED_ORDER_LIST, !(shared_orders || _settings_client.gui.enable_single_veh_shared_order_gui));
 
 		this->GetWidget<NWidgetStacked>(WID_O_SEL_OCCUPANCY)->SetDisplayedPlane(IsWidgetLowered(WID_O_OCCUPANCY_TOGGLE) ? 0 : SZSP_NONE);
+
+		/* R3R (问题 2): adding or removing a top-row slot changes the layout of the
+		 * surrounding container, which is only recomputed on re-initialisation. */
+		if (layout_changed) this->ReInit();
 
 		this->SetDirty();
 	}
@@ -4861,8 +4905,13 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_ROW_GROUNDVEHICLE),
 			NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
-				NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_NON_STOP), SetMinimalSize(60, 12), SetFill(1, 0),
-														SetStringTip(STR_ORDER_NON_STOP, STR_ORDER_TOOLTIP_NON_STOP), SetResize(1, 0),
+				/* R3R (问题 2): the non-stop control is meaningless for most order
+				 * types, so it gets its own selection and is hidden entirely instead
+				 * of only being greyed out. */
+				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_NON_STOP),
+					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_NON_STOP), SetMinimalSize(60, 12), SetFill(1, 0),
+															SetStringTip(STR_ORDER_NON_STOP, STR_ORDER_TOOLTIP_NON_STOP), SetResize(1, 0),
+				EndContainer(),
 				NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_TOP_LEFT),
 					NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_FULL_LOAD), SetMinimalSize(60, 12), SetFill(1, 0),
 															SetStringTip(STR_ORDER_TOGGLE_FULL_LOAD, STR_ORDER_TOOLTIP_FULL_LOAD), SetResize(1, 0),

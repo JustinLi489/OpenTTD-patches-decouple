@@ -66,6 +66,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_SEL_TOP_LEFT,              ///< #NWID_SELECTION widget for left part of the top row of the 'your train' order window.
 	WID_O_SEL_TOP_MIDDLE,            ///< #NWID_SELECTION widget for middle part of the top row of the 'your train' order window.
 	WID_O_SEL_TOP_RIGHT,             ///< #NWID_SELECTION widget for right part of the top row of the 'your train' order window.
+	WID_O_SEL_NON_STOP,              ///< #NWID_SELECTION widget to show or completely hide the 'non-stop' button of the top row.
 	WID_O_SEL_TOP_ROW_GROUNDVEHICLE, ///< #NWID_SELECTION widget for the top row of the 'your train' order window.
 	WID_O_SEL_TOP_ROW,               ///< #NWID_SELECTION widget for the top row of the 'your non-trains' order window.
 	WID_O_SEL_TOP_YARD,              ///< R3R: #NWID_SELECTION widget to show/hide the destination yard / couple side dropdown of the top row.

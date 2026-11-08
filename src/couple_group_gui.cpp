@@ -25,8 +25,10 @@
 #include "tilehighlight_type.h"
 #include "train.h"
 #include "vehicle_base.h"
+#include "vehicle_gui.h"
 #include "window_func.h"
 #include "window_gui.h"
+#include "zoom_func.h"
 #include "core/geometry_func.hpp"
 #include "r3r_perf.h"
 #include "widgets/couple_group_widget.h"
@@ -312,8 +314,22 @@ public:
 		}
 		this->group_depth.resize(this->groups.size());
 		this->group_has_children.resize(this->groups.size(), 0);
+		/* R3R (第 392 轮 / 玩家报告 3a): 被折叠祖先遮住的组绝不能走兜底 —— 它们没进
+		 * this->groups 正是上面 push_children 被 is_folded 跳过的结果；若在这里补回来，
+		 * 折叠就等于失效，而且 depth 会被写成 0，子组会从缩进位置跳到列表末尾顶格。
+		 * 沿父链上溯（带步数上限防旧档父子环）；父链一旦走出可见范围就停（那种组按根处理）。 */
+		const auto hidden_by_folded_ancestor = [&](CoupleGroupID id) {
+			CoupleGroupID parent = R3RGetCoupleGroupParent(id);
+			for (uint guard = 0; parent != INVALID_COUPLE_GROUP && guard <= visible_groups.size(); guard++) {
+				if (!visible_contains(parent)) return false;
+				if (is_folded(parent)) return true;
+				parent = R3RGetCoupleGroupParent(parent);
+			}
+			return false;
+		};
 		/* 兜底：只出现在环里的组（深度优先走不到）仍要列出来，绝不静默丢组。 */
 		for (const CoupleGroupID id : visible_groups) {
+			if (hidden_by_folded_ancestor(id)) continue;
 			if (std::find(this->groups.begin(), this->groups.end(), id) == this->groups.end()) {
 				this->groups.push_back(id);
 				this->group_segments.push_back(R3RCountSegmentsInCoupleGroup(id));
@@ -482,7 +498,10 @@ public:
 		switch (widget) {
 			case WID_CG_GROUPS:
 			case WID_CG_SEGMENTS:
-				resize.height = GetCharacterHeight(FontSize::Normal) + 2;
+				/* R3R (第 392 轮 / 玩家报告 3b): 右栏段行要放列车缩略图，行高必须够。
+				 * 两栏必须同高 —— Window::resize.step_height 取根容器的最小正孩子，
+				 * 而绘制循环用的是窗口级 step_height；两栏不一致会让滚动/点击错位。 */
+				resize.height = std::max<int>(GetCharacterHeight(FontSize::Normal) + 2, ScaleGUITrad(GetVehicleHeight(VehicleType::Train)) + 2);
 				size.height = resize.height * 6 + WidgetDimensions::scaled.framerect.Vertical();
 				break;
 
@@ -576,9 +595,12 @@ public:
 				DrawString(ir.left, ir.right, ir.top, STR_COUPLE_GROUP_NO_SEGMENTS);
 				return;
 			}
+			const bool rtl = _current_text_dir == TD_RTL;
+			const int row_height = this->resize.step_height;
+			const int image_height = ScaleGUITrad(GetVehicleHeight(VehicleType::Train));
 			int y = ir.top;
-			for (int i = this->segment_scroll->GetPosition(); i < static_cast<int>(this->segments.size()) && this->segment_scroll->IsVisible(i); i++, y += this->resize.step_height) {
-				if (i == this->selected_segment) GfxFillRect(r.left + 1, y, r.right, y + this->resize.step_height - 1, PC_DARK_GREY);
+			for (int i = this->segment_scroll->GetPosition(); i < static_cast<int>(this->segments.size()) && this->segment_scroll->IsVisible(i); i++, y += row_height) {
+				if (i == this->selected_segment) GfxFillRect(r.left + 1, y, r.right, y + row_height - 1, PC_DARK_GREY);
 				const Train *t = Train::GetIfValid(this->segments[i]);
 				if (t == nullptr) continue;
 				std::string text = GetString(STR_COUPLE_GROUP_SEGMENT_ITEM, t->unitnumber, this->segment_cars[i]);
@@ -599,7 +621,25 @@ public:
 					text.append(" ");
 					text.append(GetString(STR_COUPLE_GROUP_OWNER_MARK, index, total));
 				}
-				DrawString(ir.left, ir.right, y, text);
+				/* R3R (第 392 轮 / 玩家报告 3b): 行首画本段列车的缩略图（和普通分组列表一致）。
+				 * DrawTrainImage 的逐节循环条件是 px < max_width，所以把"本段各节显示宽度之和"
+				 * 当作 rect 宽度，就恰好只画本段、不会串到后面那一段去。 */
+				Rect row = ir.WithY(y, y + row_height - 1);
+				const int thumb_limit = std::max(0, ir.Width() / 2);
+				int thumb_width = 0;
+				for (const Train *u = t; u != nullptr; u = u->Next()) {
+					if (u != t && u->IsSegmentFront()) break;
+					Point offset;
+					thumb_width += Train::From(u)->GetDisplayImageWidth(&offset);
+					if (thumb_width >= thumb_limit) {
+						thumb_width = thumb_limit;
+						break;
+					}
+				}
+				Rect thumb = row.WithWidth(thumb_width, rtl).WithHeight(image_height, false).Translate(0, (row_height - image_height) / 2);
+				DrawVehicleImage(t, thumb, VehicleID::Invalid(), EIT_IN_LIST, 0);
+				Rect tr = row.Indent(thumb_width + WidgetDimensions::scaled.hsep_normal, rtl);
+				DrawString(tr, text);
 			}
 		}
 	}
