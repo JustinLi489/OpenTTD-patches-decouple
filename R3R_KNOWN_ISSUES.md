@@ -23799,3 +23799,26 @@ A 跑 b/c 期间不会把它们的坐标写进 a 的书签。坏的只是「层�
   `DISP-POOL-BUSY veh=%d st=%d`、`non-segment`、`DECOUPLE-SKIP consist=%d tx=%d ty=%d real=%d segs=%u reason=%s` 全部命中
   （`reason=non-segment` 整串不存在属正常：`reason=%s` 与 `"non-segment"` 是两个独立字面量）。
 - 状态：**已实现 + 已编译，游戏内复测待做**（判据见 KI-623 / KI-624 各条）。
+
+## 第 430 轮（2026-11-13 发布：提交 / tag / 无探针发行版 / 打包）
+
+本轮**零源码改动**，只做发布动作。
+
+- 源码提交：`275d234ccfb10f4d8d427f0898c647963bf0f482`
+  —— `R3R: rounds 407-429 checkpoint (2026-11-13)`，63 files changed / +14901 / −296。
+  入库内容 = 源码 + 构建脚本（`R3R_inc_guard.ps1`、`R3R_release_build.cmd`、`R3R_release_fullbuild.cmd`）+ `R3R_*.md` 备忘 + `R3R_KNOWN_ISSUES.md`；
+  未入库 = `*.zip`、`R3R_debug.log` / `R3R_perf.log`、`_qc_*.txt`、`diag_*.ps1`、`*.r3r_bak` / `*.bak`、`ninja`、`INCREMENTAL`、`build1.zip`。
+- 稳定 tag：`r3r-stable-2026-11-13`（**轻量 tag**，`objecttype=commit`，指向上述提交；**未 push**）。
+  回退方式：`git checkout r3r-stable-2026-11-13 -- src`（不要用 `git reset --hard`）。
+- 发行版构建（无探针运行口径）：复用既有唯一发布入口 `R3R_release_fullbuild.cmd`（未新建任何脚本），全量 709 步。
+  - `build-release\R3R_release_fullbuild.done` = `EXIT_CODE=0`；日志尾部 `[709/709] Linking CXX executable openttd.exe`；
+    `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+  - `build-release\openttd.exe` = **2026-11-13 03:10:26，23 724 032 B**（上一版 v1.0.5 为 23 588 352 B）。
+  - 版本串：`Version string: r3r-stable-2026-11-13, Release: 0.73.1`（configure 自动套用了本轮 tag）。
+  - `FLAGS = /DWIN32 /D_WINDOWS /GR /EHsc /Zi /O2 /Ob2 /DNDEBUG -std:c++20 -MT ...`，`build-release\build.ninja` 内 `/Od` 计数 **0**。
+  - `DEFINES` 含 `WITH_ZLIB WITH_LIBLZMA WITH_ZSTD WITH_LZO WITH_PNG WITH_OPUSFILE WITH_OPENGL` + `R3R_PROBES_DEFAULT=0 R3R_PROBES=1`（三道硬门全过）。
+  - `lang\*.lng` 66 个为本轮 02:39 重新生成（`simplified_chinese.lng` 229 687 B）。
+- 打包：`R3R-v1.0.6-win64-2026-11-13.zip`，16 333 518 B / **135 条目**，顶层目录 `R3R-OpenTTD-0.73.1-win64\`。
+  - 内容 = `openttd.exe` + 上游原有 `changelog.md` / `jgrpp-changelog.md` / `COPYING.md` / `README.md` + `ai\ baseset\ game\ lang\ scripts\`。
+  - **刻意不放 `README_R3R.txt`**：按玩家 2026-11-13 明确要求（"不用添加你写的教程，玩家抱怨 AI 味道很大"），发行包内不附 AI 撰写的说明文档，改由玩家手写；上一版 v1.0.5 内的该文件（5 195 B）因此在本版消失，条目数 136→135。
+- 探针口径说明（避免误读"无探针"）：发行版沿用 `R3R_PROBES_DEFAULT=0` —— 默认**关闭**，不采集、不写 `R3R_debug.log`、无常驻开销，与 v1.0.5 完全一致；探针代码仍编入，便于排查时以 `R3R_DBG=1` 开启。若需要"探针代码完全不编入"的版本，须改 `-DR3R_PROBES=0` 并重配全量（本轮未做，因既有发布口径与历史包一致）。
