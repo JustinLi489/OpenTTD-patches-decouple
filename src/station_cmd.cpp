@@ -2172,13 +2172,20 @@ bool Station::R3RIsYardShared(uint16_t yard) const
 
 bool Station::R3RIsYardWorkshop(uint16_t yard) const
 {
-	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return false;
+	/* 第 420 轮 (KI-599): 整站（R3R_YARD_NONE）的检修所独立存放。 */
+	if (yard == R3R_YARD_NONE) return this->r3r_whole_workshop;
+	if (yard > this->R3RNumYards()) return false;
 	return this->r3r_yards[yard - 1].is_workshop;
 }
 
 void Station::R3RSetYardWorkshop(uint16_t yard, bool workshop)
 {
-	if (yard == R3R_YARD_NONE || yard > this->R3RNumYards()) return;
+	if (yard == R3R_YARD_NONE) {
+		/* 整站没有「停满回落」语义，直接记标志。 */
+		this->r3r_whole_workshop = workshop;
+		return;
+	}
+	if (yard > this->R3RNumYards()) return;
 	this->r3r_yards[yard - 1].is_workshop = workshop;
 	/* 检修所不参与「停满回落」：它自身不回落到别的场；别的场也不该回落到它
 	 * （否则「目的地是本检修所」的车会被引到普通场去而得不到检修）。 */
@@ -2192,8 +2199,9 @@ void Station::R3RSetYardWorkshop(uint16_t yard, bool workshop)
 
 bool Station::R3RIsWorkshopTile(TileIndex tile) const
 {
-	const uint16_t yard = this->R3RGetYardOfTile(tile);
-	return yard != R3R_YARD_NONE && this->r3r_yards[yard - 1].is_workshop;
+	/* 第 420 轮 (KI-599): 没有划进任何场的站台归「整站」，其检修所标志存在
+	 * r3r_whole_workshop 里（R3RIsYardWorkshop 已统一处理 R3R_YARD_NONE）。 */
+	return this->R3RIsYardWorkshop(this->R3RGetYardOfTile(tile));
 }
 
 bool Station::R3RHasAnyYard() const
@@ -2250,6 +2258,209 @@ void Station::R3RCollectYardTiles(uint16_t yard, std::vector<TileIndex> &out) co
 	}
 	std::sort(out.begin(), out.end());
 	out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+/* ------------------------------------------------------------------------- *
+ * R3R (第 416 轮): 调度池
+ *
+ * 第 428 轮 (KI-621) 起，条目的身份是**排程**（OrderList 池下标 schedule），
+ * 不再是「模板车」。原因：两列车共享同一张表时，按车登记会让同一个排程在
+ * 池里出现两次；而无主排程（第 417 轮，first_shared == nullptr）压根没有车
+ * 可以挂，于是根本进不了池。
+ *
+ * 表本体仍由 OrderList 池持有，车辆名下的表与无主排程完全同构，因此池条目
+ * 不需要自己管 OrderList 的生命周期。host 只是「模板车」缓存（用于显示与
+ * 旧档兼容），无主排程时无效。
+ *
+ * 排程被删/被清空时条目自动失效，由 Count/Pick 里的可用性判据兜住（不会再被
+ * 领用）。条目本身仍留在池里并照样存档 —— 窗口按「(已消失)」显示，玩家可以手
+ * 动删除，免得 issued/limit 无声消失。
+ * ------------------------------------------------------------------------- */
+
+/** R3R: 条目指向的排程池下标（旧档条目没记录排程，回退到模板车名下的表）。 */
+static uint32_t R3RDispatchEntryScheduleIndex(const Station::R3RStationYard::R3RDispatchPoolEntry &e)
+{
+	if (e.schedule != Station::R3R_DISPATCH_NO_SCHEDULE) return e.schedule;
+	if (!Vehicle::IsValidID(e.host)) return Station::R3R_DISPATCH_NO_SCHEDULE;
+	const Vehicle *const v = Vehicle::Get(e.host);
+	if (v == nullptr || v->orders == nullptr) return Station::R3R_DISPATCH_NO_SCHEDULE;
+	return v->orders->index.base();
+}
+
+/**
+ * R3R: 这张排程现在还能不能当调度模板（表还在、表里至少有一条命令）。
+ *
+ * R3R (第 417 轮，玩家拍板): 第 416 轮这里还要求「表里不能有解挂/挂接/等待挂接
+ * 命令」，理由是那会把归属关系绕成环。玩家明确要求撤销该禁令 —— 任何样子的
+ * 排程都允许进入车站分配池，环/自引用等**非崩溃性**后果由玩家承担。这里因此
+ * 只保留「能安全拿到一张表」的硬校验。
+ */
+static bool R3RDispatchScheduleUsable(uint32_t schedule, OrderList **out_orders = nullptr)
+{
+	if (schedule == Station::R3R_DISPATCH_NO_SCHEDULE) return false;
+	OrderList *const ol = OrderList::GetIfValid(OrderListID(schedule));
+	if (ol == nullptr || ol->GetNumOrders() == 0) return false;
+	if (out_orders != nullptr) *out_orders = ol;
+	return true;
+}
+
+/** R3R: 这条池条目现在还能不能用（排程可解析且非空）。 */
+static bool R3RDispatchEntryUsable(const Station::R3RStationYard::R3RDispatchPoolEntry &e, OrderList **out_orders = nullptr)
+{
+	return R3RDispatchScheduleUsable(R3RDispatchEntryScheduleIndex(e), out_orders);
+}
+
+/** R3R: 调度池容量上限（玩家可在高级设置里调，1..256）。 */
+static uint16_t R3RDispatchPoolCapacity()
+{
+	return std::max<uint16_t>(1, _settings_game.order.r3r_dispatch_pool_capacity);
+}
+
+std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *Station::R3RDispatchPoolRef(uint16_t yard)
+{
+	if (yard == R3R_YARD_NONE) return &this->r3r_whole_pool;
+	if (yard > this->R3RNumYards()) return nullptr;
+	return &this->r3r_yards[yard - 1].pool;
+}
+
+const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *Station::R3RDispatchPoolRef(uint16_t yard) const
+{
+	if (yard == R3R_YARD_NONE) return &this->r3r_whole_pool;
+	if (yard > this->R3RNumYards()) return nullptr;
+	return &this->r3r_yards[yard - 1].pool;
+}
+
+uint16_t Station::R3RDispatchPoolPrune(uint16_t yard)
+{
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return 0;
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	const size_t before = pool.size();
+	pool.erase(std::remove_if(pool.begin(), pool.end(), [](const R3RStationYard::R3RDispatchPoolEntry &e) {
+		return !R3RDispatchEntryUsable(e);
+	}), pool.end());
+	for (R3RStationYard::R3RDispatchPoolEntry &e : pool) {
+		if (e.limit == 0) e.limit = 1;
+		/* 陈旧占位（理论上不该出现）：宁可放掉也不要把坑位永久锁死。 */
+		if (e.issued > e.limit) e.issued = 0;
+	}
+	return static_cast<uint16_t>(before - pool.size());
+}
+
+uint16_t Station::R3RDispatchPoolCount(uint16_t yard) const
+{
+	const std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool = this->R3RDispatchPoolRef(yard);
+	if (pool == nullptr) return 0;
+	uint16_t n = 0;
+	for (const R3RStationYard::R3RDispatchPoolEntry &e : *pool) {
+		if (R3RDispatchEntryUsable(e)) n++;
+	}
+	return n;
+}
+
+int Station::R3RDispatchPoolAdd(uint16_t yard, uint32_t schedule, uint16_t limit)
+{
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return -1;
+	OrderList *ol = nullptr;
+	if (!R3RDispatchScheduleUsable(schedule, &ol)) return -1;
+	const uint16_t cap = R3RDispatchPoolCapacity();
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	if (pool.size() >= cap) return -1;
+	for (const R3RStationYard::R3RDispatchPoolEntry &e : pool) {
+		/* 同一张排程在同一场只登记一次（要加坑位请改 limit）。
+		 * 按排程而不是按车去重：多列车共享同一张表时池里只出现一次。 */
+		if (R3RDispatchEntryScheduleIndex(e) == schedule) return -1;
+	}
+	R3RStationYard::R3RDispatchPoolEntry e;
+	e.schedule = schedule;
+	/* 模板车只是缓存（显示/旧档兼容）；无主排程时保持无效。 */
+	const Vehicle *const first = ol->GetFirstSharedVehicle();
+	if (first != nullptr) e.host = first->index;
+	e.limit = std::max<uint16_t>(1, std::min<uint16_t>(limit == 0 ? 1 : limit, cap));
+	e.issued = 0;
+	pool.push_back(e);
+	return static_cast<int>(pool.size() - 1);
+}
+
+bool Station::R3RDispatchPoolRemove(uint16_t yard, uint16_t index)
+{
+	/* 第 420 轮 (KI-599): 整站（R3R_YARD_NONE）也有自己的池，统一经 Ref 取池。 */
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return false;
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	if (index >= pool.size()) return false;
+	pool.erase(pool.begin() + index);
+	return true;
+}
+
+bool Station::R3RDispatchPoolSetLimit(uint16_t yard, uint16_t index, uint16_t limit)
+{
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return false;
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	if (index >= pool.size()) return false;
+	const uint16_t cap = R3RDispatchPoolCapacity();
+	R3RStationYard::R3RDispatchPoolEntry &e = pool[index];
+	e.limit = std::max<uint16_t>(1, std::min<uint16_t>(limit == 0 ? 1 : limit, cap));
+	if (e.issued > e.limit) e.issued = e.limit;
+	return true;
+}
+
+int Station::R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule) const
+{
+	out_schedule = R3R_DISPATCH_NO_SCHEDULE;
+	const std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return -1;
+	const std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	for (uint i = 0; i < pool.size(); i++) {
+		const R3RStationYard::R3RDispatchPoolEntry &e = pool[i];
+		const uint32_t schedule = R3RDispatchEntryScheduleIndex(e);
+		if (schedule == except_schedule) continue;      // 不能领自己的表
+		if (e.issued >= std::max<uint16_t>(1, e.limit)) continue; // 坑位已满
+		if (!R3RDispatchScheduleUsable(schedule)) continue;
+		out_schedule = schedule;
+		return static_cast<int>(i);
+	}
+	return -1;
+}
+
+bool Station::R3RDispatchPoolAcquire(uint32_t schedule)
+{
+	if (schedule == R3R_DISPATCH_NO_SCHEDULE) return false;
+	/* 第 420 轮 (KI-599): 整站池（yard == R3R_YARD_NONE）同样参与坑位收发。 */
+	auto try_acquire = [schedule](std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool) -> int {
+		for (R3RStationYard::R3RDispatchPoolEntry &e : pool) {
+			if (R3RDispatchEntryScheduleIndex(e) != schedule) continue;
+			if (e.issued >= std::max<uint16_t>(1, e.limit)) return -1; // 找到了但已满
+			e.issued++;
+			return 1;
+		}
+		return 0;
+	};
+	/* 同一张排程可能被登记在本站的多个场里：按场顺序找第一个还有坑位的场，
+	 * 只有「全都满了」才算失败（旧写法遇到第一个满的场就直接失败）。 */
+	for (R3RStationYard &y : this->r3r_yards) {
+		if (try_acquire(y.pool) > 0) return true;
+	}
+	return try_acquire(this->r3r_whole_pool) > 0;
+}
+
+bool Station::R3RDispatchPoolRelease(uint32_t schedule)
+{
+	if (schedule == R3R_DISPATCH_NO_SCHEDULE) return false;
+	auto try_release = [schedule](std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool) -> bool {
+		for (R3RStationYard::R3RDispatchPoolEntry &e : pool) {
+			if (R3RDispatchEntryScheduleIndex(e) != schedule) continue;
+			if (e.issued > 0) e.issued--;
+			return true;
+		}
+		return false;
+	};
+	for (R3RStationYard &y : this->r3r_yards) {
+		if (try_release(y.pool)) return true;
+	}
+	return try_release(this->r3r_whole_pool);
 }
 
 bool R3RStationYardIsFull(const Station *st, uint16_t yard)
@@ -2378,7 +2589,7 @@ CommandCost CmdR3RSetStationYardShared(DoCommandFlags flags, StationID station_i
  * 升级费用 = 该场平台数 × 车库造价；降级免费（不退款）。
  * @param flags operation to perform
  * @param station_id station that owns the yard
- * @param yard the yard to modify (#Station::R3R_YARD_NONE is not allowed)
+ * @param yard the yard to modify (#Station::R3R_YARD_NONE = 整站，第 420 轮 KI-599 起允许)
  * @param workshop true to turn the yard into a workshop, false to remove it
  * @return the cost of this operation or an error
  */
@@ -2386,7 +2597,7 @@ CommandCost CmdR3RSetStationYardWorkshop(DoCommandFlags flags, StationID station
 {
 	Station *st = Station::GetIfValid(station_id);
 	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
-	if (yard == Station::R3R_YARD_NONE || yard > st->R3RNumYards()) return CMD_ERROR;
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(st->owner);
 	if (ret.Failed()) return ret;
@@ -2396,8 +2607,17 @@ CommandCost CmdR3RSetStationYardWorkshop(DoCommandFlags flags, StationID station
 	/* 升级费 = 该场的平台数量 × 车库造价，与「建 n 个车库」等价。降级免费。 */
 	uint platforms = 0;
 	if (workshop) {
-		for (TileIndex t : st->R3RYardTiles(yard)) {
-			if (R3RIsPlatformNorthEnd(t)) platforms++;
+		if (yard == Station::R3R_YARD_NONE) {
+			/* 整站检修所只管「没有划进任何场」的站台（划进场里的站台归各自的场管）。 */
+			std::vector<TileIndex> all;
+			R3REnumeratePlatforms(st, all);
+			for (TileIndex t : all) {
+				if (st->R3RGetYardOfTile(t) == Station::R3R_YARD_NONE) platforms++;
+			}
+		} else {
+			for (TileIndex t : st->R3RYardTiles(yard)) {
+				if (R3RIsPlatformNorthEnd(t)) platforms++;
+			}
 		}
 		if (platforms == 0) return CommandCost(STR_ERROR_R3R_YARD_WORKSHOP_EMPTY);
 	}
@@ -2509,6 +2729,85 @@ CommandCost CmdR3RRemoveStationYard(DoCommandFlags flags, StationID station_id, 
 		InvalidateWindowData(WindowClass::StationYard, st->index, 0);
 		InvalidateWindowClassesData(WindowClass::VehicleOrders);
 		SetWindowDirty(WindowClass::StationView, st->index);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 416 轮, 第 428 轮改按排程): 把一张排程登记成本场调度池的一条条目。
+ * @param flags operation to perform
+ * @param station_id station that owns the yard
+ * @param yard yard whose pool grows (#Station::R3R_YARD_NONE = 整站池，第 420 轮起允许)
+ * @param schedule OrderList pool index of the schedule (not a vehicle: 共享同一张表的
+ *                 多列车只登记一次，无主排程也能登记)
+ * @param limit how many trains may borrow the table at the same time (1..capacity)
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RAddDispatchPoolEntry(DoCommandFlags flags, StationID station_id, uint16_t yard, uint32_t schedule, uint16_t limit)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	/* 只接受「能安全拿到表」的排程：表还在、表非空。 */
+	OrderList *orders = nullptr;
+	if (!R3RDispatchScheduleUsable(schedule, &orders)) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_INVALID_TRAIN);
+
+	/* R3R (第 418 轮, C-5): 别家公司的排程只有在它那张表被公开时才可登记，
+	 * 否则私有排程会被别家公司借走。无主排程的归属由表自己的所有者字段决定。 */
+	const CompanyID schedule_owner = orders->GetR3RScheduleOwner();
+	if (schedule_owner != st->owner && !R3RScheduleAccessibleBy(orders, st->owner)) {
+		return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED);
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		if (st->R3RDispatchPoolAdd(yard, schedule, limit) < 0) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_FULL);
+		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 416 轮): 删除本场调度池的一条条目。已经借出去的份数随条目一起丢弃
+ * （借用的列车仍会跑完手上的表，归还时找不到条目就静默结束）。
+ */
+CommandCost CmdR3RRemoveDispatchPoolEntry(DoCommandFlags flags, StationID station_id, uint16_t yard, uint16_t index)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	/* 第 420 轮 (KI-599): 整站池（场 ID 0）同样可增删改。 */
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		if (!st->R3RDispatchPoolRemove(yard, index)) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY);
+		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 416 轮): 改一条池条目的坑位（同时可领用的列车数）。往下调不会打断
+ * 已经借出去的列车，只是暂时不再发新的。
+ */
+CommandCost CmdR3RSetDispatchPoolLimit(DoCommandFlags flags, StationID station_id, uint16_t yard, uint16_t index, uint16_t limit)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	/* 第 420 轮 (KI-599): 整站池（场 ID 0）同样可增删改。 */
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		if (!st->R3RDispatchPoolSetLimit(yard, index, limit)) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY);
+		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
 	}
 	return CommandCost();
 }

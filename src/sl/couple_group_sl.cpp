@@ -131,6 +131,9 @@ static const NamedSaveLoad _r3r_park_desc[] = {
 	NSL("orders_backup",        SLE_REF(Vehicle, orders_backup, REF_ORDERLIST)),
 	NSL("order_backup_index",   SLE_VAR(Vehicle, orders_backup_real_index, SLE_VEHORDERID)),
 	NSL("order_backup_index_i", SLE_VAR(Vehicle, orders_backup_implicit_index, SLE_VEHORDERID)),
+	/* R3R (第 416 轮): 时间表进度也有自己的停放副本 —— 跑调度池表期间它是池表的坐标，
+	 * 归还时不能拿它当自己的位置，必须用这里存的那一份。表驱动读写，旧档读回 INVALID。 */
+	NSL("order_backup_index_t", SLE_VAR(Vehicle, orders_backup_timetable_index, SLE_VEHORDERID)),
 	NSL("unitnumber_backup",    SLE_VAR(Vehicle, unitnumber_backup, SLE_UINT16)),
 	/* R3R (第 160 轮 / KI-261): 车名的停放副本。原来是 NOSAVE（vehicle_base.h:380），
 	 * 于是"耦合时链头穿上车组的名字、自己的名字停在 name_backup"这一对借用/返还
@@ -143,6 +146,13 @@ static const NamedSaveLoad _r3r_park_desc[] = {
 	 * 该段重新成为链头时取回）。与其它停放字段一样只在稀疏块里写，不动车辆表布局。 */
 	NSL("group_id_backup",      SLE_VAR(Vehicle, group_id_backup, SLE_UINT16)),
 	NSL("orders_borrowed",      SLE_VAR(Vehicle, r3r_orders_borrowed, SLE_BOOL)),
+	/* R3R (第 416 轮): 跟随的是「调度池条目」而不是别段的表。存档往返必须保留，
+	 * 否则读档后这份日程永远不会归还（列车会一直跑池表，池表末条后又从头绕）。 */
+	NSL("follow_pool",          SLE_VAR(Vehicle, r3r_follow_pool, SLE_BOOL)),
+	/* R3R (第 429 轮 / 玩家需求壹): 耦合借用期间被挂起的调度池表。借用分三层
+	 * （自有 → 调度池 → 耦合方），而耦合会把 follow_orders 覆盖掉，没有这一格
+	 * 池层就整层丢失，归还时还会拿耦合方的表去释放池坑位。表驱动读写，旧档读回 nullptr。 */
+	NSL("pool_orders",          SLE_REF(Vehicle, r3r_pool_orders, REF_ORDERLIST)),
 	NSL("priority",             SLE_VAR(Vehicle, r3r_priority, SLE_UINT16)),
 	/* R3R (第 152 轮): which segment this car belongs to. The identity data lives
 	 * in the R3SG chunk below, so this is only the address; a car whose chain
@@ -155,9 +165,12 @@ static bool R3RHasParkState(const Vehicle *v)
 {
 	return v->r3r_follow_orders != nullptr ||
 			v->r3r_follow_owner != VehicleID::Invalid() ||
+			v->r3r_pool_orders != nullptr ||
 			v->orders_backup != nullptr ||
 			v->orders_backup_real_index != INVALID_VEH_ORDER_ID ||
 			v->orders_backup_implicit_index != INVALID_VEH_ORDER_ID ||
+			v->orders_backup_timetable_index != INVALID_VEH_ORDER_ID ||
+			v->r3r_follow_pool ||
 			v->unitnumber_backup != 0 ||
 			!v->name_backup.empty() ||
 			v->r3r_orders_borrowed ||

@@ -807,6 +807,8 @@ struct OrderSettings {
 	uint8_t  old_occupancy_smoothness;       ///< moved to company settings: percentage smoothness of occupancy measurement changes
 	bool   old_timetable_separation;         ///< moved to company settings: whether to perform automatic separation based on timetable
 	uint8_t  old_timetable_separation_rate;  ///< moved to company settings: percentage of timetable separation change to apply
+
+	uint16_t r3r_dispatch_pool_capacity;     ///< R3R: max number of dispatch pool entries per station yard
 };
 
 /** Enumeration of the driving sides of a road vehicle. */

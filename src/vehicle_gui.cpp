@@ -27,6 +27,7 @@
 #include "group_gui.h"
 #include "couple_group.h"
 #include "couple_group_gui.h"
+#include "r3r_schedule_gui.h"
 #include "r3r_perf.h"
 #include "strings_func.h"
 #include "strings_internal.h"
@@ -589,6 +590,7 @@ Dimension BaseVehicleListWindow::GetActionDropdownSize(bool show_autoreplace, bo
 	/* R3R: couple groups are a train-only concept. */
 	if (this->vli.vtype == VehicleType::Train) {
 		d = maxdim(d, GetStringBoundingBox(STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS));
+		d = maxdim(d, GetStringBoundingBox(STR_VEHICLE_LIST_MANAGE_SCHEDULES));
 	}
 
 	return d;
@@ -681,6 +683,9 @@ DropDownList BaseVehicleListWindow::BuildActionDropdownList(bool show_autoreplac
 	 * Couple groups only exist for trains, so the entry is hidden elsewhere. */
 	if (this->vli.vtype == VehicleType::Train) {
 		list.push_back(MakeDropDownListStringItem(STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS, ADI_COUPLE_GROUP_MGMT, false));
+		/* R3R (第 417 轮): the schedule pool is train-only as well (see
+		 * R3RSchedulePoolWindow::IsListable()), so the entry is hidden elsewhere. */
+		list.push_back(MakeDropDownListStringItem(STR_VEHICLE_LIST_MANAGE_SCHEDULES, ADI_R3R_SCHEDULE_MGMT, false));
 	}
 	if (change_order_str != 0) {
 		list.push_back(MakeDropDownListStringItem(change_order_str, ADI_CHANGE_ORDER, disable));
@@ -3091,6 +3096,10 @@ public:
 
 					case ADI_COUPLE_GROUP_MGMT: // R3R: couple group management (Q4)
 						ShowCoupleGroupWindow(this->owner);
+						break;
+
+					case ADI_R3R_SCHEDULE_MGMT: // R3R (第 417 轮): schedule pool
+						ShowR3RScheduleWindow(this->owner, this->vehicle_sel);
 						break;
 
 					default: NOT_REACHED();

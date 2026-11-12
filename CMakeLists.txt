@@ -547,6 +547,20 @@ if(DEFINED R3R_PROBES_DEFAULT)
     message(STATUS "R3R probes default override -- -DR3R_PROBES_DEFAULT=${R3R_PROBES_DEFAULT}")
 endif()
 
+# R3R (2026-11-08): compile-time master switch, separate from the runtime default
+# above. src/r3r_perf.h documents the combination this enables:
+#   -DR3R_PROBES=1 -DR3R_PROBES_DEFAULT=0
+# = probe code is linked in, but stays off unless R3R_DBG=1 asks for it.
+# That is what the optimised diagnostic tree needs: /O2 speed AND probes that can
+# be switched on for one run. Without this block CMake only warns
+# "Manually-specified variables were not used by the project", the define never
+# reaches build.ninja, and the [5d] hard gate in R3R_release_build.cmd aborts
+# with EXIT_CODE=94.
+if(DEFINED R3R_PROBES)
+    add_definitions(-DR3R_PROBES=${R3R_PROBES})
+    message(STATUS "R3R probes compile switch -- -DR3R_PROBES=${R3R_PROBES}")
+endif()
+
 enable_testing()
 
 add_subdirectory(regression)

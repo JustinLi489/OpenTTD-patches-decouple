@@ -27,6 +27,9 @@ void FindVehiclesWithOrder(VehiclePredicate veh_pred, OrderPredicate ord_pred, V
 
 		/* We assume all vehicles sharing an order list match the condition. */
 		const Vehicle *v = orderlist->GetFirstSharedVehicle();
+		/* R3R (第 417 轮 无主排程): loose schedules have no vehicle at all, and
+		 * veh_pred() dereferences its argument. */
+		if (v == nullptr) continue;
 		if (!veh_pred(v)) continue;
 
 		/* Vehicle is a candidate, search for a matching order. */

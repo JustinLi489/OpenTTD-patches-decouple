@@ -59,7 +59,10 @@ void MoveBuoysToWaypoints()
 {
 	/* Buoy orders become waypoint orders */
 	for (OrderList *ol : OrderList::Iterate()) {
-		VehicleType vt = ol->GetFirstSharedVehicle()->type;
+		/* R3R (第 417 轮 无主排程): loose schedules have no vehicle type. */
+		const Vehicle *const first_shared = ol->GetFirstSharedVehicle();
+		if (first_shared == nullptr) continue;
+		VehicleType vt = first_shared->type;
 		if (vt != VehicleType::Ship && vt != VehicleType::Train) continue;
 
 		for (Order *o : ol->Orders()) UpdateWaypointOrder(o);

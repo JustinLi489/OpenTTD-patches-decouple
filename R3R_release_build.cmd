@@ -126,6 +126,16 @@ if defined CACHEOK (
 )
 
 echo.
+echo ---- [4c] incremental safety guard (header newer than object = full rebuild) ----
+rem  build-release has the same broken MSVC header dependency info as build\ (KI-183),
+rem  so an incremental ninja run after a src\*.h edit would link a mixed-ABI binary.
+rem  The guard drops the affected objects - all of them for a widely included header,
+rem  but only the 5 yapf objects when a yapf header changed. Its exit code is
+rem  informational: 2 just means "objects were dropped, expect a full rebuild".
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\R3R_inc_guard.ps1" -BuildDir "build-release"
+echo   guard exit=%ERRORLEVEL%
+
+echo.
 echo ---- [5] cmake configure (RelWithDebInfo, forced /O2 /Ob2) ----
 "%CMAKEEXE%" -S "%ROOT%" -B "%BLD%" -G Ninja ^
   -DCMAKE_MAKE_PROGRAM="%NINJA%" ^
@@ -135,6 +145,7 @@ echo ---- [5] cmake configure (RelWithDebInfo, forced /O2 /Ob2) ----
   -DCMAKE_C_FLAGS_RELWITHDEBINFO="/Zi /O2 /Ob2 /DNDEBUG" ^
   -DOPTION_USE_ASSERTS=ON ^
   -DR3R_PROBES_DEFAULT=0 ^
+  -DR3R_PROBES=1 ^
   -DVCPKG_TARGET_TRIPLET=x64-windows-static
 set "CFG=%ERRORLEVEL%"
 echo CMAKE_CONFIGURE_EXIT=%CFG%
@@ -182,7 +193,15 @@ if errorlevel 1 (
     > "%DONE%" echo EXIT_CODE=94
     exit /b 94
 )
-echo   OK: probes default OFF (runtime override: set R3R_DBG=1)
+findstr /C:"-DR3R_PROBES=1" "%BLD%\build.ninja" >nul 2>&1
+if errorlevel 1 (
+    echo   [FATAL] build.ninja does not carry -DR3R_PROBES=1
+    echo   [FATAL] no probe code would be compiled in, so R3R_DBG=1 could
+    echo   [FATAL] not switch the probes on at runtime in this tree.
+    > "%DONE%" echo EXIT_CODE=94
+    exit /b 94
+)
+echo   OK: probes compiled IN, default OFF (runtime override: set R3R_DBG=1)
 
 echo.
 echo ---- [6] ninja -C build-release -j %JOBS% openttd  (FULL BUILD) ----

@@ -949,8 +949,41 @@ public:
 		/* R3R: 玩家给这个场起的名字（UTF-8）。空 = 未命名，界面一律显示默认的
 		 * 「N 场」。名字只是标签，不参与寻路/占用判定，也不要求全局唯一。 */
 		std::string name;
+		/* R3R (第 416 轮): 调度池条目。
+		 *
+		 * 一条 = 「一份可以被领取的调度表」+「同时允许几列车领用(limit)」+
+		 * 「已经发出几份(issued)」。列车在带「等待分配」标记的到站命令处领取一条，
+		 * 跑完池表的最后一条命令再把命令指回自己表的下一条。
+		 *
+		 * 第 428 轮 (KI-621) 起，条目的身份是**排程**（schedule = OrderList 池下标），
+		 * 不再按列车登记：
+		 *  - 同一个表被多列车共享时，池里只出现一次（旧实现按模板车登记，会重复）；
+		 *  - 无主排程（第 417 轮，first_shared == nullptr）也能进池。旧实现在这里只存
+		 *    VehicleID，无主排程根本无处安放，于是池里压根看不到它们。
+		 * host 保留为「模板车」缓存，只用于显示与旧档兼容；它可以无效（无主排程）。
+		 * 表本体仍由 OrderList 池持有，与车辆名下的表完全同构（第 417 轮已把
+		 * GetFirstSharedVehicle() 的调用点全部做了空值守卫）。
+		 *
+		 * 容量上限 = 游戏设置 order.r3r_dispatch_pool_capacity（默认 256）。
+		 */
+		struct R3RDispatchPoolEntry {
+			VehicleID host = VehicleID::Invalid(); ///< 持有该调度表的模板车
+			uint32_t schedule = R3R_DISPATCH_NO_SCHEDULE; ///< R3R (第 428 轮): 排程（OrderList 池下标）
+			uint16_t limit = 1;                    ///< 同时可领用的列车数（坑位），0 视为 1
+			uint16_t issued = 0;                   ///< 已发出、尚未归还的份数
+		};
+		std::vector<R3RDispatchPoolEntry> pool; ///< R3R: 本场的调度池
 	};
 	std::vector<R3RStationYard> r3r_yards{}; ///< R3R: 场的列表（有效场 ID = 下标 + 1）
+
+	/* R3R (第 420 轮, KI-599): 「整站」（R3R_YARD_NONE）自己的调度池与检修所标志。
+	 * 在此之前整站只是「不设场」的一个空概念，没有任何存储实体，于是站场窗口切到
+	 * 整站时列表恒空、检修所/调度池按钮恒灰 —— 玩家要求整站也能管理这两样。
+	 * 与各场池**相互独立、不合并**（整站池只服务「订单里没有指定场」的领取方）。
+	 * 存档：独立 chunk "SYRD" v7 追加块（v6 已被第 416 轮的各场池占用；
+	 * 第 428 轮把池条目扩成带排程 ⇒ 升到 v8，见 src/sl/station_yard_sl.cpp）。 */
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> r3r_whole_pool{};
+	bool r3r_whole_workshop = false; ///< R3R: 整站是否为检修所（该站全部平台都不接货）
 
 	/* R3R: [存档兼容] SYRD v1 的三个场列表。v2 起场数据统一编码进 r3r_yard_a（见
 	 * src/sl/station_yard_sl.cpp），r3r_yard_b / r3r_yard_shared 恒为空：保留它们只是
@@ -984,6 +1017,8 @@ public:
 	 * 场数量不限（受 16 位 order 存储上限约束，最多 65534 个）。 */
 	static constexpr uint16_t R3R_YARD_NONE = 0; ///< R3R: 无场，订单按整站处理
 	static constexpr uint16_t R3R_MAX_YARDS = 65534; ///< R3R: 单车站场数量上限
+	/** R3R (第 428 轮, KI-621): 调度池条目尚未记录排程（旧档条目，按模板车的表推导）。 */
+	static constexpr uint32_t R3R_DISPATCH_NO_SCHEDULE = 0xFFFFFFFF;
 
 	/* R3R: [存档兼容] SYRD v1 的三个固定场。v2 起场数据统一编码进 r3r_yard_a，
 	 * 读 v1 存档时按「A→场1、B→场2、共用→场3(shared)」迁移。 */
@@ -1026,6 +1061,33 @@ public:
 	bool    R3RHasAnyYard() const;
 	/** R3R: 收集某个场中仍然有效的铁路 tile（升序、无重复）。 */
 	void    R3RCollectYardTiles(uint16_t yard, std::vector<TileIndex> &out) const;
+
+	/* R3R (第 416 轮): 调度池（见 R3RStationYard::R3RDispatchPoolEntry）。
+	 * 实现见 src/station_cmd.cpp。 */
+	/** R3R (第 420 轮, KI-599): 调度池的存储选址。yard == R3R_YARD_NONE 时指向整站池
+	 *  （r3r_whole_pool），否则指向 r3r_yards[yard - 1].pool。
+	 *  @return nullptr 表示场 ID 越界，调用方必须按「没有池」处理。 */
+	std::vector<R3RStationYard::R3RDispatchPoolEntry>       *R3RDispatchPoolRef(uint16_t yard);
+	const std::vector<R3RStationYard::R3RDispatchPoolEntry> *R3RDispatchPoolRef(uint16_t yard) const;
+	/** R3R: 本场调度池里仍然有效的条目数（排程已消失/已清空的不计）。 */
+	uint16_t R3RDispatchPoolCount(uint16_t yard) const;
+	/** R3R: 丢弃无效条目（排程已消失且模板车也追不回），返回丢弃条数。 */
+	uint16_t R3RDispatchPoolPrune(uint16_t yard);
+	/** R3R (第 428 轮, KI-621): 加入一条调度池条目（排程 + 坑位），成功返回下标，失败返回 -1。
+	 * @param schedule OrderList 池下标（0 起）；池条目的身份是排程而不是车，模板车只由它推导。 */
+	int      R3RDispatchPoolAdd(uint16_t yard, uint32_t schedule, uint16_t limit);
+	/** R3R: 删除指定下标的池条目。 */
+	bool     R3RDispatchPoolRemove(uint16_t yard, uint16_t index);
+	/** R3R: 修改指定下标的坑位（1..容量上限）。 */
+	bool     R3RDispatchPoolSetLimit(uint16_t yard, uint16_t index, uint16_t limit);
+	/** R3R: 为一次领取挑一个还有空坑位的条目，返回下标（-1 = 没有可用的）。
+	 * @param except_schedule 领取方自己正在跑的表（它不能领自己名下的表）。
+	 * @param out_schedule 输出被选中的排程（OrderList 池下标）。 */
+	int      R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule) const;
+	/** R3R: 领取成功后占掉一个坑位（按排程查找）。 */
+	bool     R3RDispatchPoolAcquire(uint32_t schedule);
+	/** R3R: 归还一个坑位（按排程查找全部车站的场）。 */
+	bool     R3RDispatchPoolRelease(uint32_t schedule);
 
 	void RecomputeCatchment(bool no_clear_nearby_lists = false);
 	static void RecomputeCatchmentForAll();

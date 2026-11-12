@@ -36,7 +36,18 @@ VehicleOrderID AdvanceOrderIndexDeferred(const Vehicle *v, VehicleOrderID index)
 void FlushAdvanceOrderIndexDeferred(const Vehicle *v, bool apply);
 uint GetOrderDistance(const Order *prev, const Order *cur, const Vehicle *v, int conditional_depth = 0);
 
-void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int y, bool selected, bool timetable, int left, int middle, int right);
+struct OrderList;
+
+/**
+ * R3R (第 424 轮, KI-607 C-5): draw one order line.
+ *
+ * `v` may be nullptr for an ownerless schedule. In that case `list` (the ownerless
+ * schedule itself) and `owner` (the company allowed to edit it) supply the context
+ * which normally comes from the vehicle, so that the schedule-only lines -- station
+ * usability, scheduled dispatch name, slot group warnings, dispatch tail note -- are
+ * drawn exactly like they are for a vehicle.
+ */
+void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int y, bool selected, bool timetable, int left, int middle, int right, VehicleType vtype = VehicleType::Invalid, const OrderList *list = nullptr, CompanyID owner = CompanyID::Invalid());
 
 static const uint DEF_SERVINT_DAYS_TRAINS   = 150;
 static const uint DEF_SERVINT_DAYS_ROADVEH  = 150;

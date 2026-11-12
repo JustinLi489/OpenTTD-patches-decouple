@@ -14,6 +14,7 @@
 #include "textbuf_gui.h"
 #include "company_func.h"
 #include "command_func.h"
+#include "error.h"
 #include "vehicle_gui.h"
 #include "cargotype.h"
 #include "station_gui.h"
@@ -31,6 +32,7 @@
 #include "sortlist_type.h"
 #include "core/geometry_func.hpp"
 #include "vehiclelist.h"
+#include "vehicle_base.h"
 #include "sound_func.h"
 #include "town.h"
 #include "linkgraph/linkgraph.h"
@@ -446,6 +448,8 @@ protected:
 		station_vehicle_calling_counts.clear();
 
 		auto can_vehicle_use_facility = [&](const Vehicle *v) -> bool {
+			/* R3R (第 417 轮 无主排程): a loose schedule has no vehicle to ask. */
+			if (v == nullptr) return false;
 			switch (v->type) {
 				case VehicleType::Train:
 					return facilities.Test(StationFacility::Train);
@@ -3143,6 +3147,7 @@ static constexpr NWidgetPart _nested_station_yard_widgets[] = {
 		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SY_YARD_SEL), SetMinimalSize(90, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_YARD_NAME_NONE, STR_R3R_YARD_SEL_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_ASSIGN), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_ASSIGN, STR_R3R_YARD_ASSIGN_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_NEW_YARD), SetMinimalSize(60, 12), SetStringTip(STR_R3R_YARD_NEW, STR_R3R_YARD_NEW_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SY_DISPATCH), SetMinimalSize(60, 12), SetStringTip(STR_R3R_DISPATCH_POOL_BUTTON, STR_R3R_DISPATCH_POOL_BUTTON_TOOLTIP),
 	EndContainer(),
 
 	NWidget(NWID_HORIZONTAL),
@@ -3160,6 +3165,9 @@ static WindowDesc _station_yard_desc(__FILE__, __LINE__,
 	WindowClass::StationYard, WindowClass::None,
 	{}, _nested_station_yard_widgets
 );
+
+/** R3R (第 416 轮): open the dispatch pool (调度池) window of \a yard of \a station. */
+void ShowStationDispatchWindow(StationID station, uint16_t yard);
 
 /**
  * R3R: window which assigns the rail platforms of one station to any of its
@@ -3290,11 +3298,12 @@ private:
 		this->SetDirty();
 	}
 
-	/** R3R: whether the currently selected yard is a workshop (检修所). */
+	/** R3R: whether the currently selected yard is a workshop (检修所).
+	 *  第 420 轮 (KI-599): 「整站」也有自己的检修所（只管没划进任何场的站台）。 */
 	bool SelectedYardIsWorkshop() const
 	{
 		const Station *st = Station::GetIfValid(this->station_id);
-		if (st == nullptr || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return false;
+		if (st == nullptr || this->sel_yard > st->R3RNumYards()) return false;
 		return st->R3RIsYardWorkshop(this->sel_yard);
 	}
 
@@ -3303,7 +3312,7 @@ private:
 	void ToggleWorkshopOfSelected()
 	{
 		const Station *st = Station::GetIfValid(this->station_id);
-		if (st == nullptr || !this->CanEdit() || this->sel_yard == Station::R3R_YARD_NONE || this->sel_yard > st->R3RNumYards()) return;
+		if (st == nullptr || !this->CanEdit() || this->sel_yard > st->R3RNumYards()) return;
 		const bool now = st->R3RIsYardWorkshop(this->sel_yard);
 		Command<Commands::SetR3RStationYardWorkshop>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->sel_yard, !now);
 		this->SetDirty();
@@ -3432,16 +3441,21 @@ public:
 		const Station *st = Station::GetIfValid(this->station_id);
 		const uint16_t num_yards = (st != nullptr) ? st->R3RNumYards() : 0;
 		const bool sel_yard_valid = this->sel_yard != Station::R3R_YARD_NONE && this->sel_yard <= num_yards;
+		/* 第 420 轮 (KI-599): 「整站」（场 ID 0）现在也有自己的检修所与调度池，
+		 * 所以这两个按钮对整站同样可用，只有越界的残留 selection 才拦。 */
+		const bool sel_ok = this->sel_yard <= num_yards;
 
 		this->SetWidgetDisabledState(WID_SY_YARD_SEL, !can_edit);
 		this->SetWidgetDisabledState(WID_SY_ASSIGN, !can_edit || !has_sel);
 		this->SetWidgetDisabledState(WID_SY_NEW_YARD, !can_edit || num_yards >= Station::R3R_MAX_YARDS);
 		/* 检修所不参与「停满回落」共享，因此选中检修所时共享下拉不可用。 */
 		this->SetWidgetDisabledState(WID_SY_SHARED_SEL, !can_edit || !sel_yard_valid || this->SelectedYardIsWorkshop());
-		this->SetWidgetDisabledState(WID_SY_WORKSHOP, !can_edit || !sel_yard_valid);
+		this->SetWidgetDisabledState(WID_SY_WORKSHOP, !can_edit || !sel_ok);
 		this->SetWidgetDisabledState(WID_SY_LOCATE, !has_sel);
 		this->SetWidgetDisabledState(WID_SY_RENAME, !can_edit || !sel_yard_valid);
 		this->SetWidgetDisabledState(WID_SY_DELETE, !can_edit || !sel_yard_valid);
+		/* 调度池：整站选中时打开的是整站池，具体场选中时是该场的池。 */
+		this->SetWidgetDisabledState(WID_SY_DISPATCH, !sel_ok);
 		this->DrawWidgets();
 	}
 
@@ -3524,6 +3538,10 @@ public:
 				this->DeleteSelectedYard();
 				break;
 
+			case WID_SY_DISPATCH:
+				ShowStationDispatchWindow(this->station_id, this->GetSelectedYard());
+				break;
+
 			default:
 				break;
 		}
@@ -3564,4 +3582,384 @@ void ShowStationYardWindow(StationID station)
 {
 	if (BringWindowToFrontById(WindowClass::StationYard, station) != nullptr) return;
 	new StationYardWindow(_station_yard_desc, station);
+}
+
+/** R3R (第 428 轮, KI-621): 池条目指向的排程。
+ *  条目按排程登记；旧档条目没记排程时回退到模板车名下的表，行为与旧版一致。 */
+static const OrderList *R3RDispatchEntryScheduleGui(const Station::R3RStationYard::R3RDispatchPoolEntry &e)
+{
+	if (e.schedule != Station::R3R_DISPATCH_NO_SCHEDULE) {
+		const OrderList *const ol = OrderList::GetIfValid(OrderListID(e.schedule));
+		if (ol != nullptr) return ol;
+	}
+	const Vehicle *const v = Vehicle::GetIfValid(e.host);
+	return (v != nullptr) ? v->orders : nullptr;
+}
+
+/** R3R (第 416 轮/第 417 轮): 一张排程能否当调度池的模板（表非空）。
+ *  与 station_cmd.cpp 里的 R3RDispatchScheduleUsable 同义，只是这里用于筛选候选列表；
+ *  真正的校验在命令层，所以两者不一致也只会让命令报错而不会写坏数据。
+ *  R3R (第 417 轮): 按玩家拍板撤销「表里不能有解挂/挂接/等待挂接命令」的限制。 */
+static bool R3RDispatchScheduleUsableGui(const OrderList *ol)
+{
+	return ol != nullptr && ol->GetNumOrders() > 0;
+}
+
+/** R3R (第 420 轮, KI-601 / 第 428 轮按排程): 调度池条目的显示名。
+ *  优先排程名；无名时：有模板车就回退车名，无主排程则显示「未命名排程 #池下标」，
+ *  因为无主排程没有车可回退，光写「未命名排程」会让多个条目无法区分。 */
+static std::string R3RDispatchScheduleLabel(const OrderList *ol)
+{
+	if (ol == nullptr) return GetString(STR_R3R_DISPATCH_POOL_ENTRY_GONE);
+	const std::string &name = ol->GetR3RScheduleName();
+	if (!name.empty()) return name;
+	const Vehicle *const first = ol->GetFirstSharedVehicle();
+	if (first != nullptr) return GetString(STR_VEHICLE_NAME, first->index.base());
+	return GetString(STR_R3R_SCHEDULE_UNNAMED) + " #" + std::to_string(ol->index.base());
+}
+
+/** R3R (第 420 轮, KI-601 / 第 428 轮按排程): 添加下拉的条目文案 =「调度名（车名）」。
+ *  有名排程且与模板车名不同时把车名放进括号，帮玩家认出是哪一列；
+ *  排程名本身为空时 R3RDispatchScheduleLabel 已经回退到车名，不再重复括号。 */
+static std::string R3RDispatchPickerLabel(const OrderList *ol)
+{
+	const std::string schedule = R3RDispatchScheduleLabel(ol);
+	const Vehicle *const first = ol->GetFirstSharedVehicle();
+	if (first == nullptr || ol->GetR3RScheduleName().empty()) return schedule;
+	const std::string vehicle = GetString(STR_VEHICLE_NAME, first->index.base());
+	if (schedule == vehicle) return schedule;
+	return schedule + " (" + vehicle + ")";
+}
+
+/** R3R (第 416 轮): layout of the dispatch pool (调度池) management window. */
+static constexpr NWidgetPart _nested_station_dispatch_widgets[] = {
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_CLOSEBOX, Colours::Grey),
+		NWidget(WWT_CAPTION, Colours::Grey, WID_SD_CAPTION), SetStringTip(STR_R3R_DISPATCH_POOL_CAPTION, STR_TOOLTIP_WINDOW_TITLE_DRAG_THIS),
+		NWidget(WWT_SHADEBOX, Colours::Grey),
+		NWidget(WWT_DEFSIZEBOX, Colours::Grey),
+		NWidget(WWT_STICKYBOX, Colours::Grey),
+	EndContainer(),
+
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_PANEL, Colours::Grey, WID_SD_LIST), SetMinimalSize(300, 130), SetResize(1, 10), SetToolTip(STR_R3R_DISPATCH_POOL_LIST_TOOLTIP), SetScrollbar(WID_SD_SCROLLBAR), EndContainer(),
+		NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_SD_SCROLLBAR),
+	EndContainer(),
+
+	NWidget(NWID_HORIZONTAL),
+		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SD_YARD_SEL), SetMinimalSize(110, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_DISPATCH_POOL_YARD_NONE, STR_R3R_YARD_SEL_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_ADD), SetMinimalSize(50, 12), SetStringTip(STR_R3R_DISPATCH_POOL_ADD, STR_R3R_DISPATCH_POOL_ADD_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_DELETE), SetMinimalSize(50, 12), SetStringTip(STR_R3R_DISPATCH_POOL_DELETE, STR_R3R_DISPATCH_POOL_DELETE_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_SLOTS_DOWN), SetMinimalSize(20, 12), SetStringTip(STR_R3R_DISPATCH_POOL_SLOTS_DOWN, STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_SLOTS_UP), SetMinimalSize(20, 12), SetStringTip(STR_R3R_DISPATCH_POOL_SLOTS_UP, STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP),
+		NWidget(WWT_RESIZEBOX, Colours::Grey),
+	EndContainer(),
+};
+
+static WindowDesc _station_dispatch_desc(__FILE__, __LINE__,
+	WindowPosition::Automatic, "r3r_station_dispatch", 340, 200,
+	WindowClass::StationDispatch, WindowClass::None,
+	{}, _nested_station_dispatch_widgets
+);
+
+/**
+ * R3R (第 416 轮): 调度池（dispatch pool）管理窗口。
+ *
+ * 一行 = 本场池里的一条班次（模板车 + 命令数 + 已用/总坑位）。可添加（从全图
+ * 列车里挑一辆作模板）、移除、加减坑位。所有修改都走命令层，因此多人/回放安全。
+ */
+struct StationDispatchWindow : Window {
+private:
+	Scrollbar *scroll = nullptr;   ///< Scrollbar of the pool list.
+	StationID station_id;          ///< The station whose yard pools are managed.
+	uint16_t yard = Station::R3R_YARD_NONE; ///< Yard whose pool is shown.
+	std::vector<uint16_t> rows;    ///< Indices into the yard's pool which are currently usable.
+	int selected = -1;             ///< Selected index into #rows, or -1.
+	uint16_t pending_delete_index = 0; ///< Pool index the pending delete confirmation applies to.
+
+	/** R3R (第 420 轮, KI-599): the pool of #yard; the whole-station pool (场 ID 0) is a
+	 *  real entity now, so this returns nullptr only when the station/yard is invalid. */
+	const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *GetPool() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st == nullptr || this->yard > st->R3RNumYards()) return nullptr;
+		return st->R3RDispatchPoolRef(this->yard);
+	}
+
+	/** Rebuild #rows from the station. */
+	void Rebuild()
+	{
+		this->rows.clear();
+		this->selected = -1;
+
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st != nullptr) {
+			/* 只有越界的残留 selection 才回退；「整站」是合法选择，不再被强制改成 1 场。 */
+			if (this->yard > st->R3RNumYards()) this->yard = Station::R3R_YARD_NONE;
+			const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *const pool = this->GetPool();
+			if (pool != nullptr) {
+				/* 第 428 轮 (KI-621): 条目身份是排程（不是模板车）。这里**不再**按可用性
+				 * 过滤 —— 排程被释放后条目仍然存在（limit/issued 还占着），以前它从列表里
+				 * 消失就再也删不掉。现在它会以「(已消失)」显示，玩家可以正常删除。 */
+				for (size_t i = 0; i < pool->size(); i++) {
+					this->rows.push_back(static_cast<uint16_t>(i));
+				}
+			}
+		} else {
+			this->yard = Station::R3R_YARD_NONE;
+		}
+
+		this->scroll->SetCount(this->rows.size());
+		if (!this->rows.empty()) this->selected = 0;
+	}
+
+	/** The selected pool entry, or nullptr. */
+	const Station::R3RStationYard::R3RDispatchPoolEntry *GetSelectedEntry() const
+	{
+		const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *const pool = this->GetPool();
+		if (pool == nullptr) return nullptr;
+		if (this->selected < 0 || this->selected >= static_cast<int>(this->rows.size())) return nullptr;
+		const uint16_t idx = this->rows[this->selected];
+		if (idx >= pool->size()) return nullptr;
+		return &(*pool)[idx];
+	}
+
+	/** Whether the local company may edit this station's pools. */
+	bool CanEdit() const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		return st != nullptr && Company::IsValidID(st->owner) && st->owner == _local_company;
+	}
+
+	/** Plain label of \a yard ("[n 场]" or the player's own name). */
+	std::string YardLabel(uint16_t y) const
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		/* 第 420 轮 (KI-599): 「整站」是可选择的池，标签按整站显示。 */
+		if (y == Station::R3R_YARD_NONE) return GetString(STR_R3R_YARD_NAME_NONE);
+		if (st == nullptr || y > st->R3RNumYards()) return GetString(STR_R3R_DISPATCH_POOL_YARD_NONE);
+		const std::string &name = st->R3RGetYardName(y);
+		if (!name.empty()) return name;
+		return GetString(STR_R3R_YARD_NAME_N, y);
+	}
+
+	/** Change the slots of the selected entry by \a delta. */
+	void ChangeSlots(int delta)
+	{
+		const Station::R3RStationYard::R3RDispatchPoolEntry *e = this->GetSelectedEntry();
+		if (e == nullptr || !this->CanEdit()) return;
+		const int next = std::clamp<int>(static_cast<int>(e->limit) + delta, 1, 256);
+		if (next == e->limit) return;
+		Command<Commands::SetR3RDispatchPoolLimit>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->yard, this->rows[this->selected], static_cast<uint16_t>(next));
+		this->SetDirty();
+	}
+
+	/** Confirmation callback for removing the selected entry. */
+	static void DeleteEntryCallback(Window *w, bool confirmed);
+
+public:
+	StationDispatchWindow(WindowDesc &desc, StationID station, uint16_t y) : Window(desc), station_id(station), yard(y)
+	{
+		this->CreateNestedTree();
+		this->scroll = this->GetScrollbar(WID_SD_SCROLLBAR);
+		this->FinishInitNested(station);
+	}
+
+	void OnInit() override
+	{
+		const Station *st = Station::GetIfValid(this->station_id);
+		if (st != nullptr) this->owner = st->owner;
+		this->Rebuild();
+	}
+
+	void UpdateWidgetSize(WidgetID widget, Dimension &size, const Dimension &padding, Dimension &fill, Dimension &resize) override
+	{
+		if (widget == WID_SD_LIST) {
+			resize.height = GetCharacterHeight(FontSize::Normal) + 2;
+			size.height = resize.height * 8 + WidgetDimensions::scaled.framerect.Vertical();
+		}
+	}
+
+	void DrawWidget(const Rect &r, WidgetID widget) const override
+	{
+		if (widget != WID_SD_LIST) return;
+
+		const Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
+		/* 第 420 轮 (KI-599): 整站池（场 ID 0）也是真实存在的池。 */
+		const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *const pool = this->GetPool();
+		if (pool == nullptr) {
+			DrawString(ir.left, ir.right, ir.top, STR_R3R_DISPATCH_POOL_YARD_NONE);
+			return;
+		}
+		if (this->rows.empty()) {
+			DrawString(ir.left, ir.right, ir.top, STR_R3R_DISPATCH_POOL_EMPTY);
+			return;
+		}
+
+		/* 行距必须取自列表控件本身（KI-262 同族：容器的 resize_y 可能被
+		 * 步长为 0 的兄弟控件（滚动条）拉成 0，导致所有行画在同一行）。 */
+		const NWidgetBase *list_widget = this->GetWidget<NWidgetBase>(WID_SD_LIST);
+		const int step = (list_widget != nullptr && list_widget->resize_y > 0) ? static_cast<int>(list_widget->resize_y) : (GetCharacterHeight(FontSize::Normal) + 2);
+
+		int y = ir.top;
+		for (int i = this->scroll->GetPosition(); i < static_cast<int>(this->rows.size()) && this->scroll->IsVisible(i); i++, y += step) {
+			if (i == this->selected) GfxFillRect(r.left + 1, y, r.right, y + step - 1, PC_DARK_GREY);
+			const uint16_t idx = this->rows[i];
+			if (idx >= pool->size()) continue;
+			const Station::R3RStationYard::R3RDispatchPoolEntry &e = (*pool)[idx];
+			/* {RAW_STRING} 需要一个字符串参数，所以先取名字再拼。
+			 * 第 420 轮 (KI-601): 优先显示排程名，空则回退模板车车名。
+			 * 第 428 轮 (KI-621): 条目按排程登记，无主排程也有名字可显示。 */
+			const OrderList *const entry_orders = R3RDispatchEntryScheduleGui(e);
+			const int num_orders = (entry_orders != nullptr) ? static_cast<int>(entry_orders->GetNumOrders()) : 0;
+			const std::string schedule_name = R3RDispatchScheduleLabel(entry_orders);
+			DrawString(ir.left, ir.right, y, GetString(STR_R3R_DISPATCH_POOL_ENTRY, schedule_name, num_orders, e.issued, e.limit));
+		}
+	}
+
+	void OnResize() override
+	{
+		this->scroll->SetCapacityFromWidget(this, WID_SD_LIST, WidgetDimensions::scaled.framerect.Vertical());
+	}
+
+	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
+	{
+		if (widget == WID_SD_YARD_SEL) return GetString(STR_R3R_DISPATCH_POOL_YARD_SEL, this->YardLabel(this->yard));
+		if (widget == WID_SD_CAPTION) return GetString(STR_R3R_DISPATCH_POOL_CAPTION_STATION, this->station_id);
+		return this->Window::GetWidgetString(widget, stringid);
+	}
+
+	void OnPaint() override
+	{
+		const bool can_edit = this->CanEdit();
+		const bool has_entry = this->GetSelectedEntry() != nullptr;
+		/* R3R (第 419 轮): choosing which yard to look at is a read-only operation, so the
+		 * selector must never be disabled (KI-592: it could not be pressed at all). */
+		/* 第 420 轮 (KI-599): 整站池也能加条目，所以不再按 yard == 0 禁用。 */
+		this->SetWidgetDisabledState(WID_SD_ADD, !can_edit);
+		this->SetWidgetDisabledState(WID_SD_DELETE, !can_edit || !has_entry);
+		this->SetWidgetDisabledState(WID_SD_SLOTS_DOWN, !can_edit || !has_entry);
+		this->SetWidgetDisabledState(WID_SD_SLOTS_UP, !can_edit || !has_entry);
+		this->DrawWidgets();
+	}
+
+	void OnInvalidateData(int data = 0, bool gui_scope = true) override
+	{
+		if (!gui_scope) return;
+		this->Rebuild();
+		this->SetDirty();
+	}
+
+	void OnClick(Point pt, WidgetID widget, int click_count) override
+	{
+		switch (widget) {
+			case WID_SD_LIST: {
+				const int sel = this->scroll->GetScrolledRowFromWidget(pt.y, this, WID_SD_LIST, WidgetDimensions::scaled.framerect.top);
+				if (sel == INT_MAX || sel >= static_cast<int>(this->rows.size())) break;
+				if (sel != this->selected) {
+					this->selected = sel;
+					this->SetDirty();
+				}
+				break;
+			}
+
+			case WID_SD_YARD_SEL: {
+				const Station *st = Station::GetIfValid(this->station_id);
+				/* R3R (第 419 轮): an empty dropdown looks like a dead button, so tell the
+				 * player why nothing happens (KI-592).
+				 * 第 420 轮 (KI-599): 「整站」也是一项，因此一个场都没建时下拉不再是空的。 */
+				if (st == nullptr) break;
+				DropDownList list;
+				list.push_back(MakeDropDownListStringItem(this->YardLabel(Station::R3R_YARD_NONE), Station::R3R_YARD_NONE, false));
+				for (uint16_t y = 1; y <= st->R3RNumYards(); y++) {
+					list.push_back(MakeDropDownListStringItem(this->YardLabel(y), y, false));
+				}
+				ShowDropDownList(this, std::move(list), this->yard, WID_SD_YARD_SEL, 0, {});
+				break;
+			}
+
+			case WID_SD_ADD: {
+				const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> *const pool = this->GetPool();
+				if (pool == nullptr) break;
+				const Station *const st = Station::GetIfValid(this->station_id);
+				if (st == nullptr) break;
+				/* 第 428 轮 (KI-621): 候选改成「排程」而不是「模板车」——
+				 *  · 多列车共享同一张表时只出现一次（条目按排程去重）；
+				 *  · 无主排程（没有车、first_shared 为空）也能登记；
+				 *  · 别家公司的私有表不列出来（命令层也会拒，列出来只会让玩家点了报错）。 */
+				DropDownList list;
+				for (const OrderList *ol : OrderList::Iterate()) {
+					if (!R3RDispatchScheduleUsableGui(ol)) continue;
+					if (ol->GetR3RScheduleOwner() != st->owner && !R3RScheduleAccessibleBy(ol, st->owner)) continue;
+					const uint32_t schedule = ol->index.base();
+					bool already = false;
+					for (const auto &e : *pool) {
+						const OrderList *const entry_orders = R3RDispatchEntryScheduleGui(e);
+						if (entry_orders == ol || (entry_orders != nullptr && entry_orders->index.base() == schedule)) {
+							already = true;
+							break;
+						}
+					}
+					if (already) continue;
+					/* 第 420 轮 (KI-601): 下拉里显示「调度名（车名）」，让玩家既认得出调度也认得出车。 */
+					std::string text = R3RDispatchPickerLabel(ol);
+					list.push_back(MakeDropDownListStringItem(std::move(text), static_cast<int>(schedule), false));
+				}
+				if (list.empty()) {
+					ShowErrorMessage(GetEncodedString(STR_R3R_DISPATCH_POOL_ADD_EMPTY), GetEncodedString(STR_R3R_DISPATCH_POOL_ADD_EMPTY), WarningLevel::Warning);
+					break;
+				}
+				ShowDropDownList(this, std::move(list), -1, WID_SD_ADD, 0, {});
+				break;
+			}
+
+			case WID_SD_DELETE: {
+				const Station::R3RStationYard::R3RDispatchPoolEntry *e = this->GetSelectedEntry();
+				if (e == nullptr || !this->CanEdit()) break;
+				this->pending_delete_index = this->rows[this->selected];
+				/* 第 420 轮 (KI-601): 删除确认同样按调度名显示，与列表行一致。 */
+				const std::string label = R3RDispatchScheduleLabel(R3RDispatchEntryScheduleGui(*e));
+				ShowQuery(GetEncodedString(STR_R3R_DISPATCH_POOL_DELETE), GetEncodedString(STR_R3R_DISPATCH_POOL_DELETE_CONFIRM, label), this, DeleteEntryCallback);
+				break;
+			}
+
+			case WID_SD_SLOTS_DOWN:
+				this->ChangeSlots(-1);
+				break;
+
+			case WID_SD_SLOTS_UP:
+				this->ChangeSlots(+1);
+				break;
+
+			default:
+				break;
+		}
+	}
+
+	void OnDropdownSelect(WidgetID widget, int index, int) override
+	{
+		if (widget == WID_SD_YARD_SEL && index >= 0 && index <= Station::R3R_MAX_YARDS) {
+			this->yard = static_cast<uint16_t>(index);
+			this->Rebuild();
+			this->SetDirty();
+		} else if (widget == WID_SD_ADD && index >= 0 && this->yard <= Station::R3R_MAX_YARDS) {
+			Command<Commands::AddR3RDispatchPoolEntry>::Post(STR_ERROR_CAN_T_DO_THIS, this->station_id, this->yard,
+					static_cast<uint32_t>(index), static_cast<uint16_t>(1));
+			this->SetDirty();
+		}
+	}
+};
+
+void StationDispatchWindow::DeleteEntryCallback(Window *w, bool confirmed)
+{
+	if (!confirmed) return;
+	StationDispatchWindow *sd = static_cast<StationDispatchWindow *>(w);
+	Command<Commands::RemoveR3RDispatchPoolEntry>::Post(STR_ERROR_CAN_T_DO_THIS, sd->station_id, sd->yard, sd->pending_delete_index);
+}
+
+/** R3R (第 416 轮): open (or bring to the front) the dispatch pool window of \a yard. */
+void ShowStationDispatchWindow(StationID station, uint16_t yard)
+{
+	if (BringWindowToFrontById(WindowClass::StationDispatch, station) != nullptr) return;
+	new StationDispatchWindow(_station_dispatch_desc, station, yard);
 }

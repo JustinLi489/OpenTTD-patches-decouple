@@ -1912,6 +1912,9 @@ STR_CONFIG_SETTING_SERVINT_DISABLED                             :Disabled
 STR_CONFIG_SETTING_NOSERVICE                                    :Disable servicing when breakdowns set to none: {STRING2}
 STR_CONFIG_SETTING_NOSERVICE_HELPTEXT                           :When enabled, vehicles do not get serviced if they cannot break down
 
+STR_CONFIG_SETTING_R3R_DISPATCH_POOL_CAPACITY                   :Dispatch pool capacity per station yard: {STRING2}
+STR_CONFIG_SETTING_R3R_DISPATCH_POOL_CAPACITY_HELPTEXT          :Maximum number of dispatch schedules which may be stored in one yard of a station. This limits the number of stored schedules only, not the number of trains which may run one of them
+
 STR_CONFIG_SETTING_STATION_LENGTH_LOADING_PENALTY               :Loading speed penalty for trains that are longer than the station: {STRING2}
 STR_CONFIG_SETTING_STATION_LENGTH_LOADING_PENALTY_HELPTEXT      :When enabled, trains which are too long for the station load more slowly than a train which fits the station. This setting does not affect pathfinding
 
@@ -4015,6 +4018,98 @@ STR_ORDER_R3R_YARD_NAMED                                        :Yard {NUM}
 STR_ORDER_R3R_YARD_NAMED_SHARED                                 :Yard {NUM} (shared)
 STR_ORDER_R3R_YARD_TOOLTIP                                      :{BLACK}Which yard of the destination station this order stops at
 
+# R3R: auto separation marker on a station order (order window)
+STR_ORDER_R3R_SEPARATION                                        :Auto sep.
+STR_ORDER_R3R_SEPARATION_TOOLTIP                                :{BLACK}Keep the vehicles running this order list evenly spaced. The marker applies to the whole order list, so every vehicle sharing it takes part in the alignment. Click to choose either this marker or "Wait for dispatch"; the two are mutually exclusive, clicking the current one clears it
+
+# R3R: wait-for-dispatch marker on a station order (order window)
+STR_ORDER_R3R_WAIT_DISPATCH                                     :Wait for dispatch
+STR_ORDER_R3R_WAIT_DISPATCH_TOOLTIP                             :{BLACK}On arrival this train takes a schedule from the dispatch pool of the station yard and runs it once from its first order, then continues with its own orders after this one
+
+# R3R: suffixes appended to a "go to station" order, mirroring "wait to unbunch" of depot orders
+STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX                            :{SPACE}(Wait for auto sep.)
+STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX                              :{SPACE}(Wait for dispatch)
+
+# R3R: dispatch pool (station window)
+STR_R3R_DISPATCH_POOL_CAPTION                                   :{BLACK}Dispatch pool
+STR_R3R_DISPATCH_POOL_CAPTION_STATION                           :{BLACK}Dispatch pool - {STATION}
+STR_R3R_DISPATCH_POOL_EMPTY                                     :{BLACK}No schedule in the dispatch pool of this yard
+STR_R3R_DISPATCH_POOL_ENTRY                                     :{BLACK}{RAW_STRING}: {NUM} orders, slots {NUM}/{NUM}
+STR_R3R_DISPATCH_POOL_ENTRY_GONE                                :{BLACK}(schedule gone)
+STR_R3R_DISPATCH_POOL_ADD                                       :{BLACK}Add
+STR_R3R_DISPATCH_POOL_ADD_TOOLTIP                               :{BLACK}Register the order list of a train as a schedule which arriving trains may be given
+STR_R3R_DISPATCH_POOL_DELETE                                    :{BLACK}Remove
+STR_R3R_DISPATCH_POOL_DELETE_TOOLTIP                            :{BLACK}Remove the selected schedule from the dispatch pool of this yard
+STR_R3R_DISPATCH_POOL_SLOTS_UP                                  :{BLACK}+
+STR_R3R_DISPATCH_POOL_SLOTS_DOWN                                :{BLACK}-
+STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP                             :{BLACK}How many trains may run this schedule at the same time
+STR_R3R_DISPATCH_POOL_BUTTON                                    :{BLACK}Dispatch pool
+STR_R3R_DISPATCH_POOL_BUTTON_TOOLTIP                            :{BLACK}Manage the dispatch pools of this station's yards: register a train's order list as a schedule which arriving trains may be given
+STR_R3R_DISPATCH_POOL_YARD_SEL                                  :{BLACK}Yard: {RAW_STRING}
+STR_R3R_DISPATCH_POOL_YARD_NONE                                 :{BLACK}No yard
+STR_R3R_DISPATCH_POOL_NO_YARD                                   :{BLACK}This station has no yard yet. Create one in the station yard window first
+STR_R3R_DISPATCH_POOL_LIST_TOOLTIP                              :{BLACK}Lists the schedules in the pool of this yard. Each row is "schedule: number of orders, slots used/total"
+STR_R3R_DISPATCH_POOL_ADD_SEL                                   :{BLACK}Select the schedule to add to the dispatch pool
+STR_R3R_DISPATCH_POOL_ADD_EMPTY                                 :{BLACK}No schedule of this savegame is left to add here
+STR_R3R_DISPATCH_POOL_DELETE_CONFIRM                            :{BLACK}Remove "{STRING}" from the dispatch pool of this yard?
+STR_ERROR_R3R_DISPATCH_POOL_FULL                                :{WHITE}The dispatch pool of this yard is full
+STR_ERROR_R3R_DISPATCH_POOL_INVALID_TRAIN                       :{WHITE}That schedule no longer exists
+STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED                          :{WHITE}That schedule belongs to another company and is not public
+STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY                       :{WHITE}That schedule is no longer in the dispatch pool
+
+# R3R: schedule pool (order list pool)
+STR_R3R_SCHEDULE_CAPTION                                        :{BLACK}Schedule pool
+STR_R3R_SCHEDULE_LIST_TOOLTIP                                   :{BLACK}Every schedule of this savegame. A schedule a train points at is shown together with that train; a schedule nothing points at is a loose (ownerless) one kept in the pool. A flag marks a public schedule of your own
+STR_R3R_SCHEDULE_TARGET_NONE                                    :{BLACK}No train
+STR_R3R_SCHEDULE_TARGET_SEL                                     :{BLACK}Train: {STRING}
+STR_R3R_SCHEDULE_TARGET_SEL_TOOLTIP                             :{BLACK}Which train the Assign button works on
+STR_R3R_SCHEDULE_NEW                                            :{BLACK}New
+STR_R3R_SCHEDULE_NEW_TOOLTIP                                    :{BLACK}Create a new, empty loose schedule which no train is using yet
+STR_R3R_SCHEDULE_DELETE                                         :{BLACK}Delete
+STR_R3R_SCHEDULE_DELETE_TOOLTIP                                 :{BLACK}Delete the selected loose schedule from the pool
+STR_R3R_SCHEDULE_ASSIGN                                         :{BLACK}Assign
+STR_R3R_SCHEDULE_ASSIGN_TOOLTIP                                 :{BLACK}Pick a train which should run the selected schedule
+STR_R3R_SCHEDULE_ASSIGN_PICK_TITLE                              :{BLACK}Assign schedule: {RAW_STRING}
+STR_R3R_SCHEDULE_ASSIGN_PICK_TOOLTIP                            :{BLACK}Pick the train which should run this schedule. Only the schedule pointer of the train is changed; nothing is copied
+STR_R3R_SCHEDULE_ASSIGN_PICK_EMPTY                              :{BLACK}None of your trains can run this schedule
+STR_R3R_SCHEDULE_ASSIGN_ROW                                     :{RAW_STRING} ({RAW_STRING})
+STR_R3R_SCHEDULE_HINT                                           :{BLACK}Assigning only re-points the train's schedule pointer: the train and every other user run the very same schedule. Nothing is copied, so editing it changes it for all of them
+STR_R3R_SCHEDULE_ROW_OWNED                                      :{RAW_STRING}: {NUM} orders
+STR_R3R_SCHEDULE_ROW_OWNED_SHARED                               :{RAW_STRING}: {NUM} orders, {NUM} trains
+STR_R3R_SCHEDULE_ROW_LOOSE                                      :Loose schedule: {NUM} orders
+STR_R3R_SCHEDULE_EMPTY                                          :{BLACK}There is no schedule in this savegame yet
+STR_R3R_SCHEDULE_NEW_EMPTY                                      :{BLACK}Empty schedule
+STR_R3R_SCHEDULE_NEW_SEL                                        :{BLACK}Copy the orders of which schedule into the new loose one?
+STR_R3R_SCHEDULE_DELETE_TITLE                                   :{BLACK}Delete schedule
+STR_R3R_SCHEDULE_DELETE_CONFIRM                                 :{BLACK}Delete the loose schedule with {NUM} orders?
+STR_R3R_SCHEDULE_DELETE_IN_USE                                  :{WHITE}This schedule is used by vehicles and cannot be deleted
+
+# R3R (第 421 轮, C-8 / E-2): editor for an ownerless schedule
+STR_R3R_SCHEDULE_EDITOR_CAPTION                                 :{WHITE}Schedule editor
+STR_R3R_SCHEDULE_EDITOR_LIST_TOOLTIP                            :{BLACK}Orders of this schedule. Click an order to select it
+STR_R3R_SCHEDULE_EDITOR_EMPTY                                   :{BLACK}This schedule has no orders yet. Use "Add" to insert one
+STR_R3R_SCHEDULE_EDITOR_ADD                                     :Add
+STR_R3R_SCHEDULE_EDITOR_ADD_TOOLTIP                             :{BLACK}Add an order behind the selected one
+STR_R3R_SCHEDULE_EDITOR_DELETE                                  :Delete
+STR_R3R_SCHEDULE_EDITOR_DELETE_TOOLTIP                          :{BLACK}Delete the selected order
+STR_R3R_SCHEDULE_EDITOR_DUPLICATE                               :Copy
+STR_R3R_SCHEDULE_EDITOR_DUPLICATE_TOOLTIP                       :{BLACK}Duplicate the selected order
+STR_R3R_SCHEDULE_EDITOR_MOVE_UP                                 :Up
+STR_R3R_SCHEDULE_EDITOR_MOVE_UP_TOOLTIP                         :{BLACK}Move the selected order one position towards the front
+STR_R3R_SCHEDULE_EDITOR_MOVE_DOWN                               :Down
+STR_R3R_SCHEDULE_EDITOR_MOVE_DOWN_TOOLTIP                       :{BLACK}Move the selected order one position towards the back
+STR_R3R_SCHEDULE_RENAME                                         :Rename
+STR_R3R_SCHEDULE_RENAME_TOOLTIP                                 :{BLACK}Give the selected schedule a name of your own
+STR_R3R_SCHEDULE_EDIT                                           :Edit schedule
+STR_R3R_SCHEDULE_EDIT_TOOLTIP                                   :{BLACK}Open the order window of the selected schedule
+STR_R3R_SCHEDULE_PREVIEW                                        :Users
+STR_R3R_SCHEDULE_PREVIEW_TOOLTIP                                :{BLACK}List the trains which currently run the selected schedule
+STR_R3R_SCHEDULE_PUBLIC                                         :Public
+STR_R3R_SCHEDULE_PUBLIC_TOOLTIP                                 :{BLACK}Let other companies point their trains at this schedule
+STR_R3R_SCHEDULE_UNNAMED                                        :Unnamed schedule
+STR_R3R_SCHEDULE_RENAME_TITLE                                   :{BLACK}Rename schedule
+STR_ERROR_R3R_SCHEDULE_NAME_TAKEN                               :{WHITE}Another schedule of this savegame already uses this name
+
 STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}Edit station sign
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}Close airport
@@ -4199,6 +4294,7 @@ STR_VEHICLE_LIST_AVAILABLE_AIRCRAFT                             :Available Aircr
 
 STR_VEHICLE_LIST_MANAGE_LIST                                    :{BLACK}Manage list
 STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS                           :{BLACK}Manage couple groups
+STR_VEHICLE_LIST_MANAGE_SCHEDULES                               :{BLACK}Manage schedules
 STR_VEHICLE_LIST_MANAGE_LIST_TOOLTIP                            :{BLACK}Send instructions to all vehicles in this list
 STR_VEHICLE_LIST_REPLACE_VEHICLES                               :Replace vehicles
 STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Send for servicing

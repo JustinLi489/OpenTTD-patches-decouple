@@ -94,6 +94,82 @@ void R3RClearSelfLock()
 	_r3r_selflock_tile = INVALID_TILE;
 }
 
+/* R3R (答案本 / 2026-11-09): 上一次 A* 算出来的路径，下一次直接照抄铺预留。
+ *
+ * 为什么存这里而不存轨道位（见 R3R_perf_yapf_cache_plan_memo.md §17.1）：
+ *   - 轨道位 `_m[t].m2` bit 8-11 上能存的只有"预留"= 排他占位，一旦写上就挡别人、
+ *     随存档走、还必须由订它的车负责撤销（KI-203/345/346 全是撤销出事的伤疤）。
+ *     答案若存那里，答案长度就等于预留长度，"答案长、预留短"直接失效。
+ *   - 引擎侧存的是"记忆"：不占位、不挡人、失效就丢、零副作用。
+ *
+ * 为什么用文件内 static 表 + 非 static 接口（不碰 .h）：
+ *   沿用本文件既有的跨文件通信做法（见 :59-71 R3RNoteSelfLock 那段注释）。
+ *   数据本体 static，接口函数非 static，train_cmd.cpp 侧手写 extern 声明。
+ *
+ * 本表是纯运行时态：读档清空、卖车/解挂由 R3RAnswerDrop() 清。
+ * 失效判据不外挂——抄答案时本来就要逐格 TryReserveRailTrack，订不上即失效。 */
+struct R3RAnswerStep {
+	TileIndex tile;
+	Trackdir td;
+};
+
+static std::map<uint32_t, std::vector<R3RAnswerStep>> _r3r_answer_steps;
+static std::map<uint32_t, PBSTileInfo> _r3r_answer_origin;
+/* 记录该答案是为"哪个订单目的地"算的（v->dest_tile，订单目的地，不是 A* 的 res_dest_tile）。
+ * 换单是唯一一个"车的物理状态一点没变、但答案指向完全错的地方"的失效场景：
+ * origin 定位照样能命中（车确实还停在旧路径上），逐格预留也照样能订上
+ * （轨道没变），于是会一路开到旧目的地。只有比对目的地才能抓到。 */
+static std::map<uint32_t, TileIndex> _r3r_answer_dest;
+static std::map<uint32_t, uint32_t> _r3r_answer_store_count;
+static std::map<uint32_t, uint32_t> _r3r_answer_hit_count;
+
+/** 丢弃某车的答案（卖车/解挂/掉头等链结构变化处显式调用；换单由回放里的目的地比对兜住）。reason 只用于探针。 */
+void R3RAnswerDrop(VehicleID veh, const char *reason)
+{
+	const uint32_t key = veh.base();
+	const bool had_answer = _r3r_answer_steps.erase(key) != 0;
+	_r3r_answer_origin.erase(key);
+	_r3r_answer_dest.erase(key);
+	_r3r_answer_store_count.erase(key);
+	_r3r_answer_hit_count.erase(key);
+	if (!had_answer) return;
+	FILE *dbg = R3RFopenDbg("a");
+	if (dbg != nullptr) {
+		fprintf(dbg, "ANSWER-DROP veh=%u reason=%s\n", (unsigned)key, reason != nullptr ? reason : "?");
+		fclose(dbg);
+	}
+}
+
+/** 本次 TryReservePath 逐格走过的 (tile, td)，成功后由 R3RAnswerCommit() 收进表。 */
+static std::vector<R3RAnswerStep> _r3r_answer_build;
+
+/** 把本次刚铺过的路径收进答案本。只在主寻路（非 unstafe_pos）路径上调用。 */
+static void R3RAnswerCommit(VehicleID veh, TileIndex order_dest)
+{
+	const uint32_t key = veh.base();
+	if (_r3r_answer_build.size() < 2) {
+		_r3r_answer_build.clear();
+		return;
+	}
+	std::vector<R3RAnswerStep> &dst = _r3r_answer_steps[key];
+	dst.swap(_r3r_answer_build);
+	_r3r_answer_origin[key] = PBSTileInfo(dst.front().tile, dst.front().td, true);
+	_r3r_answer_dest[key] = order_dest;
+	++_r3r_answer_store_count[key];
+	{
+		FILE *dbg = R3RFopenDbg("a");
+		if (dbg != nullptr) {
+			fprintf(dbg, "ANSWER-STORE veh=%u n=%u from=%d,%d to=%d,%d dest=%d,%d nth=%u\n",
+					(unsigned)key, (unsigned)dst.size(),
+					(int)TileX(dst.front().tile), (int)TileY(dst.front().tile),
+					(int)TileX(dst.back().tile), (int)TileY(dst.back().tile),
+					(int)TileX(order_dest), (int)TileY(order_dest),
+					(unsigned)_r3r_answer_store_count[key]);
+			fclose(dbg);
+		}
+	}
+}
+
 template <typename Tpf> void DumpState(Tpf &pf1, Tpf &pf2)
 {
 	DumpTarget dmp1, dmp2;
@@ -562,9 +638,14 @@ private:
 	 * @param tile The start tile.
 	 * @param td The track direction that is to be reserved.
 	 * @return \c true iff reservation succeeded.
+	 * @param reserver Explicit vehicle to reserve for. Passed only by the answer-book
+	 *                 replay, which runs *before* FindPath(); at that point
+	 *                 Yapf().GetVehicle() is still nullptr (yapf_base.hpp only assigns
+	 *                 `vehicle` inside FindPath()), so it must never be used there.
 	 */
-	bool ReserveSingleTrack(TileIndex tile, Trackdir td)
+	bool ReserveSingleTrack(TileIndex tile, Trackdir td, const Train *reserver = nullptr)
 	{
+		const Train *const veh = (reserver != nullptr) ? reserver : Yapf().GetVehicle();
 		if (IsRailStationTile(tile)) {
 			if (!ReserveRailStationPlatform(tile, TrackdirToExitdir(ReverseTrackdir(td)), td)) {
 				/* Platform could not be reserved, undo. */
@@ -572,7 +653,7 @@ private:
 				this->res_fail_td = td;
 			}
 		} else {
-			if (!TryReserveRailTrackdir(Yapf().GetVehicle(), tile, td)) {
+			if (!TryReserveRailTrackdir(veh, tile, td)) {
 				/* Tile couldn't be reserved, undo. */
 				this->res_fail_tile = tile;
 				this->res_fail_td = td;
@@ -920,6 +1001,8 @@ public:
 		R3RResvPhaseGuard r3r_phase("yapf-resv", R3RResvActorID(Yapf().GetVehicle()));
 		this->res_fail_tile = INVALID_TILE;
 		this->origin_tile = origin;
+		/* R3R (答案本): 本次铺预留的逐格序列，成功收尾时由 R3RAnswerCommit() 取走。 */
+		_r3r_answer_build.clear();
 		/* R3R (第 342 轮, ε-A): 每次预留尝试从"无自锁"开始，避免陈旧记录 */
 		R3RClearSelfLock();
 
@@ -981,6 +1064,8 @@ public:
 				}
 
 				const bool r3r_tok = this->ReserveSingleTrack(tile, td);
+				/* R3R (答案本): 只记主寻路这条路径的格；挂接寻路(unsafe_pos)不参与。 */
+				if (r3r_tok && !unsafe_pos) _r3r_answer_build.push_back(R3RAnswerStep{tile, td});
 				++r3r_ntry;
 				if (r3r_tok) {
 					++r3r_nok;
@@ -1106,6 +1191,117 @@ public:
 			YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
 		}
 
+		return true;
+	}
+
+	/**
+	 * R3R (答案本, 2026-11-09): 照抄上一次 A* 算出来的路径，逐格铺预留，不跑搜索。
+	 *
+	 * 等价性的全部依据有两条：
+	 *   1. A* 无随机项 —— 地图（轨道/信号/别人的预留）不变则答案必然相同；
+	 *   2. 铺预留本身就是校验 —— 抄的过程仍走 ReserveSingleTrack，
+	 *      订不上即答案已失效，不需要额外的失效通知机制。
+	 *
+	 * 安全边界：只抄到"答案段内最后一个岔路之前"。岔路 = 该格有多条轨道可走，
+	 * 那里才是真正的决策点，一律留给 A*（见备忘 §17.4）。
+	 *
+	 * 为什么必须放在 CYapfReserveTrack 而不是派生类 CYapfFollowRailT：
+	 * ReserveSingleTrack / origin_tile / res_fail_tile / res_dest_* 都是本类
+	 * private 成员，派生类看不见（第一版写在派生类里，编译报 C2248）。
+	 *
+	 * @return true 表示已铺好预留，调用方应直接返回 first_td 而不进 YAPF。
+	 */
+	bool R3RAnswerReplay(const Train *v, const PBSTileInfo &origin, PBSTileInfo *target, TileIndex *dest, Trackdir *first_td)
+	{
+		/* 开 desync/yapfdesync 调试时会同一场景跑两遍做逐节点比对，此时一律走原生
+		 * 寻路，保证两次调用的行为与改前逐字相同，不受答案本影响。 */
+		if (GetDebugLevel(DebugLevelID::yapfdesync) >= 1 || GetDebugLevel(DebugLevelID::desync) >= 2) return false;
+
+		/* 车必须由调用方传入，绝不能用 Yapf().GetVehicle()：本函数跑在 FindPath() 之前，
+		 * 基类的 vehicle 成员此刻还没赋值（yapf_base.hpp:163 只在 FindPath 里写），
+		 * 首次寻路就是 nullptr。第 409 轮崩溃正是这里解引用 nullptr + 0x38：
+		 * crash-20261108T164103Z.log 栈 [00] PoolID<VehicleIDTag>::base [01] R3RAnswerReplay。 */
+		assert(v != nullptr);
+		const Train *const veh = v;
+		const uint32_t key = veh->index.base();
+		if (veh->current_order.IsType(OT_GOTO_COUPLE)) return false; // 挂接寻路有独立语义，不抄答案
+
+		auto it = _r3r_answer_steps.find(key);
+		if (it == _r3r_answer_steps.end()) return false;
+		const std::vector<R3RAnswerStep> &steps = it->second;
+
+		/* 换单是唯一"车的物理状态分毫未变、答案却指向别处"的失效场景：origin 照样能
+		 * 定位（车就停在旧路径上）、轨道照样能订上，于是一路开到旧目的地。记录时存的是
+		 * 当时的订单目的地 v->dest_tile，这里比一次即可，且不依赖任何外部通知
+		 * （玩家改单、自动推进到下一条单、条件单跳转都可能不经过 InvalidateVehicleOrder）。 */
+		const auto dit = _r3r_answer_dest.find(key);
+		if (dit == _r3r_answer_dest.end() || dit->second != veh->dest_tile) {
+			R3RAnswerDrop(veh->index, "dest-changed");
+			return false;
+		}
+
+		/* 车辆可能停在上次答案段的中间，故按 (tile, td) 在答案里定位。
+		 * 定位不到（换道/掉头/被挪走）即作废，回落原生寻路。 */
+		size_t idx = steps.size();
+		for (size_t i = 0; i < steps.size(); i++) {
+			if (steps[i].tile == origin.tile && steps[i].td == origin.trackdir) { idx = i; break; }
+		}
+		if (idx >= steps.size() || idx + 1 >= steps.size()) {
+			R3RAnswerDrop(veh->index, "origin-not-in-answer");
+			return false;
+		}
+
+		R3RResvPhaseGuard r3r_phase("yapf-answer", R3RResvActorID(veh));
+		this->res_fail_tile = INVALID_TILE;
+		this->res_fail_td = INVALID_TRACKDIR;
+		this->origin_tile = origin.tile;
+		/* ReserveSingleTrack() 的返回值是 "tile != res_dest_tile || td != res_dest_td"，
+		 * 而复刻路径从不调用 SetReservationTarget()，必须显式清掉上一轮的残留目标，
+		 * 否则恰好抄到同一格时会被误判成"预订失败"。 */
+		this->res_dest_tile = INVALID_TILE;
+		this->res_dest_td = INVALID_TRACKDIR;
+
+		size_t booked = 0;
+		size_t last = idx;
+		bool hit_choice = false;
+		for (size_t i = idx + 1; i < steps.size(); i++) {
+			if (!this->ReserveSingleTrack(steps[i].tile, steps[i].td, veh)) break;
+			/* 站台分支订不上时只在 res_fail_tile 上留痕、返回值仍是 true，
+			 * 必须在这里补一次检查，否则会把失败当成功继续往下订。 */
+			if (this->res_fail_tile != INVALID_TILE) break;
+			++booked;
+			last = i;
+			/* 订完这一格后若它自己就是岔路格，就地收手：岔路之后的走向是决策，不作数。 */
+			const bool plain = IsTileType(steps[i].tile, TileType::Railway) && IsPlainRail(steps[i].tile);
+			if (plain && KillFirstBit(GetTrackBits(steps[i].tile)) != TRACK_BIT_NONE) { hit_choice = true; break; }
+		}
+
+		if (booked == 0) {
+			/* 一格都没订上：答案已失效，交给 A* 重算（本 tick 不重复尝试）。 */
+			R3RAnswerDrop(veh->index, "nothing-booked");
+			return false;
+		}
+
+		if (target != nullptr) {
+			target->tile = steps[last].tile;
+			target->trackdir = steps[last].td;
+			target->okay = true;
+		}
+		if (dest != nullptr) *dest = steps[last].tile;
+		/* 返回值语义 = "下一格上要走的 trackdir"（原生取根节点第一个子节点的
+		 * trackdir），不是 origin 格自己的出口方向 —— 故取第一格抄到的步。 */
+		*first_td = steps[idx + 1].td;
+		++_r3r_answer_hit_count[key];
+		{
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				fprintf(dbg, "ANSWER-REPLAY veh=%u at=%u/%u booked=%u stop=%d,%d choice=%d hit=%u\n",
+						(unsigned)key, (unsigned)idx, (unsigned)steps.size(), (unsigned)booked,
+						(int)TileX(steps[last].tile), (int)TileY(steps[last].tile),
+						(int)hit_choice, (unsigned)_r3r_answer_hit_count[key]);
+				fclose(dbg);
+			}
+		}
 		return true;
 	}
 
@@ -2010,6 +2206,15 @@ public:
 		} else {
 			origin = FollowTrainReservation(v, nullptr, FollowTrainReservationFlag::OkayUnused);
 		}
+		/* R3R (答案本): 先试照抄上一次的路径，铺成功即不进 YAPF。 */
+		if (reserve_track) {
+			Trackdir answer_td = INVALID_TRACKDIR;
+			if (this->R3RAnswerReplay(v, origin, target, dest, &answer_td)) {
+				path_found = true;
+				return answer_td;
+			}
+		}
+
 		Yapf().SetOrigin(origin.tile, origin.trackdir, INVALID_TILE, INVALID_TRACKDIR, 1);
 		Yapf().SetTreatFirstRedTwoWaySignalAsEOL(true);
 		Yapf().SetDestination(v);
@@ -2056,7 +2261,10 @@ public:
 
 			if (reserve_track && path_found) {
 				if (dest != nullptr) *dest = Yapf().GetBestNode()->GetLastTile();
-				this->TryReservePath(target, node->GetLastTile());
+				if (this->TryReservePath(target, node->GetLastTile())) {
+					/* R3R (答案本): 本次路径已逐格铺好，收进答案本供下一次照抄。 */
+					R3RAnswerCommit(v->index, v->dest_tile);
+				}
 			}
 		}
 

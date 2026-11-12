@@ -54,6 +54,7 @@ void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag);
 
 #include <limits>
 #include <ranges>
+#include <utility>
 #include <vector>
 
 #include "safeguards.h"
@@ -608,16 +609,34 @@ void OrderList::CopyOrderListContents(const OrderList &other)
 
 /**
  * Recomputes everything.
- * @param v one of vehicle that is using this orderlist
+ * @param v one of vehicle that is using this orderlist, or nullptr for an ownerless
+ *          ("loose") schedule which lives in the schedule pool on its own.
+ *
+ * R3R (第 417 轮 无主排程): an ownerless list keeps `first_shared == nullptr` and
+ * `num_vehicles == 0`. It has never been registered in any destination reference
+ * list, so the counters are recomputed from the orders alone and nothing is
+ * registered here; as soon as a vehicle adopts the list (AssignR3RSchedule) the
+ * normal path below registers everything for it.
  */
 void OrderList::Initialize(Vehicle *v)
 {
 	this->first_shared = v;
 
 	this->num_manual_orders = 0;
-	this->num_vehicles = 1;
+	this->num_vehicles = (v != nullptr) ? 1 : 0;
 	this->timetable_duration = 0;
 	this->total_duration = 0;
+
+	if (v == nullptr) {
+		for (const Order *o : this->Orders()) {
+			if (!o->IsType(OT_IMPLICIT)) ++this->num_manual_orders;
+			if (!o->IsType(OT_CONDITIONAL)) {
+				this->timetable_duration += o->GetTimetabledWait() + o->GetTimetabledTravel();
+				this->total_duration += o->GetWaitTime() + o->GetTravelTime();
+			}
+		}
+		return;
+	}
 
 	VehicleType type = v->type;
 	Owner owner = v->owner;
@@ -739,10 +758,19 @@ void OrderList::FreeChain(bool keep_orderlist)
 		}
 	}
 
-	VehicleType type = this->GetFirstSharedVehicle()->type;
-	Owner owner = this->GetFirstSharedVehicle()->owner;
+	/* R3R (第 417 轮 无主排程): an ownerless schedule has no vehicle to take
+	 * type/owner from, and it was never registered in a destination reference
+	 * list (Initialize(nullptr) skips RegisterOrderDestination), so unregistering
+	 * would corrupt the station/waypoint order counters. */
+	const Vehicle *const first_shared = this->GetFirstSharedVehicle();
+	VehicleType type = VehicleType::Train;
+	Owner owner = OWNER_NONE;
+	if (first_shared != nullptr) {
+		type = first_shared->type;
+		owner = first_shared->owner;
+	}
 	for (Order *o : this->Orders()) {
-		UnregisterOrderDestination(o, type, owner);
+		if (first_shared != nullptr) UnregisterOrderDestination(o, type, owner);
 		if (!CleaningPool()) o->InvalidateGuiOnRemove();
 	}
 	this->orders.clear();
@@ -922,7 +950,10 @@ void OrderList::InsertOrderAt(Order &&ins_order, VehicleOrderID index)
 		this->timetable_duration += new_order->GetTimetabledWait() + new_order->GetTimetabledTravel();
 		this->total_duration += new_order->GetWaitTime() + new_order->GetTravelTime();
 	}
-	RegisterOrderDestination(new_order, this->GetFirstSharedVehicle()->type, this->GetFirstSharedVehicle()->owner);
+	/* R3R (第 417 轮 无主排程): an ownerless list has no vehicle to derive the
+	 * destination reference owner from; it is registered when a vehicle adopts it. */
+	const Vehicle *const first_shared = this->GetFirstSharedVehicle();
+	if (first_shared != nullptr) RegisterOrderDestination(new_order, first_shared->type, first_shared->owner);
 
 	/* We can visit oil rigs and buoys that are not our own. They will be shown in
 	 * the list of stations. So, we need to invalidate that window if needed. */
@@ -950,7 +981,9 @@ void OrderList::DeleteOrderAt(VehicleOrderID index)
 		this->timetable_duration -= (to_remove->GetTimetabledWait() + to_remove->GetTimetabledTravel());
 		this->total_duration -= (to_remove->GetWaitTime() + to_remove->GetTravelTime());
 	}
-	UnregisterOrderDestination(to_remove, this->GetFirstSharedVehicle()->type, this->GetFirstSharedVehicle()->owner);
+	/* R3R (第 417 轮 无主排程): ownerless lists were never registered. */
+	const Vehicle *const first_shared = this->GetFirstSharedVehicle();
+	if (first_shared != nullptr) UnregisterOrderDestination(to_remove, first_shared->type, first_shared->owner);
 
 	to_remove->InvalidateGuiOnRemove();
 
@@ -1090,7 +1123,8 @@ static void DeleteOrderWarnings(const Vehicle *v)
 
 /**
  * Returns a tile somewhat representing the order destination (not suitable for pathfinding).
- * @param v The vehicle to get the location for.
+ * @param v The vehicle to get the location for, or nullptr when the order belongs to an
+ *          ownerless (loose) schedule. R3R (KI-619).
  * @param airport Get the airport tile and not the station location for aircraft.
  * @return destination of order, or INVALID_TILE if none.
  */
@@ -1100,13 +1134,13 @@ TileIndex Order::GetLocation(const Vehicle *v, bool airport) const
 		case OT_GOTO_WAYPOINT:
 		case OT_GOTO_STATION:
 		case OT_IMPLICIT:
-			if (airport && v->type == VehicleType::Aircraft) return Station::Get(this->GetDestination().ToStationID())->airport.tile;
+			if (airport && v != nullptr && v->type == VehicleType::Aircraft) return Station::Get(this->GetDestination().ToStationID())->airport.tile;
 			return BaseStation::Get(this->GetDestination().ToStationID())->xy;
 
 		case OT_GOTO_DEPOT:
 			if (this->GetDepotActionType() & ODATFB_NEAREST_DEPOT) return INVALID_TILE;
 			if (this->GetDestination() == DepotID::Invalid()) return INVALID_TILE;
-			return (v->type == VehicleType::Aircraft) ? Station::Get(this->GetDestination().ToStationID())->xy : Depot::Get(this->GetDestination().ToDepotID())->xy;
+			return (v != nullptr && v->type == VehicleType::Aircraft) ? Station::Get(this->GetDestination().ToStationID())->xy : Depot::Get(this->GetDestination().ToDepotID())->xy;
 
 		default:
 			return INVALID_TILE;
@@ -2512,6 +2546,30 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
 }
 
 /**
+ * R3R (KI-575): does any vehicle which actually drives the order list of
+ * \a v_start already use one of the two other separation mechanisms?
+ *
+ * The "自动调节班次" marker is an order-list level property, so the mutual
+ * exclusion with scheduled dispatch and depot unbunching has to be evaluated
+ * for the whole order list, not only for the vehicle the player clicked on -
+ * exactly like CmdTimetableSeparation does for the whole timetable.
+ *
+ * @param v_start Any vehicle of the order list.
+ * @return true iff a conflict exists.
+ */
+static bool R3RSeparationConflictOnOrders(const Vehicle *v_start)
+{
+	const OrderList *const list = v_start->GetEffectiveOrders();
+	if (list == nullptr) return false;
+	for (const Vehicle *v2 : Vehicle::Iterate()) {
+		if (!v2->IsPrimaryVehicle()) continue;
+		if (v2->GetEffectiveOrders() != list) continue;
+		if (v2->vehicle_flags.Test(VehicleFlag::ScheduledDispatch) || v2->HasUnbunchingOrder()) return true;
+	}
+	return false;
+}
+
+/**
  * Modify an order in the orderlist of a vehicle.
  * @param flags operation to perform
  * @param veh ID of the vehicle
@@ -2524,17 +2582,83 @@ CommandCost CmdReverseOrderList(DoCommandFlags flags, VehicleID veh, ReverseOrde
  * @param text for MOF_LABEL_TEXT
  * @return the cost of this operation or an error
  */
+/**
+ * R3R (第 424 轮, KI-607 C-1=R2): the four things CmdModifyOrder actually needs.
+ *
+ * The whole ModifyOrderFlags whitelist below only ever looks at these four values:
+ * the order list itself, the vehicle type, the owning company, and (for the few flags
+ * which inspect live vehicle state) the vehicle. A vehicle-owned order list fills all
+ * four; an ownerless ("loose") schedule fills `veh == nullptr`.
+ *
+ * Both callers deliberately share ONE implementation. A second copy of the whitelist
+ * would drift and silently reject flags in one of the two windows -- that is exactly
+ * the KI-124 defect (a missing `MOF_R3R_YARD` in the whitelist: the UI dropdown did
+ * nothing and reported nothing).
+ */
+struct R3ROrderHost {
+	OrderList *list;   ///< Order list being edited, never nullptr.
+	VehicleType vtype; ///< Vehicle type the list is built for.
+	CompanyID company; ///< Company owning the list.
+	Vehicle *veh;      ///< Vehicle running the list, or nullptr for a loose schedule.
+
+	bool IsGroundVehicle() const
+	{
+		return this->vtype == VehicleType::Train || this->vtype == VehicleType::Road;
+	}
+
+	/* The two vehicle flags below have no per-list equivalent. A loose schedule has no
+	 * timetable and no scheduled dispatch, so a missing vehicle reads as "not set",
+	 * which is the permissive side: the player may arrange orders freely and only
+	 * hits the real check once the schedule is handed to a vehicle. */
+	bool HasScheduledDispatch() const
+	{
+		return this->veh != nullptr && this->veh->vehicle_flags.Test(VehicleFlag::ScheduledDispatch);
+	}
+
+	bool HasTimetableSeparation() const
+	{
+		return this->veh != nullptr && this->veh->vehicle_flags.Test(VehicleFlag::TimetableSeparation);
+	}
+
+	/* Same predicates as Vehicle::HasFullLoadOrder() / HasConditionalOrder() /
+	 * HasUnbunchingOrder() (vehicle.cpp:4201..4236), which only ever walk the order
+	 * list and therefore need no vehicle at all. */
+	bool HasFullLoadOrder() const
+	{
+		for (const Order *o : this->list->Orders()) {
+			if (o->IsType(OT_GOTO_STATION) && o->IsFullLoadOrder()) return true;
+			if (o->IsType(OT_GOTO_STATION) && o->GetLoadType() == OrderLoadType::CargoTypeLoad) {
+				for (CargoType cid{}; cid < NUM_CARGO; cid++) {
+					if (IsFullLoadOrderLoadType(o->GetCargoLoadType(cid))) return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	bool HasConditionalOrder() const
+	{
+		for (const Order *o : this->list->Orders()) {
+			if (o->IsType(OT_CONDITIONAL)) return true;
+		}
+		return false;
+	}
+
+	bool HasUnbunchingOrder() const
+	{
+		for (const Order *o : this->list->Orders()) {
+			if (o->IsType(OT_GOTO_DEPOT) && (o->GetDepotActionType() & ODATFB_UNBUNCH)) return true;
+		}
+		return false;
+	}
+};
+
+static CommandCost R3RModifyOrderHost(DoCommandFlags flags, R3ROrderHost &host, VehicleOrderID sel_ord, ModifyOrderFlags mof, uint16_t data, CargoType cargo_id, const std::string &text);
+
 CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID sel_ord, ModifyOrderFlags mof, uint16_t data, CargoType cargo_id, const std::string &text)
 {
-	if (mof >= MOF_END) return CMD_ERROR;
-
-	if (mof != MOF_LABEL_TEXT && !text.empty()) return CMD_ERROR;
-
-	Vehicle *v = Vehicle::GetIfValid(veh);
+	Vehicle *const v = Vehicle::GetIfValid(veh);
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
-
-	CommandCost ret = CheckOwnership(v->owner);
-	if (ret.Failed()) return ret;
 
 	/* R3R (KI-132): refuse to edit an order list which a cross-company coupling
 	 * handed to this train -- see R3ROrdersSharedWithOtherCompany(). Without this
@@ -2542,17 +2666,44 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 	 * schedule that belongs to the other company's segment. */
 	if (R3ROrdersSharedWithOtherCompany(v)) return CMD_ERROR;
 
-	/* Is it a valid order? */
-	if (sel_ord >= v->GetNumOrders()) return CMD_ERROR;
+	R3ROrderHost host;
+	host.list = v->GetEffectiveOrders();
+	host.vtype = v->type;
+	host.company = v->owner;
+	host.veh = v;
+	return R3RModifyOrderHost(flags, host, sel_ord, mof, data, cargo_id, text);
+}
 
-	Order *order = v->GetOrder(sel_ord);
+/**
+ * R3R (第 424 轮): shared body of CmdModifyOrder (vehicle-owned list) and
+ * CmdR3RModifyLooseOrder (ownerless schedule). \a host.veh is nullptr in the latter.
+ */
+static CommandCost R3RModifyOrderHost(DoCommandFlags flags, R3ROrderHost &host, VehicleOrderID sel_ord, ModifyOrderFlags mof, uint16_t data, CargoType cargo_id, const std::string &text)
+{
+	/* Only used by the flags which genuinely need live vehicle state; every such use
+	 * is guarded by `v != nullptr` below. */
+	Vehicle *const v = host.veh;
+
+	if (host.list == nullptr) return CMD_ERROR;
+
+	if (mof >= MOF_END) return CMD_ERROR;
+
+	if (mof != MOF_LABEL_TEXT && !text.empty()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(host.company);
+	if (ret.Failed()) return ret;
+
+	/* Is it a valid order? */
+	if (sel_ord >= host.list->GetNumOrders()) return CMD_ERROR;
+
+	Order *order = host.list->GetOrderAt(sel_ord);
 	assert(order != nullptr);
 	if (mof == MOF_COLOUR) {
 		if (order->GetType() == OT_IMPLICIT) return CMD_ERROR;
 	} else {
 		switch (order->GetType()) {
 			case OT_GOTO_STATION:
-				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_R3R_YARD) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_R3R_YARD && mof != MOF_R3R_STATION_SEPARATION && mof != MOF_R3R_WAIT_DISPATCH) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_DEPOT:
@@ -2614,15 +2765,15 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 		default: NOT_REACHED();
 
 		case MOF_NON_STOP:
-			if (!v->IsGroundVehicle()) return CMD_ERROR;
+			if (!host.IsGroundVehicle()) return CMD_ERROR;
 			if (data >= ONSF_END) return CMD_ERROR;
 			if ((data & ONSF_NO_STOP_AT_DESTINATION_STATION) && order->IsType(OT_GOTO_DEPOT)) return CMD_ERROR;
 			if (data == order->GetNonStopType()) return CommandCost();
-			if (_settings_game.order.nonstop_only && !(data & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS) && v->IsGroundVehicle()) return CMD_ERROR;
+			if (_settings_game.order.nonstop_only && !(data & ONSF_NO_STOP_AT_INTERMEDIATE_STATIONS) && host.IsGroundVehicle()) return CMD_ERROR;
 			break;
 
 		case MOF_STOP_LOCATION:
-			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
 			if (data >= to_underlying(OrderStopLocation::End)) return CMD_ERROR;
 			break;
 
@@ -2658,7 +2809,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (order->GetNonStopType() & ONSF_NO_STOP_AT_DESTINATION_STATION) return CMD_ERROR;
 			if ((data > to_underlying(OrderLoadType::NoLoad) && data != to_underlying(OrderLoadType::CargoTypeLoad)) || data == 1) return CMD_ERROR;
 			if (data == to_underlying(order->GetLoadType())) return CommandCost();
-			if (IsFullLoadOrderLoadType(static_cast<OrderLoadType>(data)) && v->HasUnbunchingOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_FULL_LOAD);
+			if (IsFullLoadOrderLoadType(static_cast<OrderLoadType>(data)) && host.HasUnbunchingOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_FULL_LOAD);
 			break;
 
 		case MOF_DEPOT_ACTION:
@@ -2667,22 +2818,22 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			/* Check if we are allowed to add unbunching. We are always allowed to remove it. */
 			if (data == DA_UNBUNCH) {
 				/* Only one unbunching order is allowed in a vehicle's orders. If this order already has an unbunching action, no error is needed. */
-				if (v->HasUnbunchingOrder() && !(order->GetDepotActionType() & ODATFB_UNBUNCH)) return CommandCost(STR_ERROR_UNBUNCHING_ONLY_ONE_ALLOWED);
+				if (host.HasUnbunchingOrder() && !(order->GetDepotActionType() & ODATFB_UNBUNCH)) return CommandCost(STR_ERROR_UNBUNCHING_ONLY_ONE_ALLOWED);
 
-				if (v->vehicle_flags.Test(VehicleFlag::ScheduledDispatch)) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_SCHED_DISPATCH);
-				if (v->vehicle_flags.Test(VehicleFlag::TimetableSeparation)) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_AUTO_SEPARATION);
+				if (host.HasScheduledDispatch()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_SCHED_DISPATCH);
+				if (host.HasTimetableSeparation()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_AUTO_SEPARATION);
 
 				/* We don't allow unbunching if the vehicle has a conditional order. */
-				if (v->HasConditionalOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_CONDITIONAL);
+				if (host.HasConditionalOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_CONDITIONAL);
 				/* We don't allow unbunching if the vehicle has a full load order. */
-				if (v->HasFullLoadOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_FULL_LOAD);
+				if (host.HasFullLoadOrder()) return CommandCost(STR_ERROR_UNBUNCHING_NO_UNBUNCHING_FULL_LOAD);
 			}
 			break;
 
 		case MOF_COND_VARIABLE: {
 			OrderConditionVariable cond_variable = static_cast<OrderConditionVariable>(data);
 			if (cond_variable >= OrderConditionVariable::End) return CMD_ERROR;
-			if ((cond_variable == OrderConditionVariable::FreePlatforms || cond_variable == OrderConditionVariable::DrivingBackwards) && v->type != VehicleType::Train) return CMD_ERROR;
+			if ((cond_variable == OrderConditionVariable::FreePlatforms || cond_variable == OrderConditionVariable::DrivingBackwards) && host.vtype != VehicleType::Train) return CMD_ERROR;
 			break;
 		}
 
@@ -2709,14 +2860,14 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				case OrderConditionVariable::VehicleInSlot: {
 					if (occ != OrderConditionComparator::IsTrue && occ != OrderConditionComparator::IsFalse && occ != OrderConditionComparator::Equal && occ != OrderConditionComparator::NotEqual) return CMD_ERROR;
 					const TraceRestrictSlot *slot = TraceRestrictSlot::GetIfValid(order->GetXData());
-					if (slot != nullptr && slot->vehicle_type != v->type) return CMD_ERROR;
+					if (slot != nullptr && slot->vehicle_type != host.vtype) return CMD_ERROR;
 					break;
 				}
 
 				case OrderConditionVariable::VehicleInSlotGroup: {
 					if (occ != OrderConditionComparator::IsTrue && occ != OrderConditionComparator::IsFalse) return CMD_ERROR;
 					const TraceRestrictSlotGroup *sg = TraceRestrictSlotGroup::GetIfValid(order->GetXData());
-					if (sg != nullptr && sg->vehicle_type != v->type) return CMD_ERROR;
+					if (sg != nullptr && sg->vehicle_type != host.vtype) return CMD_ERROR;
 					break;
 				}
 
@@ -2750,7 +2901,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					if (data != INVALID_TRACE_RESTRICT_SLOT_ID) {
 						const TraceRestrictSlot *trslot = TraceRestrictSlot::GetIfValid(data);
 						if (trslot == nullptr) return CMD_ERROR;
-						if (!trslot->IsUsableByOwner(v->owner)) return CMD_ERROR;
+						if (!trslot->IsUsableByOwner(host.company)) return CMD_ERROR;
 					}
 					break;
 				}
@@ -2759,16 +2910,16 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					if (data != INVALID_TRACE_RESTRICT_SLOT_ID) {
 						const TraceRestrictSlot *trslot = TraceRestrictSlot::GetIfValid(data);
 						if (trslot == nullptr) return CMD_ERROR;
-						if (trslot->vehicle_type != v->type) return CMD_ERROR;
-						if (!trslot->IsUsableByOwner(v->owner)) return CMD_ERROR;
+						if (trslot->vehicle_type != host.vtype) return CMD_ERROR;
+						if (!trslot->IsUsableByOwner(host.company)) return CMD_ERROR;
 					}
 					break;
 
 				case OrderConditionVariable::VehicleInSlotGroup:
 					if (data != INVALID_TRACE_RESTRICT_SLOT_GROUP) {
 						const TraceRestrictSlotGroup *sg = TraceRestrictSlotGroup::GetIfValid(data);
-						if (sg == nullptr || sg->vehicle_type != v->type) return CMD_ERROR;
-						if (!sg->CompanyCanReferenceSlotGroup(v->owner)) return CMD_ERROR;
+						if (sg == nullptr || sg->vehicle_type != host.vtype) return CMD_ERROR;
+						if (!sg->CompanyCanReferenceSlotGroup(host.company)) return CMD_ERROR;
 					}
 					break;
 
@@ -2808,7 +2959,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					if (data != INVALID_TRACE_RESTRICT_COUNTER_ID) {
 						const TraceRestrictCounter *ctr = TraceRestrictCounter::GetIfValid(data);
 						if (ctr == nullptr) return CMD_ERROR;
-						if (!ctr->IsUsableByOwner(v->owner)) return CMD_ERROR;
+						if (!ctr->IsUsableByOwner(host.company)) return CMD_ERROR;
 					}
 					break;
 
@@ -2821,7 +2972,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					break;
 
 				case OrderConditionVariable::DispatchSlot:
-					if (data != UINT16_MAX && data >= v->GetEffectiveOrders()->GetScheduledDispatchScheduleCount()) {
+					if (data != UINT16_MAX && data >= host.list->GetScheduledDispatchScheduleCount()) {
 						return CMD_ERROR;
 					}
 					break;
@@ -2870,7 +3021,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			break;
 
 		case MOF_COND_DESTINATION:
-			if (data >= v->GetNumOrders() || data == sel_ord) return CMD_ERROR;
+			if (data >= host.list->GetNumOrders() || data == sel_ord) return CMD_ERROR;
 			break;
 
 		case MOF_WAYPOINT_FLAGS:
@@ -2880,21 +3031,21 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 		case MOF_SLOT:
 			if (data != INVALID_TRACE_RESTRICT_SLOT_ID) {
 				const TraceRestrictSlot *slot = TraceRestrictSlot::GetIfValid(data);
-				if (slot == nullptr || slot->vehicle_type != v->type) return CMD_ERROR;
-				if (!slot->IsUsableByOwner(v->owner)) return CMD_ERROR;
+				if (slot == nullptr || slot->vehicle_type != host.vtype) return CMD_ERROR;
+				if (!slot->IsUsableByOwner(host.company)) return CMD_ERROR;
 			}
 			break;
 
 		case MOF_SLOT_GROUP:
 			if (data != INVALID_TRACE_RESTRICT_SLOT_GROUP) {
 				const TraceRestrictSlotGroup *sg = TraceRestrictSlotGroup::GetIfValid(data);
-				if (sg == nullptr || sg->vehicle_type != v->type) return CMD_ERROR;
-				if (!sg->CompanyCanReferenceSlotGroup(v->owner)) return CMD_ERROR;
+				if (sg == nullptr || sg->vehicle_type != host.vtype) return CMD_ERROR;
+				if (!sg->CompanyCanReferenceSlotGroup(host.company)) return CMD_ERROR;
 			}
 			break;
 
 		case MOF_RV_TRAVEL_DIR:
-			if (v->type != VehicleType::Road) return CMD_ERROR;
+			if (host.vtype != VehicleType::Road) return CMD_ERROR;
 			if (data >= to_underlying(DiagDirection::End) && data != to_underlying(DiagDirection::Invalid)) return CMD_ERROR;
 			break;
 
@@ -2902,7 +3053,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (data != INVALID_TRACE_RESTRICT_COUNTER_ID) {
 				const TraceRestrictCounter *ctr = TraceRestrictCounter::GetIfValid(data);
 				if (ctr == nullptr) return CMD_ERROR;
-				if (!ctr->IsUsableByOwner(v->owner)) return CMD_ERROR;
+				if (!ctr->IsUsableByOwner(host.company)) return CMD_ERROR;
 			}
 			break;
 
@@ -2937,7 +3088,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			break;
 
 		case MOF_R3R_YARD: {
-			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
 			if (!order->IsType(OT_GOTO_STATION)) return CMD_ERROR;
 			if (data > Station::R3R_MAX_YARDS) return CMD_ERROR;
 			/* The yard must actually exist at the destination station. */
@@ -2947,13 +3098,13 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 		}
 
 		case MOF_COUPLE_SIDE:
-			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
 			if (!order->IsType(OT_GOTO_COUPLE)) return CMD_ERROR;
 			if (data >= OCS_END) return CMD_ERROR;
 			break;
 
 		case MOF_COUPLE_TEMP_GROUP: {
-			if (v->type != VehicleType::Train) return CMD_ERROR;
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
 			/* R3R (KI-225): valid on a coupling order (the consist looks for the
 			 * group) and on a waiting order (the parked consist offers itself to
 			 * that group). */
@@ -2963,8 +3114,36 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 			if (data != 0) {
 				const CoupleGroup *cg = CoupleGroup::GetIfValid(CoupleGroupID(static_cast<uint16_t>(data - 1)));
 				if (cg == nullptr) return CMD_ERROR;
-				if (!R3RCoupleGroupIsVisibleTo(cg, v->owner)) return CMD_ERROR;
+				if (!R3RCoupleGroupIsVisibleTo(cg, host.company)) return CMD_ERROR;
 			}
+			break;
+		}
+
+		case MOF_R3R_STATION_SEPARATION: {
+			/* R3R (KI-575): the marker on a GOTO_STATION order turns the
+			 * "auto separation" on for the whole order list that contains it.
+			 * It is an order-list level property, so it must stay mutually
+			 * exclusive with the other two separation mechanisms. */
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
+			if (!order->IsType(OT_GOTO_STATION)) return CMD_ERROR;
+			if (data > 1) return CMD_ERROR;
+			/* R3R (第 424 轮): an ownerless schedule has no live vehicle to carry the
+			 * dispatch/separation flags, so only the in-list conflict (unbunching)
+			 * can fire for it. */
+			if (data != 0) {
+				if (v != nullptr ? R3RSeparationConflictOnOrders(v) : host.HasUnbunchingOrder()) {
+					return CommandCost(STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE);
+				}
+			}
+			break;
+		}
+
+		case MOF_R3R_WAIT_DISPATCH: {
+			/* R3R (第 416 轮): 「等待分配」标记落在 GOTO_STATION 命令上。列车停到
+			 * 该站、该站所在场的调度池还有空坑位时，领取一份池里的表接着跑。 */
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
+			if (!order->IsType(OT_GOTO_STATION)) return CMD_ERROR;
+			if (data > 1) return CMD_ERROR;
 			break;
 		}
 	}
@@ -2978,11 +3157,15 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					order->SetRefit(CARGO_NO_REFIT);
 					order->SetLoadType(OrderLoadType::LoadIfPossible);
 					order->SetUnloadType(OrderUnloadType::UnloadIfPossible);
-					if (order->IsWaitTimetabled() || order->GetWaitTime() > 0) {
-						Command<Commands::ChangeTimetable>::Do(flags, v->index, sel_ord, MTF_WAIT_TIME, 0, ModifyTimetableCtrlFlag::ClearField);
-					}
-					if (order->IsScheduledDispatchOrder(false)) {
-						Command<Commands::ChangeTimetable>::Do(flags, v->index, sel_ord, MTF_ASSIGN_SCHEDULE, -1, {});
+					/* R3R (第 424 轮): a loose schedule has no timetable, so there is
+					 * nothing to clear; only a live vehicle can carry timetable data. */
+					if (v != nullptr) {
+						if (order->IsWaitTimetabled() || order->GetWaitTime() > 0) {
+							Command<Commands::ChangeTimetable>::Do(flags, v->index, sel_ord, MTF_WAIT_TIME, 0, ModifyTimetableCtrlFlag::ClearField);
+						}
+						if (order->IsScheduledDispatchOrder(false)) {
+							Command<Commands::ChangeTimetable>::Do(flags, v->index, sel_ord, MTF_ASSIGN_SCHEDULE, -1, {});
+						}
 					}
 				}
 				break;
@@ -3074,6 +3257,34 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 				order->SetCoupleTempGroup(data == 0 ? INVALID_COUPLE_GROUP : CoupleGroupID(static_cast<uint16_t>(data - 1)));
 				break;
 
+			case MOF_R3R_STATION_SEPARATION: {
+				/* R3R (KI-575): the marker lives on the order (i.e. on the order
+				 * list), so switching it affects every vehicle which drives this
+				 * list - followers of a control segment included.  Clearing
+				 * #VehicleFlag::SeparationActive makes every one of them re-enter
+				 * the separation state machine at its next station call, which is
+				 * what turning the marker on has to do; turning it off stops the
+				 * alignment because the state machine is gated on the marker. */
+				order->SetR3RStationSeparation(data != 0);
+				for (Vehicle *v2 : Vehicle::Iterate()) {
+					if (!v2->IsPrimaryVehicle()) continue;
+					if (v2->GetEffectiveOrders() != host.list) continue;
+					v2->vehicle_flags.Reset(VehicleFlag::SeparationActive);
+				}
+				/* R3R (第 424 轮): no live vehicle == a loose schedule, which has no
+				 * timetable window to refresh. */
+				if (v != nullptr) SetTimetableWindowsDirty(v, STWDF_ORDERS);
+				break;
+			}
+
+			case MOF_R3R_WAIT_DISPATCH: {
+				/* R3R (第 416 轮): 纯标记，不牵动其它车的状态；清掉时若列车正在
+				 * 借用池表（r3r_follow_pool）不打断，那一轮跑完自然归还。 */
+				order->SetR3RWaitDispatch(data != 0);
+				if (v != nullptr) SetTimetableWindowsDirty(v, STWDF_ORDERS);
+				break;
+			}
+
 			case MOF_COND_VARIABLE: {
 				/* Check whether old conditional variable had a cargo as value */
 				const OrderConditionVariable old_condition = order->GetConditionVariable();
@@ -3103,7 +3314,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 					case OrderConditionVariable::VehicleInSlot:
 						if (!old_var_was_slot) {
 							order->GetXDataRef() = INVALID_TRACE_RESTRICT_SLOT_ID.base();
-						} else if (order->GetConditionVariable() == OrderConditionVariable::VehicleInSlot && order->GetXData() != INVALID_TRACE_RESTRICT_SLOT_ID && TraceRestrictSlot::Get(order->GetXData())->vehicle_type != v->type) {
+						} else if (order->GetConditionVariable() == OrderConditionVariable::VehicleInSlot && order->GetXData() != INVALID_TRACE_RESTRICT_SLOT_ID && TraceRestrictSlot::Get(order->GetXData())->vehicle_type != host.vtype) {
 							order->GetXDataRef() = INVALID_TRACE_RESTRICT_SLOT_ID.base();
 						}
 						if (old_condition != order->GetConditionVariable()) order->SetConditionComparator(OrderConditionComparator::IsTrue);
@@ -3198,7 +3409,7 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 
 					case OrderConditionVariable::VehicleInSlot:
 						order->GetXDataRef() = data;
-						if (data != INVALID_TRACE_RESTRICT_SLOT_ID && TraceRestrictSlot::Get(data)->vehicle_type != v->type) {
+						if (data != INVALID_TRACE_RESTRICT_SLOT_ID && TraceRestrictSlot::Get(data)->vehicle_type != host.vtype) {
 							if (order->GetConditionComparator() == OrderConditionComparator::Equal) order->SetConditionComparator(OrderConditionComparator::IsTrue);
 							if (order->GetConditionComparator() == OrderConditionComparator::NotEqual) order->SetConditionComparator(OrderConditionComparator::IsFalse);
 						}
@@ -3320,9 +3531,13 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 		/* Update the windows and full load flags, also for every vehicle that uses the same order list.
 		 * R3R (KI-465 修法 D): 跟随者不在 v->FirstShared() 环里，所以用"索引持有者全集"代替环遍历，
 		 * 否则被跟随表上其他段列车的 current_order 装载标志不会跟着改。 */
-		OrderList *const eff_orders = v->GetEffectiveOrders();
-		Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
-		DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+		OrderList *const eff_orders = host.list;
+		/* R3R (第 424 轮): a loose schedule has no vehicle to carry order advice, and
+		 * the holder walk below simply finds nobody, so both steps are vehicle-only. */
+		if (v != nullptr) {
+			Vehicle *const ring_head = eff_orders->GetFirstSharedVehicle();
+			DeleteOrderWarnings(ring_head != nullptr ? ring_head : v);
+		}
 		std::vector<Vehicle *> r3r_holders;
 		R3RForEachOrderListHolder(eff_orders, [&](Vehicle *w, bool live, bool /*parked*/) { if (live) r3r_holders.push_back(w); });
 		for (Vehicle *u : r3r_holders) {
@@ -3384,6 +3599,10 @@ CommandCost CmdModifyOrder(DoCommandFlags flags, VehicleID veh, VehicleOrderID s
 
 			InvalidateVehicleOrder(u, VIWD_MODIFY_ORDERS);
 		}
+
+		/* R3R (第 424 轮): an ownerless schedule has no vehicle whose window
+		 * InvalidateVehicleOrder() could refresh, so refresh the editor explicitly. */
+		if (v == nullptr) InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
 	}
 
 	return CommandCost();
@@ -4034,6 +4253,488 @@ void RemoveOrderFromAllVehicles(OrderType type, DestinationID destination, bool 
 			return (ot == type && o->GetDestination() == destination);
 		});
 	}
+}
+
+/**
+ * R3R (第 418 轮 排程池): the company which owns this schedule.
+ *
+ * An ownerless ("loose") schedule has no vehicle which could be asked, so the owning
+ * company is stored in the order list itself. A schedule which is in use falls back to
+ * the owner of its shared chain, which is the authoritative answer anyway.
+ */
+CompanyID OrderList::GetR3RScheduleOwner() const
+{
+	if (this->r3r_owner != CompanyID::Invalid()) return this->r3r_owner;
+	const Vehicle *const first = this->first_shared;
+	return (first != nullptr) ? first->owner : CompanyID::Invalid();
+}
+
+/**
+ * R3R (第 418 轮 排程池): may \a company point its vehicles at \a list?
+ *
+ * - the owning company always may;
+ * - a public schedule may be used by every company (only the owner may rename it or
+ *   make it private again);
+ * - a schedule carried in from an older savegame records no owner at all, so it is
+ *   never locked away from the player.
+ */
+bool R3RScheduleAccessibleBy(const OrderList *list, CompanyID company)
+{
+	if (list == nullptr) return false;
+	const CompanyID owner = list->GetR3RScheduleOwner();
+	if (owner == CompanyID::Invalid()) return true;
+	return owner == company || list->IsR3RSchedulePublic();
+}
+
+/**
+ * R3R (第 418 轮 排程池): may \a company edit the metadata (name, public flag) of
+ * \a list? Publishing is a unilateral act of the owner, so it is never granted by the
+ * public flag itself.
+ */
+static bool R3RScheduleEditableBy(const OrderList *list, CompanyID company)
+{
+	if (list == nullptr) return false;
+	const CompanyID owner = list->GetR3RScheduleOwner();
+	return owner == CompanyID::Invalid() || owner == company;
+}
+
+/**
+ * R3R (第 417 轮 排程池): create an ownerless ("loose") schedule in the schedule pool.
+ *
+ * A loose schedule is a normal OrderList which no vehicle points at, so it has
+ * `first_shared == nullptr` and `num_vehicles == 0`. It lives in `_orderlist_pool`
+ * just like a shared one, which means Save_ORDL() writes it out for free and the
+ * savegame format does not change.
+ *
+ * @param copy_from 0 to create an empty schedule, otherwise (OrderList index + 1) of a
+ *                  schedule whose orders are copied into the new one. An empty loose
+ *                  schedule cannot be edited (the order window always needs a vehicle),
+ *                  so the GUI creates loose schedules by copying an existing one.
+ */
+CommandCost CmdR3RCreateLooseSchedule(DoCommandFlags flags, uint32_t copy_from)
+{
+	if (copy_from != 0 && !OrderList::IsValidID(OrderListID(copy_from - 1))) return CMD_ERROR;
+
+	/* Same Pool::GetNew() gate the command layer always respects (see the KI-186 note
+	 * in DecoupleTrain): the debug build asserts that CanAllocateItem() was asked. */
+	if (!OrderList::CanAllocateItem()) return CommandCost(STR_ERROR_NO_MORE_SPACE_FOR_ORDERS);
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		OrderList *const list = OrderList::Create(nullptr, static_cast<Vehicle *>(nullptr));
+		/* R3R (第 418 轮): a loose schedule has no vehicle which could tell who owns it,
+		 * so the creating company becomes its owner. This is also the company which may
+		 * rename / delete / publish it. */
+		list->SetR3RScheduleStoredOwner(_current_company);
+		if (copy_from != 0) {
+			const OrderList *const src = OrderList::GetIfValid(OrderListID(copy_from - 1));
+			if (src != nullptr) {
+				list->CopyOrderListContents(*src);
+				/* The copied contents carry the source's ownership (first_shared and the
+				 * shared-chain counters). A loose schedule owns nothing and has never been
+				 * registered in any destination reference list, so recompute from scratch. */
+				list->Initialize(nullptr);
+			}
+		}
+		/* R3R (第 419 轮): the schedule pool window has to show the new row right away
+		 * instead of only after it is reopened (KI-596). */
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 417 轮 排程池): delete an ownerless schedule from the schedule pool.
+ *
+ * Only a list which no vehicle points at may be deleted; deleting an in-use list
+ * would leave that vehicle with a dangling `orders` pointer. Hard (anti-crash)
+ * validation only -- the player is free to delete any loose schedule.
+ */
+CommandCost CmdR3RDeleteLooseSchedule(DoCommandFlags flags, uint32_t ol_index)
+{
+	if (!OrderList::IsValidID(OrderListID(ol_index))) return CMD_ERROR;
+	OrderList *const list = OrderList::GetIfValid(OrderListID(ol_index));
+	if (list == nullptr) return CMD_ERROR;
+
+	/* Anti-crash guard: the list must have no owner at all. */
+	if (list->GetFirstSharedVehicle() != nullptr || list->GetNumVehicles() != 0) return CMD_ERROR;
+
+	/* R3R (第 418 轮): only the owning company may delete a schedule. */
+	if (!R3RScheduleEditableBy(list, _current_company)) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->FreeChain(false);
+		/* R3R (第 419 轮): drop the deleted row from the schedule pool window at once
+		 * (KI-596, same defect as creation). */
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 421 轮, C-8 / E-2): fetch an ownerless schedule which \a _current_company may edit.
+ *
+ * Only lists which no vehicle points at are accepted: a list that some vehicle runs is
+ * edited through that vehicle (the VehicleOrders window and the normal order commands),
+ * which is what keeps the per-vehicle order indices (`cur_real_order_index` and friends)
+ * consistent. An ownerless list has no such indices at all, so editing it is a plain
+ * OrderList mutation.
+ *
+ * @return the list, or nullptr when it does not exist, is in use, or belongs to another company.
+ */
+static OrderList *R3RGetEditableLooseSchedule(uint32_t ol_index)
+{
+	if (!OrderList::IsValidID(OrderListID(ol_index))) return nullptr;
+	OrderList *const list = OrderList::GetIfValid(OrderListID(ol_index));
+	if (list == nullptr) return nullptr;
+	if (list->GetFirstSharedVehicle() != nullptr || list->GetNumVehicles() != 0) return nullptr;
+	if (!R3RScheduleEditableBy(list, _current_company)) return nullptr;
+	return list;
+}
+
+/**
+ * R3R (第 421 轮, C-8 / E-2): insert an order into an ownerless schedule.
+ *
+ * Deliberately *does not* run PreInsertOrderCheck(): that function hard-requires a
+ * vehicle (`v == nullptr || ... || !v->IsPrimaryVehicle()` in its first line) and checks
+ * vehicle-level invariants such as "only one unbunch order per list" and "a conditional
+ * order must jump to an existing order". Those are enforced again when the schedule is
+ * handed to a vehicle; a loose schedule nobody runs may hold an incomplete arrangement
+ * while the player is still editing it.
+ *
+ * @param flags operation to perform
+ * @param data  target list, insertion position and the order fields to insert
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RInsertLooseOrder(DoCommandFlags flags, const InsertLooseOrderCmdData &data)
+{
+	OrderList *const list = R3RGetEditableLooseSchedule(data.order_list);
+	if (list == nullptr) return CMD_ERROR;
+
+	/* Appending is the common case: sel_ord == INVALID_VEH_ORDER_ID (or anything past
+	 * the end) means "put it at the back", exactly like CmdInsertOrder. */
+	const VehicleOrderID count = list->GetNumOrders();
+	const VehicleOrderID insert_at = (data.sel_ord >= count) ? count : data.sel_ord;
+
+	Order new_order{};
+	MemberPtrsTie(new_order, Order::GetCmdRefFields()) = data.new_order;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->InsertOrderAt(std::move(new_order), insert_at);
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 421 轮, C-8 / E-2): delete an order of an ownerless schedule.
+ *
+ * The vehicle version (DeleteOrder() at the top of this file) additionally fixes up the
+ * order indices of every holder of the list and cancels loading; an ownerless list has
+ * neither holders nor a loading vehicle, so this reduces to DeleteOrderAt().
+ *
+ * @param flags operation to perform
+ * @param ol_index index of the ownerless schedule
+ * @param sel_ord  order to delete
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RDeleteLooseOrder(DoCommandFlags flags, uint32_t ol_index, uint16_t sel_ord)
+{
+	OrderList *const list = R3RGetEditableLooseSchedule(ol_index);
+	if (list == nullptr) return CMD_ERROR;
+	if (sel_ord >= list->GetNumOrders()) return CMD_ERROR;
+	if (list->GetOrderAt(static_cast<VehicleOrderID>(sel_ord)) == nullptr) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->DeleteOrderAt(static_cast<VehicleOrderID>(sel_ord));
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 421 轮, C-8 / E-2): move a block of orders inside an ownerless schedule.
+ *
+ * Conditional orders store the index they jump to, so those indices have to follow the
+ * move; that part is not vehicle specific and is reproduced from CmdMoveOrder().
+ *
+ * @param flags operation to perform
+ * @param ol_index index of the ownerless schedule
+ * @param moving_order first order of the block to move
+ * @param target_order order the block is moved in front of
+ * @param count number of orders in the block
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RMoveLooseOrder(DoCommandFlags flags, uint32_t ol_index, uint16_t moving_order, uint16_t target_order, uint16_t count)
+{
+	OrderList *const list = R3RGetEditableLooseSchedule(ol_index);
+	if (list == nullptr) return CMD_ERROR;
+
+	const VehicleOrderID order_count = list->GetNumOrders();
+
+	/* Don't make senseless movements (same rules as CmdMoveOrder). */
+	if (count == 0 || order_count <= 1 || moving_order >= order_count || target_order >= order_count || moving_order == target_order) return CMD_ERROR;
+
+	if (moving_order < target_order) {
+		if (target_order < moving_order + count) return CMD_ERROR;
+	} else {
+		if (moving_order + count > order_count) return CMD_ERROR;
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->MoveOrders(static_cast<VehicleOrderID>(moving_order), static_cast<VehicleOrderID>(target_order), count);
+
+		auto adjust_order_idx = [&](VehicleOrderID idx) -> VehicleOrderID {
+			if (idx >= order_count) return idx;
+			if (idx >= moving_order && idx < moving_order + count) return target_order + (idx - moving_order);
+			if (idx > moving_order && idx <= target_order) return idx - count;
+			if (idx < moving_order && idx >= target_order) return idx + count;
+			return idx;
+		};
+
+		/* As we move an order, the order to skip to will be 'wrong'. */
+		for (VehicleOrderID i = 0; i < order_count; i++) {
+			Order *const order = list->GetOrderAt(i);
+			if (order != nullptr && order->IsType(OT_CONDITIONAL)) {
+				order->SetConditionSkipToOrder(adjust_order_idx(order->GetConditionSkipToOrder()));
+			}
+		}
+
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 421 轮, C-8 / E-2): duplicate one order of an ownerless schedule.
+ *
+ * The reset of the travel timetable mirrors CmdDuplicateOrder: a copy must not inherit
+ * the source order's travel timing.
+ *
+ * @param flags operation to perform
+ * @param ol_index index of the ownerless schedule
+ * @param sel_ord  order to duplicate
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RDuplicateLooseOrder(DoCommandFlags flags, uint32_t ol_index, uint16_t sel_ord)
+{
+	OrderList *const list = R3RGetEditableLooseSchedule(ol_index);
+	if (list == nullptr) return CMD_ERROR;
+	if (sel_ord >= list->GetNumOrders()) return CMD_ERROR;
+
+	const Order *const src_order = list->GetOrderAt(static_cast<VehicleOrderID>(sel_ord));
+	if (src_order == nullptr) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		Order new_order(*src_order);
+		new_order.SetTravelTimetabled(false);
+		new_order.SetTravelTime(0);
+		new_order.SetTravelFixed(false);
+		new_order.SetDispatchScheduleIndex(-1);
+		list->InsertOrderAt(std::move(new_order), static_cast<VehicleOrderID>(sel_ord) + 1);
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 424 轮, KI-607 C-1=R2): modify one order of an ownerless schedule.
+ *
+ * This is the loose counterpart of CmdModifyOrder() and shares R3RModifyOrderHost()
+ * with it, so both windows accept exactly the same set of parameters. Keeping one
+ * implementation is deliberate: a second copy of that whitelist drifts and silently
+ * rejects flags in one of the two windows (that is how KI-124 happened -- a missing
+ * MOF_R3R_YARD made a dropdown do nothing without any error).
+ *
+ * The host is filled with `veh == nullptr`; the flags which genuinely need live
+ * vehicle state (timetable clearing, separation bookkeeping) take their permissive
+ * side here and are checked again when the schedule is handed to a train.
+ *
+ * @param flags operation to perform
+ * @param ol_index index of the ownerless schedule
+ * @param sel_ord  order to modify
+ * @param mof what data to modify (@see ModifyOrderFlags)
+ * @param data the data to modify
+ * @param cargo_id cargo for MOF_CARGO_TYPE_UNLOAD / MOF_CARGO_TYPE_LOAD
+ * @param text text for MOF_LABEL_TEXT
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdR3RModifyLooseOrder(DoCommandFlags flags, uint32_t ol_index, uint16_t sel_ord, ModifyOrderFlags mof, uint16_t data, CargoType cargo_id, const std::string &text)
+{
+	OrderList *const list = R3RGetEditableLooseSchedule(ol_index);
+	if (list == nullptr) return CMD_ERROR;
+	if (sel_ord >= list->GetNumOrders()) return CMD_ERROR;
+
+	R3ROrderHost host;
+	host.list = list;
+	/* C-2: an order list carries no vehicle type yet, and an ownerless schedule is only
+	 * offered for trains. Generic order editing (load/unload/conditions/...) is identical
+	 * for all types anyway; only the vehicle-type specific flags below look at this. */
+	host.vtype = VehicleType::Train;
+	host.company = list->GetR3RScheduleOwner();
+	host.veh = nullptr;
+	return R3RModifyOrderHost(flags, host, static_cast<VehicleOrderID>(sel_ord), mof, data, cargo_id, text);
+}
+
+/**
+ * R3R (第 417 轮 无主排程): a list which has just lost its last user becomes ownerless.
+ *
+ * Ownerless lists are never registered in any destination reference list -- that is
+ * what OrderList::Initialize(nullptr) guarantees, and OrderList::FreeChain() /
+ * RemoveOrder() rely on it (they only unregister while a first_shared exists). So the
+ * transition "owned -> ownerless" has to unregister the destinations itself, otherwise
+ * every assignment leaks one reference count per order on stations and waypoints.
+ */
+static void R3RMakeOrderListOwnerless(OrderList *list, VehicleType type, Owner owner)
+{
+	if (list == nullptr || list->GetFirstSharedVehicle() != nullptr || list->GetNumVehicles() != 0) return;
+	for (const Order *o : list->Orders()) UnregisterOrderDestination(o, type, owner);
+}
+
+/**
+ * R3R (第 417 轮 排程池): re-point a vehicle's schedule pointer (`Vehicle::orders`)
+ * at another order list. The list itself is never copied and never moved: after this
+ * command the vehicle and every other vehicle already using the target list run that
+ * very same list (sharing it natively), while the previously used list is left in the
+ * pool. When the vehicle was its last user the old list simply becomes ownerless, so
+ * the player does not lose the schedule they were running.
+ *
+ * @param veh_index Index of the vehicle whose schedule pointer is changed.
+ * @param ol_index  Index of the schedule (OrderList) to point the vehicle at.
+ */
+CommandCost CmdR3RAssignSchedule(DoCommandFlags flags, uint32_t veh_index, uint32_t ol_index)
+{
+	if (!Vehicle::IsValidID(VehicleID(veh_index))) return CMD_ERROR;
+	if (!OrderList::IsValidID(OrderListID(ol_index))) return CMD_ERROR;
+
+	Vehicle *const v = Vehicle::Get(VehicleID(veh_index));
+	OrderList *const list = OrderList::GetIfValid(OrderListID(ol_index));
+	if (v == nullptr || list == nullptr) return CMD_ERROR;
+
+	/* Anti-crash guards: only the primary vehicle of a consist owns the schedule
+	 * pointer, and a vehicle which is currently borrowing a schedule (R3R couple
+	 * priority) or which has a parked schedule must be left alone. */
+	if (!IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(v->owner);
+	if (ret.Failed()) return ret;
+	if (v->r3r_orders_borrowed || v->orders_backup != nullptr || v->IsR3RFollower()) return CMD_ERROR;
+
+	/* R3R (第 418 轮 排程池): the ownership check above only covers the train. A train
+	 * may only be pointed at a schedule of another company while that schedule is
+	 * public (C-5), otherwise a shared list would leak between companies. */
+	if (!R3RScheduleAccessibleBy(list, v->owner)) return CMD_ERROR;
+
+	/* Anti-crash guard: the native game shares order lists only between vehicles of
+	 * the same type (see CmdShareVehicleOrders), and an order list built for one type
+	 * may not be executable by another (e.g. an aircraft order with a hangar flag). */
+	const Vehicle *const first_shared = list->GetFirstSharedVehicle();
+	if (first_shared != nullptr && first_shared->type != v->type) return CMD_ERROR;
+
+	if (v->orders == list) return CommandCost();
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		/* Detach from the old list. The old list is deliberately kept in the pool; it
+		 * becomes ownerless when this vehicle was its last user. */
+		if (v->orders != nullptr) {
+			OrderList *const old = v->orders;
+			const VehicleType old_type = v->type;
+			const Owner old_owner = v->owner;
+			if (old->GetNumVehicles() > 1 || v->PreviousShared() != nullptr || v->NextShared() != nullptr) {
+				v->RemoveFromShared();
+			} else {
+				old->RemoveVehicle(v);
+			}
+			v->orders = nullptr;
+			R3RMakeOrderListOwnerless(old, old_type, old_owner);
+		}
+
+		/* The order indices of the old list mean nothing in the new one. */
+		v->cur_implicit_order_index = 0;
+		v->cur_real_order_index = 0;
+		v->cur_timetable_order_index = INVALID_VEH_ORDER_ID;
+		v->current_order.Free();
+		v->ResetDepotUnbunching();
+		v->StopSeparation();
+
+		v->orders = list;
+		if (list->GetFirstSharedVehicle() == nullptr) {
+			/* Ownerless list: adopt it. Initialize() registers every order destination
+			 * for this vehicle, which is exactly what a loose list never did. */
+			list->Initialize(v);
+		} else {
+			/* Already used by other vehicles: join the native shared order chain. */
+			v->AddToShared(list->GetFirstSharedVehicle());
+		}
+
+		DeleteOrderWarnings(v);
+		InvalidateWindowClassesData(WindowClass::DepartureBoard);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 418 轮 排程池): rename a schedule.
+ *
+ * The name is metadata of the order list, not of the vehicle, so every vehicle running
+ * that schedule sees the new name at once. Only the owning company may rename it.
+ *
+ * @param ol_index Index of the schedule (OrderList) to rename.
+ * @param name     New name, empty to fall back to the automatic label.
+ */
+CommandCost CmdR3RRenameSchedule(DoCommandFlags flags, uint32_t ol_index, const std::string &name)
+{
+	if (name.size() > R3R_SCHEDULE_NAME_MAX_BYTES) return CMD_ERROR;
+
+	OrderList *const list = OrderList::GetIfValid(OrderListID(ol_index));
+	if (list == nullptr) return CMD_ERROR;
+	if (!R3RScheduleEditableBy(list, _current_company)) return CMD_ERROR;
+
+	/* 第 428 轮 (KI-622): 排程名在本存档里唯一 —— 调度池、排程窗口、车辆列表
+	 * 都只拿名字当标识，重名会让玩家无法分辨自己选的是哪一份表。空名字例外
+	 * （空 = 自动标签，允许很多份）。比较区分大小写，与显示一致。 */
+	if (!name.empty()) {
+		for (const OrderList *other : OrderList::Iterate()) {
+			if (other == list) continue;
+			if (other->GetR3RScheduleName() == name) return CommandCost(STR_ERROR_R3R_SCHEDULE_NAME_TAKEN);
+		}
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->SetR3RScheduleName(name);
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 418 轮 排程池): publish a schedule, or make it private again.
+ *
+ * A public schedule may be run by the trains of every company (C-5): another company
+ * may point its own trains at it and may register it in the dispatch pool of its own
+ * stations. Editing the orders, renaming and un-publishing stay with the owner.
+ *
+ * @param ol_index    Index of the schedule (OrderList) to change.
+ * @param make_public True to publish it, false to make it private again.
+ */
+CommandCost CmdR3RSetSchedulePublic(DoCommandFlags flags, uint32_t ol_index, bool make_public)
+{
+	OrderList *const list = OrderList::GetIfValid(OrderListID(ol_index));
+	if (list == nullptr) return CMD_ERROR;
+	if (!R3RScheduleEditableBy(list, _current_company)) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		list->SetR3RSchedulePublic(make_public);
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+	return CommandCost();
 }
 
 /**
@@ -5411,6 +6112,34 @@ bool InsertOrderCmdData::Deserialise(DeserialisationBuffer &buffer, StringValida
 void InsertOrderCmdData::FormatDebugSummary(format_target &output) const
 {
 	output.format("{}, {}, order: ", this->veh, this->sel_ord);
+
+	auto handler = [&]<size_t... Tindices>(std::index_sequence<Tindices...>) {
+		output.format(Order::CMD_TUPLE_FMT, std::get<Tindices>(this->new_order)...);
+	};
+	handler(std::make_index_sequence<std::tuple_size_v<decltype(this->new_order)>>{});
+}
+
+/* R3R (第 421 轮, C-8 / E-2): same wire format as InsertOrderCmdData, with the
+ * VehicleID replaced by an OrderList index. */
+void InsertLooseOrderCmdData::SerialisePayload(BufferSerialisationRef buffer) const
+{
+	buffer.Send_generic(this->order_list);
+	buffer.Send_generic(this->sel_ord);
+	buffer.Send_generic(this->new_order);
+}
+
+bool InsertLooseOrderCmdData::Deserialise(DeserialisationBuffer &buffer, StringValidationSettings default_string_validation)
+{
+	buffer.Recv_generic(this->order_list, default_string_validation);
+	buffer.Recv_generic(this->sel_ord, default_string_validation);
+	buffer.Recv_generic(this->new_order, default_string_validation);
+
+	return true;
+}
+
+void InsertLooseOrderCmdData::FormatDebugSummary(format_target &output) const
+{
+	output.format("orderlist {}, {}, order: ", this->order_list, this->sel_ord);
 
 	auto handler = [&]<size_t... Tindices>(std::index_sequence<Tindices...>) {
 		output.format(Order::CMD_TUPLE_FMT, std::get<Tindices>(this->new_order)...);

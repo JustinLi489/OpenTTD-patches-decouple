@@ -57,6 +57,7 @@ enum OrderWidgets : WidgetID {
 	WID_O_R3R_YARD,                  ///< R3R: choose the destination yard of a station order (whole station, or any yard of the destination station).
 	WID_O_COUPLE_SIDE,               ///< R3R: choose which side of the coupled train to attach to (front = [this][target], rear = [target][this]).
 	WID_O_COUPLE_TEMP_GROUP,         ///< R3R: choose the couple group a GOTO_COUPLE order temporarily joins while it runs.
+	WID_O_R3R_SEPARATION,            ///< R3R: toggle the auto separation marker of a station order (KI-575).
 	WID_O_SEL_COND_VALUE,            ///< Widget for conditional value or conditional cargo type.
 	WID_O_SEL_COND_AUX,              ///< Widget for auxiliary conditional cargo type. WID_O_SEL_COND_AUX... IDs must be sequential.
 	WID_O_SEL_COND_AUX2,             ///< Widget for auxiliary conditional via button.
@@ -77,6 +78,32 @@ enum OrderWidgets : WidgetID {
 	WID_O_SEL_OCCUPANCY,             ///< #NWID_SELECTION widget for the occupancy list panel.
 	WID_O_OCCUPANCY_LIST,            ///< Occupancy list panel.
 	WID_O_OCCUPANCY_TOGGLE,          ///< Toggle display of occupancy measures.
+	WID_O_SEL_OCCUPANCY_TOGGLE,      ///< R3R (round 427, KI-618): #NWID_SELECTION widget holding #WID_O_OCCUPANCY_TOGGLE, so a window without a vehicle can hide the button completely.
+};
+
+/** Widgets of the #R3RScheduleEditorWindow class (R3R, round 421, C-8 / E-2). */
+enum R3RScheduleEditorWidgets : WidgetID {
+	WID_R3RSE_CAPTION,     ///< Caption of the window.
+	WID_R3RSE_ORDER_LIST,  ///< Order list panel.
+	WID_R3RSE_SCROLLBAR,   ///< Order list scrollbar.
+	WID_R3RSE_ADD,         ///< Add an order behind the selected one (or at the end).
+	WID_R3RSE_DELETE,      ///< Delete the selected order.
+	WID_R3RSE_DUPLICATE,   ///< Duplicate the selected order.
+	WID_R3RSE_MOVE_UP,     ///< Move the selected order one position towards the front.
+	WID_R3RSE_MOVE_DOWN,   ///< Move the selected order one position towards the back.
+
+	/* R3R (round 424, C-6 stage A): per-order parameter editing, mirroring the
+	 * corresponding widgets of the regular orders window. */
+	WID_R3RSE_LOAD,               ///< Load mode dropdown.
+	WID_R3RSE_UNLOAD,             ///< Unload mode dropdown.
+	WID_R3RSE_NON_STOP,           ///< Non-stop dropdown (repeated in the station, depot and waypoint planes).
+	WID_R3RSE_DEPOT_ACTION,       ///< Depot action dropdown.
+	WID_R3RSE_COUPLE_SIDE,        ///< Couple side dropdown.
+	WID_R3RSE_COUPLE_TEMP_GROUP,  ///< Temporary couple group dropdown (repeated in the two coupling planes).
+	WID_R3RSE_YARD,               ///< Destination yard dropdown.
+	WID_R3RSE_SEPARATION,         ///< Separation marker dropdown.
+	WID_R3RSE_DECOUPLE_BOUNDARY,  ///< Decouple segment boundary dropdown.
+	WID_R3RSE_SEL_PARAMS,         ///< Selection holding one parameter row per order type.
 };
 
 /** Widgets of the #CargoTypeOrdersWindow class. */

@@ -141,7 +141,10 @@ void MoveWaypointsToBaseStations()
 
 	/* Update the orders of vehicles */
 	for (OrderList *ol : OrderList::Iterate()) {
-		if (ol->GetFirstSharedVehicle()->type != VehicleType::Train) continue;
+		/* R3R (第 417 轮 无主排程): a loose schedule has no vehicle to take the
+		 * type from; it never belonged to a train, so skip it. */
+		const Vehicle *const first_shared = ol->GetFirstSharedVehicle();
+		if (first_shared == nullptr || first_shared->type != VehicleType::Train) continue;
 
 		for (Order *o : ol->Orders()) UpdateWaypointOrder(o);
 	}

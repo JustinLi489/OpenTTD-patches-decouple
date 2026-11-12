@@ -48,6 +48,19 @@ enum StationYardWidgets : WidgetID {
 	WID_SY_LOCATE,       ///< Scroll the main view to the selected platform.
 	WID_SY_RENAME,       ///< R3R: give the selected yard a name of its own.
 	WID_SY_DELETE,       ///< R3R: delete the selected yard.
+	WID_SY_DISPATCH,     ///< R3R: open the dispatch pool window of the selected yard (KI-586).
+};
+
+/** Widgets of the #StationDispatchWindow class (R3R dispatch pool management). */
+enum StationDispatchWidgets : WidgetID {
+	WID_SD_CAPTION,      ///< Caption of the window.
+	WID_SD_YARD_SEL,     ///< R3R: choose which yard's pool is shown.
+	WID_SD_LIST,         ///< List of pool entries.
+	WID_SD_SCROLLBAR,    ///< Scrollbar of the list.
+	WID_SD_ADD,          ///< Add the order list of a train as a pool entry.
+	WID_SD_DELETE,       ///< Remove the selected pool entry.
+	WID_SD_SLOTS_DOWN,   ///< Decrease the slots of the selected entry.
+	WID_SD_SLOTS_UP,     ///< Increase the slots of the selected entry.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

@@ -54,16 +54,53 @@
  *     每字装 4 个 UTF-8 字节（低位在前，末字高位补 0）。名称块放在「场标志」之后、
  *     tile 数量之前。读取 v4/v3/v2 时名称恒为空（界面显示默认的「N 场」）。
  *
- * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v5/v4/v3/v2 解码；否则按 v1 迁移（任一 v1 列表
- * 非空时构造场 1/2/3，保证旧存档里订单引用的场 ID 仍然有效）。
+ * v6：每组新增「调度池」块（Station::R3RStationYard::pool，第 416 轮），放在名称
+ *     块之后、tile 数量之前：先一个字是条目数 P，紧跟 P 组、每组 3 个字——
+ *         宿主模板车的 VehicleID 序号 + 1（0 = 无效）、坑位 limit、已发出 issued。
+ *     读取 v5 及更早的存档时池恒为空。
+ *
+ * v7：所有场组之后追加「整站」块（第 420 轮，KI-599）——整站(场 ID 0)此前没有
+ *     任何存储实体，站场窗口切到整站时调度池/检修所恒空恒灰。整站块布局：
+ *         word   : 整站标志（bit0 = r3r_whole_workshop 检修所）
+ *         word   : 整站调度池条目数 P
+ *         P 组、每组 3 个字：同 v6 的池条目编码。
+ *     读取 v6 及更早的存档时整站池恒空、整站检修所为 false。
+ *     另外 v7 起「只有整站池/整站检修所、一个场都没建」的车站也会被写出。
+ *
+ * v8：池条目的身份从「模板车」改成「排程」（第 428 轮，KI-621）。每组从 3 个字
+ *     变成 4 个字，多出的那个字是 OrderList 池下标 + 1（0 = 尚未记录，读档后按
+ *     模板车推导）：
+ *         word   : 模板车 VehicleID 序号 + 1（0 = 无效/无主排程）
+ *         word   : 坑位 limit
+ *         word   : 已发出 issued
+ *         word   : 排程 = OrderList 池下标 + 1（0 = 旧档条目，无排程字段）
+ *     读取 v7 及更早的存档时排程恒为 R3R_DISPATCH_NO_SCHEDULE。
+ *     注意 OrderList 池下标在存读档之间是稳定的（ORDL 按池下标逐项写出并
+ *     CreateAtIndex 原样重建），但**运行期**表被释放后下标可能被别的表复用，
+ *     此时条目会静默指向新表 —— 与 VehicleID 复用同一类限制，由 Prune 兜底。
+ *
+ * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v8/v7/v6/v5/v4/v3/v2 解码；否则按 v1 迁移（任一
+ * v1 列表非空时构造场 1/2/3，保证旧存档里订单引用的场 ID 仍然有效）。
+ *
+ * 注意：本 chunk 的加载顺序与车辆池(VEHS)没有保证，因此解码阶段**绝不能**校验
+ * 宿主车/排程是否存在（要读 Vehicle::Get / OrderList::GetIfValid），只做纯数值
+ * 钳制；失效条目留给运行期的 Prune/Count/Pick 兜底。
  */
 static constexpr uint32_t SYRD_V2_MAGIC = 0xFFFFFF01;
 static constexpr uint32_t SYRD_V3_MAGIC = 0xFFFFFF02;
 static constexpr uint32_t SYRD_V4_MAGIC = 0xFFFFFF03;
 static constexpr uint32_t SYRD_V5_MAGIC = 0xFFFFFF04;
+static constexpr uint32_t SYRD_V6_MAGIC = 0xFFFFFF05;
+static constexpr uint32_t SYRD_V7_MAGIC = 0xFFFFFF06;
+static constexpr uint32_t SYRD_V8_MAGIC = 0xFFFFFF07;
+
+/** R3R: 读档时对池条目数量的硬上限（防御损坏的编码，正常不超过设置上限 256）。 */
+static constexpr uint32_t SYRD_MAX_POOL_ENTRIES = 4096;
 
 /** R3R: SYRD v5 场标志 word 的位定义。 */
 static constexpr uint32_t SYRD_YARD_FLAG_WORKSHOP = 0x00000001; ///< 本场是检修所
+/** R3R: SYRD v7 整站块标志 word 的位定义。 */
+static constexpr uint32_t SYRD_WHOLE_FLAG_WORKSHOP = 0x00000001; ///< 整站是检修所
 
 /** R3R: 场名解码时的合法长度上限（字节）。命令层按
  * #MAX_LENGTH_STATION_NAME_CHARS 个字符校验，最坏 4 字节/字符，所以上限取
@@ -103,6 +140,44 @@ static std::string R3RUnpackName(const std::vector<TileIndex> &in, size_t &p)
 	return name;
 }
 
+/** R3R: 把调度池打包进 SYRD word 流（v8 起的编码，v7 的整站块复用同一格式）。 */
+static void R3RPackPool(std::vector<TileIndex> &out, const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> &pool)
+{
+	out.push_back(static_cast<TileIndex>(pool.size()));
+	for (const Station::R3RStationYard::R3RDispatchPoolEntry &e : pool) {
+		out.push_back(static_cast<TileIndex>(e.host == VehicleID::Invalid() ? 0 : e.host.base() + 1));
+		out.push_back(static_cast<TileIndex>(e.limit));
+		out.push_back(static_cast<TileIndex>(e.issued));
+		/* v8: 排程（OrderList 池下标 + 1，0 = 未记录）。 */
+		out.push_back(static_cast<TileIndex>(e.schedule == Station::R3R_DISPATCH_NO_SCHEDULE ? 0 : e.schedule + 1));
+	}
+}
+
+/** R3R: 从 SYRD word 流解出调度池，并把 \a p 推进到池块之后。
+ * @param has_schedule v8+ 的池条目多一个「排程」word；更早的格式没有。 */
+static std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> R3RUnpackPool(const std::vector<TileIndex> &in, size_t &p, bool has_schedule)
+{
+	std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> pool;
+	if (p >= in.size()) return pool;
+	const uint32_t pc = std::min<uint32_t>(in[p++].base(), SYRD_MAX_POOL_ENTRIES);
+	const size_t words = has_schedule ? 4 : 3;
+	for (uint32_t k = 0; k < pc; k++) {
+		if (p + words > in.size()) break;
+		const uint32_t hw = in[p++].base();
+		const uint32_t lim = in[p++].base();
+		const uint32_t iss = in[p++].base();
+		const uint32_t sw = has_schedule ? in[p++].base() : 0;
+		Station::R3RStationYard::R3RDispatchPoolEntry e;
+		if (hw != 0) e.host = VehicleID(static_cast<uint32_t>(hw - 1));
+		/* 纯数值钳制：这里不能问车辆池/排程池（加载顺序不保证）。 */
+		e.limit = static_cast<uint16_t>(std::clamp<uint32_t>(lim == 0 ? 1 : lim, 1, 256));
+		e.issued = static_cast<uint16_t>(std::min<uint32_t>(iss, e.limit));
+		e.schedule = (sw != 0) ? static_cast<uint32_t>(sw - 1) : Station::R3R_DISPATCH_NO_SCHEDULE;
+		pool.push_back(e);
+	}
+	return pool;
+}
+
 static const NamedSaveLoad _r3r_station_yard_desc[] = {
 	NSL("yard_a",      SLE_VARVEC(Station, r3r_yard_a,      SLE_UINT32)),
 	NSL("yard_b",      SLE_VARVEC(Station, r3r_yard_b,      SLE_UINT32)),
@@ -120,30 +195,40 @@ static void R3REncodeYards(Station *st)
 	st->r3r_yard_b.clear();
 	st->r3r_yard_shared.clear();
 
-	if (st->r3r_yards.empty()) return;
+	if (st->r3r_yards.empty() && st->r3r_whole_pool.empty() && !st->r3r_whole_workshop) return;
 
-	out.push_back(static_cast<TileIndex>(SYRD_V5_MAGIC));
+	out.push_back(static_cast<TileIndex>(SYRD_V8_MAGIC));
 	out.push_back(static_cast<TileIndex>(st->r3r_yards.size() & 0xFFFF));
 	for (const Station::R3RStationYard &y : st->r3r_yards) {
 		out.push_back(static_cast<TileIndex>(y.shared_with));
 		out.push_back(static_cast<TileIndex>(y.is_workshop ? SYRD_YARD_FLAG_WORKSHOP : 0));
 		R3RPackName(out, y.name);
+		/* v6: 调度池（宿主车序号 + 1，0 表示无效；v8 起追加排程）。 */
+		R3RPackPool(out, y.pool);
 		out.push_back(static_cast<TileIndex>(y.tiles.size()));
 		out.insert(out.end(), y.tiles.begin(), y.tiles.end());
 	}
+	/* v7: 整站块（场 ID 0 的检修所标志 + 调度池）。 */
+	out.push_back(static_cast<TileIndex>(st->r3r_whole_workshop ? SYRD_WHOLE_FLAG_WORKSHOP : 0));
+	R3RPackPool(out, st->r3r_whole_pool);
 }
 
-/** R3R: decode a v5/v4/v3/v2 yard buffer into \a st->r3r_yards. Returns false if \a in is none of them. */
+/** R3R: decode a v8..v2 yard buffer into \a st->r3r_yards. Returns false if \a in is none of them. */
 static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 {
 	if (in.empty()) return false;
 	const uint32_t magic = in[0].base();
-	if (magic != SYRD_V5_MAGIC && magic != SYRD_V4_MAGIC && magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
+	if (magic != SYRD_V8_MAGIC && magic != SYRD_V7_MAGIC && magic != SYRD_V6_MAGIC && magic != SYRD_V5_MAGIC && magic != SYRD_V4_MAGIC && magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
 	const bool legacy_v2 = (magic == SYRD_V2_MAGIC);
-	const bool has_flags = (magic == SYRD_V5_MAGIC || magic == SYRD_V4_MAGIC);
-	const bool has_names = (magic == SYRD_V5_MAGIC);
+	const bool has_flags = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC || magic == SYRD_V4_MAGIC);
+	const bool has_names = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC);
+	const bool has_pool = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC);
+	const bool has_whole = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC);
+	const bool has_schedule = (magic == SYRD_V8_MAGIC);
 
 	st->r3r_yards.clear();
+	st->r3r_whole_pool.clear();
+	st->r3r_whole_workshop = false;
 
 	size_t p = 1;
 	if (p >= in.size()) return true;
@@ -161,6 +246,8 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 		}
 		std::string name;
 		if (has_names) name = R3RUnpackName(in, p);
+		std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> pool;
+		if (has_pool) pool = R3RUnpackPool(in, p, has_schedule);
 		if (p >= in.size()) break; // 截断的编码，安全停止
 		const uint32_t m = in[p++].base();
 		Station::R3RStationYard &y = st->r3r_yards.emplace_back();
@@ -172,7 +259,15 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 		}
 		y.is_workshop = (flags & SYRD_YARD_FLAG_WORKSHOP) != 0;
 		y.name = std::move(name);
+		y.pool = std::move(pool);
 		for (uint32_t i = 0; i < m && p < in.size(); i++) y.tiles.push_back(in[p++]);
+	}
+
+	/* v7: 全部场组之后的整站块。截断的编码按「没有整站数据」处理。 */
+	if (has_whole && p < in.size()) {
+		const uint32_t whole_flags = in[p++].base();
+		st->r3r_whole_workshop = (whole_flags & SYRD_WHOLE_FLAG_WORKSHOP) != 0;
+		st->r3r_whole_pool = R3RUnpackPool(in, p, has_schedule);
 	}
 
 	if (legacy_v2) {
@@ -237,9 +332,10 @@ static void Save_SYRD()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_station_yard_desc);
 
-	/* 稀疏：只写出真正建过场（哪怕场还是空的）的车站，以保住场的数量与下标。 */
+	/* 稀疏：只写出真正建过场（哪怕场还是空的）的车站，以保住场的数量与下标。
+	 * v7 起，只有整站池/整站检修所、一个场都没建的车站也要写出。 */
 	for (Station *st : Station::Iterate()) {
-		if (st->r3r_yards.empty()) continue;
+		if (st->r3r_yards.empty() && st->r3r_whole_pool.empty() && !st->r3r_whole_workshop) continue;
 		R3REncodeYards(st);
 		SlSetArrayIndex(st->index);
 		SlObjectSaveFiltered(st, slt);

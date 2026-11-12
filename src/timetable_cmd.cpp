@@ -757,6 +757,29 @@ CommandCost CmdTimetableSeparation(DoCommandFlags flags, VehicleID veh, bool sep
 	return CommandCost();
 }
 
+/**
+ * R3R (KI-575): does the order list which \a v actually drives carry the
+ * "自动调节班次" marker on any of its station orders?
+ *
+ * The marker is an order-level flag (bit 5 of the order extra flags), which
+ * makes it a property of the order list: every vehicle driving that list -
+ * including a follower which borrowed it from a control segment - sees it.
+ *
+ * @param v The vehicle.
+ * @return true iff the effective order list contains a marked station order.
+ */
+static bool R3ROrdersHaveStationSeparation(const Vehicle *v)
+{
+	/* Only trains may set the marker (CmdModifyOrder enforces that), and bit 5
+	 * of the order extra flags is the road vehicle travel direction on the
+	 * other vehicle types, so never interpret it for them. */
+	if (v->type != VehicleType::Train) return false;
+	for (const Order *o : v->Orders()) {
+		if (o->HasR3RStationSeparation()) return true;
+	}
+	return false;
+}
+
 static inline bool IsOrderUsableForSeparation(const Order *order)
 {
 	if (order->HasNoTimetableTimes()) return true;
@@ -1247,7 +1270,12 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 
 	if (set_scheduled_dispatch) {
 		// do nothing
-	} else if (v->vehicle_flags.Test(VehicleFlag::TimetableSeparation) && v->vehicle_flags.Test(VehicleFlag::TimetableStarted)) {
+	} else if (v->vehicle_flags.Test(VehicleFlag::TimetableStarted) &&
+			(v->vehicle_flags.Test(VehicleFlag::TimetableSeparation) || R3ROrdersHaveStationSeparation(v))) {
+		/* R3R (KI-575): in addition to the native vehicle-level flag, the
+		 * separation can be requested by the order list itself (a marked
+		 * GOTO_STATION order).  Both mechanisms feed the same state machine,
+		 * so the rest of this branch is unchanged. */
 		v->current_order_time = time_taken;
 		v->current_loading_time = time_loading;
 		UpdateSeparationOrder(v);

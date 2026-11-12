@@ -490,7 +490,7 @@ static constexpr CommandCost CMD_ERROR = CommandCost(INVALID_STRING_ID);
  *
  * @see _command_proc_table
  */
-enum class Commands : uint8_t {
+enum class Commands : uint16_t {
 	BuildRailLong,                          ///< build a rail track
 	RemoveRailLong,                         ///< remove a rail track
 	BuildRail,                              ///< build a single rail track
@@ -789,6 +789,21 @@ enum class Commands : uint8_t {
 	SetR3RStationYardWorkshop,              ///< R3R: upgrade a yard to a workshop (or remove the workshop status)
 	SetR3RStationYardName,                  ///< R3R: give a yard a name of its own (empty name = back to the default label)
 	RemoveR3RStationYard,                   ///< R3R: delete a yard (its platforms go back to the whole station)
+	AddR3RDispatchPoolEntry,                ///< R3R (第 416 轮): register a train's order list as a dispatch pool entry of a yard
+	RemoveR3RDispatchPoolEntry,             ///< R3R (第 416 轮): drop one dispatch pool entry of a yard
+	SetR3RDispatchPoolLimit,                ///< R3R (第 416 轮): change how many trains may use one dispatch pool entry at the same time
+	CreateR3RLooseSchedule,                 ///< R3R (第 417 轮): create an ownerless order list in the schedule pool
+	DeleteR3RLooseSchedule,                 ///< R3R (第 417 轮): delete an ownerless order list from the schedule pool
+	AssignR3RSchedule,                      ///< R3R (第 417 轮): re-point a train's schedule pointer (Vehicle::orders) at another order list
+	RenameR3RSchedule,                      ///< R3R (第 418 轮): rename a schedule of the schedule pool
+	SetR3RSchedulePublic,                   ///< R3R (第 418 轮): publish a schedule (other companies may point their trains at it) or make it private again
+
+	/* order_cmd.cpp (R3R ownerless schedule editing, C-8 / E-2) */
+	InsertR3RLooseOrder,                    ///< R3R (第 421 轮): insert an order into an ownerless schedule
+	DeleteR3RLooseOrder,                    ///< R3R (第 421 轮): delete an order of an ownerless schedule
+	MoveR3RLooseOrder,                      ///< R3R (第 421 轮): reorder the orders of an ownerless schedule
+	DuplicateR3RLooseOrder,                 ///< R3R (第 421 轮): duplicate an order of an ownerless schedule
+	ModifyR3RLooseOrder,                    ///< R3R (第 424 轮): modify one order of an ownerless schedule
 
 	End,                                    ///< Must ALWAYS be on the end of this list!! (period)
 };

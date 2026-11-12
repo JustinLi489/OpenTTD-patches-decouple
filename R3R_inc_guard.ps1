@@ -18,12 +18,20 @@
 #   translation unit; for those only the named objects are deleted and the run stays
 #   incremental. Debug probes in such a header therefore cost one object, not 620.
 #
+# Usage (2026-11-08): -BuildDir selects which tree to guard, e.g.
+#       R3R_inc_guard.ps1 -BuildDir build-release
+#   Default is 'build' (the internal test tree).
+#
 # Exit codes: 0 = incremental is safe, 2 = objects were dropped (full rebuild follows).
+
+param(
+    [string]$BuildDir = 'build'
+)
 
 $ErrorActionPreference = 'Continue'
 
 $root  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$build = Join-Path $root 'build'
+$build = Join-Path $root $BuildDir
 if (-not (Test-Path -LiteralPath $build)) {
     Write-Host 'GUARD: no build directory - nothing to check (full build anyway)'
     exit 0
@@ -70,8 +78,16 @@ if ($newer.Count -eq 0) {
 #   rg -n 'include "yapf_destrail.hpp"' src
 # If a second .cpp starts including a header listed here, extend the value list in the
 # same commit - otherwise that object is linked against the old header (mixed ABI).
+$yapf5 = @('yapf_common.cpp.obj', 'yapf_rail.cpp.obj', 'yapf_road.cpp.obj', 'yapf_ship.cpp.obj', 'yapf_ship_regions.cpp.obj')
 $smallClosure = @{
-    'src\pathfinder\yapf\yapf_destrail.hpp' = @('yapf_rail.cpp.obj')
+    'src\pathfinder\yapf\yapf_destrail.hpp'  = @('yapf_rail.cpp.obj')
+    # Verified 2026-11-08 by include-closure scan: yapf.hpp is included by exactly these
+    # 5 TUs, and yapf_base.hpp / yapf_costcache.hpp are included ONLY by yapf.hpp.
+    # Re-verify before trusting this list:
+    #   rg -n 'include "yapf_base.hpp"' src
+    'src\pathfinder\yapf\yapf.hpp'           = $yapf5
+    'src\pathfinder\yapf\yapf_base.hpp'      = $yapf5
+    'src\pathfinder\yapf\yapf_costcache.hpp' = $yapf5
 }
 
 $remaining = @()

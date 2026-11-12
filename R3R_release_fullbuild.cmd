@@ -129,6 +129,15 @@ if defined CACHEOK (
 )
 
 echo.
+echo ---- [5c] incremental safety guard ----
+rem  Harmless for a genuine full build (the guard prints "no object files present"
+rem  and exits 0 when the tree was already cleaned). It only matters if this script
+rem  is ever run on a partly built tree: build-release has the same broken MSVC
+rem  header dependency info as build\ (KI-183).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\R3R_inc_guard.ps1" -BuildDir "build-release"
+echo   guard exit=%ERRORLEVEL%
+
+echo.
 echo ---- [6] cmake configure (RelWithDebInfo, forced /O2 /Ob2) ----
 "%CMAKEEXE%" -S "%ROOT%" -B "%BLD%" -G Ninja ^
   -DCMAKE_MAKE_PROGRAM="%NINJA%" ^
@@ -138,6 +147,7 @@ echo ---- [6] cmake configure (RelWithDebInfo, forced /O2 /Ob2) ----
   -DCMAKE_C_FLAGS_RELWITHDEBINFO="/Zi /O2 /Ob2 /DNDEBUG" ^
   -DOPTION_USE_ASSERTS=ON ^
   -DR3R_PROBES_DEFAULT=0 ^
+  -DR3R_PROBES=1 ^
   -DVCPKG_TARGET_TRIPLET=x64-windows-static
 set "CFG=%ERRORLEVEL%"
 echo   CMAKE_CONFIGURE_EXIT=%CFG%
@@ -193,7 +203,15 @@ if errorlevel 1 (
     > "%DONE%" echo EXIT_CODE=94
     goto :END
 )
-echo   OK: probes default OFF
+findstr /C:"-DR3R_PROBES=1" "%BLD%\build.ninja" >nul 2>&1
+if errorlevel 1 (
+    echo   [FATAL] build.ninja does not carry -DR3R_PROBES=1
+    echo   [FATAL] no probe code would be compiled in, so R3R_DBG=1 could
+    echo   [FATAL] not switch the probes on at runtime in this tree.
+    > "%DONE%" echo EXIT_CODE=94
+    goto :END
+)
+echo   OK: probes compiled IN, default OFF (runtime override: set R3R_DBG=1)
 
 if defined CHECKONLY (
     echo.

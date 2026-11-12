@@ -619,6 +619,16 @@ static void Load_ORDL()
 	}
 
 	_old_scheduled_dispatch_slots.clear();
+
+	/* R3R (第 417 轮 无主排程): the per-list counters (num_manual_orders, timetable
+	 * duration, total duration) are not saved, they are always recomputed from the
+	 * orders. Vehicles have not been loaded yet, so every list is ownerless at this
+	 * point; recomputing here gives ownerless lists valid counters, and the vehicle
+	 * pass later recomputes the lists which do get an owner (and registers their
+	 * destinations). */
+	for (OrderList *list : OrderList::Iterate()) {
+		if (list->GetFirstSharedVehicle() == nullptr && list->GetNumVehicles() == 0) list->Initialize(nullptr);
+	}
 }
 
 void Ptrs_ORDL()
@@ -627,6 +637,77 @@ void Ptrs_ORDL()
 
 	for (OrderList *list : OrderList::Iterate()) {
 		SlObjectPtrOrNullFiltered(list, slt);
+	}
+}
+
+/**
+ * R3R (第 418 轮 排程池): metadata of one schedule (name, owning company, visibility).
+ *
+ * The metadata is written to its own sparse chunk (R3SM) keyed by the OrderList index
+ * instead of being added to ORDL. That keeps the order list layout - and with it the
+ * savegame compatibility with older executables - completely untouched: an older
+ * executable skips the unknown chunk, and an older savegame simply has no metadata at
+ * all (empty name, no stored owner, private visibility).
+ */
+struct R3RScheduleMeta {
+	std::string name;         ///< User supplied name, empty when unnamed.
+	uint8_t owner = 0xFF;     ///< Owning company, 0xFF (INVALID_COMPANY) when not known.
+	bool is_public = false;   ///< Whether other companies may use this schedule.
+};
+
+static NamedSaveLoadTable GetR3RScheduleMetaDescription()
+{
+	static const NamedSaveLoad _r3r_schedule_meta_desc[] = {
+		NSL("name",      SLE_SSTR(R3RScheduleMeta, name,     SLE_STR)),
+		NSL("owner",     SLE_VAR(R3RScheduleMeta, owner,     SLE_UINT8)),
+		NSL("is_public", SLE_VAR(R3RScheduleMeta, is_public, SLE_BOOL)),
+	};
+
+	return _r3r_schedule_meta_desc;
+}
+
+static void Save_R3SM()
+{
+	SaveLoadTableData slt = SlTableHeader(GetR3RScheduleMetaDescription());
+
+	for (OrderList *list : OrderList::Iterate()) {
+		/* Only schedules which actually carry metadata need a record. Everything else
+		 * keeps the defaults (unnamed, private, owner taken from the shared chain). */
+		if (list->GetR3RScheduleName().empty() && !list->IsR3RSchedulePublic() &&
+				list->GetR3RScheduleStoredOwner() == CompanyID::Invalid()) {
+			continue;
+		}
+
+		R3RScheduleMeta meta;
+		meta.name = list->GetR3RScheduleName();
+		meta.owner = static_cast<uint8_t>(list->GetR3RScheduleStoredOwner().base());
+		meta.is_public = list->IsR3RSchedulePublic();
+
+		SlSetArrayIndex(list->index);
+		SlObjectSaveFiltered(&meta, slt);
+	}
+}
+
+static void Load_R3SM()
+{
+	SaveLoadTableData slt = SlTableHeader(GetR3RScheduleMetaDescription());
+
+	int index;
+	while ((index = SlIterateArray()) != -1) {
+		R3RScheduleMeta meta;
+		SlObjectLoadFiltered(&meta, slt);
+
+		OrderList *list = OrderList::GetIfValid(OrderListID(index));
+		if (list == nullptr) {
+			/* ORDL is loaded before this chunk, so this cannot happen. Stay defensive
+			 * anyway, the record has to be consumed to keep the reader in sync. */
+			list = OrderList::CreateAtIndex(OrderListID(index));
+			list->Initialize(nullptr);
+		}
+
+		list->SetR3RScheduleName(meta.name);
+		list->SetR3RScheduleStoredOwner(CompanyID(meta.owner));
+		list->SetR3RSchedulePublic(meta.is_public);
 	}
 }
 
@@ -700,6 +781,7 @@ static const ChunkHandler order_chunk_handlers[] = {
 	{ 'BKOR', Save_BKOR, Load_BKOR, Ptrs_BKOR, nullptr, CH_TABLE },
 	{ 'ORDR', nullptr,   Load_ORDR, nullptr,   nullptr, CH_READONLY },
 	{ 'ORDL', Save_ORDL, Load_ORDL, Ptrs_ORDL, nullptr, CH_TABLE },
+	{ 'R3SM', Save_R3SM, Load_R3SM, nullptr,   nullptr, CH_SPARSE_TABLE },
 	{ 'ORDX', nullptr,   Load_ORDX, nullptr,   nullptr, CH_READONLY },
 };
 

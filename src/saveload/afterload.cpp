@@ -4399,7 +4399,9 @@ bool AfterLoadGame()
 				if (!(ds.GetScheduledDispatchStartTick() >= 0 && ds.IsScheduledDispatchValid()) && ds.GetScheduledDispatch().empty()) {
 					order_list->GetScheduledDispatchScheduleSet().clear();
 				} else {
-					VehicleOrderID idx = order_list->GetFirstSharedVehicle()->GetFirstWaitingLocation(false);
+					/* R3R (第 417 轮 无主排程): a loose schedule has no vehicle. */
+					const Vehicle *const first_shared = order_list->GetFirstSharedVehicle();
+					VehicleOrderID idx = (first_shared != nullptr) ? first_shared->GetFirstWaitingLocation(false) : INVALID_VEH_ORDER_ID;
 					if (idx != INVALID_VEH_ORDER_ID) {
 						order_list->GetOrderAt(idx)->SetDispatchScheduleIndex(0);
 					}

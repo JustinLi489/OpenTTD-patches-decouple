@@ -1900,6 +1900,9 @@ STR_CONFIG_SETTING_SERVINT_DISABLED                             :关闭
 STR_CONFIG_SETTING_NOSERVICE                                    :在无故障模式下禁用维护周期：{STRING}
 STR_CONFIG_SETTING_NOSERVICE_HELPTEXT                           :"打开"时，在无故障模式下，车辆禁用保养周期
 
+STR_CONFIG_SETTING_R3R_DISPATCH_POOL_CAPACITY                   :每站场调度池容量：{STRING}
+STR_CONFIG_SETTING_R3R_DISPATCH_POOL_CAPACITY_HELPTEXT          :一个车站的一个站场最多可存储多少份可分配的班次排程. 本项只限制存储的排程数量, 不限制可同时领取它们的列车数量
+
 STR_CONFIG_SETTING_STATION_LENGTH_LOADING_PENALTY               :站台长度装卸惩罚：{STRING}
 STR_CONFIG_SETTING_STATION_LENGTH_LOADING_PENALTY_HELPTEXT      :启用站台长度装卸惩罚。过长的火车将会在站台中装卸得更慢。此项设置不会影响寻路
 
@@ -3998,6 +4001,82 @@ STR_ORDER_R3R_YARD_NAMED                                        :{NUM} 场
 STR_ORDER_R3R_YARD_NAMED_SHARED                                 :{NUM} 场(共享)
 STR_ORDER_R3R_YARD_TOOLTIP                                      :{BLACK}本订单在目的车站的哪个场停靠
 
+# R3R:车站订单的自动调节班次标记(订单窗口)
+STR_ORDER_R3R_SEPARATION                                        :调节班次
+STR_ORDER_R3R_SEPARATION_TOOLTIP                                :{BLACK}让运行本排程的列车按班次间隔均匀分布. 该标记作用于整份排程, 共享它的全部列车一起参与对齐. 点击后选择本标记或「等待分配调度」, 两者互斥, 再次选择当前项即取消
+
+# R3R:车站订单的等待分配标记(订单窗口)
+STR_ORDER_R3R_WAIT_DISPATCH                                     :等待分配
+STR_ORDER_R3R_WAIT_DISPATCH_TOOLTIP                             :{BLACK}到站后从该站场调度池领取一份班次排程, 从它的第一条命令开始执行一遍, 跑完再接着执行本排程在这条命令之后的命令
+
+# R3R:前往车站命令后追加的括号说明(与车库订单的"等待调节班次"同风格)
+STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX                            :（等待调节班次）
+STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX                              :（等待分配调度）
+
+# R3R:调度池(车站窗口)
+STR_R3R_DISPATCH_POOL_CAPTION                                   :{BLACK}调度池
+STR_R3R_DISPATCH_POOL_CAPTION_STATION                           :{BLACK}调度池 - {STATION}
+STR_R3R_DISPATCH_POOL_EMPTY                                     :{BLACK}本站场的调度池里还没有排程
+STR_R3R_DISPATCH_POOL_ENTRY                                     :{BLACK}{RAW_STRING}: {NUM} 条命令, 坑位 {NUM}/{NUM}
+STR_R3R_DISPATCH_POOL_ENTRY_GONE                                :{BLACK}(排程已消失)
+STR_R3R_DISPATCH_POOL_ADD                                       :{BLACK}添加
+STR_R3R_DISPATCH_POOL_ADD_TOOLTIP                               :{BLACK}把某列车的排程登记为可分配给到站列车的班次
+STR_R3R_DISPATCH_POOL_DELETE                                    :{BLACK}移除
+STR_R3R_DISPATCH_POOL_DELETE_TOOLTIP                            :{BLACK}把选中的班次从本站场的调度池移除
+STR_R3R_DISPATCH_POOL_SLOTS_UP                                  :{BLACK}+
+STR_R3R_DISPATCH_POOL_SLOTS_DOWN                                :{BLACK}-
+STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP                             :{BLACK}这份班次最多可同时分配给几列车
+STR_R3R_DISPATCH_POOL_BUTTON                                    :{BLACK}调度池
+STR_R3R_DISPATCH_POOL_BUTTON_TOOLTIP                            :{BLACK}管理本站各站场的调度池: 把某列车的排程登记成可分配给到站列车的班次
+STR_R3R_DISPATCH_POOL_YARD_SEL                                  :{BLACK}场: {RAW_STRING}
+STR_R3R_DISPATCH_POOL_YARD_NONE                                 :{BLACK}无场
+STR_R3R_DISPATCH_POOL_NO_YARD                                   :{BLACK}本站还没有场。请先在车站窗口里新建一个场
+STR_R3R_DISPATCH_POOL_LIST_TOOLTIP                              :{BLACK}列出本场调度池里的班次. 每行是「排程: 命令数, 已用坑位/总坑位」
+STR_R3R_DISPATCH_POOL_ADD_SEL                                   :{BLACK}选择要加入调度池的排程
+STR_R3R_DISPATCH_POOL_ADD_EMPTY                                 :{BLACK}没有可加入的排程
+STR_R3R_DISPATCH_POOL_DELETE_CONFIRM                            :{BLACK}确定把「{STRING}」从本站场的调度池里移除吗?
+STR_ERROR_R3R_DISPATCH_POOL_FULL                                :{WHITE}本站场的调度池已满
+STR_ERROR_R3R_DISPATCH_POOL_INVALID_TRAIN                       :{WHITE}该排程已不存在
+STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED                          :{WHITE}该排程属于其它公司, 且未公开
+STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY                       :{WHITE}该班次已不在调度池中
+
+# R3R: 排程池(所有排程的池)
+STR_R3R_SCHEDULE_CAPTION                                        :{BLACK}排程池
+STR_R3R_SCHEDULE_LIST_TOOLTIP                                   :{BLACK}本存档里的所有排程. 被某列车使用的排程会连同那列车一起显示; 没有任何车辆指向的排程是留在池里的无主排程. 自家公开的排程名称前会有一面小旗
+STR_R3R_SCHEDULE_TARGET_NONE                                    :{BLACK}无列车
+STR_R3R_SCHEDULE_TARGET_SEL                                     :{BLACK}列车: {STRING}
+STR_R3R_SCHEDULE_TARGET_SEL_TOOLTIP                             :{BLACK}「分配」按钮作用在哪列车上
+STR_R3R_SCHEDULE_NEW                                            :{BLACK}新建
+STR_R3R_SCHEDULE_NEW_TOOLTIP                                    :{BLACK}直接新建一份空的、还没有列车使用的无主排程
+STR_R3R_SCHEDULE_DELETE                                         :{BLACK}删除
+STR_R3R_SCHEDULE_DELETE_TOOLTIP                                 :{BLACK}把选中的无主排程从池里删除
+STR_R3R_SCHEDULE_ASSIGN                                         :{BLACK}分配
+STR_R3R_SCHEDULE_ASSIGN_TOOLTIP                                 :{BLACK}点选一列要用这份排程的车
+STR_R3R_SCHEDULE_ASSIGN_PICK_TITLE                              :{BLACK}为排程选择列车: {RAW_STRING}
+STR_R3R_SCHEDULE_ASSIGN_PICK_TOOLTIP                            :{BLACK}点选要用这份排程的列车. 只会改动列车的排程指针, 不会复制任何东西
+STR_R3R_SCHEDULE_ASSIGN_PICK_EMPTY                              :{BLACK}你没有可以执行这份排程的列车
+STR_R3R_SCHEDULE_ASSIGN_ROW                                     :{RAW_STRING}（{RAW_STRING}）
+STR_R3R_SCHEDULE_HINT                                           :{BLACK}「分配」只改列车的排程指针: 这列车和其它使用同一排程的车跑的是同一份排程. 不会复制任何东西, 所以改动它对所有使用者同时生效
+STR_R3R_SCHEDULE_ROW_OWNED                                      :{RAW_STRING}: {NUM} 条命令
+STR_R3R_SCHEDULE_ROW_OWNED_SHARED                               :{RAW_STRING}: {NUM} 条命令, {NUM} 列车
+STR_R3R_SCHEDULE_ROW_LOOSE                                      :无主排程: {NUM} 条命令
+STR_R3R_SCHEDULE_EMPTY                                          :{BLACK}本存档里还没有任何排程
+STR_R3R_SCHEDULE_NEW_EMPTY                                      :{BLACK}空排程
+STR_R3R_SCHEDULE_NEW_SEL                                        :{BLACK}把哪份排程的命令复制进新的无主排程?
+STR_R3R_SCHEDULE_DELETE_TITLE                                   :{BLACK}删除排程
+STR_R3R_SCHEDULE_DELETE_CONFIRM                                 :{BLACK}确定删除这份含 {NUM} 条命令的无主排程吗?
+STR_R3R_SCHEDULE_RENAME                                         :重命名
+STR_R3R_SCHEDULE_RENAME_TOOLTIP                                 :{BLACK}给选中的排程起一个自己的名字
+STR_R3R_SCHEDULE_EDIT                                           :编辑排程
+STR_R3R_SCHEDULE_EDIT_TOOLTIP                                   :{BLACK}打开选中排程的命令窗口
+STR_R3R_SCHEDULE_PREVIEW                                        :查看使用者
+STR_R3R_SCHEDULE_PREVIEW_TOOLTIP                                :{BLACK}列出正在使用选中排程的列车
+STR_R3R_SCHEDULE_PUBLIC                                         :公开
+STR_R3R_SCHEDULE_PUBLIC_TOOLTIP                                 :{BLACK}允许其它公司把列车指向这份排程
+STR_R3R_SCHEDULE_UNNAMED                                        :未命名排程
+STR_R3R_SCHEDULE_RENAME_TITLE                                   :{BLACK}重命名排程
+STR_ERROR_R3R_SCHEDULE_NAME_TAKEN                               :{WHITE}本存档里已有另一份排程使用这个名字
+
 STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}编辑车站标志
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}关闭机场
@@ -4182,6 +4261,7 @@ STR_VEHICLE_LIST_AVAILABLE_AIRCRAFT                             :可用的飞机
 
 STR_VEHICLE_LIST_MANAGE_LIST                                    :{BLACK}管理列表
 STR_VEHICLE_LIST_MANAGE_COUPLE_GROUPS                           :{BLACK}管理挂接分组
+STR_VEHICLE_LIST_MANAGE_SCHEDULES                               :{BLACK}管理排程
 STR_VEHICLE_LIST_MANAGE_LIST_TOOLTIP                            :{BLACK}向所有在此列表中的运输工具发出指令
 STR_VEHICLE_LIST_REPLACE_VEHICLES                               :替换车辆/飞机/船只
 STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :进行保养

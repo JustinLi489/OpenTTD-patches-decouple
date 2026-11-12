@@ -382,6 +382,8 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_R3R_YARD,        ///< R3R: change the destination yard of a station order.
 	MOF_COUPLE_SIDE,     ///< R3R: change which side of the coupled train this train is attached to.
 	MOF_COUPLE_TEMP_GROUP, ///< R3R: change the couple group a GOTO_COUPLE order temporarily joins while it runs.
+	MOF_R3R_STATION_SEPARATION, ///< R3R: toggle the "自动调节班次" (automatic separation) marker of a station order.
+	MOF_R3R_WAIT_DISPATCH, ///< R3R: toggle the "等待分配" (wait for a dispatch pool schedule) marker of a station order.
 	MOF_END
 };
 

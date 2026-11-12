@@ -490,16 +490,23 @@ std::string OrderListToJSONString(const OrderList *ol)
 		return json;
 	};
 
+	/* R3R (第 417 轮 无主排程): a loose schedule has no vehicle, so no type and
+	 * no group. Dump the orders without the vehicle-derived metadata; OrderToJSON()
+	 * below still needs a type for the vehicle-specific order fields, so fall back
+	 * to trains (the schedule pool only offers trains as assignment targets). */
 	const Vehicle *veh = ol->GetFirstSharedVehicle();
-	VehicleType vt = veh->type;
-	const Group *group = Group::GetIfValid(veh->group_id);
+	VehicleType vt = VehicleType::Train;
+	if (veh != nullptr) {
+		vt = veh->type;
+		const Group *group = Group::GetIfValid(veh->group_id);
 
-	json[FName::VEHICLE_TYPE] = vt;
-	if (group != nullptr && !group->name.empty()) {
-		json[FName::VEHICLE_GROUP_NAME] = group->name;
-		json[FName::NESTED_VEHICLE_GROUP_NAMES] = nlohmann::json::array();
-		for (; group != nullptr; group = Group::GetIfValid(group->parent)) {
-			json[FName::NESTED_VEHICLE_GROUP_NAMES] += group->name;
+		json[FName::VEHICLE_TYPE] = vt;
+		if (group != nullptr && !group->name.empty()) {
+			json[FName::VEHICLE_GROUP_NAME] = group->name;
+			json[FName::NESTED_VEHICLE_GROUP_NAMES] = nlohmann::json::array();
+			for (; group != nullptr; group = Group::GetIfValid(group->parent)) {
+				json[FName::NESTED_VEHICLE_GROUP_NAMES] += group->name;
+			}
 		}
 	}
 

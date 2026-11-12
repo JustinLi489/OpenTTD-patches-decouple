@@ -862,6 +862,24 @@ enum class WindowClass : uint16_t {
 	 */
 	StationYard,
 
+	/**
+	 * R3R dispatch pool (调度池) management window; %Window numbers:
+	 *   - StationID = #StationDispatchWidgets
+	 */
+	StationDispatch,
+
+	/**
+	 * R3R (第 417 轮) schedule pool (排程池) management window; %Window numbers:
+	 *   - 0 = #R3RScheduleWidgets (the window is per company, one instance only)
+	 */
+	R3RSchedule,
+
+	/**
+	 * R3R (第 421 轮, C-8 / E-2) order editor for an ownerless (loose) schedule; %Window numbers:
+	 *   - #OrderListID = #R3RScheduleEditorWidgets
+	 */
+	R3RScheduleEditor,
+
 	End,              ///< End sentinel.
 	Invalid = 0xFFFF, ///< Invalid window.
 };

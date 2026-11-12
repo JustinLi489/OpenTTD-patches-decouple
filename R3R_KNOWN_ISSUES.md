@@ -22309,3 +22309,1493 @@ if (r3r_goal_pair != nullptr) {
 **总判定 = 修法 A 生效，REG-405-A 现场症状（`spd=2` 钉在 `248,127`、全程无 `COUPLE-OK`）消失。** 修法 B/C 仍按玩家口径搁置；`build-release` 未编。
 观察（不属本轮）：`:1815 ORD-AFTER-COUPLE head=0 n=5 real=0 borrowed=1 owner=3` → `:1828 settle-in real=1->0`，属既有借用层索引回零家族（KI-04 / 第 353 轮 KI-527），本轮未动。
 
+---
+
+## 第 407 轮（方案 B：发布树带探针 + 护栏覆盖 build-release）
+
+**来源**：用户 2026-11-08 指令「那就先提交，再打tag。还有，我希望这一轮内打tag和方案B改造一起做完。」
+**方案出处**：`R3R_perf_yapf_cache_plan_memo.md` §4（方案 B）与 §4.4（落地记录）。
+**状态**：已实现 + 已构建验证（运行时两条判据待玩家实测，见下）。
+**严重度**：低（工具链能力增强，不改任何游戏行为）。
+
+### 一、先固化的稳定点（已完成）
+
+- 源码提交 `b0122745b7`（6 files, +835/−108，第 392~406 轮功能）；文档提交 `6335aa70c2`（17 files, +5193/−32）。
+- 附注标签 `r3r-stable-2026-11-08` → `6335aa70c2`（附注里注明源码提交号）。
+- 顺序理由：附注标签只能指向提交，故"先提交再打 tag"是唯一可行顺序；打 tag 前已核对 `build\openttd.exe`（11-08 17:24:20）晚于全部被改源码（最新 `src\train_cmd.cpp` 17:02:16）。
+- **标签之后**才做的方案 B 改动（脚本 + `CMakeLists.txt`）**不在标签内**，属工具链，回退标签不影响它们。
+
+### 二、四处改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `CMakeLists.txt`（`if(DEFINED R3R_PROBES_DEFAULT)` 块之后） | 新增 `if(DEFINED R3R_PROBES) add_definitions(-DR3R_PROBES=${R3R_PROBES}) endif()` |
+| `R3R_release_build.cmd` | configure 加 `-DR3R_PROBES=1`；新增 `[4c]` 调用 `R3R_inc_guard.ps1 -BuildDir "build-release"`；`[5d]` 硬闸门追加 `findstr -DR3R_PROBES=1`（缺失 `EXIT_CODE=94`） |
+| `R3R_release_fullbuild.cmd` | 同上（configure + 护栏 + 闸门）——**两个入口写同一个 `build-release`**，参数不一致会互相触发全量重编（每次 30~50 分钟），必须同参同闸 |
+| `R3R_inc_guard.ps1` | 新增 `param([string]$BuildDir = 'build')`；`$smallClosure` 由 1 条扩到 4 条（`yapf.hpp` / `yapf_base.hpp` / `yapf_costcache.hpp` → 同名 5 个 obj） |
+
+### 三、关键坑（KI-183 家族新增一条，必须记住）
+
+`CMakeLists.txt` 原本**只有** `if(DEFINED R3R_PROBES_DEFAULT)` 一个消费块；`-DR3R_PROBES=1` 会被 CMake 判为未使用变量（"Manually-specified variables were not used by the project"）并**静默丢弃**，`build.ninja` 的 `DEFINES` 里根本不会出现 `-DR3R_PROBES` ⇒ 自设闸门必然以 `EXIT_CODE=94` 拦下。**凡是在 `.cmd` 里传 `-D某变量`，必须先在 `CMakeLists.txt` 里有对应 `if(DEFINED 某变量)` 消费块；configure 成功 ≠ 宏存在。**
+
+### 四、构建自证（2026-11-08，`R3R_release_build.cmd` 后台全量）
+
+- 护栏先行：`-BuildDir "build-release"` → `1 header/lang file(s) are newer than the newest object file … newer: src\widgets\order_widget.h … REMOVED 620 object file(s)` ⇒ 发布树 620 obj 清空，本次必然全量。
+- configure 双行：`-- R3R probes default override -- -DR3R_PROBES_DEFAULT=0` + `-- R3R probes compile switch -- -DR3R_PROBES=1`；`FIRST FLAGS => FLAGS = /DWIN32 … /Zi /O2 /Ob2 /DNDEBUG …`，`OK: /Od absent`；`[5c]` 外部库闸门通过（`-DWITH_ZLIB -DWITH_LIBLZMA -DWITH_ZSTD -DWITH_LZO -DWITH_PNG -DWITH_OPUSFILE` 全在）；`[5d] OK: probes compiled IN, default OFF`。
+- `[698/698] Linking CXX executable openttd.exe`；`BUILD FINISHED rc=0`；`build-release\R3R_release_build.done` = `EXIT_CODE=0`；日志 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**。
+- 产物：`build-release\openttd.exe` **2026-11-08 19:04:54（23 555 072 B）**（对照 Debug 树 52 524 544 B）。
+- `build-release\build.ninja` 的 `DEFINES` 实测含 `-DR3R_PROBES=1 -DR3R_PROBES_DEFAULT=0` 与全部 vcpkg 库宏。
+- exe 字面量（ASCII 直读）：`FOLDCHK` HIT、`SPD-DROP` HIT、`COUPLE-OK` HIT、`DECOUPLE-DONE` HIT、`TPR-BLOCKED` HIT、`COUPLE-PREFLIGHT` HIT、`RESV-GC` HIT、`DECOUPLE-INTERLOCK` HIT、`respace-after` HIT ⇒ **探针代码确实链进了 /O2 树**（不是只改了宏）。
+- 顺带澄清一个假疑点：`RESV-AUDIT*` 在两棵树 exe 里都搜不到，原因不是被 `/O2` 折掉，而是该段探针已从现行 `src\train_cmd.cpp` 中移除（`RESV-AUDIT-SUMMARY` 在 `src\train_cmd.cpp` 命中 **0** 次，只在未跟踪的陈旧备份 `src\train_cmd.cpp.r3r_bak` 里命中 2 次）。**教训：`src\` 下有 `.r3r_bak` 备份文件，grep 会把它算进结果并带出误导性行号；排查"代码在哪"时要限定文件名。**
+
+### 五、判据（①~⑤ 已达成，⑥⑦ 待玩家实测）
+
+| # | 判据 | 状态 |
+| --- | --- | --- |
+| ① | `build-release` 全量能编过、`EXIT_CODE=0`、链接到 `openttd.exe` | 通过 |
+| ② | `build.ninja` 的 `DEFINES` 含 `-DR3R_PROBES=1` 且含 `-DR3R_PROBES_DEFAULT=0` | 通过 |
+| ③ | `/O2 /Ob2 /DNDEBUG`、无 `/Od`、库宏齐全 | 通过 |
+| ④ | exe 内可检索到探针格式串（证明编译进去） | 通过（9/9 命中） |
+| ⑤ | 增量护栏能守护 `build-release`（`-BuildDir`） | 通过（删 620 obj 实测） |
+| ⑥ | 不带 `R3R_DBG` 启动**不生成** `R3R_debug.log` | **待实测**（默认关；由 `R3R_PROBES_DEFAULT=0` 决定，构建期已证，运行期须当面验证） |
+| ⑦ | `R3R_DBG=1` 启动**生成** `R3R_debug.log`（同一 exe，运行时打开） | **待实测**（这是方案 B 的核心价值：/O2 树可按需诊断） |
+
+**⑥⑦ 实测方法**：把 `build-release\openttd.exe` 拷到独立目录（如 `D:\r3r_opt\`），①先直接双击跑一段，确认该目录**没有** `R3R_debug.log`；②关掉游戏，`cmd` 里 `set R3R_DBG=1` 后同一 exe 再跑，确认出现 `R3R_debug.log` 且含 `FOLDCHK`/`COUPLE-OK` 等行。两步都成立即方案 B 端到端成立。
+
+### 六、边界与风险
+
+- 这棵树**不是**纯发布树：`R3R_PROBES=1` 下 `R3RDbgWrite` 调用点仍要**求值参数**（虽然默认关、函数体折叠）。要绝对干净的性能读数，必须 `R3R_DBG=0 R3R_PERF=0` 跑，并与纯发布树对照量化残差；A/B 相对比较只要同树同设置即可。
+- **今后对外发布的 exe 仍须用 `-DR3R_PROBES=0` 单独编一份**（现有脚本还没有"纯发布"模式开关，属待办）。带探针 exe 默认关探针，但二进制更大（23.5 MB，纯发布会略小）、调用点有参求值残差。
+- `-j2` 不可上调（8 GB 机器 + `/O2` 会把 `cl.exe` 换页冻死）；两棵树不可同时编。
+- 本次发布树全量耗时约 36 分钟（698 步）。
+
+### 七、未确认
+
+- **U-407-1**：⑥⑦ 未实测（见上表）。
+- **U-407-2**：未与"纯 `-DR3R_PROBES=0` 发布树"做过同场景性能对照，探针残差量级未知。
+- **U-407-3**：`R3R_release_fullbuild.cmd` 的 `[9]` 闸门与 `R3R_release_build.cmd` 的 `[5d]` 是否在所有分支（如 reconfigure 被跳过）都执行到，仅静态核对，未逐个分支实跑。
+
+---
+
+## 第 408 轮（2026-11-09）：答案本（抄上次 A* 路径 + 逐格铺预留）
+
+### KI-500
+
+| 项 | 内容 |
+| --- | --- |
+| 描述 | 铁路寻路的「答案本」：把上一次 `TryReservePath` 逐格铺过的 `(tile, trackdir)` 序列按车辆 index 记下来；下一次同一辆车寻路时先按 `(tile, td)` 线性定位当前所在位置，从下一格起照抄，逐格调 `ReserveSingleTrack` 铺预留，**不进 A\***；抄到答案段内第一个岔路格即收手，余下交给 A\* |
+| 来源 | `R3R_perf_yapf_cache_plan_memo.md` §17（答案存在哪）+ §18（实现清单）+ §18.6（编译自证） |
+| 状态 | **已实现 + 已编译通过**（`EXIT_CODE=0`）；游戏内命中率/正确性**未复测** |
+| 严重度 | 中（若接线有误会退化寻路行为；不涉存档、不涉崩溃面） |
+
+**改动范围**：只有 `src\pathfinder\yapf\yapf_rail.cpp` 一个文件，**未碰任何 `src\*.h`**（沿用本文件 `:59-95` 的成文先例：数据体 `static`、对外接口非 static、调用方手写 `extern`），因此走增量构建，无 16~20 分钟全量。
+
+**四个锚点**：
+
+| 环节 | 位置 | 动作 |
+| --- | --- | --- |
+| 存 | `TryReservePath` 内逐格 lambda | `ReserveSingleTrack` 成功即 `_r3r_answer_build.push_back({tile, td})`；`TryReservePath` 开头 `clear()` |
+| 提交 | `ChooseRailTrack` 尾部 `TryReservePath` 成功之后 | `R3RAnswerCommit(v->index)`，打 `ANSWER-STORE veh= n= src=` |
+| 抄 | `ChooseRailTrack` 里 `SetOrigin` **之前**、仅 `reserve_track` 为真时 | `this->R3RAnswerReplay(origin, target, dest, &answer_td)` 成功则 `path_found = true; return answer_td;`，打 `ANSWER-REPLAY veh= at= booked= stop= choice=` |
+| 丢 | replay 内两条天然失效路径 | 定位不到 ⇒ `ANSWER-DROP reason=origin-not-in-answer`；一格都没订上 ⇒ `ANSWER-DROP reason=nothing-booked` |
+
+**收手判据**（等价性的核心）：`IsTileType(tile, TileType::Railway) && IsPlainRail(tile) && KillFirstBit(GetTrackBits(tile)) != TRACK_BIT_NONE` ⇒ 该格是岔路，订完即停。即「答案段内绝不含决策」，岔路一直留给 A\*（备忘 §17.4）。
+
+**为什么放在 `CYapfReserveTrack` 而不是派生类**：`ReserveSingleTrack`（`:638`）、`origin_tile`（`:230`）、`res_fail_tile`、`res_dest_*` 全在 `CYapfReserveTrack` 的 `private:` 区间（`:224`~`:685`），派生类 `CYapfFollowRailT` **看不见**。第一版写在派生类里，编译直接 `error C2248`（两处）。⇒ 函数整体搬进基类的 public 区（`TryReservePath` 之后）。
+
+**三处不报错但致命的语义坑（已修，写在这里防止后人重踩）**：
+
+1. `ReserveSingleTrack()` 返回值是 `tile != res_dest_tile || td != res_dest_td`（`:661`），而复刻从不调用 `SetReservationTarget()`，`res_dest_*` 会留上一轮 A\* 的残留值 ⇒ 抄到同一格时被误判失败。修法：replay 开头显式置 `res_dest_tile = INVALID_TILE; res_dest_td = INVALID_TRACKDIR;`。
+2. 站台格分支订不上时只在 `res_fail_tile` 留痕、**返回值仍是 true** ⇒ 必须补 `if (res_fail_tile != INVALID_TILE) break;`。
+3. `next_trackdir` 语义 = 根节点**第一个子节点**的 trackdir（下一格要走的 trackdir），不是 origin 格的出口方向 ⇒ 必须 `*first_td = steps[idx + 1].td`，不能用 `origin.trackdir`。
+
+**调试模式闸门**：`GetDebugLevel(DebugLevelID::yapfdesync) >= 1 || GetDebugLevel(DebugLevelID::desync) >= 2` 时 replay 直接返回 false。理由：`stChooseRailTrack` 在 desync 调试下会用两个 `Tpf` 各跑一遍做逐节点比对（`stDesyncCheck`），若一次走答案本、另一次走 A\*，会报 CACHE ERROR 假警报。
+
+**边界与未做**：
+
+- 表是纯运行时 `std::map`：不写存档（读档即清空）、不占轨道位、不挡别的车。
+- `OT_GOTO_COUPLE` 的机车一律不抄（挂接寻路有独立几何/语义）。
+- **`train_cmd.cpp` 侧的显式 `R3RAnswerDrop` 调用点（卖车/解挂/换单/掉头）尚未接线**：目前靠「origin 定位失败」与「一格都订不上」两条天然失效兜底；车辆 index 被复用时理论上可被脏答案命中，只能靠定位判据拦住（极端巧合才会中）。下一轮补。
+- 答案长度未设上限（`steps` 原样跟随 `TryReservePath` 的实际份量）。
+
+**构建自证**：复用 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`），`GUARD: incremental is safe`、`[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-11-09 00:35:52）、`yapf_rail.cpp` 00:32:55 → obj 00:33:16 → `build\openttd.exe` 00:35:48、`read_lints` 0 条、exe 明文命中 `ANSWER-REPLAY` / `ANSWER-STORE` / `ANSWER-DROP` / `origin-not-in-answer` / `nothing-booked` / `yapf-answer`。
+
+**复测判据（待玩家实测 `build\R3R_debug.log`）**：
+
+| # | 判据 |
+| --- | --- |
+| ① | 正常行车（无岔路的长直道 / 站间直连）应出现成对 `ANSWER-STORE` → 下一次 `ANSWER-REPLAY`，且 `booked >= 1` |
+| ② | `ANSWER-REPLAY` 之后列车实际行驶轨迹与改前逐格一致（同格同 trackdir），不出现「原地不动」「乱窜」 |
+| ③ | 岔路场景：`ANSWER-REPLAY ... choice=1` 收手后紧接一次 A\*（`FOLDCHK`/`CPL-*` 等原生探针照常出现），且岔路选择与改前一致 |
+| ④ | 负判据：`OT_GOTO_COUPLE` 的机车全程**不应**出现 `ANSWER-REPLAY`（挂接寻路不进答案本） |
+| ⑤ | 负判据：开 `debug_level yapfdesync 1` 或 `debug_level desync 2` 后，`ANSWER-REPLAY` 完全消失、改前改后日志逐字可比 |
+| ⑥ | 失效路径可观测：换道/掉头/被别人占住时出现 `ANSWER-DROP`，且随后 A\* 正常算出路径（不出现 `COUPLE-FAIL` 刷屏或 `TPR-BLOCKED` 新增） |
+| ⑦ | 无回归：`RESV-AUDIT`（若启用）/`RESV-PURGE` 类孤儿预留计数不因本次改动上升 |
+
+**未确认**：U-408-1 命中率（能否覆盖多数调用）未实测；U-408-2 抄答案是否真的比 A\* 快（需 `R3R_PERF` 读数对比）；U-408-3 车辆 index 复用导致脏答案的实际发生概率。
+
+---
+
+## 第 409 轮（2026-11-09）：答案本初版崩溃修复
+
+### KI-572（第 409 轮；KI-501 编号已被第 322 轮占用，故改用新号）
+
+| 项 | 内容 |
+| --- | --- |
+| 描述 | 第 408 轮答案本初版一进游戏即崩溃（`C0000005` 读 `0x38`）：`R3RAnswerReplay` 在 `FindPath()` 之前调用 `Yapf().GetVehicle()`，而基类 `vehicle` 成员只在 `FindPath()` 里赋值 ⇒ 首次寻路拿到 nullptr ⇒ `veh->index.base()` 解引用 nullptr+0x38 |
+| 来源 | 崩溃日志 `C:\Users\冯洁敏\Documents\OpenTTD\crash-20261108T164103Z.log`；临时报告 `R3R_answer_book_crash_round409_memo.md` |
+| 状态 | **已修 + 已编译通过**（`EXIT_CODE=0`）；游戏内复测待做 |
+| 严重度 | 高（启动后立刻崩，功能完全不可用） |
+
+**栈（原文）**：
+
+```
+:14  Fault addr: 0000000000000038
+:33  [00] PoolID<VehicleIDTag>::base + 11         (src\core\pool_id_type.hpp:73)
+:34  [01] CYapfReserveTrack<...>::R3RAnswerReplay + 133  (yapf_rail.cpp:1212)
+:35  [02] CYapfFollowRailT<...>::ChooseRailTrack + 399   (yapf_rail.cpp:2188)
+```
+
+**机制**：`cyapf_base.hpp` 的 `vehicle` 成员**只**在 `FindPath(v)` 里赋值（`yapf_base.hpp:163`）。`TryReservePath()` 能安全用 `Yapf().GetVehicle()`（`yapf_rail.cpp:992`/`:647`）是因为它永远在 `FindPath` 之后。第 408 轮把回放插在 `SetDestination(v)`（`:2196`）与 `FindPath(v)`（`:2199`）**之前**，于是首次寻路时 `vehicle` 是构造初值 nullptr。⇒ 不是逻辑错或越界，是**取错 vehicle 来源**：`ChooseRailTrack(const Train *v, ...)` 手上就有 `v`。
+
+**连带隐患（同一个坑第二处，一并修掉）**：`ReserveSingleTrack()` 内部第 647 行也写死 `TryReserveRailTrackdir(Yapf().GetVehicle(), ...)`，回放调用它时即使首行改好，走到非站台格仍会以 nullptr 调 `pbs.cpp`。⇒ 必须把车显式传下去。
+
+**改动（仅 `src\pathfinder\yapf\yapf_rail.cpp`，零 `.h` 改动）**：
+
+1. `ReserveSingleTrack(TileIndex tile, Trackdir td, const Train *reserver = nullptr)`：函数首算 `const Train *const veh = (reserver != nullptr) ? reserver : Yapf().GetVehicle();`，`:647` 的 `TryReserveRailTrackdir` 改用它。原生调用点一行不改。
+2. `R3RAnswerReplay(const Train *v, const PBSTileInfo &origin, ...)`：删除 `Yapf().GetVehicle()`，加 `assert(v != nullptr)`，内部改用 `v`，回放循环改 `ReserveSingleTrack(..., veh)`。
+3. `ChooseRailTrack` 调用点改 `this->R3RAnswerReplay(v, origin, target, dest, &answer_td)`。
+
+**刻意不选**：① 回放前补 `Yapf().SetVehicle(v)` —— `CYapfBaseT` 没有这个公开 API，硬加要改 `yapf_base.hpp` 触发全量重编；② 在回放里复制一份 `ReserveSingleTrack` 逻辑 —— 两份实现必然分叉。
+
+**硬规则（写进备忘）**：`FindPath` 之前不许调用任何依赖 `Yapf().GetVehicle()` 的成员。已知依赖者：`ReserveSingleTrack`（`:647`）、`TryReservePath`（`:992`）。
+
+**构建自证**：`R3R_fullbuild.cmd inc detach`（未新建 `.cmd`），guard=`incremental is safe`，`[3/3] Linking CXX executable openttd.exe`，`build\R3R_incbuild.done`=`EXIT_CODE=0`（00:49:11），`yapf_rail.cpp` 00:47:02 → obj 00:47:49 → `build\openttd.exe` 00:49:02（52 524 544 B），`read_lints` 0 条。
+
+**复测判据**：① 同档同操作不再崩、无新 `crash-*.log`；② 出现 `ANSWER-REPLAY ... booked=N`（N>=1）证明回放在跑而非全程回落；③ 回放后轨迹与改前一致（不原地抖动/反向）；④ `ANSWER-DROP reason=nothing-booked` 不刷屏；⑤ 覆盖一次站台场景（第二处隐患所在）。
+
+---
+
+## 第 410 轮（2026-11-09）：答案本失效通知接线 + 双树构建
+
+### KI-573（第 410 轮）
+
+| 项 | 内容 |
+| --- | --- |
+| 描述 | 第 408 轮答案本只靠"逐格订不上"兜底，没有任何主动失效通知：卖车后 `VehicleID` 被复用、解挂后链头换身份、掉头后方向反转、换单后目的地变了 —— 四种情况下旧答案都还是"能定位、能订上"，于是会被照抄并开到错的地方 |
+| 来源 | 第 409 轮 KI-572 末尾"未做"项；玩家 2026-11-09 原话「补接线吧」；临时报告 `R3R_answer_book_wiring_round410_memo.md` |
+| 状态 | **已修 + 双树编译通过**（内测 `EXIT_CODE=0`、发布 `EXIT_CODE=0`）；游戏内复测待做 |
+| 严重度 | 中（不崩，但会开错路；且属于"功能正确性"缺陷而非性能） |
+
+**关键判断：换单不能挂在 `InvalidateVehicleOrder()`**。全仓该函数有 **32 个调用点**，多数是纯 UI 刷新（订单窗口重绘、到站刷新），挂这里会把答案清得比命中还快；更严重的是它**覆盖不全** —— `ProcessOrders` 自动推进到下一条单、条件单跳转都可能不经过它，漏一条就会"抄旧答案开去旧目的地"。
+
+**换单的解法（治根、零外部通知）**：让答案本自己记住"这条答案是为哪个目的地算的"。
+
+1. 新增 `_r3r_answer_dest`（`uint32_t key -> TileIndex`），`R3RAnswerCommit(VehicleID, TileIndex order_dest)` 存 `veh->dest_tile`（**订单目的地**）。必须用这个而不是 `res_dest_tile`：后者是 A* 算出的具体终点格（可能是站台某一格），两者不同概念，只有前后都取 `dest_tile` 才自洽。
+2. `R3RAnswerReplay()` 在找到 `steps` 之后、按 `(tile, td)` 定位之前比对一次；不等即 `R3RAnswerDrop(veh->index, "dest-changed")` 回落 A*。代价 = 一次 `map::find`（与已有的 `_r3r_answer_steps` 查找同量级）。
+3. 这条比对同时覆盖：玩家改单、自动跳到下一条单、条件单分支、GOTO_* 互换、订单表整体替换。
+
+**显式接线三处（这三类 `dest_tile` 一点没变，上面的比对抓不到）**：
+
+| 场景 | 落点 | reason |
+| --- | --- | --- |
+| 卖车 | `CmdSellRailWagon()`，`MakeTrainBackup()` 之后（链仍完整；`flags.Test(Execute)` 才清，避免 AutoReplace 的 Test 预估误清） | `sell` |
+| 解挂 | `DecoupleTrain()`，`TryTrainDecouple()` 成功之后、KI-69 结算块之前（此刻 `v`/`u` 已各自成链，`Next()` 不会串到对面） | `decouple-front` / `decouple-rear` |
+| 掉头 | `ReverseTrainDirection()`，紧邻 `R3RMarkChainJustReversed()` | `reverse` |
+
+新增 helper（`train_cmd.cpp`，定义在 `CmdSellRailWagon()` 之前以便其后三处都能用）：
+
+```cpp
+extern void R3RAnswerDrop(VehicleID veh, const char *reason);
+
+static void R3RDropAnswerChain(const Train *head, const char *reason)
+{
+	for (const Train *w = head; w != nullptr; w = w->Next()) R3RAnswerDrop(w->index, reason);
+}
+```
+
+逐节清而不只清链头：任何一节都可能在后续编辑（车库拖动、解挂）里成为链头。
+
+**刻意不接**：① `InvalidateVehicleOrder()`（理由见上）；② `CmdMoveRailVehicle()`（车库拖动）—— 库内不寻路，出库后 origin 是库格，与旧答案首格定位必然失败，天然失效，接了只是多一次无谓遍历。
+
+**"探针版延迟高"的口径说明（同一轮登记）**：
+
+- `build\` 是 **CMAKE_BUILD_TYPE=Debug**（`/Zi /Ob0 /Od /RTC1 -MTd -D_DEBUG -DDBG_ASSERTS`），零优化、禁内联、断言全开 ⇒ 比 Release 慢 5~20×。`build\openttd.exe` 的唯一用途是**采探针日志定位 bug**，不是给玩家玩手感的。
+- `build-release\` 是 **RelWithDebInfo + /O2 /Ob2**（`23 588 352 B`），玩家实测/谈延迟必须用这个。
+- 本轮以前 `build-release\openttd.exe` 停在 2026-11-08 19:04（不含第 408~410 轮的答案本），已在本轮补编。
+- `build-release\build.ninja` 的 `DEFINES` 含 `-DR3R_PROBES=1 -DR3R_PROBES_DEFAULT=0`：探针代码编进去了但默认关闭，答案本功能正常运行、只是默认不写日志。
+
+**构建自证**：内测 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`），`[4/4] Linking`，`build\R3R_incbuild.done`=`EXIT_CODE=0`（01:04:59），`yapf_rail.cpp` 01:02:08 / `train_cmd.cpp` 01:02:35 → `train_cmd.cpp.obj` 01:03:32 → `build\openttd.exe` 01:04:50（52 524 544 B）。发布 `R3R_release_build.cmd`（增量），`BUILD FINISHED rc=0`、`R3R_release_build.done`=`EXIT_CODE=0`、日志 error/FAILED 计数 0、`Linking CXX executable` 1 次、`train_cmd.cpp.obj` 01:07:52 → `build-release\openttd.exe` 01:09:10（23 588 352 B）。`read_lints` 两文件 0 条。
+
+**复测判据**：① 不再崩（承接 KI-572）；② `ANSWER-REPLAY ... booked=N`（N≥1）；③ `ANSWER-STORE ... dest=x,y` 的 dest 等于当前订单目的地；④ **改单**：半路改目的地 ⇒ 必须出现 `ANSWER-DROP reason=dest-changed`，随后开往**新**目的地（不得照旧答案开去旧站）；⑤ **卖车**：`reason=sell`；⑥ **解挂**：`reason=decouple-front`/`decouple-rear`；⑦ **掉头**：`reason=reverse`；⑧ `reason=nothing-booked` 不刷屏；⑨ 发布树延迟回到可接受范围。
+
+---
+
+## 第 411 轮（2026-11-09）：列车耗时压榨第二轮（答案本到顶，换靶）
+
+### KI-574（第 411 轮）
+
+| 项 | 内容 |
+| --- | --- |
+| 描述 | 答案本（第 404~410 轮）只替换 `FindPath()` 的单次 A*，实测帧率面板「列车」耗时仅从 22~21 ms 降到 21~20 ms/帧。剩余 20 ms 全在 `TrainLocoHandler` 的每帧固定开销（4 万节车 / 940 条链），必须换靶 |
+| 来源 | 玩家 2026-11-09 原话「之前没改这个的时候列车处理耗时平均在 22~21 毫秒，现在变成了 21~20 毫秒」「我看的是帧率里面的列车耗时。如果寻路这边已经不能压榨了，就换个地方继续压榨」；临时报告 `R3R_perf_pressure_round411_memo.md` |
+| 状态 | **已实现 + 已编译 + 已取数（2026-11-09）：`astar` 仅占 `ctrl` 的 0.25~0.5% ⇒ 寻路证伪，`ctrl` 是逐节物理步进** |
+| 严重度 | 低（性能项，非功能缺陷） |
+
+**口径**：玩家读数是**帧率面板的每帧列车耗时**（ms/帧），不是 `PERF-TICK` 的 `X/s Yms/s`。
+
+**为何 1 ms 就是答案本的上限**：它只省 A* 那一次；`UpdateSpeed` / `MaxSpeedInfo`（整链遍历）/ `CheckTrainCollision` / `ReserveTrackUnderConsist`（每 tick 重订脚下格）一格没省。存档规模 `chains=940 vehs=40027 maxChain=243 artic=27004`（`build\R3R_perf.log` 快照）⇒ A* 摊薄后本就是百分之几。
+
+**候选靶子（全部待取数验证，未改码）**：
+
+| 编号 | 目标 | 机制 / 位置 |
+| --- | --- | --- |
+| T-1 | R3R 的 O(链长) 判定每帧多次调用 | `R3RGetControlSegment` / `R3RGetLowestPriority` / `R3RIsCarOnlyFormation` / `R3RChainHasRealArticPart` 均为整链线性扫描（第 152 轮备忘自陈 O(链长)） |
+| T-2 | `Train::ReserveTrackUnderConsist()` | `train_cmd.cpp:19269`，每 tick 每链遍历全 consist 重复 `SetTrackReservation`（幂等但每帧重订 4 万节） |
+| T-3 | `MaxSpeedInfo` / `UpdateSpeed` | 每帧遍历整链取最小限速，链成员不变时限速不变 ⇒ 可缓存 |
+| T-4 | R3R 自己的每帧全图/全链扫描 | `R3REnsureCouplePair`、waiter 清扫、`_r3r_couple_dest_idle`、`R3RReservationAudit` 等上游没有的东西 |
+
+**疑点登记**：
+
+- **REG-411-A**：目前只有玩家口述的「20 ms/帧」，没有 `PERF-TICK` 分解。`sub=` / `resid=` 与各桶读数拿到之前，T-1~T-4 全是猜测，**不得直接改码**。
+- **REG-411-B**：`build\R3R_perf.log` 尾部是**暂停态**采样（`loco=0.0/s 0ms/s`、`fps=61.6`、`dump=4~6ms/s`），不能当耗时基线；其中 `nl=14768ms/s` 是**假读数**（把累计值 `glTrains=239.87ms` 当每帧值 × fps），`R3RGetTrainsMs()` 未按窗口清零。
+- **REG-411-C**：发布树 `R3R_PROBES_DEFAULT=0`，默认不写 `PERF-TICK`；要取真实 20 ms 分解，需确认运行时能否开探针（控制台命令），否则只能用 Debug 树取**相对比例**（Debug 无内联，比例会失真，仅供定性）。
+
+**本轮判据**：① 帧率面板「列车」耗时显著下降（或给出各桶下降的量化证据）；② 负判据：`COUPLE-OK`/`DECOUPLE-DONE`/`ORD-*` 行为与改前逐字一致；③ 负判据：无新增 `TPR-BLOCKED`/`RESV-AUDIT-STRAY`/`rail_map.h:168` 断言；④ `ANSWER-REPLAY` 命中率不低于改前（不得靠牺牲答案本换速度）。
+
+**取数结果（2026-11-09，`build\R3R_perf.log` 运行态窗口 A，fps≈33 换算成 ms/帧）**：
+`ctrl` 9.4 ms/帧（**47%**）、`resid` 4.8（24%）、`stk` 2.1（10%）、`dep` 1.2（6%），
+`spd`/`vp`/`ord`/`load`/`coll`/`dec` 合计约 2.5（13%）；`resv`/`coupleH`/`plat`/`wpr`/`rev` 全为 0。
+- **T-2 证伪**：`resv=0.0/s 0ms/s`，`ReserveTrackUnderConsist()` 全文件仅 3 个调用点（`:10194` 解挂、`:20098` Crash 后、`:22576` waiter），**不在主 tick 路径**。
+- **T-3 降级**：`spd` 仅占 4%，`MaxSpeedInfo` 缓存收益很小。
+- **T-1 仍在 `resid`（24%）里，未证**。
+- **新线索**：`stk=449.2/s 68ms/s` ⇒ 每帧约 13.5 次、单次 151 µs，即常年有 7~13 条链处于 `Stuck` 重试；既是 10% 开销，也是行为缺陷线索（KI-330 家族）。
+
+**已落地改动（`src\train_cmd.cpp`，未碰任何 `src\*.h`）**：新增 `static uint64_t r3r_astar_calls/ns`（`astar` 是 `ctrl` 的**子集**，故 `sub_ms` 公式不变、只额外打印）；
+`PERF-TICK` 在 `ctrl=` 与 `coll=` 之间插入 `astar=%.1f/s %.0fms/s |` 并补对应参数；
+`R3RPerfDumpAndReset()` 补一行清零；
+计时点 = `TrainController()` 内 `prev == nullptr` 分支的 `ChooseTrainTrack(...)`，包进立即执行 lambda 使计时器在红信号处理之前停止（`ChooseTrainTrackResult` 为两字段 POD，按值返回安全）。
+
+**结构结论**：`ctrl` 的计时器挂在 `TrainController()` 函数入口（`:20818`），覆盖整个逐节循环；该函数内唯一 A* 入口就是这一处 `ChooseTrainTrack`；`ExtendTrainReservation()`（`:16114`，调用点 `:17525`）在 `TrainLocoHandler` 内、**不在** `ctrl` 里。
+⇒ 判读：`astar` 接近 `ctrl` ⇒ 9.4 ms/帧 是寻路，继续在 `ChooseTrainTrack`/`TryLongReserve` 里找；`astar` 远小于 `ctrl` ⇒ 换靶到逐节物理步进与 `resid`。
+
+**构建自证（2026-11-09 02:32，已编译通过）**：首次 `R3R_fullbuild.cmd inc detach` 被脚本闸门拦下（`build\R3R_incbuild.done` = `EXIT_CODE=97`，`openttd.exe` PID 20216 在运行）；玩家关闭游戏后重跑，`tasklist` 确认无 `openttd.exe`，护栏 `GUARD: incremental is safe`，`[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`，`build\R3R_incbuild.done` = `EXIT_CODE=0`（02:32:09）。时间戳链：`src\train_cmd.cpp` 02:24:38 → `train_cmd.cpp.obj` 02:30:08（15 823 934 B）→ `build\openttd.exe` 02:31:53（52 610 560 B）。产物自证：`findstr /M /C:"astar=%.1f/s %.0fms/s" build\openttd.exe` 命中。⇒ 状态 = 已实现 + 已编译，**待玩家跑一次运行态日志取 `astar` 读数**。
+
+**取数结果（2026-11-09 02:43，`build\R3R_perf.log` 128 755 B / 183 个 `PERF-TICK`）**：
+只有 **5 个非零运行态窗口**（其余 178 条全零＝暂停态），且其中**前 2 条没有 `astar` 字段**（上一版 exe 的旧记录，日志是追加写的，**认新 exe 必须看行内有没有 `astar=`**）。三条新 exe 窗口：
+
+| fps / avg | loco | ctrl | astar | stk | resid | sub |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3.5 / 289.1ms | 4038.6/s 654ms/s | 1572.3/s 262ms/s | **107.3/s 1ms/s** | 379.8/s 72ms/s | 202ms/s | 451ms/s |
+| 5.3 / 188.6ms | 6461.9/s 727ms/s | 2505.1/s 398ms/s | **171.2/s 1ms/s** | 611.0/s 71ms/s | 137ms/s | 590ms/s |
+| 59.0 / 16.9ms | 6189.0/s 698ms/s | 2398.8/s 385ms/s | **163.7/s 2ms/s** | 584.4/s 66ms/s | 132ms/s | 566ms/s |
+
+- **结论：寻路不是瓶颈**——`astar`/`ctrl` = 0.38% / 0.25% / 0.52%；干净窗口（fps=59）里 `astar` 仅 **0.034 ms/帧**（16.9ms 帧的 0.2%），单次 ~12 µs vs 单次 `ctrl` ~160 µs；`astar`/`ctrl` 调用比恒 ≈ 6.8%。⇒ `ChooseTrainTrack`/`TryLongReserve`/lookahead 方向**停止投入**，`ctrl` 的 5~6.5 ms/帧全是逐节物理步进。
+- **口径订正（重要）**：日志自带 `fps=59.0~61.7`、`frameMs avg=16.2~16.9`，**不是 33 fps**；此前「`ctrl` 9.4 ms/帧、占 47%」的分母错误，按实测重算 = **6.5 ms/帧、占 38%**（`resid` 2.2 / 13%，`stk` 1.1 / 6.6%，`dep` 0.58，`spd` 0.58，`vp` 0.39）。
+- **疑点 REG-411-A（`nl` 口径）**：`nl_ms`（`:8773`）= `R3RGetTrainsMs()*fps - loco_ns`，干净窗口算出 432ms/s（7.3ms/帧，比 `ctrl` 还大），而旧 exe 窗口仅 55ms/s，且 `glTrains=213.25ms` 在三个窗口**逐字相同**、用 `213.25×5.3-727` 反推窗口④应得 ≈403 而实测 17 ⇒ 量纲不自洽，`nl` **不进靶清单、不据此下结论**。
+- **疑点 REG-411-B（fps 3.5/5.3）**：窗口内 `dbgWrite=228.8/2207.0 次/s`、`skipped=451~484/s`、`max=531ms`、`posHelper/dbgEdge` 同时非零＝玩家编辑操作期的探针刷屏；干净窗口这些全 0、fps=59.0 ⇒ **不是本轮代码回归**（本轮只有计数器 + 计时器作用域）。
+- **新线索（未取数）**：同行末尾 `chains=942 vehs=40036 maxChain=243 segs=2 artic=27004` ⇒ 4 万节车里 **27 004 节是铰接部件（67%）**，而 `TrainController` 逐节循环（`:20843`，`GetMovingPrev` 系列）**不跳过 artic 部件**。这是 `ctrl` 唯一剩下的量级级入口：要降 6.5ms/帧只能减少参与步进的节数，不能让寻路更聪明。
+- **下一步候选**：A（低风险先做）查 `stk` 449~611 次/秒为何重试（行为缺陷 + 6.6% 帧耗，KI-330 家族）；B ~~artic 部件能否在 `TrainController` 逐节循环里跳过~~ **已取证推翻，见下**；C `ctrl` 寻路部分已证伪，不再投入。
+
+**B 方案取证结论（2026-11-09，读码后撤回）**：artic 部件**不能跳过**。
+- `train_cmd.cpp:20853` 主循环确实遍历全部节（`for (prev = v->GetMovingPrev(); v != nomove; prev = v, v = v->GetMovingNext())`，无 `IsArticulatedPart()` 分支）。
+- 但每节车的位置是该循环**独立算出来并写进去的**：`:20862` `GetNewVehiclePos(v)` → `:21303-21304` 写 `v->tile`/`v->track` → `:21525-21529` `UpdateDeltaXY()` + `v->x_pos/y_pos = gp.x/gp.y` + `UpdatePosition()` → `:21535` `UpdateInclination()`。而 `GetNewVehiclePos`（`vehicle.cpp:2986-3009`）通篇无 artic 特例，就是"沿本节自己的朝向走 1px"。
+- ⇒ artic 部件不是"位置由父车 `CalcNextVehicleOffset` 决定的被动附属物"，`continue` 掉它们会让部件停住不跟随（图像断裂 / 占位错误 / 碰撞误判）。**该方案作废**，只剩"对 artic 少做某几步（位置哈希/Z/包围盒）"这种需逐项证明的高风险微调。
+- 保留的事实：`artic=27004`（67%）确实是 `ctrl` 迭代基数的 3 倍放大器。**靶子回到 A（`stk`）与 `resid`（2.2 ms/帧 13%，尚未看代码）。**
+
+---
+
+## 第 412 轮（2026-11-10）：GOTO_STATION「车站自动调节车次」+「条件性分配调度（调度与列车分离）」论证
+
+**本轮零源码改动、零构建**，只做可行性与设计论证。完整文档 = `R3R_station_dispatch_separation_round412_memo.md`。
+玩家原话：「我希望对 GOTO_STATION 添加两个功能，第一个是在车站自动调节车次（应当一个简单移植就行了），第二个是条件性分配调度（这需要我们做一个调度与列车的分离），我们先论证一下」
+
+### KI-575（中，待实现·待拍板）：GOTO_STATION 订单级「到站自动调节班次/间隔」
+
+现状：自动间隔调节是**车级**开关 `VehicleFlag::TimetableSeparation`（`src/base_consist.h:50`，构造时取 `settings.vehicle.auto_separation_by_default`，`src/train_cmd.cpp:3428`），由 `UpdateSeparationOrder(Vehicle*)`（`src/timetable_cmd.cpp:853`）在 `:1050`/`:1253` 被调用；一次性均分出发时刻走 `CmdSetTimetableStart(..., timetable_all, ...)`（`timetable_cmd.cpp:568`）；"同排程多车"迭代器 `R3RForEachTimetableVehicle`（`timetable_cmd.cpp:48`）。
+玩家要的"简单移植"= 把该能力**下放到单个 GOTO_STATION 订单**。**口径已定（2026-11-10，玩家订正）**：自动调节班次是**排程级**属性 —— 只要排程里存在一条带标记的 GOTO_STATION，**共享这份排程的所有车（含借用跟随者）全部一起算入**，不是只算带标记那一列。原"必须先问整条排程还是单列（C-13）"的前提是错的，C-13 取消。锚点：`CmdTimetableSeparation` 用 `R3RForEachTimetableVehicle` 把开关落到整份排程上的所有车（`src/timetable_cmd.cpp:746-753`）；`SeparationActive` 只是入场券，命令执行时统一清（`:752`），此后每辆车自己在首次到站/离站时置位（`UpdateSeparationOrder` 首行 `:855`），收集组时的 `:801` 过滤只是跳过"还没跑过一站"的车。
+最小改动面：`OrderExtraInfo::xflags`（`src/order_base.h:101`）取一未用位 + `CmdModifyOrder` 对 `OT_GOTO_STATION` 的 `MOF_*` 白名单（`src/order_cmd.cpp`；KI-124 教训：漏加即 UI 静默失败）+ `order_gui.cpp` 一个 plane + `:1250` 门禁改为「本车当前排程是否含带标记的 GOTO_STATION」后调 `UpdateSeparationOrder`。**存档零格式变更**（复用 `xflags` 位）。
+互斥必须尊重（否则静默失效）：`TimetableSeparation` ⟂ `ScheduledDispatch`（`src/schdispatch_cmd.cpp:74` 返回 `STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE`）、⟂ Unbunching 订单（`src/order_cmd.cpp:2673`）。
+状态：**定案 F1-a + 排程级语义**（2026-11-10），**一期已实现 + 已编译，游戏内复测待做**（2026-11-10，第 413 轮）。C-6 定案=均分同排程多车间隔（只改 `lateness_counter`，不改时刻表/订单），C-7 定案=到站/离站沿用原生 `:1246` 分流规则。备忘 §9.1、§9.2、§10.2、§十一。
+
+**一期落地清单（第 413 轮，2026-11-10，零存档格式变更）**
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/order_type.h` | `ModifyOrderFlags` 新增 `MOF_R3R_STATION_SEPARATION`（`MOF_COUPLE_TEMP_GROUP` 之后、`MOF_END` 之前）。 |
+| `src/order_base.h` | `xflags` 注释补 bit 5；新增 `HasR3RStationSeparation()` / `SetR3RStationSeparation(bool)`，走 `GetXFlagsRef()` + `AssignBit(..., 5, ...)`，带"已相同且 extra 非空则跳过"守卫。 |
+| `src/order_cmd.cpp` | ①`OT_GOTO_STATION` 的 `MOF_*` 白名单追加 `MOF_R3R_STATION_SEPARATION`（KI-124 教训）；②新增文件级 `R3RSeparationConflictOnOrders(const Vehicle*)`（按 `GetEffectiveOrders()` 找同表全部主车，查 `ScheduledDispatch` / `HasUnbunchingOrder`）；③预检分支：仅 `VehicleType::Train` + `OT_GOTO_STATION` + `data<=1`，`data!=0` 时冲突返回 `STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE`；④执行分支：`SetR3RStationSeparation(data != 0)` + 清同表所有主车的 `VehicleFlag::SeparationActive`（重新入场券）+ `SetTimetableWindowsDirty(v, STWDF_ORDERS)`。 |
+| `src/timetable_cmd.cpp` | ①新增 `R3ROrdersHaveStationSeparation(const Vehicle*)`（`v->type != Train` 直接 false —— bit 5 在公路车上承载行程方向；遍历 `v->Orders()` 找标记）；②`:1250` 门禁改为 `TimetableStarted && (车级 TimetableSeparation \|\| R3ROrdersHaveStationSeparation(v))`。 |
+| `src/widgets/order_widget.h` | 新增 `WID_O_R3R_SEPARATION`。 |
+| `src/order_gui.cpp` | ①`WID_O_SEL_TOP_YARD` 的 plane 1 由单个 60px 下拉框改成 `NWID_HORIZONTAL`+`EqualSize` 的 30px 下拉框（目的地场，`WID_O_R3R_YARD`）+ 30px `WWT_TEXTBTN`（`WID_O_R3R_SEPARATION`），**顶行总宽不变 60px**（避免复发 KI-262 的窗口过宽）；②`OnClick` 取反发 `CmdModifyOrder(MOF_R3R_STATION_SEPARATION)`；③`OT_GOTO_STATION` 回显分支 `SetWidgetLoweredState(WID_O_R3R_SEPARATION, order->HasR3RStationSeparation())`。 |
+| `src/lang/english.txt` / `simplified_chinese.txt` | 新增 `STR_ORDER_R3R_SEPARATION`（"Auto sep." / "调节班次"）、`STR_ORDER_R3R_SEPARATION_TOOLTIP`。繁中未加（该文件的既有 R3R 场串本就缺，一并保持回退英文）。 |
+
+**设计要点**：标记写在 `Order` 上 ⇒ 天然是"排程级"属性，共享同一份 `OrderList` 的列车（含 R3R 借用跟随者，因为 `v->Orders()` 返回 effective list）全部看到同一个标记；`UpdateSeparationOrder` 的状态机与 `PopulateSeparationState` 的 `SeparationActive` 过滤**一字未改**，原生车级开关与订单标记两个入口共用同一条流水线。
+
+**复测判据**：①同一排程 N 辆车，任一车的某条 `GOTO_STATION` 打开标记后，整排程 N 辆车都开始被均分间隔（不是只有那一列）；②关闭标记后不再对齐，且不残留 `SeparationActive`；③已启用 `ScheduledDispatch` 或含 Unbunching 订单的排程，打开标记被拒并报"互斥"；④公路/船/飞机订单窗口看不到该按钮，命令层也拒；⑤订单窗口顶行宽度与改动前一致（5×60=300px）；⑥存档往返后标记保留（`xflags` 走 `XSLFI_TIMETABLE_EXTRA`）；⑦对照：原生"时刻表窗口的分离开关"行为逐字不变。
+
+**已知边界**：①时间表窗口（`timetable_gui.cpp`）的分离按钮仍只反映车级 `TimetableSeparation`，用订单标记开启时那里不显示按下态；②`CmdTimetableSeparation` 打开时不反过来检查订单标记（两者共存无害，同一状态机）；③借用跟随者的 `cur_real_order_index` 冻结问题（KI-04 / KI-215b）会同样影响 `PopulateSeparationState` 的取数，属既有缺陷不属本轮；④二期（池/坑位/条件/回环归还）未动。
+
+**构建自证（第 413 轮，2026-11-10）**：复用既有 `R3R_fullbuild.cmd`（未新建任何 `.cmd`），因改了 `src\order_type.h` / `src\order_base.h` / `src\widgets\order_widget.h` / `src\lang\*.txt`，护栏判 `REMOVED 624 object file(s) - upgrading this build to a FULL rebuild`；**第一次全量在 `script_event.cpp` 处失败**（见 KI-584：widget 头注释里写了英文双引号 `"自动调节班次"` 导致生成的 `build\generated\script\api\script_window.hpp:2329` 字符串断行），把注释改成纯英文后第二次全量通过：`[697/697]`、`build\R3R_incbuild.done` = `EXIT_CODE=0`、日志 `error C`/`fatal error`/`FAILED:`/`build stopped` 计数 **0**、`Linking CXX executable openttd.exe` 出现 1 次、`build\openttd.exe` @ 2026-11-10 02:26:00（52 618 752 B）；`order_gui.cpp` 02:09:25 → obj 02:17:56、`order_cmd.cpp` 01:49:41 → obj 02:17:54、`timetable_cmd.cpp` 01:49:24 → obj 02:21:48（全部 obj 晚于源码）；`build\generated\table\strings.h` 含 `STR_ORDER_R3R_SEPARATION = 0xC7F` / `STR_ORDER_R3R_SEPARATION_TOOLTIP = 0xC80`；`read_lints` 三文件 0 条。**构建期间额外补的崩溃防护**：`order_gui.cpp` 的回显不再直接调 `SetWidgetLoweredState()`（该 inline 函数不判空，见 `window_gui.h:514-517`），改为 `GetWidget<NWidgetCore>()` 判空后再 `SetLowered()` —— 否则车队列表多选行模式 / 非列车车辆下该 widget 不在窗口查找表里会解引用空指针（同 `order_gui.cpp:2667-2675` 非停站按钮已有的防护）。
+
+### KI-576（高，待拍板）：「调度」不是实体 ⇒ 条件性分配调度无法实现
+
+三条硬证据：①调度表 `DispatchSchedule` 挂在 **OrderList**（`src/order_base.h:1336` 定义、`:1591` 成员、`:1808-1814` 访问器），而 OrderList 的所有权在**车**身上（`Vehicle::orders`/`orders_backup`/共享记账）；②「用第几个车次」存在 **Order** 上 —— `OrderExtraInfo::dispatch_index`（`order_base.h:100`，语义 `Scheduled dispatch index + 1`）⇒ **共享排程的 N 列车共享同一个 slot**，无法逐车分配；③权威进度是**借用期链头的活索引**（`r3r_follow_owner` + `ORD-PUSH` 补账，第 133 轮 KI-215b），换调度就要补一次账 ⇒ KI-04/527/526 家族会成倍增长。
+已存在的半个分离：`GetEffectiveOrders()`（`src/vehicle_base.h:405`，注释 `:388`）是读侧间接层，12 个读点已全部走它；`R3RSegmentRecord` 已持 `OrderList *orders` + `orders_borrowed`（`src/couple_group.h:547/:551`）。缺口 = **写侧没有槽对象、没有实体生命周期、没有进度归属**。
+已存在的条件机制：`OrderConditionVariable`（含 `DispatchSlot`/`Unconditionally`）+ `OT_CONDITIONAL` 的 `GetConditionDispatchScheduleID()` ⇒ 条件是"跳转"不是"分配"。
+提议（三期）见备忘 §4.2：一期 `R3RSchedule` 实体（稀疏块 R3SC + `Vehicle::r3r_schedule_id` + `GetEffectiveOrders()` 内部改指实体）；二期条件求值 + 到站自动分配（只允许停稳/站台格/订单边界，走命令）；三期借用层退役（KI-04/527/526 收口）。
+状态：待拍板（C-3/C-4/C-5 未回填）。
+
+### KI-577（中，既有限制）：`dispatch_index` 逐订单存储使"每列车不同车次"只能靠不共享排程
+
+`OrderExtraInfo::dispatch_index`（`order_base.h:100`）在 Order 上，而共享排程（Ctrl+共享、R3R 车组共用表）意味着同一张表被 N 车共用 ⇒ slot 号必然相同。目前要么每车各存一份不共享的表（放弃共享好处，且 R3R 段/挂接会频繁改写表），要么靠 `lateness` 自然漂移（不可控，且被索引冻结放大）。
+影响：KI-575 若做成"自动推进车次槽"（F1-b），必然先改这条；做成"自动调节间隔"（F1-a）则可绕过。
+状态：既有限制，未修。
+
+### KI-578（已收口，2026-11-10）：「车次」口径已澄清为「班次」
+
+玩家订正原话：「第一点可能因为我的笔误导致了你的理解错误。游戏原文应该是"自动调节班次"。」
+⇒ 功能一 = **时刻表班次 / 发车间隔**，KI-575 定案 **F1-a**（订单级开关 + `UpdateSeparationOrder`），与 `dispatch_index` 无关。本条不再追踪。备忘 §8.1。
+
+### KI-579（高，待实现·设计已定）：车站调度池 = 「表的主人」的第三态，现有借用层表达不了
+
+功能二要求"在该分配车站放入供分配的调度计划（每个表限定好最多分配几份）"。这批表的**主人是车站池条目，不是任何一辆车**，而现有借用层的 owner 恒为 `Train *`：
+- `R3RPushProgressToOwner()`（`train_cmd.cpp:7213-7235`）用 `R3RGetPriorityHead(chain)` 取 owner（返回 `Train *`），并以 `owner->GetEffectiveOrders() != driven` 校验 ⇒ 池表永远匹配不上，进度无处写回；
+- `R3RRebuildCouplePriorities()` 按链上 `r3r_priority` 选 owner ⇒ 选不出"车站"；
+- `r3r_follow_owner` 是 `VehicleID`（`vehicle_base.h:395`）⇒ 装不下"车站 + 池槽号"。
+
+⇒ 玩家说的"如果必要，需要创建第五和第六项表属性和排程进度"的实质 = **给"表的主人"增加第三种类型 + 给池条目存进度**，最小落地三件：
+1. 池 chunk（照 `SYRD` 先例：独立 chunk、**不动 STNN**，`src/sl/station_yard_sl.cpp:17-22` 自陈理由），每份调度计划含 `orders` 指针 + `issued`/`limit` 配额 + 池内进度（real/implicit/timetable 三索引）；
+2. `r3r_follow_pool`（车站 ID + 池槽号），`R3RPushProgressToOwner` 在 owner 车无效时回写池条目；
+3. 单层指针问题：`r3r_follow_orders` 只有一个 ⇒ 要么**禁链**（池表必须是叶子，只能含普通订单），要么升级借用栈。
+4. **坑位制（玩家 2026-11-10 口径）**：每份表有固定坑位数，只有固定数量的车能同时持有该表；`issued >= limit` 即不再发 ⇒ 池条目需要 `issued`/`limit` 两个字段。
+5. **回环归还（玩家 2026-11-10 口径）**：不是每条命令归还、也不是永不归还 —— 车把这份表跑完**一整圈**才交回池子、释放坑位。判据候选 = `cur_real_order_index` 回绕（最后一条 → 0）那一刻，需先取证 `IncrementRealOrderIndex` 的回绕点。
+6. **条件宿主 = 车站池条目（玩家 2026-11-10 口径）**：分配条件（如"表A 需极速 ≥160""表B 需最大牵引力 ≥ X kN"）写在**该车站那份表的进入条件**上，列车到站申领时匹配一次；不在列车上、不在班表任意位置。⇒ 列车侧只负责"领表 / 交回"，条件数据全部落在池条目。条件变量缺 Power/MaxTE 见 KI-583。
+状态：待实现（二期）。备忘 §8.2(4)、§8.7、§10.2。
+
+### KI-580（中，待实现·方案已定）：if / elif / else **不需要**新 OrderType，用现有条件订单的绝对跳转即可拼出
+
+现有 `OT_CONDITIONAL` 的编码（`order_base.h`）：
+- 变量 `GetConditionVariable() = GB(dest.value, 11, 5)` ⇒ **只有 5 位，上限 31**；
+- 比较符 `GetConditionComparator() = GB(type, 5, 3)`；
+- 跳转目标 `GetConditionSkipToOrder() = flags`（整个 `flags` 存**绝对**订单索引）。
+
+⇒ 三种结构的拼法（与可编程信号灯"伪指令跳转"同构）：
+- `if (A) {then} else {else}`：在 then 前放 `IF !A → skip_to(else首)`；
+- `endif`：then 尾放 `Unconditionally → skip_to(after)`；
+- `elif`：else 段首再放一条 `IF`（即"嵌套"）。
+⇒ **零新 OrderType、零新存档块**，复用玩家已熟悉的订单条件 UI。可编程信号灯仅作结构参照：`SignalIf` 持 `condition`/`if_true`/`if_false`/`after` + `PseudoInstruction`（Else/Endif 伪指令）——`src/programmable_signals.h:309`、`:368-371`、`:322-348`。
+代价/风险：跳转是绝对索引 ⇒ 插入/删除订单必须重映射 `flags`（**既有机制，实现前必须核对 `order_cmd.cpp` 是否已修正**，未修正则是我们也要一并补的坑）。
+状态：待实现（三期）。备忘 §8.7。
+
+### KI-581（低，待实现）：订单位「等待分配命令」用 `xflags` bit 5（Train 专用）
+
+`OrderExtraInfo::xflags` 的 bits 5-7 是 `GetRoadVehTravelDirection()`，其**全部使用点**都带 `VehicleType::Road` 判定（`order_gui.cpp:1098`/`:1154`、`order_serialisation.cpp:242`、`roadveh_cmd.cpp:1614`、`yapf_road.cpp:282`）⇒ 对 Train 的 GOTO_STATION 取 **bit 5** 作 `R3ROF_WAIT_DISPATCH` 安全、**存档零格式变更**。必须同步 `CmdModifyOrder` 的 `MOF_*` 白名单（KI-124 教训）+ `order_gui.cpp` plane。
+状态：待实现（二期）。备忘 §8.2(1)。
+
+### KI-582（高，待实现）：时刻表进度没有停放副本 ⇒ 分配/归还必丢"班次位置"
+
+`cur_timetable_order_index` 定义在 **`base_consist.h:73`**（consist 级），而借用期的停放字段只有 `orders_backup_real_index` / `orders_backup_implicit_index`（`vehicle_base.h:413-414`），全库无 `orders_backup_timetable*`。⇒ 一列有时刻表进度的车被"分配"或被"归还"时，`cur_timetable_order_index` 会被 `R3RPushProgressToOwner`（`train_cmd.cpp:7235`）覆盖或被 `= cur_real_order_index` 重置（`train_cmd.cpp:7663/7831` 等十余处），表现为**班次位置丢失/时刻表重算**。修法：`R3VP` 稀疏块（`src/sl/couple_group_sl.cpp`）加一字段 `orders_backup_timetable_index`，并在切表/还表处成对停放/取回。
+状态：待实现（二期必做）。备忘 §8.2(3)、§8.7。
+
+### KI-583（中，待实现）：分配条件缺 Power/最大牵引力变量 + 「跑完一个回环」无现成判据
+
+2026-11-10 玩家口径落地的两个缺口（备忘 §10.2、§10.3）：
+1. **条件变量缺项**：`OrderConditionVariable`（`src/order_type.h:297-323`）已有 Reliability / MaxSpeed 一类，但**没有 Power、没有 MaxTractiveEffort**；玩家举的例子正是"表A 需极速 ≥160""表B 需最大牵引力 ≥ X kN" ⇒ 需在 `End` 之前新增两个枚举值并接入求值函数（字段 5 位、上限 31、现用 22，容量够；存档宽度随 `OrderCondition` 既有格式，不新增块）。
+2. **回环判据缺项**："跑完一个回环就交回池子"需要落成代码判据。候选 = `cur_real_order_index` 回绕（从最后一条回到 0）那一刻，但借用期索引由所有者冻结（KI-04/KI-215b），回绕点可能出现在 `ORD-PUSH` 补账而非链头上 ⇒ 实现前必须取证 `IncrementRealOrderIndex`（`src/vehicle_base.h`）的回绕点与借用期的可见性。
+状态：待实现（二期，C-8/C-9/C-10 定案的前置）。备忘 §10.3 的 P-1、P-3。
+
+### KI-584（低，已修）：`src\widgets\*.h` 的 `///<` 注释里出现英文双引号会打断 script API 生成
+
+2026-11-10 第 413 轮实测。现象：在 `src\widgets\order_widget.h` 新增 `WID_O_R3R_SEPARATION, ///< R3R: toggle the "自动调节班次" marker ...` 后，全量构建在 `CMakeFiles\openttd_lib.dir\src\script\api\script_event.cpp.obj` 处失败：
+
+```
+build\generated\script\api\script_window.hpp(2329): error C2001: 常量中有换行符
+build\generated\script\api\script_window.hpp(2329): error C2143 / C2059 / C2011 ...
+```
+
+生成物里那一行是 `        ///< R3R: toggle the \"` 换行 `        \" marker of a station order (KI-575).` —— 生成器把 widget 的 `///<` 文档注释原样搬进 doc 字符串，遇到 `"` 就当成字符串终止并换行续接，同时把紧随其后的中文整段吞掉。
+
+根因：`src/script/api/` 的文档生成（`generate_widget_docs` / `script_window.hpp` 生成器）不做 C++ 字符串转义。
+
+修法：widget 头的注释里**不要出现英文双引号**（中文引号同样有风险，一并避免）；本轮改成 `toggle the auto separation marker of a station order (KI-575).` 后全量通过。
+
+排查口诀：全量构建停在 `script\api\script_*.cpp` 且报 `error C2001 常量中有换行符`，先去看上一步改过的 `src\widgets\*.h` 注释有没有引号，不要去查 C++ 代码。
+
+### KI-585（高，已修·**2026-11-10 实机复测通过**）：KI-575 一期落地后，订单窗口的「调节班次」按钮点击无反应
+
+2026-11-10 第 414 轮，玩家现场原话：「目前是只做了车站的均匀班次是吧，我向你报告，这个调节班次按钮按不下去」。确认：一期确实只做了车站订单（`GOTO_STATION`）的排程级均分，池/坑位/条件属二期，未动。
+
+**已排除（静态读码，源码行号为当前工作树）**：
+
+| 检查面 | 结论 | 锚点 |
+| --- | --- | --- |
+| 命令白名单 | 齐全，`MOF_R3R_STATION_SEPARATION` 已进 `OT_GOTO_STATION` 白名单 | `order_cmd.cpp:2579` |
+| 预检分支 | 齐全：Train + 站订单 + `data<=1` + 冲突检查 | `order_cmd.cpp:2995-3005` |
+| 执行分支 | 齐全：`SetR3RStationSeparation` + 清同表 `SeparationActive` + 刷新时刻表窗口 | `order_cmd.cpp:3113-3132` |
+| 存档位写入 | `GetXFlagsRef()` 会自动 `CheckExtraInfoAlloced()`，守卫只在「值已相同且 extra 非空」时跳过，不会吞掉置位 | `order_base.h:166-170`、`:681-685` |
+| 控件显示 plane | `OT_GOTO_STATION` → `DP_YARD_DROPDOWN`（plane 1），与我把 60px 拆成「场下拉 + 调节班次」的位置一致 | `order_gui.cpp:2683-2697` |
+| 回显代码位置 | 在 `case OT_GOTO_STATION:` 分支内、`break` 之前，`GetWidget` 判空后 `SetLowered` | `order_gui.cpp:2818-2826` |
+
+**根因（第 414 轮定死，非三个候选，而是第四个被漏掉的面：handler 放错了 switch）**：`WID_O_R3R_SEPARATION` 是 `WWT_TEXTBTN`，点击由 `OrderWindow::OnClick()`（`order_gui.cpp:3473` 起的 `switch (widget)`）分发；但第 412 轮把 `case WID_O_R3R_SEPARATION:` 写进了 **`OnDropdownSelect()`** 的 switch（本轮删除前位于 `order_gui.cpp:4346`，紧邻 `WID_O_R3R_YARD` 的 dropdown 分支）。`OnDropdownSelect` 只在「下拉列表被选中并回调」时进来，纯按钮永远不会走到 ⇒ 点击进入 `OnClick` 后没有任何 case 命中、落到 `default` 静默返回，命令从未 Post，所以既没有凹陷后保持、也没有错误提示，表现为「按不下去」。静态上「白名单/预检/执行/存档位/plane/回显」六项全都正确（见上表），因此只有把 handler 的**分发入口**列入检查面才能命中——这也是本轮结论：以后新增按钮控件，先确认它归 `OnClick` 还是 `OnDropdownSelect`，别只看控件树。
+
+**修法（第 414 轮，仅改 `src\order_gui.cpp`，未碰任何 `src\*.h`、未新增语言串）**：
+1. `OnClick()` 内新增 `case WID_O_R3R_SEPARATION:`（现 `order_gui.cpp:3763-3772`，紧跟 `WID_O_COUPLE_TEMP_GROUP` 之后）：取 `this->vehicle->GetOrder(this->OrderGetSel())`，判空且必须是 `OT_GOTO_STATION`，然后 `this->ModifyOrder(sel, MOF_R3R_STATION_SEPARATION, order->HasR3RStationSeparation() ? 0 : 1)` —— 与 `MOF_COUNTER_VALUE`（`:4217`）、`MOF_DECOUPLE_BOUNDARY`（`:4247`）同一调用范式（成员版签名见 `:1979-1982`）。
+2. 删除 `OnDropdownSelect()` 里那份放错位置的 `case WID_O_R3R_SEPARATION:`（死代码，纯按钮不可能回调到那里，留着只会让下一个人再判错一次）。
+
+**复测判据（4 条）**：①列车车站订单上点「调节班次」⇒ 按钮立即凹下；再点 ⇒ 弹起。②凹下后切到别的订单再切回来 ⇒ 该订单仍凹（标记落在订单上，不是窗口临时状态）。③同一 `OrderList` 的其它车站订单不因点击而变凹（标记逐条设置，但均分按整表生效）。④若该车启用了原生班次调度/Unbunching，点击应弹「互斥」错误提示而不是静默——这是预期拒绝，不是本 bug。
+
+**已知瑕疵（未修，低）**：按钮 `SetMinimalSize(30, 12)` 与场下拉平分 60px 槽位，中文四字「调节班次」在 30px 内会被裁字（与 KI-262「顶行 5×60=300px 不得撑宽」的约束冲突）。若玩家反馈文字看不清，正解是把按钮移出 `WID_O_SEL_TOP_YARD`（例如第二行管理区或独立槽），不是继续压缩宽度。**本轮未动宽度**，先保证可点击。
+
+**构建自证（第 414 轮）**：复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建任何 `.cmd`）；`build\R3R_incbuild.guard.log` 末行 = `GUARD: incremental is safe (no header/lang file is newer than the newest object)`；日志含 `[3/3] Linking CXX executable openttd.exe`、`error C*` / `fatal error` / `FAILED:` / `build stopped` 命中 0 条；`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-11-10 02:46:57）；`src\order_gui.cpp` 02:43:25 → `build\CMakeFiles\openttd_lib.dir\src\order_gui.cpp.obj` 02:45:13 → `build\openttd.exe` 02:46:43（52 618 752 B）；`read_lints` 0 条。本轮未新增日志字面量/语言串，故不做 exe 串核对。
+
+**实机复测（2026-11-10 第 415 轮，玩家原话「不错，这个按钮正常」）**：点击已生效 ⇒ 判据 ①（点即凹、再点即弹）通过。判据 ②③④ 本会话未逐条取证（玩家只报了按钮可点），按"通过但不记为已验"处理：标记是否真的落在订单上/同表其它订单是否不受影响/互斥车是否弹错，留待二期回归时顺带观察。**本条结案，不再加探针**。教训（已写入 §13.2）：排查"按钮没反应"必须核对 handler 归属（`OnClick` vs `OnDropdownSelect`），只看控件树不够。
+
+
+
+
+### KI-586（高，待实机复测）第 416 轮：车站调度分离 —— 调度池（dispatcher pool）首版落地
+
+2026-11-10 第 416 轮。玩家口径：①坑位默认 1、上限 256 且**放进设置**；②池管理界面挂在车站 → 站场窗口「场」下拉旁边；③列车跑完自己的带「等待分配」标记的到站命令后领池表、从 `idx=0` 跑完池表末条再把命令指回自己表的下一条；④其余全量重编。
+
+**数据模型（不建独立 OrderList）**：`Station::R3RStationYard::R3RDispatchPoolEntry { VehicleID host; uint16_t limit = 1; uint16_t issued = 0; }` + `std::vector<...> pool`，表本体仍挂模板车的 `Vehicle::orders`。理由不变：`OrderList::first_shared` 是 `Vehicle*`，9 处 `GetFirstSharedVehicle()` 无条件解引用，无主表必崩（KI-169a 同族）。锚点：`station_base.h` 内 `struct R3RDispatchPoolEntry`。
+
+**两个容量概念必须分清**：
+
+| 概念 | 含义 | 出处 | 上限 |
+| --- | --- | --- | --- |
+| 池条目数 | 一个场里有几份班次 | `order.r3r_dispatch_pool_capacity`（`game_settings.ini`，def=max=256） | 256，设置里可调 |
+| 坑位 `limit` | 一份班次同时发给几列车 | 每条条目的字段 | 钳 1..256 |
+
+**命令层**（`command_type.h` / `station_cmd.h` / `station_cmd.cpp`）：`AddR3RDispatchPoolEntry(StationID, yard, host_index, limit)`、`RemoveR3RDispatchPoolEntry(StationID, yard, index)`、`SetR3RDispatchPoolLimit(StationID, yard, index, limit)`，均 `CommandType::OtherManagement`，执行后 `InvalidateWindowData(WindowClass::StationDispatch, ...)`。添加时用 `R3RDispatchHostUsable` 卡「活车 / 有自己的表 / 表内无解挂挂接命令」。
+
+**订单标记**：xflags bit6 = 等待分配（`order_base.h` 的 `HasR3RWaitDispatch/SetR3RWaitDispatch`、`order_type.h` 的 `MOF_R3R_WAIT_DISPATCH`、`order_cmd.cpp` 的 `OT_GOTO_STATION` 白名单 + 预检 + 执行三处）。订单窗口 `WID_O_R3R_SEPARATION` 改 `NWID_BUTTON_DROPDOWN`：**主区仍直接切「自动调节班次」**（保留第 415 轮已验收手感），箭头弹带勾选的两项菜单。宽度仍 30px，不撑宽 `WID_O_SEL_TOP_YARD` 的 60px 槽（KI-262）。
+
+**踩坑（本轮新增教训，§13.2 追加）**：本 fork 的 `DropdownWindow` 只用 `selected_result` 做高亮（`dropdown.cpp` 内 `item->result == this->selected_result`），**`ShowDropDownMenu()` 的 `selected` 不是位掩码**，传 `sep|wait` 这种掩码不会出现勾。要勾选必须 `MakeDropDownListCheckedItem(...)` + `ShowDropDownList()`。以后写「多选菜单」先看这条。
+
+**运行期**：`TrainDispatchHandler()`（停稳 + 站订单 + 等待分配 + 真停在该站）→ `R3RGetYardOfTile` → `R3RDispatchPoolPick`，无坑位原地等（`DISP-POOL-NOSLOT` 节流），领到则 `Acquire` + `R3RBeginBorrow(..., true)` + 备份 `cur_timetable_order_index` + `r3r_follow_pool = true` + 三索引清零 + `Free()`。`R3RReturnDispatchPool()` 在池表末条将回绕那一瞬归还：清标志 → `R3RReturnBorrowedOrders(v, false)` → `real = backup + 1`（越界回 0）→ 时刻表索引沿用备份 → `Free/清 dest/InvalidateVehicleOrder` → 遍历 `Station::Iterate()` 调 `Release`。`R3RPushProgressToOwner()` 对 `r3r_follow_pool` 直接 return（防池坐标写回模板车，KI-215b 同族）。
+
+**存档**：`sl/couple_group_sl.cpp` R3VP 加 `order_backup_index_t` + `follow_pool` 两个字段（不新增 chunk）；`sl/station_yard_sl.cpp` SYRD 升 **v6**（`0xFFFFFF05`），每场多一个池块（条目数 + 每项 3 word：host 序号+1 / limit / issued）。**读档阶段绝不能校验宿主机是否存在**（SYRD 与 VEHS 加载顺序无保证），只做数值钳制；v2~v5 老档读回空池。
+
+**界面**：`StationYardWidgets::WID_SY_DISPATCH`（站场窗口第一行，场下拉之后，60×12，行宽 270 < 既有 330）；新增 `StationDispatchWindow`（`WindowClass::StationDispatch`、ini key `r3r_station_dispatch`、340×200）：列表行 `{VEHICLE}: N 条命令, 坑位 used/limit`、「添加」下拉遍历全图列车、删除走 `ShowQuery` 确认、`-`/`+` 改坑位。行距取 `WID_SD_LIST` 自身的 `resize_y`（兄弟滚动条 `resize_y = 0` 会把容器步长拉 0，KI-262 同族）。
+
+**已知风险**：
+1. `issued` 泄漏 —— 模板车被卖/解挂时不归还坑位，`Prune` 只在 `issued > limit` 时清零，已发出的份数不会自动回收。二期待补「车辆删除钩子」。
+2. SYRD v6 老引擎读不了（未知 MAGIC 整块丢弃 → 存档不兼容告警）。回退版本前须备份。
+3. `TrainDispatchHandler` 只能挂在停稳分支，行驶中不领表（预期行为，非缺陷）。
+
+**构建自证**：改动了 `src/*.h` 与 lang，`R3R_fullbuild.cmd inc detach` 的 guard 已判定 `REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`（全量重编）。三件套核对结果见本节下方「复测记录」。
+
+**复测记录（2026-11-10 04:25）**：`R3R_fullbuild.cmd inc detach` 全量重编通过 —— `build\R3R_incbuild.done` = `EXIT_CODE=0`，日志尾 `[27/27] Linking CXX executable openttd.exe`，`build\openttd.exe` mtime `04:24:52` 晚于最新源码 `04:19:45`，obj 620 个。此前连续 4 次构建失败，教训（§13.2 与 §14 已追加）：
+
+1. **本 fork 的 lang 没有 `{NEWLINE}` 命令**（`english.txt` 里 0 次使用），字符串换行只能靠下一行以 `:` 开头续写，或干脆写成一句。
+2. **`{VEHICLE}` 不能出现在带 `{P ...}` 复数标记的串里**：strgen 报 `Command 'VEHICLE' has no (default) plural position (FATAL)`，并把 `lang/afrikaans.txt` 判为「not compiled」导致整个 build 失败（报错行号会指向该语言文件里另一条恰好也用 `{VEHICLE}` 的串，非常误导）。这类串改用 `{RAW_STRING}` + GUI 侧 `GetString(STR_VEHICLE_NAME, id)`。
+3. **`src/widgets/*.h` 的 `///<` 注释必须纯 ASCII**：写「第 416 轮」会让 doc 生成器把中文截断并插入换行（KI-584 同族的另一种表现），生成出来的 `script_window.hpp` 直接语法错误（`C2001: 常量中有换行符`）。判定命令：`Select-String -Path src\widgets\*.h -Pattern "///<" | Where-Object { $_.Line -match "[^\x00-\x7F]" }` 必须为空。
+4. 接口事实：`OrderList` 没有 `GetOrder()`，只有 `GetOrderAt(VehicleOrderID)`；`MakeDropDownListStringItem` 的 `std::string` 重载收的是右值引用（要 `std::move`）；`ShowErrorMessage` 的两个 `EncodedString&&` 参数不能塞 `INVALID_STRING_ID`，用 `GetEncodedString(...)`；`train_cmd.cpp` 用 `std::set` 要显式 `#include <set>`；`Order::GetDestination()` 返回 `DestinationID`，取车站要 `.ToStationID()`。
+
+---
+
+## 第 417 轮（2026-11-10）：排程池 —— 「无主排程」管理与指针分配
+
+2026-11-10 第 417 轮。玩家口径：要一个能把排程（`OrderList`）当成「池」来管理的窗口 —— 池里可以放没有列车持有的表，任意列车可以**把指针换到**池中任一张表上；**只改指针，不复制表内容**；任何操作不许崩；已知边界一律写进备忘与本文档。
+
+前置结论（第 416 轮 KI-586）：`OrderList::first_shared` 是 `Vehicle*`，全代码库 9 处 `GetFirstSharedVehicle()` 无条件解引用 ⇒ 无主表若不补空守卫必崩，这是本轮所有改动的硬约束。
+
+### KI-587（中，已实现 + 已编译，游戏内复测待做）：无主排程 + 指针分配首版
+
+**数据模型**：不新增实体、不改存档格式。「无主排程」= 池里 `first_shared == nullptr && num_vehicles == 0` 的 `OrderList`；表本体仍由 `_orderlist_pool` 持有，`Vehicle::orders` 仍是指针。因此无主排程**随存档自然保存**（`OrderList` 池本来就整体序列化），不需要新 chunk、不需要版本号迁移。
+
+**目的地引用计数（本轮唯一真正危险的语义）**：`OrderList::Initialize(v)` 会逐条 `RegisterOrderDestination`，`Initialize(nullptr)` 不会。⇒ ①建无主表必须走 `Initialize(nullptr)`（否则引用计数凭空多一份，站点永远显示"被排程使用"）；②把一张有主表摘成无主时，必须逐条 `UnregisterOrderDestination` 补回来，这就是新增文件内静态 `R3RMakeOrderListOwnerless()` 的职责（`FreeChain` 对无主表按设计不反注册，因为它假定无主表从未注册过）。
+
+**三条新命令**（`CommandType::OtherManagement`，`src\order_cmd.h` 用 `DEF_CMD_TUPLE_NT` + `src\order_cmd.cpp` 实现；形参一律 `DoCommandFlags`）：
+
+| 命令 | 载荷 | 守卫与语义 |
+| --- | --- | --- |
+| `CreateR3RLooseSchedule` | `uint32_t copy_from` | `copy_from==0` ⇒ 建空表；否则深拷贝源表命令。**先 `OrderList::CanAllocateItem()` 闸门**（`Pool::GetNew` 在 debug 下断言容量，缺了直接 assert），失败回 `STR_ERROR_NO_MORE_SPACE_FOR_ORDERS`；新表一律 `Initialize(nullptr)` |
+| `DeleteR3RLooseSchedule` | `uint32_t ol_index` | 仅 `GetFirstSharedVehicle()==nullptr && GetNumVehicles()==0` 才允许，有主表一律 `CMD_ERROR`；删除走 `FreeChain(false)` |
+| `AssignR3RSchedule` | `uint32_t veh_index, uint32_t ol_index` | **只重指 `v->orders`，不复制命令**。守卫链：ID 有效 / 表非空 / `IsCompanyBuildableVehicleType` + `IsPrimaryVehicle` / `CheckOwnership` / 表主人类型与车类型一致 / `IsR3RFollower()`·`orders_backup!=nullptr`·`r3r_orders_borrowed` 三种"第二份账"状态一律拒绝 / 旧表按「共享链」或「单主人」分别 `RemoveFromShared()` 或 `RemoveVehicle()` / 新表有主 `AddToShared(first_shared)`、无主 `Initialize(v)`；旧表摘成无主时立刻 `R3RMakeOrderListOwnerless()`。成功后 `current_order.Free()` + `DeleteOrderWarnings` + `InvalidateWindowClassesData(DepartureBoard)` |
+
+**界面**（新增 4 个文件：`src\r3r_schedule_gui.cpp` / `r3r_schedule_gui.h` / `src\widgets\r3r_schedule_widget.h` + 本文档；`src\CMakeLists.txt` 与 `src\widgets\CMakeLists.txt` 都是显式源列表，**必须手加**）：`R3RSchedulePoolWindow`（`WindowClass::R3RSchedule`，ini key `r3r_schedule_pool`），一行一张表 —— 有主显示「车名: N 条命令」、无主显示「无主排程 #k: N 条命令」，目标列车当前指针指向的那行加 `*` 前缀（把"哪个指针"可见化）。按钮：新建（可选源表深拷贝）/ 删除（`ShowQuery` 二次确认）/ 让目标列车指向选中排程。底部常驻说明文字明写"只改指针、不复制表内容"。行高取 `WID_SCHED_LIST` 自身 `resize_y`、颜色走 `TextColour::FromString`（KI-262 / 废弃写法两条老坑）。入口挂在车队列表与分组列表的 action-dropdown：`ADI_R3R_SCHEDULE_MGMT` + `STR_VEHICLE_LIST_MANAGE_SCHEDULES`，**两个 switch（`vehicle_gui.cpp` / `group_gui.cpp`）都要写**，只写一处就是 `NOT_REACHED()`。
+
+**编译错误（4 批，全部本轮修完，教训见备忘 §8.3）**：
+1. `return_cmd_error` 在该翻译单元不可用 ⇒ `return CommandCost(STR_ERROR_...)`；
+2. 三条命令形参误写 `DoCommandFlag`（`enum class`，无 `operator&` / `.Test`）⇒ 全部改 `DoCommandFlags`；
+3. `OrderListToJSONString()` 支持无主排程时 `VehicleType vt` 被圈进 `if (veh != nullptr)` 作用域 ⇒ 提前声明并默认 `VehicleType::Train`；
+4. GUI 侧四连：`CompanyID` 需 `company_type.h`；本 fork **没有 `misc_gui.h`**（`ShowQuery`/`ShowQueryString` 在 `textbuf_gui.h`）；本 fork **没有 `INVALID_COMPANY`**（用 `CompanyID::Invalid()`）；`CommandTraits<Commands::X>` 由 `order_cmd.h` 的 `DEF_CMD_TUPLE_NT` 生成，漏 include 就报 `C2027 使用了未定义类型`。
+
+**构建自证（第 417 轮，2026-11-10）**：复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建任何 `.cmd`）；最后一次 `[101/101] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`（10:41）、日志 `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 0、`build\openttd.exe` @ 2026-11-10 10:41:46（52 738 048 B）、三个 `.cpp` 的 obj 均晚于对应源码、exe 内命中 `r3r_schedule_pool` 与 `R3RSchedulePoolWindow`、`strings.h` 含 `STR_R3R_SCHEDULE_CAPTION = 0xC9B`、`read_lints` 0 条。发布树 `build-release` **本轮未编**（停留在第 416 轮版本）。
+
+**已知边界（本轮刻意不做）**：①无主排程不记 owner，池条目对多公司全局可见（窗口只按 `this->owner` 过滤目标列车）；②分配只对 `IsPrimaryVehicle()` 开放，多节链点链头；③借用态 / 停放态（`r3r_orders_borrowed`、`orders_backup != nullptr`、`IsR3RFollower()`）一律拒绝分配，必须先解挂把账还清；④池表循环引用（表 A 的命令再指回 A）不拦，按玩家口径「由玩家承担」只保证不崩；⑤没有"谁在用这份表"的反向统计（只听 `num_vehicles`）；⑥窗口只列列车表，飞机/道路车辆排程不进池。
+
+**待实机复测 6 条**：①窗口能列出全部列车排程 + 无主排程且命令数正确；②`*` 前缀与目标列车实际指针一致；③新建空无主表不出现 `*`；④分配后目标列车跑新表、**原表命令一条不少**（"只改指针"的核心判据）；⑤删除对有主表弹错误而非删除；⑥反复分配 + 存档往返不崩、读档后仍指向同一张表。详见 `R3R_schedule_pool_round417_memo.md` §8.4。
+
+---
+
+## 第 418 轮（2026-11-10）：排程池窗口 5 项增强（已实现 + 已编译，游戏内复测待做；构建自证见备忘 §7.6）
+
+2026-11-10 第 418 轮。玩家在第 417 轮排程池基础上提 5 条增强（原话见 `R3R_schedule_pool_round418_memo.md` §1）：①重命名排程 + 编辑排程内容；②「分配」按钮旁镂空导致 GUI 紊乱；③按共享调度计划窗口那样预览"指向这张表的段"（带列车图像）；④同时看到其他公司的排程（名称前加色块区分）；⑤设置排程公有/私有，公有后其它公司的车站可分配、其它公司列车的自有表也可指向该表。
+
+### KI-588（中，待实现）：排程池窗口 5 项增强
+
+**已做实的一条 = 需求 2**：`src\r3r_schedule_gui.cpp:62-69` 的按钮行是 `NWID_HORIZONTAL( EqualSize(80/80/80) + RESIZEBOX )`，外层容器**没有** `SetResize`/`SetFill` ⇒ 按钮区恒 240px，而 `WID_SCHED_LIST`（`:57-60`）`SetMinimalSize(360,130)` + `SetResize(1,10)` 把窗口撑到约 360+，中间约 120px 无控件填充 = 玩家看到的镂空。修法（仅控件树、零行为变更）：`EqualSize` 容器加 `SetResize(1,0)` + `SetFill(1,0)` 让三按钮均分整行。
+
+**其余四条的共同前置 = `OrderList` 缺元数据**：`src\order_base.h` 的 `OrderList` 没有名称、没有 owner、没有 public 标志；第 417 轮的无主排程只靠 `first_shared == nullptr && num_vehicles == 0` 反推，池条目本身不存归属。⇒ 需求 1（重命名）、4（按公司区分）、5（公有/私有）必须先决定元数据存放位置（独立稀疏块 vs 扩 `ORDL` 版本），这直接决定存档兼容性。
+
+**需求 1（编辑内容）的硬约束**：`OrderWindow` 绑定 `Vehicle`（`ShowOrdersWindow(Vehicle)`），本项目没有"无宿主 OrderList 编辑"入口；要么新建只读列表+命令编辑通道，要么复用现有订单窗口（要求该表有控制列车）。
+
+**需求 3 的硬约束**：现有图像预览入口 `VehicleListWindow` 的 `VL_SHARED_ORDERS`（`src\vehiclelist.h:28`、`src\vehicle_gui.cpp:3264`）按 `first_shared` 编码 ⇒ **无主表天然列不出**，需要新形态或先有 first_shared。
+
+**需求 5 的硬约束**：`CmdR3RAssignSchedule` 现含 `CheckOwnership(v->owner)`（"只能改自己的车"通用安全线），跨公司授权不能靠放宽它，必须加独立的"目标表对本公司开放"判据。
+
+**玩家拍板（2026-11-10，原话「四个问题的我的拍板分别是BAAA」）**：C-1=**B** 复用订单窗口编辑（有控制列车才可编辑，无主表提示先分配）；C-2=**A** 元数据走独立稀疏块（不动 ORDL、不升版本、旧档读回名字空 + 默认私有、新版档旧 exe 仍可读）；C-3=**A** 预览复用现有车辆列表窗口（有主表按首车打开，无主表按钮禁用）；C-4=**A** 私有=其它公司可见但灰显不可分配；C-5=**A** 公有后打开**两条**通道（别家列车可指向 + 别家车站调度池可登记）。回填见备忘 §4.1。
+
+**状态**：拍板已落盘，**已实现**（2026-11-10），游戏内复测待做。备忘 `R3R_schedule_pool_round418_memo.md`。
+
+### 落地清单（第 418 轮）
+
+- **② 镂空**：`src\widgets\r3r_schedule_widget.h` 按钮行容器加 `SetResize(1,0)`+`SetFill(1,0)`，`PUBLIC`(开关) / `NEW` / `DELETE` / `ASSIGN` 均分整行。
+- **① 重命名**：`src\r3r_schedule_gui.cpp` 的 `WID_SCHED_RENAME` → `ShowQueryString`（`QueryStringFlag::LengthIsInChars`，32 字符，UTF-8 最坏 128 B = `R3R_SCHEDULE_NAME_MAX_BYTES`）→ `OnQueryTextFinished` 发 `CmdR3RRenameSchedule`，用 `query_schedule`(`OrderListID`) 定位（查询期间池索引可变）。
+- **① 编辑**：`WID_SCHED_EDIT` → `ShowOrdersWindow(ol->GetFirstSharedVehicle())`（C-1=B，无控制列车则置灰）。
+- **③ 预览**：`WID_SCHED_PREVIEW` → `ShowVehicleListWindow(first)`（C-3=A，复用 `VL_SHARED_ORDERS` 的带图车辆列表）；原自绘预览面板整体删除（`show_preview`、`PreviewText()`、`STR_R3R_SCHEDULE_PREVIEW_TEXT`、`..._PREVIEW_NONE` 全清），提示面板高度 4 行→2 行。
+- **④ 其它公司可见**：`Rebuild()` 收自家 + 公有表，行首画公司色块；私有表灰显不可分配（C-4=A）。
+- **⑤ 公开开关**：`WID_SCHED_PUBLIC`（`WWT_TEXTBTN` + `SetWidgetLoweredState`，lowered = 公有；见 KI-591）+ `CmdR3RSetSchedulePublic`，仅 owner 可切。
+- **C-5 ①**：`CmdR3RAssignSchedule` 授权改用 `R3RScheduleAccessibleBy(ol, company)`（owner 或 public）。
+- **C-5 ②**：`src\station_cmd.cpp` 的 `CmdR3RAddR3RDispatchPoolEntry` 在 `R3RDispatchHostUsable()` 后新增闸门——模板车 owner ≠ 车站 owner 时要求 `R3RScheduleAccessibleBy(host_orders, st->owner)`，否则 `STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED`。**该命令此前对别家模板车不设防**（只要车站是自己的、模板车可用就收），私有排程因此可被别家借走，本轮收紧为"必须公开"。
+- **文案**：`STR_R3R_SCHEDULE_RENAME / _EDIT / _PREVIEW / _PUBLIC` + `_TOOLTIP` 及 `_UNNAMED`、`_RENAME_TITLE` 中英同步；行文本去掉 `{BLACK}`（`{BLACK}{RAW_STRING}` 组合不生效），改由 `DrawString(..., TextColour::White)` 上色。
+
+### KI-589（严重，已修，第 418 轮）：命令枚举 8 位越界导致命令号回绕
+
+`src\command_type.h` 的 `enum class Commands : uint8_t` 在本轮新增两条命令后 `End` 达 256：编译期 C4369（`'256' cannot be represented in 'unsigned char'`），运行期 `Commands::End` 回绕为 0 ⇒ `IsValidCommand(cmd)` 恒 false；`SetR3RSchedulePublic`(=256) 回绕为 0 与 `BuildRailLong` 撞号，等于**全游戏命令分发被破坏**。修法：底层类型改 `uint16_t`。安全性：`CommandContainer::Serialise`（`src\command.cpp`）原本就按 `uint16` 上线、存档不存 `Commands`、`EnumIndexArray<CommandInfo, Commands, Commands::End>` 随 underlying type 自动扩容 ⇒ 无存档/网络格式变化。**教训：R3R 命令表已用满 255，后续每加命令都要先看这条警告。**
+
+### KI-590（低，已修，第 418 轮）：`R3SM` 块用 `SLE_STR` 存 `std::string` 编译失败
+
+`src\sl\order_sl.cpp` 名称字段原写 `SLE_STR(R3RScheduleMeta, name, SLE_STR, 0)`，模板静态断言不过（`SlVarWrapper<std::string, ...>` 无特化），全量构建停在 `order_sl.cpp`。正确写法 `SLE_SSTR(R3RScheduleMeta, name, SLE_STR)`（`SL_STDSTR`，表块可用）。
+
+### KI-591（低，工具链备注，第 418 轮）：本 fork 的两条 GUI API 事实
+
+构建期拦下、以后写 R3R GUI 必查的两条（同备忘 §7.7）：
+
+1. **没有 `WWT_CHECKBOX`**：`src\widget_type.h` 的 `WidgetType` 枚举里不存在该值。开关一律用 `WWT_TEXTBTN` + `SetWidgetLoweredState(id, on)` 表达"按下=开"，并在 `SetToolTip`/`SetText` 上区分文案。第 418 轮的公开开关即按此实现（`WID_SCHED_PUBLIC`）。
+2. **文本颜色是 `TextColour::White / TextColour::Grey`**（`src\gfx_type.h` 的 `enum class TextColour`），**没有** `TC_WHITE`/`TC_GREY` 宏；`DrawString(left, right, y, text, TextColour)` / `DrawStringMultiLine(..., TextColour, StringAlignment)` 直接传枚举。写 `TC_*` 会 `error C2065`。
+
+另附一条着色约束（第 418 轮踩到）：`{BLACK}` 与 `{RAW_STRING}` 组合不生效，行内变色应改由 `DrawString` 的 `TextColour` 参数控制，控制字符串只留 `{RAW_STRING}` 占位。
+
+### 复测清单（第 418 轮，待打勾）
+
+依据备忘 §7.5，实机按顺序验，每条只判"通过 / 不通过 + 证据行"。本轮**未做实机复测**，下列全部为待验：
+
+| # | 判据 | 状态 |
+|---|---|---|
+| 1 | 按钮行铺满无镂空；窗口拉宽/缩窄后 `PUBLIC/NEW/DELETE/ASSIGN` 均分不裁切 | 待复测 |
+| 2 | 重命名：中文名 ≤32 字落盘不截断、列表立刻刷新；清空名字回到「N orders」默认摘要 | 待复测 |
+| 3 | 命令按钮（`WID_SCHED_EDIT`）：有控制列车时打开该表所属列车的订单窗口；无主表按钮灰 | 待复测 |
+| 4 | 列车按钮（`WID_SCHED_PREVIEW`）：打开带列车图像的共享命令车辆列表；无主表按钮灰 | 待复测 |
+| 5 | 公开开关：勾选后别家公司能看到并分配该表；取消后立即灰显不可分配 | 待复测 |
+| 6 | C-5②：别家公司把「我的私有表列车」登记进自己车站调度池 ⇒ 报 `STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED`；公开后登记成功 | 待复测 |
+| 7 | 存档往返：名字/公开标志/owner 全保留；旧档（无 `R3SM` 块）读入名字空、默认私有、不崩 | 待复测 |
+| 8 | 负判据：别家公司点自家以外私有表的「重命名 / 公开」⇒ 命令被拒且界面状态不变 | 待复测 |
+
+判据 6 的验证前置：`CmdR3RAddR3RDispatchPoolEntry` 的闸门只在 `host vehicle owner != station owner` 时触发，同公司登记不受影响（属预期，不是遗漏）。
+
+## 第 419 轮（2026-11-11）：排程池 / 调度池界面五项优化（已实现，构建自证见末尾）
+
+玩家五条需求，临时报告 `R3R_schedule_pool_round419_memo.md`。分列为 KI-592..KI-596，五条**均已改源码**，落地明细与构建自证见本节末尾。
+
+### KI-592（中，已修，第 419 轮）：车站调度池的选场控件显示 `(invalid parameter)` 且点不开
+
+来源：玩家第 1 条「车站排程池界面有一处显示 invalid parameter，应该是用于选场的，但实际上却按钮按不下去」。
+落点：`src\station_gui.cpp` 的 `StationDispatchWindow`，控件 `WID_SD_YARD_SEL`；语言串 `STR_R3R_DISPATCH_POOL_YARD_SEL : {BLACK}场: {STRING}`。
+根因（显示）：代码把 `YardLabel()` 返回的 `std::string` 直接当 `{STRING}` 参数传给 `GetString()`；`{STRING}` 要求 `StringID`，传 `std::string` 只会登记成 raw string 参数 ⇒ 渲染出 `(invalid parameter)`。与 KI-262（站场窗口标题缺参）同族，但这次是**参数类型不匹配**而非漏参。
+根因（点不开，待实证）：两个候选——①`OnPaint()` 里 `SetWidgetDisabledState(WID_SD_YARD_SEL, ...)` 判据过严把控件灰掉（`DispatchLeftClickEvent` 对 disabled 控件直接 return，表现为"按不下去"）；②`R3RNumYards()==0` 时下拉表为空，`ShowDropDownList()` 弹出空表 ⇒ 等同于无反应。
+修法：文本改走 `{RAW_STRING}` 或直接拼好字符串；点击路径改成 `WWT_DROPDOWN` 这种"整块即下拉"的控件（`NWID_BUTTON_DROPDOWN` 是按钮+下拉两段语义，容易被误读为按不下去），并在无场可选时明确灰显 + 提示「本站还没有站场」。
+
+### KI-593（中，已修，第 419 轮）：排程分配改为"先选排程→点分配→弹出带列车图像的列车列表点选"
+
+来源：玩家第 2 条「现在是通过窗口顶部的下拉框选中要分配排程的列车。我不要这样，我要先选中排程，再点分配，再出来一个带列车图像的列车页面供玩家点选」。
+现状：`WID_SCHED_*` 顶部有"目标列车"下拉框 + 「分配」按钮（第 418 轮落地）。
+目标：删下拉框，点「分配」弹出一个**带列车图像**的列表窗口，点某一列车即完成分配。
+实现方向：新增轻量"选择列车"窗口（自绘 `DrawVehicleImage` 行 + 点击回调），列表数据复用 `GUIVehicleGroup`/`VehicleList`。**不复用普通车辆列表窗口**，因为需要"点选即回调"而不能是普通浏览。
+待确认（C-2）：列表范围（本公司全部列车 / 仅无排程的 / 含其它公司的公开表列车）。
+
+### KI-594（低，已修，第 419 轮）：自家**公开**排程在名称前加小旗子标记
+
+来源：玩家第 3 条「对于公开的自家排程，我希望能够像设置了公开的路签一样，在排程名称的前面有一个标记，比如一只小旗子」。
+落点：排程列表行的绘制（`src\r3r_schedule_gui.cpp` 的列表绘制 + 行文本拼装函数）。
+实现：行绘制时若 `meta->public && meta->owner == _local_company`，在文本左侧 `DrawSprite` 一面小旗（用现成 `SPR_*`，优先复用路签公开用的那张），文本整体右移；悬停提示补「公开」。
+待确认（C-3）：是否只标自家公开表（其它公司公开表已有公司色块，不重复标）。
+
+### KI-595（低，已修，第 419 轮）：按钮文案改造 + 新建排程直接建空的无主排程
+
+来源：玩家第 4 条：编辑排程按钮「命令」→「编辑排程」；查看使用者按钮「列车」→「查看使用者」；新建排程点一下就**直接创建空的无主排程**。
+落点：`src\lang\{english,simplified_chinese}.txt` 的 `STR_R3R_SCHEDULE_EDIT` / `STR_R3R_SCHEDULE_PREVIEW`；`WID_SCHED_NEW` 的点击处理（去掉 `ShowQueryString`，直接发 `CmdCreateR3RSchedule` 空名）。
+待确认（C-1）：「无主」的表示与可见性——`owner = INVALID_COMPANY` 后：谁能看到、谁能删除、能否分配给列车（分配时是否认领为本公司）。
+
+### KI-596（中，已修，第 419 轮）：新建排程后列表不刷新，必须重开窗口
+
+来源：玩家第 5 条「新建了排程，还得重新打开一次窗口才能看到新建的排程」。
+根因（已实证）：`CmdR3RCreateLooseSchedule` / `CmdR3RDeleteLooseSchedule` 执行成功后**没有**广播
+`InvalidateWindowClassesData(WindowClass::R3RSchedule)`，而 rename / public 两条命令有 ⇒ 只有"增/删"不通知窗口，
+列表自然停在旧内容上。不是 `OnInvalidateData` 的短路问题（该函数每次都会 `Rebuild()`）。
+修法：两条命令各补一行广播；`WID_SCHED_NEW` 另置 `pending_select_new`，`Rebuild()` 用
+`known_rows`（上一次的行集合）与当前 `rows` 的**差集**认出新建的那条并选中（命令下一 tick 才生效）。
+
+### 落地清单（第 419 轮）
+
+1. **KI-592**：`src\lang\{english,simplified_chinese}.txt` 的 `STR_R3R_DISPATCH_POOL_YARD_SEL` 由 `{STRING}` 改 `{RAW_STRING}`
+   （`station_gui.cpp:3776` 传的是已渲染 `std::string`）；新增 `STR_R3R_DISPATCH_POOL_NO_YARD`；
+   `OnPaint()` 删掉 `SetWidgetDisabledState(WID_SD_YARD_SEL, !can_edit)`（选场是只读操作，disabled 正是"按不下去"的真因）；
+   `OnClick()` 的 `WID_SD_YARD_SEL` 分支在 `R3RNumYards()==0` 时弹提示并 return，不再弹空下拉。
+2. **KI-593**：`src\widgets\r3r_schedule_widget.h` 删 `WID_SCHED_TARGET_SEL`，新增 `R3RScheduleAssignWidgets`
+   （`WID_SCHED_AS_CAPTION/_LIST/_SCROLLBAR`）；`src\r3r_schedule_gui.cpp` 删除顶部 `NWID_BUTTON_DROPDOWN`，
+   `WID_SCHED_ASSIGN` 判据改为「可编辑 + 有选中排程 + `R3RScheduleAccessibleBy`」（不再依赖目标车），
+   点击改为 `ShowR3RScheduleAssignWindow(company, ol->index)`；新增 `R3RScheduleAssignWindow`
+   （`WindowClass::R3RSchedule`、window number **1**，避开池窗口的 number 0）：行内 `DrawVehicleImage(..., EIT_IN_LIST, 0)`
+   画缩略图（宽度上限=行宽一半，逐节累加 `GetDisplayImageWidth()`）+ `STR_R3R_SCHEDULE_ASSIGN_ROW`（车名 + 该车当前排程名），
+   点行 → `Command<Commands::AssignR3RSchedule>::Post(..., veh, ol)` 后关窗；空列表画 `STR_R3R_SCHEDULE_ASSIGN_PICK_EMPTY`；
+   行高与命中一律取列表控件自己的 `resize_y`（KI-262 教训）。新增串 `STR_R3R_SCHEDULE_ASSIGN_PICK_TITLE/_TOOLTIP/_EMPTY/_ROW`。
+3. **KI-594**：`DrawWidget(WID_SCHED_LIST)` 对 `IsR3RSchedulePublic() && IsOwnSchedule(ol)` 的行在名称前
+   `DrawSprite(SPR_FLAG_VEH_RUNNING, PAL_NONE, ...)`（垂直居中，`left += flag.width + 2`）；列表提示串补充说明。
+4. **KI-595**：`STR_R3R_SCHEDULE_EDIT` = `Edit schedule` / `编辑排程`，`STR_R3R_SCHEDULE_PREVIEW` = `Users` / `查看使用者`；
+   `WID_SCHED_NEW` 去掉下拉，直接 `Command<Commands::CreateR3RLooseSchedule>::Post(STR_ERROR_CAN_T_DO_THIS, 0)`
+   + `pending_select_new = true`。旧串 `STR_R3R_SCHEDULE_NEW_EMPTY` / `_NEW_SEL` 已无引用（保留未删，无编译影响）。
+5. **KI-596**：见上条条目。
+
+**与玩家口径的对应（C 系列）**：C-1 = 采纳"新建即空无主排程"（owner 空，名字空显示 `STR_R3R_SCHEDULE_UNNAMED`，不再提供"复制现有排程"）；
+C-2 = 选车列表为**本公司全部主营列车**（`IsPrimaryVehicle()`），不筛选、不多选，点一辆即完成；
+C-3 = 小旗画在名称之前，复用路签公开标记 `SPR_FLAG_VEH_RUNNING`。
+
+**复测清单（第 419 轮，待打勾）**：
+
+| # | 判据 | 状态 |
+|---|---|---|
+| 1 | 车站调度池的「场」下拉显示 `场: 1` 之类而**不是** `(invalid parameter)`；非本公司可编辑时也能点开 | 待复测 |
+| 2 | 该车站一个场都没有时点它 ⇒ 弹「本站还没有场…」提示，不出现空下拉 | 待复测 |
+| 3 | 排程池窗口顶部**没有**目标列车下拉框；选一条排程点「分配」⇒ 弹出带列车图像的选择窗口 | 待复测 |
+| 4 | 选择窗口列出本公司全部列车（有图 + 车名 + 当前排程名）；点一辆后该车排程指针改指所选表，选择窗口关闭 | 待复测 |
+| 5 | 自家公开排程的行在名称**前**有一面小旗；非公开/别家的行没有 | 待复测 |
+| 6 | 「编辑排程」「查看使用者」文案生效；「新建」点一下立刻出现一条空的无主排程并被自动选中（不需重开窗口） | 待复测 |
+| 7 | 删除排程后列表立刻消失（不需重开窗口） | 待复测 |
+| 8 | 负判据：别家公司的私有排程「分配」按钮仍灰；无主营列车的公司点「分配」⇒ 选择窗口显示"没有可用列车" | 待复测 |
+
+**构建自证（第 419 轮）**：复用入口 `R3R_fullbuild.cmd inc detach`（未新建 .cmd）。
+①第一次因改 `src\widgets\r3r_schedule_widget.h`(02:51:05) 被护栏判 `REMOVED 620 object file(s) - upgrading this build to a FULL rebuild`，
+跑到 661/708 红在 `src\r3r_schedule_gui.cpp(565)/(584): error C3861: "ScaleGUITrad": 找不到标识符`
+（该函数声明在 `src\zoom_func.h:117`，本文件原先没 include），`R3R_incbuild.done` = `EXIT_CODE=1`(03:16:57)；
+补 `#include "zoom_func.h"` 后重跑。
+②第二次 `guard.log` = `GUARD: incremental is safe`，补齐尾部 100 步：`[100/100] Linking CXX executable openttd.exe`，
+`R3R_incbuild.done` = `EXIT_CODE=0`(03:26:33)，日志 `error C*`/`fatal error`/`FAILED:` 计数 0。
+③时间戳链：`r3r_schedule_gui.cpp` 03:18:01 → obj 03:18:48；`station_gui.cpp` 02:45:56 → obj 03:20:53；
+`order_cmd.cpp` 02:46:03 → obj 03:16:11；`strings.h` 02:56:07 → `strings.cpp.obj` 03:21:11；
+`build\openttd.exe` **2026-11-11 03:26:18，52 777 472 B**（晚于全部 obj 与源码）。
+④`strings.h` 含 `STR_R3R_DISPATCH_POOL_NO_YARD=0xC94`、`STR_R3R_SCHEDULE_ASSIGN_PICK_TITLE=0xCA8`/`_TOOLTIP=0xCA9`/`_EMPTY=0xCAA`/`_ROW=0xCAB`、
+`STR_R3R_SCHEDULE_EDIT=0xCB7`/`_TOOLTIP=0xCB8`、`STR_R3R_SCHEDULE_PREVIEW=0xCB9`/`_TOOLTIP=0xCBA`；
+`build\lang\simplified_chinese.lng` 229 207 B。
+⑤`read_lints` 四个改动文件合计 0 条。⑥只编内测树（探针 ON），发布树 `build-release` 未动，仍停留在第 418 轮版本。
+状态＝**已实现 + 已编译**（EXIT_CODE=0），游戏内复测待做。
+
+## 第 420 轮（2026-11-11）：站名标志 / 调度编辑下拉 / 整站可管调度池 / 排程删除与编辑 / 调度池显示列车名 / 分配接线失败（取证中）
+
+玩家六条报告，临时报告 `R3R_round420_six_issues_memo.md`（先落盘再取证）。分列 KI-597..KI-602。
+
+### KI-597（已关闭·非缺陷）：车站头顶的名称标志不见了，与「透明选项」无关
+
+**结案（2026-11-11，玩家原话「C7已确认是 我的问题」）**：显示开关确实是关着的 ⇒ **非代码缺陷，不修**。
+判据链（两道闸门）保留如下仅作将来备用：①`ShouldShowBaseStationViewportLabel()`（`station_gui.cpp:3122-3129`）
+⇒ 决定 `ZoomLevel::End`（永不显示）；②`_facility_display_opt`（`viewport.cpp:2147-2151`）⇒ 设施位无交集不画。
+两者都在设置（齿轮）下拉里，并存于 `openttd.cfg`（不在存档，故「新开局也不显示」是其特征）。
+
+来源：玩家第 1 条。
+现象：地图上车站上方的站名标志消失；玩家已排除"透明选项"开关。
+猜测根因（待验证 A）：与本轮改动无关的既有回归——第 419 轮只改 `station_gui.cpp` 的调度池窗口与 `r3r_schedule_gui.cpp`，未触碰地图站名绘制。
+猜测根因（待验证 B）：站名标志绘制判据用到 `Station::name` 或 R3R 站场（SYRD v5）字段，某提交点把名字清空/场重编号后绘制被跳过。
+取证入口：`viewport.cpp`/`station_gui.cpp` 的站名标志绘制、`build\R3R_debug.log`、`_settings_client.gui` 相关开关。
+
+**C-7 现场答复（玩家原话要点，2026-11-11）**：全部车站的牌子都不显示，**包括火车站、汽车站、机场、码头**；
+**新开一局同样不显示**；但**城镇名与手动放置的标志正常**。⇒ 排除存档数据、公司归属、`ShowSigns` 总开关、路点 `WPF_HIDE_LABEL`。
+
+**订正：§5.8 的「唯一闸门」结论有漏项**。站名牌有**两道**闸门：
+1. `ShouldShowBaseStationViewportLabel()`（`station_gui.cpp:3122-3129`）⇒ 决定 `zoom = ZoomLevel::End`（永不显示）；
+2. **`_facility_display_opt`**（`viewport.cpp:2147-2151` 与点击副本 `:5255-5259`）：
+   `if (!st->facilities.Any(_facility_display_opt)) break;` ⇒ 即使上面那道放行，设施位与开关无交集也**不画**。
+   幽灵站用 `STATION_FACILITY_GHOST` 兜底（`facilities.None()` 时）。
+
+`_facility_display_opt` 是 JGRPP 上游的「按设施分类型显示站名」开关（`transparency.h:50`、`transparency_gui.cpp:32`），
+菜单在**设置（齿轮）下拉**里紧跟「车站名」之后的 6 项：火车 / 汽车 / 巴士 / 船 / 机场 / 已拆除的站名（`toolbar_gui.cpp:317-324`）。
+
+**两组开关都逐位对齐、默认全开**（无错位，排除配置读写 bug）：
+- `DisplayOption`（`openttd.h:44-52`）vs `_display_opt_modes`（`misc_settings.ini:14`）8 项逐位一致，`def`（`:72`）含 `ShowStationNames` / `ShowCompetitorSigns`；
+- `StationFacility`（`station_type.h:54-62`：Train0/TruckStop1/BusStop2/Airport3/Dock4/GHOST6）vs `_facility_display_opt_modes`（`misc_settings.ini:16`）一致，`def`（`:83-88`）六项全开。
+
+**关键：两者都是 `SDTG_MMANY`（写在 `openttd.cfg`，不在存档）** ⇒ 「新开一局也不显示」正是 cfg 里开关被关的特征，不是存档损坏。
+
+**唯一待验**：请玩家打开设置下拉，报一次「车站名」与随后 6 项的勾选状态。
+若已全勾仍不显示 ⇒ 确认为真 bug，下一步在其四周加只读探针一次打印 `_display_opt` 原始字节、
+`_facility_display_opt` 原始字节、`bst->owner`/`_local_company`、`facilities` 位、函数返回值、`sign.UpdatePosition()` 收到的 `zoom`。
+
+### KI-598（中，待实现）：GOTO_STATION 的「调节班次」改下拉，两项互斥；选后按钮不高亮，改在命令文本后加括号
+
+来源：玩家第 2 条。玩家口径逐字：点「调节班次」⇒ **只出现一个下拉框**（不直接生效），下拉两项「调节班次」「等待分配」，两项**互斥**；选定后**上面的按钮不要表现为被按下**，而是「前往车站」命令文本后加括号「（等待调节班次）」或「（等待分配调度）」；**视觉参照「前往车库」现有的「等待调节班次」**。
+现状猜测（待验证）：该控件现在是 `NWID_BUTTON_DROPDOWN` 或「按钮 + `SetWidgetLoweredState`」（本 fork 无 `WWT_CHECKBOX`，第 418 轮已确认用 lowered 表达开关）⇒「按钮被按下」正是当前表现。
+待确认：C-1 两项括号文案；C-2 互斥后被取消项的数据是否清空。
+
+### KI-599（中，待实现）：车站「整站」也要能管理调度池、设为检修所
+
+来源：玩家第 3 条。
+猜测根因（待验证）：调度池/检修所控件只在选中某个**场（yard）**时可用；选中「整站」（`R3R_YARD_NONE`/整站视图）时被 `SetWidgetDisabledState` 或直接隐藏。
+待确认：C-3「整站」的调度池是站点级独立池，还是等价于「场 0」。
+
+**C-3 拍板（玩家原话「保持现状」，2026-11-11）**：整站检修所 = 只管**没有划进任何场**的站台，
+各场的检修所开关仍各自生效。**不改判定链（`R3RIsWorkshopTile`/`R3RIsYardWorkshop`）、不改检修收费口径、不做合并判定**。
+本条待拍板项关闭，实现维持现状。
+
+### KI-600（高，待实现）：排程池可直接删「有主但未借用」的排程（车改指新建空表）+ 可直接编辑无主排程
+
+来源：玩家第 4 条。
+猜测根因（待验证 A）：`WID_SCHED_DELETE` 的判据是 `IsR3RLooseSchedule()`（仅无主可删）⇒ 有主一律灰。
+猜测根因（待验证 B）：`WID_SCHED_EDIT` 走 `R3RScheduleEditableBy`（仅 owner），无主排程 owner 为 Invalid ⇒ 被判不可编辑。
+风险：删除有主排程必须**先**把所有 `v->orders` 指向它的车改指新空表（含 `orders_backup` 借用与共享链走 `AddToShared`/`RemoveFromShared`），否则悬垂指针（KI-93 崩溃族）。
+待确认：C-4 新空表是否进池并被自动选中。
+
+**C-8 拍板（玩家原话「E2」+「删除时若该排程正被某车 `r3r_orders_borrowed` 借用，选 1」，2026-11-11）**：
+- **编辑侧 = E-2**：新开**独立排程编辑窗口**，宿主从「车」改成 `(company, OrderList *)`；
+  `OrderWindow` 全篇的 `Vehicle::Get(window_number)` 要抽一层 `OrderHost` 抽象（车型/货种/车库/站台可用性等读点）。
+  **不是** E-3（编辑即占用车辆），**不是** E-1（借车临时查看）。
+- **删除侧 = 方案 1（拒绝删除）**：若该排程正被某车 `v->r3r_orders_borrowed` 借用，**直接拒绝并提示「该排程正被 N 辆车借用」**，
+  **不**自动解绑、**不**把借用者迁移到新空表。无借用者时才走「车改指新建空表」的路径。
+- 状态：**待实现（下一轮工作项）**。
+
+### KI-601（中，待取证）：车站调度池「添加调度」显示的是列车名称而不是调度名称
+
+来源：玩家第 5 条。
+猜测根因（高度可疑，直指第 419 轮）：第 419 轮把标签函数提取为 `R3RScheduleLabelOf(const OrderList *)`，回退逻辑沿用第 418 轮 `ScheduleLabel()`：`名字为空 ⇒ GetFirstSharedVehicle() 的车名 ⇒ STR_R3R_SCHEDULE_UNNAMED`。故「有主但未命名」的排程在调度池里显示成**列车名**。
+待确认：C-5 无名排程的显示文本，以及车名回退是否**全局**取消（排程池窗口一并改，保持两处一致）。
+
+### KI-602（已关闭·非缺陷）：分配调度「接线似乎失败了」
+
+**玩家澄清（2026-11-11 原话要点）**：「实际上，根据你的描述，我猜测，你理解错误了。我当时是对『调节班次』这个按钮的 GUI 有修正意见，现在这个 GUI 已经符合我预期」
+⇒ **本条不是缺陷**，玩家当时说的是 KI-598 的按钮外观意见，第 420 轮已实现并已满足。**结论：不修、不再深挖 `AssignR3RSchedule` 的拒绝面。**
+下列原始取证保留仅作历史记录。
+
+来源：玩家第 6 条（第 419 轮新写的 `R3RScheduleAssignWindow`）。
+猜测根因（待验证 A）：行命中用 `GetScrolledRowFromWidget` 与实际绘制行高不一致 ⇒ 点不中。
+猜测根因（待验证 B）：`CmdR3RAssignSchedule` 被命令层拒绝（`CheckOwnership`、无主表特殊处理），只弹 `STR_ERROR_CAN_T_DO_THIS`。
+猜测根因（待验证 C）：新窗口 `OnInit` 里 `owner` 被覆盖 ⇒ 我在 `OnClick` 加的 `this->company != _local_company` 早退直接吞掉点击。
+取证入口：`build\R3R_debug.log`、`order_cmd.cpp` 的 `CmdR3RAssignSchedule`、`r3r_schedule_gui.cpp` 的 `OnClick`。
+
+**取证结果（第 420 轮续，详见 memo §5.11 / §5.12）**：
+- 猜测 A（行命中错位）**已证伪**：`R3RScheduleAssignWindow::OnClick`（`r3r_schedule_gui.cpp:630-649`）的行高与
+  `SetCapacityFromWidget(...framerect.Vertical())` 同源，行号 ↔ 列车映射正确。
+- 猜测 C（owner 被覆盖）**已排除**：`:645` 的 `company != _local_company` 静默 return 只在看别人排程时成立。
+- **新事实**：全语言文件里没有任何名为「分配调度」的按钮，含该字样的三处全是订单标记
+  （`STR_ORDER_R3R_WAIT_DISPATCH` = 「等待分配调度」）。⇒ 玩家大概率点的是订单窗口 `WID_O_R3R_SEPARATION`
+  （标题「调节班次」，下拉第二项才是「等待分配调度」）。
+- 候选 A（订单标记）：`order_gui.cpp:3779` 与 `:4366` 在**选中订单不是 `OT_GOTO_STATION`** 时直接 `break`，
+  **零提示零反馈**＝"点不动"最强静默候选；命令层白名单已含两个 MOF（`order_cmd.cpp:2611`），
+  `MOF_R3R_STATION_SEPARATION` 还多一条冲突守卫（`:3035`，弹 `STR_ERROR_SEPARATION_MUTUALLY_EXCLUSIVE`），
+  `MOF_R3R_WAIT_DISPATCH` 无该守卫；位存储 bit 5/bit 6 独立、setter 自动分配 extra（`order_base.h:161-175`）⇒ 写入层健康。
+- 候选 B（`AssignR3RSchedule`）：`order_cmd.cpp:4286-4355` 共 6 条裸 `CMD_ERROR`（非 primary / 借用中 / 有停放排程 /
+  跟随车 / 跨公司私有 / 类型不符），UI 只显示通用 `STR_ERROR_CAN_T_DO_THIS`。
+- 候选 C（坑位 `SetR3RDispatchPoolLimit`）：`station_cmd.cpp:2771-2786` 命令层干净，且改坑位本身不接线。
+- **已知脆弱点（非当前 bug）**：`OnDropdownSelect` 用列表行索引 `index` 而非 item 的 `value`，当前两项恰为 0/1 故正确；
+  将来增删项必须同步。
+
+### 第 420 轮实现状态（2026-11-11，落地记录）
+
+| KI | 状态 | 落点 |
+| --- | --- | --- |
+| KI-598 | **已实现 + 已编译，游戏内复测待做** | `src\order_gui.cpp`（按钮 `SetLowered(false)`、主区/箭头统一弹下拉、两项互斥、再选取消）+ `src\lang\english.txt` / `simplified_chinese.txt`（`STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX` / `STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX`）+ `STR_ORDER_R3R_SEPARATION_TOOLTIP` 改写 |
+| KI-601 | **已实现 + 已编译，游戏内复测待做** | `src\station_gui.cpp` 新增 `R3RDispatchScheduleLabel()` / `R3RDispatchPickerLabel()`；池列表行、添加下拉、删除确认框三处统一显示排程名（空则车名） |
+| KI-599 | **已实现 + 已编译，游戏内复测待做** | `station_base.h` 新增 `r3r_whole_pool` / `r3r_whole_workshop` + `R3RDispatchPoolRef()`；`station_cmd.cpp` 全部池 accessor 改经 Ref、`R3RIsYardWorkshop(NONE)`、`R3RIsWorkshopTile()`、四个命令放开 `R3R_YARD_NONE`；`sl\station_yard_sl.cpp` **SYRD v6 → v7**（整站块）；`station_gui.cpp` 站场窗口 `sel_ok` 判据 + 池窗口 `GetPool()` + 场下拉新增「整站」 |
+| KI-597 | **已关闭·非缺陷**（C-7 玩家复查：是自己把显示开关关掉了） | — |
+| KI-600 | **待实现（C-8 已拍板：编辑侧 = E-2 独立排程编辑窗口；删除侧 = 方案 1 借用中则拒绝删除并提示）**
+
+**阶段 1 已完成（第 421 轮，2026-11-11，零行为变更，已编译）**：`src\order_gui.cpp` 新增文件内
+`struct OrderHost`（`veh` / `orders` / `company` / `vtype` + `GetOrders()`），`OrdersWindow` 加成员 `host`
+与两个统一入口 `GetOrders()` / `GetNumOrdersOfHost()`；构造函数填 `veh/company/vtype`。
+机械替换 `this->vehicle->GetEffectiveOrders()`→`this->GetOrders()`（15 处）、
+`this->vehicle->GetNumOrders()`→`this->GetNumOrdersOfHost()`（22 处）、裸 `vehicle->GetNumOrders()`（2 处）；
+`CargoTypeOrdersWindow` 加同名一行转发。`GetOrders()` 有主时**逐次动态**调 `GetEffectiveOrders()`
+（借用态不可缓存）⇒ 行为与改造前逐字相同。构建 `EXIT_CODE=0`、`[3/3] Linking`、exe 19:19:15。
+踩坑：`Vehicle::Orders()` 返回 `OrderIterateWrapper` 而非 `OrderList*`，`Orders()->GetNumOrders()` 报 C2039。
+详见 `R3R_round420_six_issues_memo.md` §3.7.4。**待玩家复测：订单窗口全部功能无回归**（见备忘同节清单）。 | 删除侧需同时处理 `r3r_orders_borrowed` 借用者（KI-93 家族悬垂指针） |
+| KI-602 | **取证完成（GUI 侧无错位 + 三条候选拒绝面已列全）**，**已关闭·非缺陷**（C-6 玩家澄清：是对「调节班次」按钮 GUI 的意见，现已满足） | §5.11 取证 1、§5.12 取证 2 |
+
+**口径修正（重要）**：§5.10 写的「SYRD 升 v6」已过时 —— v6 早在第 416 轮被**各场调度池**占用，
+本轮整站块只能用 **v7（`SYRD_V7_MAGIC = 0xFFFFFF06`）**。v6/v5/v4/v3/v2 全部向后可读。
+
+**KI-599 的语义选择（待 C-3 确认）**：整站检修所被实现为「只管**没有划进任何场**的站台」
+（各场站台的检修所状态仍归各场）。若玩家要的是「该站所有平台都不接货」，需改成合并判定 + 合并收费。
+
+**KI-599 的顺带修正**：调度池窗口的场下拉新增「整站」项（值 0），`Rebuild()` 不再把整站强制改写成 1 场 ⇒
+既修掉「一个场都没建时下拉是空的」这个第 419 轮遗留死按钮（KI-592 的兜底提示仍保留），
+也让从整站打开池窗口后可以切回整站。
+
+**构建自证（第 420 轮，2026-11-11 18:36 完成）**：本轮改动含 `src\station_base.h` + 两个 lang txt ⇒
+护栏 `R3R_incbuild.guard.log` 判 `REMOVED 621 object file(s) - upgrading this build to a FULL rebuild`，
+走**全量**。结果：`[703/703] Linking CXX executable openttd.exe`、
+`build\R3R_incbuild.done = EXIT_CODE=0`（18:36:57）、错误计数 0（`error C*` / `fatal error` / `FAILED:` / `build stopped`）、
+`build\openttd.exe @2026-11-11 18:36:34`（52 782 080 B）晚于全部源码；obj 均晚于对应 .cpp：
+`station_gui.cpp.obj` 18:32:17 / `station_cmd.cpp.obj` 18:32:13 / `order_gui.cpp.obj` 18:29:23 /
+`station_yard_sl.cpp.obj` 18:21:13 / `strings.cpp.obj` 18:32:36；`build\generated\table\strings.h` 含
+`STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX=0xC85`、`STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX=0xC86`、
+`STR_R3R_DISPATCH_POOL_YARD_NONE=0xC95`、`STR_R3R_YARD_NAME_NONE=0xC5B`；`read_lints` 0。
+**仅编内测树**，发布树 `build-release\` 仍停留在本轮之前、不含上述三项改动。
+
+---
+
+## 第 421 轮（2026-11-11）：无主排程编辑器（KI-600 / C-8 = E-2）+ 语言包「invalid versions」收口
+
+**玩家输入**：C-8 拍板「编辑侧 = **E-2 独立排程编辑窗口**；删除侧 = **方案 1：借用中拒绝删除并提示**」；
+随后报「看起来编译成功了，但是它跳出来一个 no available language packs(invalid versions?)」。
+临时分析报告：`R3R_schedule_editor_round421_memo.md`。
+
+### KI-600（续）无主排程编辑器 —— **已实现 + 已编译，游戏内复测待做**（严重度 中）
+
+上一轮只完成「阶段 1 宿主抽象」（`OrderHost`），本轮补齐 C-8 拍板的两个落点。
+
+**(A) 编辑侧 = E-2 独立窗口**（`src\order_gui.cpp:5434-5680`，新增区段）
+无主排程没有 `Vehicle`，而 `OrdersWindow` 每个按钮都按 `VehicleID` 发车辆命令 ⇒ 新开只认 `OrderListID` 的窗口。
+
+| 落点 | 内容 |
+|---|---|
+| `_nested_r3r_schedule_editor_widgets` :5437 | `WID_R3RSE_CAPTION` / `_ORDER_LIST`（360×100，`SetResize(1,1)`）/ `_SCROLLBAR` / `_ADD` / `_DELETE` / `_DUPLICATE` / `_MOVE_UP` / `_MOVE_DOWN`（后五个 `EqualSize`，各 72×12） |
+| `struct R3RScheduleEditorWindow` :5478 | 成员 `schedule`(OrderListID) / `vtype`(固定 `VehicleType::Train`) / `selected` / `vscroll`；窗口号 = `OrderListID` |
+| 绘制 :5587 | `DrawOrderString(nullptr, order, i, y, ..., this->vtype)` —— `DrawOrderString` 首参本轮放宽为可空，且无车时不画当前订单箭头（:1027-1028） |
+| `Add` :5518-5529 + `OnDropdownSelect` :5640 | 下拉只列**本公司 + 有设施**的车站/路点；选中后插到「当前选中项的下一行」，未选中则末尾 |
+| `_r3r_schedule_editor_desc` :5668 | `WindowClass::R3RScheduleEditor` + `WindowClass::None`（`parent_class` 必须补） |
+| `ShowR3RScheduleEditor` :5675 | `BringWindowToFrontById(...)` 保证同一排程只有一个窗口 |
+
+四个新命令（`src\command_type.h:802-805`，全部 `CommandType::OtherManagement` + `_NT`）：
+
+```cpp
+DEF_CMD_DIRECT_NT(Commands::InsertR3RLooseOrder,    CmdR3RInsertLooseOrder,    {}, CommandType::OtherManagement, InsertLooseOrderCmdData)
+DEF_CMD_TUPLE_NT (Commands::DeleteR3RLooseOrder,    CmdR3RDeleteLooseOrder,    {}, CommandType::OtherManagement, CmdDataT<uint32_t, uint16_t>)
+DEF_CMD_TUPLE_NT (Commands::MoveR3RLooseOrder,      CmdR3RMoveLooseOrder,      {}, CommandType::OtherManagement, CmdDataT<uint32_t, uint16_t, uint16_t, uint16_t>)
+DEF_CMD_TUPLE_NT (Commands::DuplicateR3RLooseOrder, CmdR3RDuplicateLooseOrder, {}, CommandType::OtherManagement, CmdDataT<uint32_t, uint16_t>)
+```
+
+`InsertLooseOrderCmdData`（`OrderListID` + 插入位置 + `Order`）**不可序列化** ⇒ 投递只能用
+`DoCommandP<Commands::InsertR3RLooseOrder>(payload, STR_ERROR_CAN_T_DO_THIS)`（`src\order_gui.cpp:5654`），
+不能用 `Command<T>::Post`（`Types` 要求可序列化）。
+
+按钮分流（`src\r3r_schedule_gui.cpp:402-414`）：有主 → 原 `ShowOrdersWindow(first)`；无主 → `ShowR3RScheduleEditor(const_cast<OrderList *>(ol))`。
+
+**(B) 删除侧 = 方案 1**（`src\r3r_schedule_gui.cpp:434-447`）
+`GetFirstSharedVehicle() != nullptr || GetNumVehicles() != 0` 时弹
+`ShowErrorMessage(GetEncodedString(STR_R3R_SCHEDULE_DELETE_IN_USE), {}, WarningLevel::Info)` 并 `break`；
+配套把 `WID_SCHED_DELETE` 的禁用条件（`OnPaint` :348）**去掉「有车就禁用」**，保留可点击——
+按钮灰掉时点击连提示都没有，正是「点不动」类抱怨的成因（同 KI-602 家族）。命令层仍拒绝（车辆不会指向已释放的列表）。
+
+**新语言串**（`build\generated\table\strings.h`）：
+
+| 串 | ID |
+|---|---|
+| `STR_R3R_SCHEDULE_DELETE_IN_USE` | `0xCB7` |
+| `STR_R3R_SCHEDULE_EDITOR_CAPTION` | `0xCB8` |
+| `STR_R3R_SCHEDULE_EDITOR_LIST_TOOLTIP` | `0xCB9` |
+| `STR_R3R_SCHEDULE_EDITOR_EMPTY` | `0xCBA` |
+| `STR_R3R_SCHEDULE_EDITOR_ADD` / `_ADD_TOOLTIP` | `0xCBB` / `0xCBC` |
+| `STR_R3R_SCHEDULE_EDITOR_DELETE` / `_DELETE_TOOLTIP` | `0xCBD` / `0xCBE` |
+| `STR_R3R_SCHEDULE_EDITOR_DUPLICATE` / `_DUPLICATE_TOOLTIP` | `0xCBF` / `0xCC0` |
+| `STR_R3R_SCHEDULE_EDITOR_MOVE_UP` / `_MOVE_UP_TOOLTIP` | `0xCC1` / `0xCC2` |
+| `STR_R3R_SCHEDULE_EDITOR_MOVE_DOWN` / `_MOVE_DOWN_TOOLTIP` | `0xCC3` / `0xCC4` |
+
+**本轮编译期踩的 8 个坑（已全部结清，`read_lints`=0）**：
+
+| # | 错误 | 修法 |
+|---|---|---|
+| 1 | 默认参数重复定义 | 默认实参只留 `src\order_func.h`，`.cpp` 定义处删掉 |
+| 2 | `Window` 无两参构造 | `R3RScheduleEditorWindow(WindowDesc &desc, int window_number) : Window(desc)` |
+| 3 | `TC_FROMSTRING` 未声明 | 改 `TextColour::FromString` |
+| 4 | `OnDropdownSelect` 签名不符 | `void OnDropdownSelect(WidgetID, int index, int click_result) override` |
+| 5 | `Command<T>::Post` 载荷不可序列化 | 改 `DoCommandP<T>(payload, err)` |
+| 6 | `WindowDesc` 缺 `parent_class` | 补 `WindowClass::None` |
+| 7/8 | `ShowErrorMessage`：没有重载接受 2 个参数（`r3r_schedule_gui.cpp(441)`） | 现存只有 `(EncodedString&&, int, int, CommandCost&)` 与 `(EncodedString&&, EncodedString&&, WarningLevel, int=0, int=0, EncodedString&&={}, CompanyID=Invalid())` ⇒ 改三参并把详情传 `{}` |
+
+**待复测 9 条**：①无主排程「编辑」弹新窗口、标题正常 ②`Add` 只列本公司有设施站点、插入位置正确
+③四个按钮的灰/亮与边界行为正确 ④空排程显示居中占位串不崩 ⑤有主排程「编辑」仍开原订单窗口
+⑥有主排程「删除」**可点**且弹提示 ⑦无主排程删除仍走确认框 ⑧语言下拉正常、不再报 invalid versions
+⑨中文界面 14 条新串为中文。
+
+**边界（未做）**：不支持改装/跳转订单/当前订单标记/时刻表编辑；`vtype` 固定 Train；
+`WID_R3RSE_ADD` 下拉用 `StationID` 当 `index` 回传（当前 item `value` 恰为 `StationID`，将来改列表必须同步，
+与第 420 轮 KI-598 的同类脆弱点）；编辑器命令层只校验「排程存在 + 有编辑权」，并发借用情形由 GUI 挡。
+
+### KI-603 「No available language packs (invalid versions?)」= 上次构建 `EXIT_CODE=1` 的回声 —— **已定位 + 已消除**（严重度 高，工具链陷阱）
+
+**现象**：玩家在「看起来编译成功」之后启动游戏，弹出 `No available language packs (invalid versions?)`，语言下拉为空。
+
+**猜测根因（已证实）**：`.lng` 已按**新** `LANGUAGE_PACK_VERSION` 重新生成，但 `openttd.exe` 仍是**旧**文件 ⇒ 版本哈希不等 ⇒ 全部语言包被判无效。
+
+**证据链**：
+
+1. 修 #8 之前那次构建的 `build\R3R_incbuild.done` 实为 **`EXIT_CODE=1`**（`error C2661: ShowErrorMessage 没有重载函数接受 2 个参数`）⇒ **链接步骤没执行**，`openttd.exe` 保持旧文件。
+2. 但 strgen 阶段已跑完，写出新的 `build\generated\table\strings.h`
+   （`LANGUAGE_PACK_VERSION = 0x138AA7C4`、`LANGUAGE_TOTAL_STRINGS = 7093`）与全部 `build\lang\*.lng`。
+3. 旧 exe 内嵌旧版本常量 ⇒ 66 个 `.lng` 全被判 invalid。
+
+⇒ **这是构建失败的回声，不是语言包坏了、不是编码问题、不是 `build\lang` 权限问题。**
+
+**修法**：无需改源码——修掉 C2661 后重跑增量构建，让 exe 与 `.lng` 重新对齐。
+
+**验证数据（实测）**：
+
+| 判据 | 读数 |
+|---|---|
+| `build\generated\table\strings.h` | `LANGUAGE_PACK_VERSION = 0x138AA7C4`，`LANGUAGE_TOTAL_STRINGS = 7093` |
+| `build\lang\*.lng` 个数 | **66** |
+| 第 5~8 字节版本 ≠ `0x138AA7C4` 的个数 | **0**（`ver 0x138AA7C4 x66`） |
+| 最新 `.lng` mtime | `vietnamese.lng` / `welsh.lng` 均 `20:21:19` |
+| `build\openttd.exe` | `21:15:24`，52 807 680 B ⇒ 晚于全部 `.lng` |
+
+**教训（长期口径）**：
+
+- 判「编译成功」**只看 `build\R3R_incbuild.done` 的 `EXIT_CODE`**，不看 cmd 窗口有无报错、不看 `.lng` 是否更新。
+- `EXIT_CODE != 0` 时 strgen/lang 已经写出新文件而 exe 仍旧，症状就是「语言包 invalid versions」，极易误判为语言/编码问题。
+- 链接前若读到 `openttd.exe` 体积异常（本轮曾读到中间态 **104 814 880 B @ 21:13:08**），那是链接器写到一半，
+  最终值为 **52 807 680 B @ 21:15:24**；**不要用中途读到的体积判断产物**。
+
+### 构建自证（第 421 轮，2026-11-11 21:15 完成）
+
+| 判据 | 读数 |
+|---|---|
+| 护栏 `build\R3R_incbuild.guard.log` | `GUARD: incremental is safe (no header/lang file is newer than the newest object)` |
+| 步数 | 100 步增量 |
+| 日志末行 | `[100/100] Linking CXX executable openttd.exe` |
+| `build\R3R_incbuild.done` | `EXIT_CODE=0`（`2026/11/11 21:15:48`） |
+| 错误计数（`error C*` / `fatal error` / `FAILED:` / `build stopped`） | **0** |
+| `build\openttd.exe` | **2026-11-11 21:15:24**，52 807 680 B |
+| obj（均早于 exe） | `order_gui.cpp.obj` 20:49:49 / `order_cmd.cpp.obj` 20:49:49 / `r3r_schedule_gui.cpp.obj` 21:02:25 / `strings.cpp.obj` 21:05:28 |
+| 源码（均早于对应 obj） | `src\order_gui.cpp` 20:19:04 / `src\r3r_schedule_gui.cpp` 21:00:34 / `src\order_func.h` 20:18:29 |
+| `read_lints` | 0 |
+
+**仅编内测树** `build\`（探针 ON）；发布树 `build-release\` 未动，早于本轮，不含 KI-600 编辑/删除侧与 KI-603 涉及的这批改动。
+
+---
+
+## 第 422 轮（2026-11-12）：无主排程编辑器崩溃 + 无主/有主编辑差异 + 等待调度池不分配
+
+**玩家输入（原话三条）**：
+1. 「编辑无主排程时，游戏出现了崩溃」
+2. 「请告诉我编辑无主排程和有主排程的区别在哪」
+3. 「我在一个存档里面尝试让列车等待分配调度。但是列车迟迟没有分配到（站场调度池确定有调度）」
+
+临时分析报告：`R3R_schedule_editor_round422_memo.md`。**本轮先落盘再取证**，本小节先在收到报告时建立，取证/改码后回填。
+
+**基线**：玩家所用 exe = **2026-11-11 21:15:24 / 52 807 680 B**（第 421 轮修复版）；
+日志 `build\R3R_debug.log` = **23 964 564 B / 161 355 行 / 2026-11-12 17:00:03**；工作区内 `crash-*.log` **零命中**。
+
+### KI-604 编辑无主排程时崩溃 —— **已修 + 已编译**（严重度 高：崩溃；第 422 轮根因做实）
+
+**期望**：`R3RScheduleEditorWindow`（第 421 轮新增，`src\order_gui.cpp:5478`）的全部按钮只碰 `OrderList` 本体，不解引用 `Vehicle`。
+**实测**：玩家在「编辑无主排程」时崩溃。第 421 轮**只做过编译验证、游戏内零复测**（该轮「待复测 9 条」全部未做）。
+
+**疑点登记（REG-422-A，按可疑度排序）**：
+
+| # | 可疑点 | 位置 | 风险 |
+|---|---|---|---|
+| A | `Delete` 分支的 `GetFirstSharedVehicle()` / `GetNumVehicles()`：排程池里的 `OrderList` 可能已 `FreeChain` 释放或从未 `Initialize`，`first_shared` 悬垂 | `src\r3r_schedule_gui.cpp:434-447` | 高（0 地址读） |
+| B | `DrawOrderString(nullptr, ...)`：第 421 轮只把首参放宽为可空，**未逐行核查函数体**是否仍有 `v->` 解引用 | `src\order_gui.cpp:1027-1028` + 函数体 | **高（渲染期崩溃，最可疑）** |
+| C | `CanEdit()` 的 `CompanyID` 来源在无车时可能取到 `Invalid` | `src\r3r_schedule_gui.cpp` | 中 |
+| D | 窗口 `schedule`(`OrderListID`) 在排程被删/合并后失效，窗口未随 `WindowClass::R3RScheduleEditor` 关闭 | `ShowR3RScheduleEditor` | 中 |
+| E | `InsertLooseOrderCmdData` 含 `Order`（内含 `std::string`/指针），`DoCommandP` 期间的生命周期 | `src\order_gui.cpp:5654` | 中 |
+
+**需要的证据**：①`crash-*.log`（含调用栈，**最关键**；默认应在 `%USERPROFILE%\Documents\OpenTTD\crash\`）②崩溃前最后点的按钮（打开即崩 / Add / Delete / Duplicate / MoveUp / MoveDown）③该排程是本次新建还是旧存档带入。
+
+#### 第 422 轮取证结果（根因做实）
+
+证据 = `C:\Users\冯洁敏\Documents\OpenTTD\crash\crash-20261111T135654Z.log`，栈：
+
+```
+[00] DrawOrderString(...)                src\order_gui.cpp:1624
+[01] R3RScheduleEditorWindow::DrawWidget src\order_gui.cpp:5588
+Exception C0000005 reading 0x3C
+```
+
+`0x3C` = `Vehicle::type` 的字节偏移 ⇒ **`v == nullptr` 时解引用 `v->type`**。`DrawOrderString` 在 switch 之后的公共尾段，任何订单类型都会走到；编辑器每帧以 `DrawOrderString(nullptr, ...)` 绘制无主排程 ⇒ 无主排程里只要有一条订单，打开编辑器必崩。
+
+⇒ **疑点 B 成立**（渲染期空指针，且第 421 轮"只把首参放宽为可空、未逐行核查函数体"的判断逐字命中）；A/C/D/E 本次无证据触发，未改。日志旁证：崩溃前最后三条命令 `CreateLooseSchedule` → `InsertLooseOrder` → `Pause`。
+
+**修法（仅 `src\order_gui.cpp`，未碰 `.h`，5 处加固）**：
+
+| 位置（改前行号） | 处置 |
+|---|---|
+| `OrderStringForVariable` 内两处 `v->type` | 加 `v != nullptr`，无车时不收窄车型（飞机/船专属文案回落） |
+| `:1358` 调度槽条件取槽名 | 加 `v != nullptr`，无车回落「schedule N」 |
+| `:1543` 槽组警告 | 无车时 `STR_NULL` |
+| `:1624` 航程越界警示（崩溃点） | 加 `v != nullptr` |
+| `:1643` 调度表后缀 | 加 `v != nullptr` |
+
+口径：无主（无车辆）时一切依赖车辆或属主的附加标注一律降级不显示，订单本职文案照常绘制；有主路径判据与改前逐字等价。
+
+**复测判据**：①新建无主排程、插入任意类型订单、打开编辑器不再崩 ②有主排程的飞机航程/调度表/槽组标注与改前一致 ③无主排程里 `GOTO_STATION`/`GOTO_WAYPOINT`/`DECOUPLE` 三类文案完整 ④编辑器「打开即有 3 条订单」的场景连续开关 10 次无崩 ⑤负判据：有主 + 无调度池的普通列车订单窗口逐字不变。
+
+**状态**：**已修 + 已编译**（第 422 轮）。构建自证：`build\R3R_incbuild.done` = `EXIT_CODE=0` @2026-11-12 17:41，`order_gui.cpp` 17:31 → obj 17:33。详见 `R3R_schedule_editor_round422_memo.md` §七、§9.1。
+
+### KI-605 列车等待分配调度，调度池有调度却迟迟不分配 —— **已修 + 已编译**（严重度 高：功能不生效；第 422 轮根因做实）
+
+**现场读数**（`build\R3R_debug.log` 末 120 行，两列车长期同格停滞）：
+
+```
+SKIP-STOPPED veh=24 order=0 real=1 spd=0 tile=452,76 parked=0 front=1 nord=3 idx=0 tt=0 blocked=753   wclr=0
+SKIP-STOPPED veh=27 order=0 real=1 spd=0 tile=452,76 parked=0 front=1 nord=3 idx=0 tt=0 blocked=753   wclr=0
+...
+SKIP-STOPPED veh=24 order=0 real=1 spd=0 tile=452,76 ... blocked=15121 wclr=0
+SKIP-STOPPED veh=27 order=0 real=1 spd=0 tile=452,76 ... blocked=15121 wclr=0
+```
+
+| 字段 | 值 | 解读 |
+|---|---|---|
+| `order=0` | `OT_NOTHING` | 当前订单类型为空，与「等待被派单」形态一致 |
+| `real=1` / `nord=3` | 索引 1 / 3 条 | 表存在且已推进到第 2 条，**之后不再推进** |
+| `spd=0` | 静止 | 从未起步 |
+| `blocked` | 753 → **15121 单调累加** | 阻塞计数持续增长，**从未清零** |
+| `parked=0` / `wclr=0` | 非停放、未清等待 | 排除 KI-169 停放态 |
+
+**疑点登记（REG-422-B）**：`blocked` 只增不减说明进到「阻塞/等待」分支后没有任何路径清它；`real=1` 说明索引不推进，可能停在一条 `OT_NOTHING`/`OT_WAIT_*` 上永远等不到事件。
+
+**猜测根因（待验证）**：
+
+| # | 猜测 | 支撑 | 待验证判据 |
+|---|---|---|---|
+| B-1 | 等待方 `order=0`（非 `OT_WAIT_COUPLE`），调度池派单的**候选筛选判据**永远选不中它 | `order=0` 硬读数 | 派单候选筛选要求的订单类型 |
+| B-2 | 两车**同格 452,76** ⇒ 派单目标冲突/互锁（KI-330 同格误判家族） | 24/27 tile 完全相同 | 派单日志是否出现 target 冲突 |
+| B-3 | `blocked` 只是「本 tick 未推进」的计数，**无超时兜底** ⇒ 永久停摆 | 15121 单调增长 | `blocked` 写入点与清零点 |
+| B-4 | 两侧取场号的方式不对称（一个按站场 ID、一个按车站 tile/场号） | 删场重编号经验（第 95 轮） | 核对两侧取场号 |
+
+**需要的证据**：`452,76` 属于哪个站场、该站场调度池几条调度、veh 24/27 的 3 条订单类型明细（玩家描述或存档）。
+
+#### 第 422 轮取证结果（两重死因，均已修）
+
+现场 `build\R3R_debug.log` 尾部只有一种形态，**全日志 `DISP-POOL-*` 零命中**（即领取钩子从未执行）：
+
+```
+SKIP-STOPPED veh=24 order=0 real=1 spd=0 tile=452,76 ... blocked=15121
+SKIP-STOPPED veh=27 order=0 real=1 spd=0 tile=452,76 ... blocked=15121
+```
+
+| 死因 | 内容 |
+|---|---|
+| **① 调用点位置错误** | `SKIP-STOPPED` 是 `TrainLocoHandler` 里「列车被停住就早退」的闸门（`blocked=15121` 就是被它挡回的 tick 数）。领取钩子 `TrainDispatchHandler` 原本的调用点在**这道门之后**，而等待分配的列车正是被 `VehState::Stopped` 停住的那一辆 ⇒ 结构上永远走不到 |
+| **② 判据对象错误** | 钩子原先只看 `v->current_order.IsType(OT_GOTO_STATION)`。列车完成装卸/被停住后 `current_order` 已是 `OT_NOTHING`（现场 `order=0`），真正带「等待分配」标记的那条订单还挂在 `cur_real_order_index`（现场 `real=1`）上 ⇒ 即使把调用点挪到门前也不成立 |
+
+**修法（仅 `src\train_cmd.cpp`）**：①判据改为「先看 `current_order`，不是到站命令就回退到 `GetEffectiveOrders()[cur_real_order_index]`」（并加索引越界防护）；②调用点**上移到「列车被停住」早退门之前**，原停驶分支里的调用点留注释不再重复调用；③绑定成功后补 `vehstatus.Reset(VehState::Stopped)`——否则分配对一辆停着的车毫无效果；`DISP-POOL-BIND` 探针新增 `unstop=%d` 记录是否真的解除停住。
+
+**复测判据**：①`DISP-POOL-BIND` 出现在等待车（`unstop=1` 表示原先是停住的）②绑定后列车自己起步执行池里的日程，不再原地不动 ③`SKIP-STOPPED` 的 `blocked` 计数不再单调累加到万级 ④负判据：没有「等待分配」标记的普通停住列车不出现 `DISP-POOL-*`（钩子不得改动其它停驶车）⑤负判据：池里无空坑位时仍然原地等待、不崩溃不刷屏。
+
+**未确认**：U-1 两车同格 `452,76` 是否会造成派单目标冲突（KI-330 同格误判家族）；U-2 `blocked` 计数无超时兜底的旁支影响；U-3 派单两侧取场号方式是否对称（原疑点 B-4 未取数）。
+
+**状态**：**已修 + 已编译**（第 422 轮）。构建自证：`build\R3R_incbuild.done` = `EXIT_CODE=0` @2026-11-12 17:48:34，日志 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking`，`train_cmd.cpp` 17:35 → obj 17:47:14 → `build\openttd.exe` 17:48:21，`findstr /M /C:"unstop=%d" build\openttd.exe` 命中。详见 `R3R_schedule_editor_round422_memo.md` §八、§9.2。
+
+### Q2 口径答复：编辑无主排程 vs 编辑有主排程（非缺陷，记录为口径）
+
+| 维度 | 有主（原生 `OrdersWindow`） | 无主（`R3RScheduleEditorWindow`，第 421 轮新增） |
+|---|---|---|
+| 打开 | 排程池「编辑」→ `ShowOrdersWindow(first_vehicle)` | 排程池「编辑」→ `ShowR3RScheduleEditor(ol)`（`src\r3r_schedule_gui.cpp:402-414` 分流） |
+| 身份锚点 | **`VehicleID`**（窗口号=车辆号） | **`OrderListID`**（窗口号=排程号） |
+| 命令族 | 车辆命令 `CmdModifyOrder`/`CmdInsertOrder`/`CmdDeleteOrder`/`CmdMoveOrder` | 第 421 轮四个**列表命令** `InsertR3RLooseOrder`/`DeleteR3RLooseOrder`/`MoveR3RLooseOrder`/`DuplicateR3RLooseOrder`（`src\command_type.h:802-805`，全 `OtherManagement` + `_NT`） |
+| 操作对象 | 该车**当前借用**的那张 `OrderList` | `OrderList` **本体**，不依赖任何车辆 |
+| 可做 | 全部订单编辑 + 改装(refit) + 跳转订单 + 当前订单高亮/箭头 + 时刻表 + 共享排程 | **仅 增 / 删 / 复制 / 上移 / 下移** |
+| 不可做 | — | refit、跳转订单、当前订单标记、时刻表编辑（都要真实车辆语义） |
+| 渲染 | `DrawOrderString(v, ...)`，`v` 非空 ⇒ 可画当前订单箭头 | `DrawOrderString(nullptr, ...)`，`vtype` 固定 `VehicleType::Train`，**永不画箭头** |
+| 空表 | 空白 | 居中 `STR_R3R_SCHEDULE_EDITOR_EMPTY` |
+| `Add` 下拉 | 原生全类型 | 只列本公司**有设施**的车站/路点（`StationID` 当 `index` 回传） |
+| 插入位置 | 由点击行决定 | 「当前选中项的下一行」，未选中追加末尾 |
+| 多开 | 一车一窗口 | `BringWindowToFrontById` ⇒ 一 `OrderListID` 一窗口 |
+| 权限 | 车辆所属公司 | `OrderList` 所属公司（`CanEdit()`） |
+
+一句话：**有主 = 借车辆的手改表；无主 = 直接改表，所以只能做不依赖车辆的动作。**
+
+### 本轮构建自证
+
+**本轮尚未改码、尚未构建**（先落盘再取证）。后续改码后按三件套补：`build\R3R_incbuild.done` 的 `EXIT_CODE=0`、日志末行 `[n/n] Linking CXX executable openttd.exe`、`openttd.exe` 与 obj 的 mtime 晚于所改源码。发布树 `build-release\` 仍早于本轮。
+
+
+
+---
+
+## 第 423 轮（KI-606 / KI-607：`economy.cpp` 断言崩溃 + 无主编辑器对齐口径）
+
+### KI-606 `economy.cpp:1650` 断言崩溃（`PrepareUnload` 的 `cargo_payment` 不变量被破坏）
+
+**来源**：玩家 2026-11-12 报告；分析见 `R3R_round423_economy_assert_and_ownerless_editor_memo.md` §一、§四、§五。
+**状态**：**已修 + 已编译**（第 423 轮）——根因见下方「崩溃日志取证」与 KI-608。
+**严重度**：高（崩溃）。
+
+断言原文（`src\economy.cpp:1650`，所在函数 `PrepareUnload` 起于 `:1639`）：
+
+```
+	assert(front_v->cargo_payment == nullptr);
+```
+
+语义：`cargo_payment` 严格成对 —— 进站 `PrepareUnload()` 断言为空并 `CargoPayment::Create(front_v)`，离站 `Vehicle::LeaveStation()` 里 `Finalize()` 并置空。⇒ 命中即「同一辆当前被当作 front 的车，在没有任何一次 `LeaveStation` 收尾的情况下第二次进站」。
+
+**已排除的猜测**：与调度池派单（`TrainDispatchHandler`）无直接关系，派单不写 `cargo_payment`；玩家看到的「客货流算不出来」应是 payment 泄漏/错挂的后果而非原因。
+
+**已有防护**：`R3RSettleLoadingBeforeChainEdit(Train *chain, const char *site)`（定义在 `src\train_cmd.cpp:9194` 附近的 `R3RTrainHasLoanPart` 之前，注释自陈 `KIs 69`）——链编辑前若结算窗口已开（`load_unload_ticks != 0`），先补一次 `LeaveStation()` 让 `payment->Finalize()` 把账结掉，否则车辆过一会儿会进 `PrepareUnload()` 再 Create 一次（即本断言）。**现有调用点只有 4 处**：`:9882` / `:9883`（`decouple-front` / `decouple-rear`）、`:11601`（`relocate-front`）、`:13066`（`couple`）。
+
+**猜测根因（待验证）**：存在**其它链编辑路径没有调用这个结清助手**，而它们同样会改写「谁是链头 / 谁是 front」。可疑路径（按可疑度）：①车库拖动与买卖（`R3RSyncChainAfterDepotEdit`、`CmdMoveRailVehicle`、`CmdSellRailWagon`）；②段升级/降级（`CmdMakeSegment` / `CmdDemoteSegment`，`R3RDestroyCarOnlyFormation` 会撤掉假引擎身份与 `FrontEngine` 位）；③克隆（`CloneVehicle`）；④`R3RRespaceChainAfterEdit` 之后紧跟的 settle。判据：崩溃前日志里是否出现上述动作，且紧随其后第一次进站即崩。
+
+**需要的证据**：`crash-*.log` 的调用栈（确认 `PrepareUnload` 的调用者与 vehicle id）+ 崩溃前 200 行 `build\R3R_debug.log`。
+
+**复测判据**：①同场景不再命中 `:1650`；②挂/解/车库编辑后第一次进站 `Create`/`Finalize` 次数配对；③负判据：普通进出站 payment 行为与改前逐字一致；④收入不重复不遗漏。
+
+### KI-607 无主排程编辑器能力远少于有主订单窗口（玩家要求对齐）
+
+**来源**：玩家 2026-11-12 原话「为什么无主排程的编辑不能向有主的编辑对齐（除了依附者这一属性之外，其它的最好照抄）」。
+**状态**：**已拍板，落地中（第 424 轮）**。玩家 2026-11-12 拍板：C-1=R2、C-2=(c 暂只服务列车)、C-3=「先下拉选订单类型 → 需要目标的再到地图点选」（混合方案，非原 N1/N2）、C-4=灰掉、C-5=逐个复核、C-6=A 先且**全部做完再验收**；附加硬要求「无主排程的编辑窗口一定要最大限度向现有窗口靠拢」「全部源码改完再全量」。落地计划见 `R3R_round424_ownerless_editor_alignment_memo.md` §12。
+**严重度**：中（功能缺失）。
+
+**现状事实**（`src\order_gui.cpp:5445-5485`）：`R3RScheduleEditorWindow` 只有 5 个按钮 `WID_R3RSE_ADD / DELETE / DUPLICATE / MOVE_UP / MOVE_DOWN`；`ShowAddOrderDropDown()`（`:5527-5538`）只遍历**本公司有设施的车站** ⇒ 连路点、车库、挂接/等待挂接/解挂命令都加不进去。类注释自陈裁剪标准是「按钮是否发车辆命令」：*"every one of its buttons posts a vehicle command ... anything which needs a real vehicle (refitting, skip to order, occupancy of the current order) is simply not offered."*
+
+**判定：该裁剪过宽**。凡是只读写 `Order` 本体字段的操作与「有没有车」无关，可以照抄；真正必须依赖车辆的三类才允许降级（Skip to order / Refit / 当前订单占用显示）。**可照抄清单（待落地）**：目的地类型全集（车站/路点/车库/挂接/等待挂接/解挂）、装载方式、解挂边界与模式、挂接侧、逆向、全载/不载、以及各订单参数下拉；**锚点类需改造**：有主窗口的插入位置与「从车当前位置推断」相关选项在无主侧改为「选中项之后 / 末尾」的等价语义。
+
+**未确认**：`vtype` 在无主编辑器里恒为 `Train`（`:5544` 注释）——将来若支持公路/船/飞机排程，需要把 vtype 存进 `OrderList` 或窗口 data，属前置改造。
+
+**复测判据**：①无主排程可加入路点/车库/挂接/等待挂接/解挂各类型订单；②每种订单的参数（装载方式、边界、模式、挂接侧）可编辑并回显；③有主窗口行为逐字不变；④负判据：Skip to order / Refit 在无主编辑器中应灰掉并给 tooltip，而不是静默失败。
+
+#### 第 424 轮：不上手论证结论（详见 `R3R_round424_ownerless_editor_alignment_memo.md`）
+
+**可对齐度远高于预期**：有主窗口真正必须依赖车辆实时状态的控件只有 4 个（Skip to order / Refit / Stop sharing + 共享链 / Occupancy 与当前订单），其余 20 余个控件的参数编辑**全部汇聚到唯一命令** `Commands::ModifyOrder`（入口助手 `order_gui.cpp:88`）。⇒ 对齐的关键不在「补按钮」，而在「给 `modify` 找一个不依附车辆的载体」。
+
+**差距的本质是缺三个状态源，不是缺功能**：①订单表本体——已有（`OrderList::GetIfValid`）；②公司——**已有**（`OrderList::GetR3RScheduleOwner()`，`order_cmd.cpp:4172` + `R3RScheduleEditableBy` `:4182`）；③车型——**缺**，`OrderList` 无 `VehicleType`，窗口硬编码 `Train`（`order_gui.cpp:5544`）。另有 `vehicle_flags`（`ScheduledDispatch`/`TimetableSeparation`）在无主侧无对应物，属可接受降级。
+
+**`CmdModifyOrder` 对 `v` 的依赖已逐点核清**（`order_cmd.cpp:2584-3030+`）：`owner`（8 处）、`type`（9 处）、`HasUnbunchingOrder/HasConditionalOrder/HasFullLoadOrder`（4 处，**实现只遍历订单表**，`vehicle.cpp:4201-4236`，可无损下沉）、`vehicle_flags`（2 处，无对应物）、列表本体（可替换）。⇒ 除 `vehicle_flags` 两项之外全部可替换。
+
+**命令层三路线**：R1 复制 `CmdModifyOrder` 的 `switch(mof)` = **两份 MOF 白名单**，必然漂移，KI-124 就是这么炸的（`order_cmd.cpp:2650-2652` 注释即该事故遗产）⇒ 不推荐；R2 抽 `OrderHost`（`list/vtype/owner/veh` 四元组）让有主/无主走进**同一张 switch** ⇒ **推荐**；R3 UI 侧挂临时车 ⇒ 否决（污染存档与 `Vehicle::Iterate()` 全量统计）。
+
+**能力三档**：A 档可直接照抄约 85% 控件；B 档需前置改造（目的地枚举放开到路点/车库/挂接/解挂/条件——建议走「类型菜单 → 二级下拉」N1，绕开 `GetOrderCmdFromTile` 的车辆依赖；车型载体）；C 档必须降级（上述 4 个，灰态 + tooltip）。
+
+**风险**：R-1 必须保住 `R3RGetEditableLooseSchedule` 的「无车引用」硬闸门（`order_cmd.cpp:4279`），否则改完不重算索引 ⇒ 跳单/越界；R-2 插入只带 `GetCmdRefFields()` 四字段**不是差距**——有主侧同样如此，其余字段靠后续 `ModifyOrder` 补；R-3 `vehicle_flags` 按「未启用」处理属宽松而非更严；R-4 **未确认 U-1**：绑定时（`CmdR3RAssignSchedule`）是否重跑 `PreInsertOrderCheck` 级校验，若不跑则无主编辑器可造出有主侧禁止的组合。
+
+**待拍板 C-1~C-6**：C-1 命令层 R1/R2（建议 R2）；C-2 车型载体现在就加还是「暂只支持列车」（建议后者）；C-3 目的地交互 N1/N2（建议 N1）；C-4 C 档控件灰掉/隐藏（建议灰掉）；C-5 `DrawOrderString` 10 处 `v==nullptr` 跳过项是否恢复（建议逐个复核，至少班次名 `:1363` 与发车尾注 `:1652` 恢复）；C-6 先做 A 档参数编辑还是先做 B 档目的地（建议先 A）。
+
+### KI-608 调度池绑定把「装卸中」的订单 `Free()` 掉，`CargoPayment` 悬挂（KI-606 的真根因）
+
+**来源**：第 423 轮取证，`R3R_round423_economy_assert_and_ownerless_editor_memo.md` §四、§五；崩溃日志 `crash-20261112T095420Z.log`（副本 `build\_r423_crash.log`）。
+**状态**：**已修 + 已编译**（第 423 轮）。
+**严重度**：高（崩溃）。
+
+**链条**：第 422 轮 KI-605 为修「停住的列车 `current_order` 已是 `OT_NOTHING`、钩子永远不成立」，把 `TrainDispatchHandler()` 的判据从 `v->current_order.IsType(OT_GOTO_STATION)` 放宽为「`current_order` 不是到站命令就回退到 `GetEffectiveOrders()[cur_real_order_index]`」。
+
+副作用：**装卸中**的列车 `current_order` 是 `OT_LOADING`，而订单表里 `cur_real_order_index` 那一位仍是打过「等待分配」标记的 `OT_GOTO_STATION` ⇒ 新判据成立，钩子继续往下走 `R3RBeginBorrow(...)` + `v->current_order.Free()`。`current_order.Free()` **不调 `Vehicle::LeaveStation()`**，而 `LeaveStation()` 才是 `delete cargo_payment` / 从 `station->loading_vehicles` 摘除 / `HideFillingPercent()` 的唯一出口 ⇒ payment 与站台登记双双悬挂、进度条残留；列车随后进任何车站，`BeginLoading() → PrepareUnload()` 撞 `economy.cpp:1650` 的 `assert(cargo_payment == nullptr)`。
+
+**现场吻合**：崩溃日志命令表 `1920-01-29, 33 | 452 x 76 | CmdStartStopVehicle | 12 / 0` 后接 `CmdPause`；788 tick 后同一站在 `TrainEnterStation` 崩。停住 → 调度钩子接管 → 换表 → 泄漏。
+
+**修法**（仅 `src\train_cmd.cpp`）：`TrainDispatchHandler()` 内 `R3RBeginBorrow(...)` 之前插入 `R3RSettleLoadingBeforeChainEdit(v, "dispatch-bind");`（既有链编辑结算助手，`:9213`，正常路径零动作）；因助手定义在 `:9213`、钩子在 `:7726`，另在文件前向声明区 `:140` 补 `static` 前向声明。结算放在索引归零之前，避免 `LeaveStation()→UpdateVehicleTimetable()` 干扰池日程的 timetable 索引。
+
+**KI-606 兜底（同轮）**：`TrainEnterStation()` 在 `consist->BeginLoading();` 之前调新增的 `static void R3RSettleStaleCargoPayment(Train*, const char*)`（`:19829`）——只 `delete cargo_payment` + 摘 `loading_vehicles` + `HideFillingPercent` + 复位 `LoadingFinished`/`CargoUnloading`/`load_unload_ticks`，**不改订单**（改走 `LeaveStation()` 会把订单写成 `OT_LEAVESTATION`，本次到站退化为「意外停靠」）。健康到站时恒为空 ⇒ 零动作、不影响收入。
+
+**排除项**：①`CmdStartStopVehicle` 只翻 `VehState::Stopped`，不碰 payment/loading_vehicles，不是直接原因；②`TrainEnterStation` 的「已在该站」判重不是漏洞——本次是新到站，问题是上一次离站从未发生。
+
+**复测判据**：①同场景（站内列车启停 + 调度池分配）不再崩 `economy.cpp:1650`；②绑定那一刻若列车在装卸，日志出现 `settle` 探针且 `station->loading_vehicles` 里该车被摘除、进度条消失；③正常到站/离站 `Create`/`Finalize` 次数仍配对、收入逐字不变；④负判据：健康到站不得出现任何结算探针（说明兜底是零动作）；⑤调度池分配后列车能自己起步执行池日程（KI-605 判据 ①② 不得回退）。
+
+### 构建自证（第 423 轮，KI-606 + KI-608）
+
+复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建任何 `.cmd`），只改 `src\train_cmd.cpp`（未碰 `src\*.h`）⇒ 增量合法。
+
+- `build\R3R_incbuild.done` = `EXIT_CODE=0`
+- 日志末行 `[3/3] Linking CXX executable openttd.exe`；`error C` / `FAILED:` / `ninja: build stopped` 计数 0
+- `src\train_cmd.cpp` 18:10:26 → obj 18:11:58 → `build\openttd.exe` 2026-11-12 18:13:38（52 807 680 B）
+- `read_lints` 0 条
+- 发布树 `build-release\` 未编译（按口径只在玩家明确要求时编）
+
+**复测必须用 18:13 的 `build\openttd.exe`**；崩溃日志中的 `r3r-stable-2026-11-08-m (2)` / Build 11-11 20:21 为旧二进制。
+
+---
+
+## 第 424 轮（2026-11-12）：无主排程编辑器参数行落地（KI-607 续）
+
+### KI-609 无主编辑器参数行与命令层语义不一致（同值报错 / no_stop 未置灰 / 互斥标记半态 / 查询标题串错）
+
+**来源**：第 424 轮落地，`R3R_round424_ownerless_editor_alignment_memo.md` §十三；代码 `src\order_gui.cpp` 的 `R3RScheduleEditorWindow::UpdateParameterWidgets()` / `OnClick()` / `OnDropdownSelect()` / `OnQueryTextFinished()`。
+**状态**：**已修 + 已编译**（第 424 轮；游戏内复测待做）。
+**严重度**：中（行为不符：会弹错、状态显示不对、可能清错标记）。
+
+参数行按订单类型分 7 个平面（`WID_R3RSE_SEL_PARAMS`）：`0` 空 / `1` STATION / `2` DEPOT / `3` WAYPOINT / `4` GOTO_COUPLE / `5` WAIT_COUPLE / `6` DECOUPLE。本轮把四处"UI 与命令层语义不一致"逐个对齐：
+
+1. **`MOF_UNLOAD` 同值即 `CMD_ERROR`**（`order_cmd.cpp:2787`：`if (unload_type == order->GetUnloadType()) return CMD_ERROR;`）⇒ 旧实现点开下拉再选同一个条目会弹 `STR_ERROR_CAN_T_MODIFY_THIS_ORDER`。改为先比较 `order->GetUnloadType()`，只在真的变化时提交。`MOF_LOAD` 侧同值返回成功（`:2807` 一带），不需要守卫。
+2. **no_stop 组合被命令层一律拒绝**（`order_cmd.cpp:2783` / `:2807` 对 `ONSF_NO_STOP_AT_DESTINATION_STATION` 直接 `CMD_ERROR`）⇒ 站台平面改为按 `no_stop` 置灰 `WID_R3RSE_LOAD` / `WID_R3RSE_UNLOAD`，与有主订单窗口 `UpdateWidgetStates` 的站台分支同判据（灰态 + 不响应点击，而不是点了才报错）。
+3. **间隔 / 等待调度共用一个按钮**（两项互斥，共用 `WID_R3RSE_SEPARATION` 的下拉）⇒ 按下态由只看 `HasR3RStationSeparation()` 改为 `HasR3RStationSeparation() || HasR3RWaitDispatch()`，否则选"等待调度"时按钮不亮；同时提交改为「先设目标标记 → **回读 `GetSelectedOrder()` 确认落地** → 才清另一个标记」，避免第一条命令被拒时把另一个标记也清掉（半态）。
+4. **解挂边界查询标题串错**：`ShowQueryString` 的 caption 原用 `STR_ORDER_DECOUPLE_QUERY_HEAD/TAIL`（那是**下拉条目**文案），改为 `STR_ORDER_DECOUPLE_HEAD_VALUE_CAPTION` / `_TAIL_VALUE_CAPTION`（`order_gui.cpp:2330-2331` 有主窗口同款）。
+
+**附带核对（无改动）**：
+- 下拉隐藏掩码 `LOAD 0x62` / `UNLOAD 0x28` 与 `_order_full_load_dropdown` / `_order_unload_dropdown` 的实际条目位置一致（分隔线与"按货物类型"项均已隐藏，后者需要车辆的 cargo 选择器）。
+- `OrderLoadType` / `OrderUnloadType` 枚举值**恰好等于列表下标** ⇒ `OnDropdownSelect` 可直接 `static_cast`，`NoLoad` 用 `to_underlying(OrderLoadType::NoLoad)`。
+- 无主参数修改统一走 `ModifySelectedOrder()` → `Command<Commands::ModifyR3RLooseOrder>::Post(...)`，命令层与有主 `CmdModifyOrder` 共用同一张 `switch (mof)`（同一套白名单 + 同一段执行）。
+
+**刻意偏离（1 处）**：`FULL_LOAD` 按钮按下态用 `IsFullLoadOrderLoadType()`（`FullLoad` 与 `FullLoadAny` 都亮），有主窗口只在 `FullLoadAny` 时亮（≈`order_gui.cpp:2953`）——本窗口该按钮文案是静态串，无法靠文案区分两档。
+**硬约束（易崩，勿改）**：`SetWidgetLoweredState()` / `SetWidgetDisabledState()` 内部 `GetWidget<T>(w)` **不判空**，只允许写"当前显示平面"的控件。
+
+**复测判据**：①站台订单在"非停（本站）"时 LOAD/UNLOAD 灰掉且点击无反应；②解挂/装货下拉重复选同一条目不弹错；③选"等待调度"后 `SEPARATION` 按钮呈按下态，且日志/界面互斥正确（设间隔会清等待调度，反之亦然）；④解挂边界输入框标题为"数值"文案而非下拉文案；⑤负判据：其它平面（DEPOT/WAYPOINT/COUPLE）按钮状态与改动前逐字相同。
+
+**构建自证（2026-11-12，内测树）**：复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`），只改 `src\order_gui.cpp` + `src\order_cmd.cpp`（未碰 `src\*.h`、未改 lang）⇒ `build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`。首次构建 20:11:40 判 `EXIT_CODE=1`，暴露两处编译期/隐患错误，均已修：
+1. `src\order_cmd.cpp(2698): error C2039: "GetOrder": 不是 "OrderList" 的成员` —— `R3ROrderHost` 共用函数体里把 `Vehicle::GetOrder()` 机械改成 `host.list->GetOrder()`，而 `OrderList` 的访问器叫 **`GetOrderAt()`**（`order_base.h:1732`）。改为 `host.list->GetOrderAt(sel_ord)`。
+2. `src\order_gui.cpp(175): warning C4717: "CargoTypeOrdersWindow::GetOrder" 递归所有控件路径 ⇒ 运行时堆栈溢出` —— 该 helper 写成 `return this->GetOrder(index);` **自递归**（本轮 stage 1 引入，因此前构建一直中断故首次暴露）。改为 `return this->vehicle->GetOrder(index);`。
+重跑后：`[115/115] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`、日志 `error C` / `FAILED:` / `build stopped` 计数 **0**；`src\order_cmd.cpp` 20:14:14 → obj 20:16:01、`src\order_gui.cpp` 20:14:20 → obj 20:16:01、`build\openttd.exe` **2026-11-12 20:26:46（52 842 496 B）**；`read_lints` 两文件 0 条。发布树 `build-release` 未重编（按口径只在玩家明确要求时编）。**复测必须用 20:26:46 的 `build\openttd.exe`**；此前 18:13 的 exe **不含**本轮参数行改动（其构建被中断，从未成功链接到本轮代码）。
+
+
+### KI-610 无主编辑器尚未布置的参数（待实现）
+
+**来源**：第 424 轮对照 `OrdersWindow` 逐项清点。
+**状态**：**待实现**。
+**严重度**：低（能力缺口，非错误）。
+
+缺口清单：①停车位置 `MOF_STOP_LOCATION`；②路点逆向 `MOF_WAYPOINT_FLAGS`；③条件 / 槽 / 计数器 / 标签类参数；④必须依赖车辆的 4 个控件（Skip / Refit / Stop sharing / Occupancy —— 有主窗口口径是"灰掉 + tooltip"，本窗口目前**未布置**，属可见差异）。另：`MOF_R3R_STATION_SEPARATION` 与 unbunching 冲突时命令层会拒绝，UI 只弹命令错误、按钮保持不亮，无专门提示（疑点 D-1，未实机验证拒绝条件）。
+
+### KI-611 玩家报「无主排程编辑器 GUI 还是老样子」（待判别）
+
+**来源**：第 424 轮玩家原话「什么东西，为什么我看到的无主排程编辑的GUI还是老样子」（2026-11-12）。
+**状态**：**已按方案变更关闭**（第 425 轮 REG-424-B：放弃手写参数行，整个编辑器改为复用 `_nested_orders_train_widgets`，见 KI-612）。
+**严重度**：中（若确为"看不到改动"，等于本轮交付未生效）。
+
+**已核事实**：①参数行 `WID_R3RSE_SEL_PARAMS`（`order_gui.cpp:5499`，plane 0 空占位 `:5500`，plane 1–6 `:5502-5541`）确在树里；②`UpdateParameterWidgets()` 由 `OnPaint()` 每帧调用（`:5736`）；③编辑器唯一入口 `r3r_schedule_gui.cpp:411`（无主排程双击时打开，有主走 `ShowOrdersWindow`）；④`build\openttd.exe` = 2026-11-12 20:26:46（含改动），`build-release\openttd.exe` = 2026-11-09 01:09:10（**不含**）。
+
+**猜测根因（待验证）**：G-1 运行的不是 20:26:46 的内测 exe；G-2 打开的是排程列表窗口 `WindowClass::R3RSchedule`（本轮未改）；G-3 已进编辑器但未选中订单（plane 0 是与旧版逐像素相同的 12px 空 panel）；G-4 参数行正常但期望的是 KI-610 那批**未布置**控件。
+
+**判据**：用 20:26:46 的 `build\openttd.exe`，在带 5 个操作按钮的编辑器窗口选中一条「前往站台」命令 ⇒ 底部出现一行 5 个下拉框（装满/卸货/非停/站场/间隔）。
+
+## 第 425 轮（2026-11-12）：无主排程编辑器复用订单窗口控件树（REG-424-B）
+
+### KI-612 无主编辑器改为整树复用 `_nested_orders_train_widgets`（手写树废弃）
+
+**来源**：第 424 轮玩家原话「什么东西，为什么我看到的无主排程编辑的GUI还是老样子」⇒ 第 425 轮口径变更 REG-424-B；备忘 `R3R_schedule_editor_shared_tree_round425_memo.md`。
+**状态**：**已修 + 已编译**（第 425 轮 21:37:47 内测 exe；游戏内复测待做）。
+**严重度**：中（观感/一致性：此前无主编辑器与订单窗口布局不同源，玩家判定"还是老样子"）。
+
+**改动（仅 `src\order_gui.cpp`，未碰任何 `src\*.h`、未改 lang）**：
+1. 删除手写控件树 `_nested_r3r_schedule_editor_widgets`，`_r3r_schedule_editor_desc` 的 tree 直接指向 `_nested_orders_train_widgets`，初始宽度 396 → **384**、高度 160 不变 ⇒ 与订单窗口同源同尺寸。
+2. 全部 `WID_R3RSE_*` 字面量改名到订单窗口的 `WID_O_*`：`CAPTION→WID_O_CAPTION`、`ORDER_LIST→WID_O_ORDER_LIST`、`SCROLLBAR→WID_O_SCROLLBAR`、`LOAD→WID_O_FULL_LOAD`、`UNLOAD→WID_O_UNLOAD`、`NON_STOP→WID_O_NON_STOP`、`DEPOT_ACTION→WID_O_DEPOT_ACTION`、`YARD→WID_O_R3R_YARD`、`SEPARATION→WID_O_R3R_SEPARATION`、`COUPLE_SIDE→WID_O_COUPLE_SIDE`、`COUPLE_TEMP_GROUP→WID_O_COUPLE_TEMP_GROUP`、`DECOUPLE_BOUNDARY→WID_O_REFIT_DROPDOWN`（复用右上 refit 下拉当解挂边界选择器，与订单窗口 `OT_DECOUPLE` 同构）、`ADD→WID_O_GOTO`、`DELETE→WID_O_DELETE`、`DUPLICATE/MOVE_UP/MOVE_DOWN→WID_O_MGMT_BTN`（合并为管理下拉）。
+3. 重写 `UpdateParameterWidgets()`：`WID_O_SEL_TOP_ROW_GROUNDVEHICLE`=0（正常行）、`WID_O_SEL_OCCUPANCY`=`SZSP_NONE`、`WID_O_SEL_NON_STOP`/`WID_O_SEL_MGMT`/`WID_O_SEL_BOTTOM_MIDDLE`/`WID_O_SEL_SHARED`=0；`WID_O_TIMETABLE_VIEW`/`WID_O_OCCUPANCY_TOGGLE`/`WID_O_SKIP`/`WID_O_SHARED_ORDER_LIST` **永久置灰**；参数类按钮先全禁用再按订单类型放开；末尾统一设置四槽平面（左 0 装货/1 改装/2 路点逆向；中 0 卸货/1 服务；右 0 空/1 下拉；站场槽 0 空/1 站场/2 挂接分组/3 挂接分组+侧/4 等待挂接临时分组）。
+4. 重写 `UpdateButtonStates()`：`WID_O_DELETE` 依赖是否有选中项，`WID_O_MGMT_BTN` 依赖是否有任何订单。
+5. `OnClick()`：三个 `WID_R3RSE_DUPLICATE/MOVE_UP/MOVE_DOWN` case 合并为 `case WID_O_MGMT_BTN:`，弹 `ShowDropDownList()`（`DDSF_SHARED`），三项分别按「无选中 / 首条 / 末条」`masked`。
+6. `OnDropdownSelect()`：新增 `case WID_O_MGMT_BTN:`，index 0/1/2 发 `Commands::DuplicateR3RLooseOrder` / `MoveR3RLooseOrder(sel, sel-1, 1)` / `MoveR3RLooseOrder(sel, sel+1, 1)`（命令体逐行搬自原 OnClick，语义未改），成功移动后同步 `this->selected` + `SetDirty()`。
+7. 新增 `GetWidgetString()` 重写：`WID_O_CAPTION ⇒ STR_R3R_SCHEDULE_EDITOR_CAPTION`（复用树本身不带 caption 串，不重写标题会空白），其余回退 `Window::GetWidgetString`。
+
+**设计要点（REG-424-B 的"置灰不隐藏"）**：订单窗口对 waypoint / couple / decouple 的部分槽位用 `SZSP_NONE` 整块摘掉并靠 `ReInit()` 重排；无主编辑器一律保留槽位 + 置灰（所有候选平面同宽 60px），因此切换选中订单**不改变布局、不需要 `ReInit()`、不闪动**。
+
+**编译坑（已踩已修，勿重犯）**：`enum DisplayPane` 是 `struct OrdersWindow` 的**私有**枚举，`R3RScheduleEditorWindow` 只是复用其控件树、并非派生 ⇒ 窗口代码里**不能写 `DP_*` 名字**（首次构建 14 条 `error C2065: "DP_LEFT_LOAD": 未声明的标识符`，`EXIT_CODE=1`）。改法：写裸平面序号 0/1/2/3/4 + 语义注释。
+
+**构建自证（2026-11-12，内测树）**：复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`）；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `[3/3] Linking CXX executable openttd.exe`（全日志唯一次 Linking）；`error C` / `FAILED:` / `build stopped` 计数 0；`src\order_gui.cpp` 21:35:42 → `order_gui.cpp.obj` 21:36:42 → `build\openttd.exe` **2026-11-12 21:37:47（52 842 496 B）**；`read_lints` 0 条。发布树 `build-release` 未重编（按口径只在玩家明确要求时编）。
+
+**复测判据**：①标题显示 `STR_R3R_SCHEDULE_EDITOR_CAPTION`（非空白/缺参数），整体与列车订单窗口逐像素一致；②切换选中不同订单类型时参数行切换但窗口尺寸不变、无闪烁、无重排；③需要车辆的控件（装载/卸货/装满/车库动作/间隔/挂接分组/改装下拉）可见但灰、点击无反应；④管理下拉可用性：无选中全灰、首条上移灰、末条下移灰、中间全亮；⑤复制/上移/下移行为与第 424 轮一致；⑥列表滚动条、6 行最小高、"前往"新增订单流程正常；⑦**复测必须用 21:37:47 的 `build\openttd.exe`**（21:1x 之前的 exe 不含本轮改动）。
+
+**未做 / 遗留**：构造函数未补 `UpdateParameterWidgets()`（首帧由 `OnPaint()` 保证，暂不动以免构造期重入）；`UpdateWidgetSize` 仍只处理 `WID_O_ORDER_LIST`；`src\widgets\order_widget.h` 的 `enum R3RScheduleEditorWidgets` 已成死代码但**刻意不删**（改 `.h` 触发全量重编）；KI-610 那批"未布置的参数"（停车位置/路点逆向/条件/槽/计数器/标签）本轮仍未接入，只是控件位置随复用树出现了。
+
+## 第 426 轮（2026-11-12）：无主排程编辑器的「前往」双语义 + 列表选中修复（KI-613、KI-614）
+
+> 临时报告：`R3R_round426_ownerless_align_goto_select_memo.md`（§三 取证锚点、§五 改码清单、§六 构建与复测判据）。**仅改 `src\order_gui.cpp`，未碰任何 `src\*.h`、未改 lang。**
+
+### KI-613（中，已修 + 已编译）：「前往」按钮在无主编辑器里没有两种点击语义
+
+**来源**：第 426 轮玩家报告 + 备忘 `R3R_round426_ownerless_align_goto_select_memo.md` §三 R-1（第 425 轮复用订单窗口控件树时，`WID_O_GOTO` 的 `OnClick` 只搬了「弹车站列表下拉」，主体/箭头分流、选目标态、`OnPlaceObject` 回调三样全缺）。
+**状态**：**已修 + 已编译**（2026-11-12 22:09:41 内测 exe；游戏内复测待做）。
+**严重度**：中（功能缺失：无主排程无法用「点地图」方式新增前往命令）。
+
+**改动**：新增成员 `bool placing_goto` / `bool placing_goto_couple`；新增 `CancelPlacingGoto()` / `StartPlacingGoto(bool couple)` / `TogglePlacingGoto()` / `ShowGotoDropDown()` / `InsertFixedOrder(const Order&)`；`OnClick()` 的 `WID_O_GOTO` 改为 `GetWidget<NWidgetLeaf>(widget)->ButtonHit(pt)` 分流（主体=切换选目标态 `SetObjectToPlaceWnd(ANIMCURSOR_PICKSTATION, PAL_NONE, HT_RECT | HT_VEHICLE, this)`，箭头=`ShowGotoDropDown()`）；`OnDropdownSelect()` 的 `WID_O_GOTO` 分支按 `ODDI_*` 语义处理（`ODDI_GO_TO`→进入普通选区、`ODDI_GOTO_COUPLE`→进入挂接选区、`ODDI_WAIT_COUPLE`→`MakeWaitCouple()` 直接插入、`ODDI_DECOUPLE`→`MakeDecouple(ODF_DECOUPLE, 0)` 直接插入）；`UpdateButtonStates()` 末尾统一 `SetWidgetLoweredState(WID_O_GOTO, placing_goto || placing_goto_couple)`，覆盖选点成功 / ESC / `ResetObjectToPlace()` 全部退出路径。
+**偏差（如实登记）**：下拉**不含「前往最近的车库」** —— 该语义需要 `Vehicle` 当前所在格做最近车库搜索，无主排程没有车辆锚点；原 `ShowAddOrderDropDown()`（列出全部自有车站）已删除，全仓 0 引用，功能由「主体点地图选站」+「箭头下拉固定类型」取代。
+
+### KI-614（高，已修 + 已编译）：无主编辑器列表点击**选不中**任何既有命令
+
+**来源**：同上，备忘 §3.3 / R-2。
+**状态**：**已修 + 已编译**（同上一版 exe；游戏内复测待做）。
+**严重度**：高（列表点不中 ⇒ 无法选中订单、无法看到/修改底部参数行，等于编辑器只剩「新增」可用）。
+
+**根因**：`R3RScheduleEditorWindow::UpdateWidgetSize()` 的 `WID_O_ORDER_LIST` 分支把 `resize.height` 写成 **`1`**，而 `Window::GetRowFromWidget()` / `Scrollbar::GetScrolledRowFromWidget()`（`src\widget.cpp:2433`）/ `SetCapacityFromWidget()`（`:2507`）在 `line_height < 0` 时**一律取 `wid->resize_y` 作为行高** ⇒ 命中行高 = 1px，任何点击 Y 坐标被直接当成行号，行号恒大于 `GetNumOrders()` ⇒ `selected` 恒为 `-1`。
+**改动**：`resize.height = GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal;`，且顺序必须是「先算 `resize.height`，再 `size.height = max(size.height, resize.height * 6)`」（第一版写反，最小高仍按 6 个字高算）；`DrawWidget()` 的 `line_height` 改取同一 `this->GetWidget<NWidgetBase>(WID_O_ORDER_LIST)->resize_y`（下限 1），使绘制与命中彻底同源。
+
+**构建自证（内测树，2026-11-12）**：复用既有入口 `R3R_fullbuild.cmd inc detach`（**未新建 `.cmd`**）；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`；`build\R3R_incbuild.done` = **`EXIT_CODE=0`**；日志 `[2/3]` 重编 `order_gui.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；`src\order_gui.cpp` 22:06:51 → `order_gui.cpp.obj` 22:07:42 → `build\openttd.exe` **2026-11-12 22:09:41（52 845 568 B）**；`read_lints` 0 条。发布树 `build-release` 未重编（按口径只在玩家明确要求时编）。
+
+**复测判据**：①点「前往」主体 ⇒ 按钮按下、光标进入选目标态，点地图车站/路点/车库/工业 ⇒ 新增前往该处的命令（`quick_goto` 开启时自动退出选区，关闭时可连续添加）；②点右侧小箭头 ⇒ 弹出 4 项（前往 / 解挂 / 前往挂接 / 等待挂接），后两项立即插入、前往挂接进入挂接选区（车站/车库 `MakeGoToCouple`，车库型 `depot_target=true`）；③ESC / 右键 ⇒ 按钮抬起、选区退出、不插入；④点列表任意一行 ⇒ 该行高亮且底部参数行随之切换；⑤滚动后点击仍命中正确行，列表最小高仍 6 行；⑥**负判据**：有主订单窗口的「前往」语义、下拉项、行高逐字不变；⑦**复测必须用 22:09:41 的 `build\openttd.exe`**。
+
+**未做 / 遗留**：下拉缺「前往最近的车库」（见 KI-613 偏差说明，需先给无主编辑器定义"锚点车辆"或"锚点格"口径才可能补）；`GetLooseOrderCmdFromTile()` 刻意跳过道路车辆的道路类型兼容校验；本轮未做游戏内实机验证。
+
+## 第 427 轮（2026-11-12）：无主排程编辑器 GUI 与有主订单窗口的「控件/下拉项对齐」
+
+> 临时报告：`R3R_round427_ownerless_gui_parity_memo.md`。玩家五条报告，**本轮先落盘再取证**，条目状态初始为「待验证」。
+> **玩家口径（覆盖第 426 轮的取舍）**：有主订单窗口有的下拉项，无主编辑器**全部都要有**，不接受"无车辆锚点做不到"作为省略理由；管理命令下拉不得出现英文；负载率按钮删除；路径预览要有。
+
+### KI-615（中，待验证）：「前往」下拉缺 10 项，只有 4 项
+
+**来源**：第 427 轮玩家报告第 2 条（原话「有主排程的下拉框有的无主排程都要有啊，又什么"条件式跳过命令""出发看板经由""路签操作"你别省略啊」）。
+**状态**：待验证 → 待实现。
+**严重度**：中（功能缺失，玩家明确不接受的省略）。
+
+**已取证事实**：`src\order_gui.cpp:607-622` 的 `enum OrderDropDownID` 共 **14 项**：`ODDI_GO_TO` / `ODDI_GO_TO_NEAREST_DEPOT` / `ODDI_CONDITIONAL` / `ODDI_SHARE` / `ODDI_INSERT_FROM_VEHICLE` / `ODDI_TRY_ACQUIRE_SLOT` / `ODDI_RELEASE_SLOT` / `ODDI_RELEASE_SLOT_GROUP` / `ODDI_CHANGE_COUNTER` / `ODDI_LABEL_TEXT` / `ODDI_LABEL_DEPARTURES_VIA` / `ODDI_DECOUPLE` / `ODDI_GOTO_COUPLE` / `ODDI_WAIT_COUPLE`。第 426 轮 `ShowGotoDropDown()` 只实现了后 4 项中的 4 个（`ODDI_GO_TO`/`ODDI_DECOUPLE`/`ODDI_GOTO_COUPLE`/`ODDI_WAIT_COUPLE`）⇒ **缺 10 项**。
+**待取证**：有主窗口这 14 项各自的点击处理（哪些需要车辆/订单表上下文、哪些只是打开一个 dropdown 或弹出输入框）。
+**复测判据（占位）**：无主「前往」下拉的项数、顺序、文案与有主窗口逐字一致。
+
+### KI-616（中，待验证）：「管理命令」下拉缺项且出现英文
+
+**来源**：第 427 轮玩家报告第 3 条（原话「"前往"按钮的很左边那个"管理命令"按钮也是同理，你省略了很多项（既有的几项还是英文）」）。
+**状态**：待验证 → 待实现。
+**严重度**：中（功能缺失 + 违反"界面不允许英文"）。
+**已取证事实**：`src\order_gui.cpp:624` 存在 `_order_manage_list_dropdown[]`（有主窗口用的字符串表），无主编辑器未复用它。
+**待取证**：`_order_manage_list_dropdown[]` 的完整项数/枚举、有主 `OnDropdownSelect` 的分支、以及第 426 轮无主侧自写的那几项在哪个函数里。
+**复测判据（占位）**：项数/顺序一致；全部为中文（`simplified_chinese.lng` 有对应串），无硬编码英文。
+
+### KI-617（低，待验证）：无主编辑器右侧有一处"镂空"
+
+**来源**：第 427 轮玩家报告第 1 条（原话「无主排程的编辑窗口右侧有一处镂空」）。
+**状态**：待验证（**需要玩家提供截图或指明位置**；本条猜测根因为复用控件树中某控件在无主模式下被隐藏但空间仍被占）。
+**严重度**：低（观感）。
+**待取证**：无主编辑器构造时对 `_nested_orders_train_widgets` 的显示/隐藏/尺寸操作；右侧控件排布。
+
+### KI-618（低，待实现）：无主编辑器的「命令负载率」按钮应删除
+
+**来源**：第 427 轮玩家报告第 4 条（原话「无主排程编辑的那个显示命令负载率的按钮应该是可以不要的」）。
+**状态**：待验证 → 待实现。
+**严重度**：低（多余控件）。
+**待取证**：该按钮对应哪个 widget ID（疑为有主窗口的负载率/`WID_O_...`），在无主模式下如何隐藏且不留空白（与 KI-617 可能同源）。
+
+### KI-619（中，待实现）：无主编辑器没有 JGRPP 的路径预览（目的地连线）
+
+**来源**：第 427 轮玩家报告第 5 条（原话「JGRPP添加的路径预览（也就是在各个命令目的地头顶连线）我希望无主排程也有」）。
+**状态**：待验证 → 待实现。
+**严重度**：中（功能缺失）。
+**待取证**：JGRPP 该特性的实现位置与数据来源（疑与 `OrdersWindow` 的订单列表 + `Vehicle` 绑定强相关）；无主编辑器只有 `OrderList`，需要找到能按"订单表"而不是"车辆"绘制的入口。
+**复测判据（占位）**：无主编辑器打开并选中某条订单时，地图上出现与有主窗口同样的目的地连线；负判据=有主窗口逐字不变。
+
+## 第 428 轮（2026-11-12）：无主排程路径预览接线 / 车站调度池按排程去重 / 排程命名全存档唯一
+
+本轮输入：玩家三条新报告（原话见 `R3R_round428_ownerless_route_dispatch_naming_memo.md` §零）。
+
+### KI-619（中，已实现 + 已编译，游戏内复测待做）：无主编辑器没有 JGRPP 的路径预览（目的地连线）
+
+**状态更新（第 428 轮）**：第 427 轮只写了设计未落地，本轮按设计接线。
+**落地要点**：`ViewportRouteOverlay` 增 `route_orders` / `route_vtype` 成员，三个 `Prepare*` 入口在
+`veh == nullptr` 时改用它们；新增 `PrepareOrderListRouteAndMarkDirtyIfChanged(const OrderList *, VehicleType)`；
+`ViewportPrepareVehicleRoute()` 在焦点窗口是注册的无主编辑器时走新入口（焦点一变即自动消失，不需要 OnBlur）；
+`Order::GetLocation()` 两处判据改为 `v != nullptr &&` 以支持无主（松散排程恒为列车）。
+**复测判据**：①打开无主编辑器即出现目的地连线与头顶序号框 ②`show_vehicle_route_mode` / `show_vehicle_route` /
+`show_vehicle_route_steps` 照旧生效 ③焦点离开编辑器后连线消失 ④有主窗口与固定车队预览逐字不变。
+
+### KI-620（低，已记录，工具链）：`src\widgets\*.h` 的注释只能是 ASCII
+
+**来源**：第 427 轮构建实锤（`build\R3R_incbuild.log` / `build\generated\script\api\script_window.hpp:2375`）。
+**现象**：脚本 API 的 widget 枚举生成器把注释里的非 ASCII 字符**替换成换行**，写成
+`WID_X, ///< R3R (第 427 轮, ...)` 会被生成为 `WID_X ... ///< R3R (` + 换行 + ` 427 ` + 换行 +
+` = to_underlying(::OrderWidgets::),`，整段被挤成代码 ⇒ `error C2059: 语法错误:“常数”`，枚举全灭。
+**纪律**：`src\widgets\*.h` 里一律写英文注释；其它文件（`.cpp`、非 widgets 头）不受影响。
+
+### KI-621（高，已实现，游戏内复测待做）：车站调度池按「列车」而非「排程」列出，且漏掉无主排程
+
+**来源**：第 428 轮玩家报告第 2 条。
+**现象**：①两列车共享同一份排程时，「添加调度」下拉里出现两条完全相同的调度；
+②无主（松散）排程在调度池里根本不出现。
+**玩家口径**：调度池的候选单位是**排程**，不是列车；同一份排程只列一次。
+**根因**：池条目身份是 `VehicleID host`，候选枚举遍历 `Vehicle::Iterate()` 并按车去重
+⇒ 共享同表的两列车各出一条、无主表没有任何车可代表。
+**落地（第 428 轮）**：
+- `src\station_base.h`：`R3RDispatchPoolEntry` 增 `uint32_t schedule`（OrderList 池下标，
+  `R3R_DISPATCH_NO_SCHEDULE = 0xFFFFFFFF` 表示旧档未记录），`host` 降级为「模板车缓存」
+  （仅显示/旧档回退，无主排程为 Invalid）。四个 API 全部按排程：
+  `Add(yard, schedule, limit)` / `Pick(yard, except_schedule, uint32_t &out_schedule)` /
+  `Acquire(schedule)` / `Release(schedule)`。
+- `src\station_cmd.cpp:2281` `R3RDispatchEntryScheduleIndex()`（旧档回退 `host->orders`）、
+  `:2298` `R3RDispatchScheduleUsable()`、`:2366` `Add`（按表去重、`host` 由
+  `GetFirstSharedVehicle()` 推导）、`:2410` `Pick`、`:2428` `Acquire`（改成"第一个还有坑位的场"）、
+  `:2757` `CmdR3RAddDispatchPoolEntry`（`orders->GetR3RScheduleOwner()` + `R3RScheduleAccessibleBy`）。
+- `src\train_cmd.cpp`：借用端按 `schedule` 取表/领坑；归还端改用
+  `borrowed->index.base()` 作 `pool_schedule` 逐站 `Release()`（旧代码只在 `host` 有效时归还，
+  无主排程会漏还 issued）。
+- `src\station_gui.cpp`：新增 `R3RDispatchEntryScheduleGui()`；`R3RDispatchScheduleLabel(const OrderList*)`
+  对已消失的排程显示 `STR_R3R_DISPATCH_POOL_ENTRY_GONE`（新语言串）；`WID_SD_ADD` 改为遍历
+  `OrderList::Iterate()`、下拉值 = 池下标、按 `e.schedule` 去重；列表**不再**过滤失效条目
+  （否则排程被释放后条目永久删不掉，limit/issued 静默占位）。
+- `src\sl\station_yard_sl.cpp`：SYRD **v8**（`0xFFFFFF07`），池条目 3 字 → 4 字（末字 = 池下标 + 1）；
+  `R3RUnpackPool(in, p, has_schedule)` 兼容 v2~v7，解码只做数值钳制（不查车辆/排程池，加载顺序不保证）。
+**已知限制**：OrderList 池下标在运行期会复用 ⇒ 排程被释放后条目可能静默指向新表
+（与旧的 VehicleID 复用同类）；旧档条目靠 `host` 回退，模板车卖掉后条目才失效。
+**复测判据**：①共享排程的两列车只出现一条候选 ②无主排程出现在候选里且可被选中添加到调度池
+③已添加过的排程不重复出现 ④正常单车排程行为不变 ⑤存档往返后条目仍指向同一张表（含无主表）
+⑥领用/归还 issued 计数与无主排程一致（不再漏还）。
+
+### KI-622（中，已实现，游戏内复测待做）：排程命名未做全存档唯一
+
+**来源**：第 428 轮玩家报告第 3 条。
+**玩家口径**：命名**全存档唯一**；存量重复「只要不崩就行」⇒ 不做读档强制改名/不阻断读档。
+**落地（第 428 轮）**：`src\order_cmd.cpp:4701-4706` 的 `CmdR3RRenameSchedule` 在权限校验之后、
+名称非空时遍历 `OrderList::Iterate()` 比对 `GetR3RScheduleName()`，命中同名即
+`CommandCost(STR_ERROR_R3R_SCHEDULE_NAME_TAKEN)`（新语言串，中英双份）。空名例外（= 自动标签）。
+校验在 check 阶段早返回、无副作用；GUI 走 `Post(STR_ERROR_CAN_T_DO_THIS, ...)` 会自动弹出该错误。
+读档不校验唯一性（旧档重名照常读入）。
+**复测判据**：①给已有名字的排程设置同名 ⇒ 命令被拒绝且有提示 ②改名到自己原名 ⇒ 放行（幂等）
+③旧档含重复名字能正常读入、不崩 ④引用/查找按 ID 而非名字（重复名字不影响功能）。
+
+## 第 429 轮（2026-11-13）
+
+本轮输入：玩家两条需求（原话见 `R3R_round429_borrow_stack_nonsegment_skip_memo.md` §零）——
+①核对自有表 / 调度池表 / 耦合借用表的边界，怀疑「a→b→c 三层借用后返还顺序紊乱」；
+②列车执行 R3R 命令时若链中含非段部分，应**直接跳过该命令**，而不是执行失败后回滚。
+
+### KI-623（中，已实现 + 已编译，游戏内复测待做）：排程借用只有一层 ⇒ 池表被耦合借用覆盖，解挂后整层跳过
+
+**来源**：第 429 轮玩家需求壹（`R3R_round429_borrow_stack_nonsegment_skip_memo.md` §一.3 / §四）。
+**玩家口径**：「A 车自有 a，分配到池表 b，随后挂接借了 c，解挂重新成为控制段后应当先还 b，
+跑完 b 后再回 a」。**玩家判断成立**，且比描述更严重——原代码是**结构性**跳层，不是偶发。
+**根因（两条，均实锤）**：
+- P-1 `R3RBeginBorrow()`（`train_cmd.cpp:6913-6942`）末尾是纯赋值 `chain->r3r_follow_orders = other;`
+  ⇒ `Couple()` 的借用入口（`:13255`）把正在跑的池表 b 的指针覆盖成 c，而 `r3r_follow_pool`
+  仍为 true。归还端 `R3RReturnDispatchPool()`（`:7843` 一带）用 `r3r_follow_orders` 取
+  `pool_schedule` ⇒ 拿 **c** 的索引去 `R3RDispatchPoolRelease()` ⇒ b 的 issued 永久泄漏，
+  且可能误放别人的坑位。
+- P-2 `R3RReturnBorrowedOrders()`（`:7620`）跟随分支只把 `r3r_follow_orders` 清空、索引写回
+  `orders_backup_*`（= a 的书签）⇒ 一次退回 a，中间的池层 b 被跳过。
+**书签本身无损**：`R3RRefreshOrderBookmark()`（`:6852`）守卫 `GetEffectiveOrders() != own`，
+A 跑 b/c 期间不会把它们的坐标写进 a 的书签。坏的只是「层」。
+**落地（第 429 轮）**：新增「池层挂起」槽，只存指针（池表坐标 = 自有表书签，已被守卫保护）：
+- `src\vehicle_base.h`：`OrderList *r3r_pool_orders = nullptr;`
+- `src\sl\couple_group_sl.cpp`：R3VP 表增 `NSL("pool_orders", SLE_REF(Vehicle, r3r_pool_orders, REF_ORDERLIST))`；
+  `R3RHasParkState()` 追加 `v->r3r_pool_orders != nullptr`。
+- `Couple()` `:13245-13253`：借用前 `if (v->r3r_follow_pool && v->r3r_follow_orders != nullptr && v->r3r_pool_orders == nullptr)`
+  ⇒ 挂起，日志 `ORD-BORROW-STACK veh= pool= tag=couple`。
+- `R3RReturnBorrowedOrders()` `:7595-7619`：`was_follower && r3r_pool_orders != nullptr` ⇒
+  `r3r_follow_orders = pool` / `r3r_pool_orders = nullptr` / `r3r_follow_pool = true` /
+  `r3r_follow_owner` 由 `pool->GetFirstSharedVehicle()` 重算 / **活索引不动** / `return true`
+  （不写自有表书签、不清 borrowed），日志 `ORD-RETURN-TO-POOL veh= pool= real= impl=`。
+  池表跑完后由 `R3RReturnDispatchPool()` 再调本函数回自有表 a。
+- `TrainDispatchHandler()` `:7788-7793`：已有挂起层 ⇒ 拒绝二次接管（防 follow_orders 被二次覆盖），
+  日志 `DISP-POOL-BUSY veh= st=`。
+**复测判据**：①跑池表 b 时被挂接出现 `ORD-BORROW-STACK ... pool=b` ②解挂后先出现
+`ORD-RETURN-TO-POOL ... pool=b`，不得直接跳回 a ③池表跑完才回自有表 a ④回到 a 后索引与 a 的长度吻合
+⑤全程不再出现"释放了错误池坑位"（池 issued 计数守恒）⑥未涉及池表的普通挂/解挂行为逐字不变。
+
+### KI-624（中，已实现 + 已编译，游戏内复测待做）：非段链仍会执行 R3R 命令（玩家要求直接跳过该命令）
+
+**来源**：第 429 轮玩家需求贰（备忘 §三 / §六）。玩家原话：「很多新手玩家不会设置段，
+结果用非段列车解挂出头车的错误示范，我需要把这条路堵死」。
+**现象（修前）**：`R3RSkipCoupleOrdersForRealArtic()`（`:22518`）只对**含真铰接**的链生效；
+含未成段散车厢的链照旧执行 GOTO_COUPLE / WAIT_COUPLE / DECOUPLE，失败后靠 `CPL-*` /
+`DECOUPLE-*` 回滚，最坏结果是"车头被解出"。
+**落地（第 429 轮）**：
+- 新增 `R3RChainAllWagonsSegmented(const Train*)`：**段外只允许** `IsEngine()` 或
+  `IsDualHeadRear()`；段外任何非引擎车厢 ⇒ 含非段部分；逐节 `IsArticulatedPart()` 跳过。
+  （刻意不要求"链头必须是 ★"——牵引机车本来就不属于任何段，那样会把「机车 + 段车底」误拦。）
+- `:22600-22603` 闸门扩为 `!gate_real_artic && !gate_non_segment` 才放行；
+  `gate_reason = gate_non_segment ? "non-segment" : "real-artic"`，两处 `ARTIC-SKIP-R3R` 日志补 `reason=%s`。
+- DECOUPLE 求值块（`:23394` 一带）：`nothing_to_release || non_segment_chain` 一并走
+  `R3RSkipUnfireableDecoupleOrder()` 收场（否则每 tick 重触发），
+  日志 `DECOUPLE-SKIP ... reason=non-segment|nothing-to-release`。
+**边界**：闸门沿用既有原语——沿 R3R 命令连续段前跳到第一条普通命令；全是 R3R 命令时只丢当前命令。
+**复测判据**：①含散车厢的列车排 GOTO_COUPLE/WAIT_COUPLE ⇒ `ARTIC-SKIP-R3R ... reason=non-segment`
+且不再 `COUPLE-FAIL` 刷屏 ②排 DECOUPLE ⇒ `DECOUPLE-SKIP ... reason=non-segment` 且**不会**解出车头
+③负判据：「机车 + 全是段的半挂车底」照旧可挂可解，不出现 `reason=non-segment`
+④负判据：真铰接链仍是 `reason=real-artic`，与第 180 轮读档打散口径一致。
+
+### 构建自证（第 429 轮）
+
+- 复用既有入口 `R3R_fullbuild.cmd inc detach`（未新建任何 `.cmd`）。
+- 第一次：护栏 `build\R3R_incbuild.guard.log` 判 `1 header/lang file(s) are newer` /
+  `newer: src\vehicle_base.h` / `REMOVED 621 object file(s) - upgrading this build to a FULL rebuild`（改头文件，预期）。
+  结果**失败**：`src\train_cmd.cpp(22604)` / `(23402)` `error C3861: "R3RChainAllWagonsSegmented"：找不到标识符`
+  —— 上一轮只改了**调用点**，函数定义仍是旧名 `R3RChainAllSegments`（且旧判据「链头必须 ★」语义错误）。
+  本轮已把定义改名并改判据（段外只允许原型非 Wagon 的真引擎 / 双头后半）。
+- 第二次增量：[26/26] Linking CXX executable openttd.exe、`build\R3R_incbuild.done` = `EXIT_CODE=0`、
+  `error C` / `fatal error` / `FAILED:` / `build stopped` 计数 **0**；
+  `src\train_cmd.cpp` 02:17:18 → obj 02:17:52 → `build\openttd.exe` **2026-11-13 02:21:02（52 867 072 B）**；
+  `read_lints`（train_cmd.cpp / vehicle_base.h / couple_group_sl.cpp）0 条。
+- exe 字面量自证：`ORD-RETURN-TO-POOL veh=%d pool=%u real=%d impl=%d`、`ORD-BORROW-STACK veh=%d pool=%u tag=couple`、
+  `DISP-POOL-BUSY veh=%d st=%d`、`non-segment`、`DECOUPLE-SKIP consist=%d tx=%d ty=%d real=%d segs=%u reason=%s` 全部命中
+  （`reason=non-segment` 整串不存在属正常：`reason=%s` 与 `"non-segment"` 是两个独立字面量）。
+- 状态：**已实现 + 已编译，游戏内复测待做**（判据见 KI-623 / KI-624 各条）。

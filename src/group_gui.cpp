@@ -31,6 +31,7 @@
 #include "group_cmd.h"
 #include "group_gui.h"
 #include "couple_group_gui.h"
+#include "r3r_schedule_gui.h"
 #include "couple_group.h"
 #include "zoom_func.h"
 #include "vehicle_cmd.h"
@@ -1223,6 +1224,10 @@ public:
 
 					case ADI_COUPLE_GROUP_MGMT: // R3R: couple group management (Q4)
 						ShowCoupleGroupWindow(this->owner);
+						break;
+
+					case ADI_R3R_SCHEDULE_MGMT: // R3R (第 417 轮): schedule pool
+						ShowR3RScheduleWindow(this->owner, this->vehicle_sel);
 						break;
 
 					default: NOT_REACHED();

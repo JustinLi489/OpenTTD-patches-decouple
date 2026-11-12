@@ -28,6 +28,7 @@
 #include "sl/saveload_common.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 #include "3rdparty/cpp-btree/btree_map.h"
 
@@ -66,6 +67,15 @@ void ClearOrderDestinationRefcountMap();
  * Bits 2-3: GetLeaveType(): Order leave type
  * Bit 4:    IsTravelFixed(): Travel time fixed
  * Bits 5-7: GetRoadVehTravelDirection(): Road vehicle travel direction
+ * Bit 5:    R3R: HasR3RStationSeparation(): OT_GOTO_STATION of a *train* order list carries
+ *           the "自动调节班次" marker. Bits 5-7 are only ever written as a group by
+ *           SetRoadVehTravelDirection() (road vehicles) and read by road vehicle code, and
+ *           order lists are never shared across vehicle types, so a train station order may
+ *           reuse bit 5 without disturbing the road vehicle field.
+ * Bit 6:    R3R: HasR3RWaitDispatch(): OT_GOTO_STATION of a *train* order list carries the
+ *           "等待分配" marker (claim a schedule from the station dispatch pool on arrival).
+ *           Same rationale as bit 5: bits 5-7 are a road-vehicle-only group and never shared
+ *           with train order lists.
  */
 /*
  * xdata users:
@@ -648,6 +658,63 @@ public:
 	}
 
 	/**
+	 * R3R: Does this station order carry the 「自动调节班次」(automatic separation) marker?
+	 *
+	 * The marker lives on the order, i.e. on the schedule, not on a vehicle: a vehicle
+	 * whose effective order list contains at least one marked GOTO_STATION takes part in
+	 * automatic separation (see UpdateVehicleTimetable in timetable_cmd.cpp). Marking one
+	 * station order therefore switches 自动调节 on for *every* vehicle sharing that
+	 * order list, exactly like the native vehicle-level VehicleFlag::TimetableSeparation
+	 * applies to a whole timetable (R3RForEachTimetableVehicle).
+	 *
+	 * Storage: bit 5 of xflags (see the xflags comment at the top of this header).
+	 * No savegame format change; xflags is already saved with the XSLFI_TIMETABLE_EXTRA
+	 * extension.
+	 *
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline bool HasR3RStationSeparation() const
+	{
+		return this->IsType(OT_GOTO_STATION) && HasBit(this->GetXFlags(), 5);
+	}
+
+	/**
+	 * R3R: Set/clear the 「自动调节班次」marker of this station order.
+	 * @param separation Whether the order carries the marker.
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline void SetR3RStationSeparation(bool separation)
+	{
+		if (HasBit(this->GetXFlags(), 5) == separation && this->extra != nullptr) return;
+		AssignBit(this->GetXFlagsRef(), 5, separation);
+	}
+
+	/**
+	 * R3R: Does this station order ask the station's dispatch pool for a schedule?
+	 *
+	 * Storage: bit 6 of xflags (see the xflags comment at the top of this header).
+	 * No savegame format change; xflags is already saved with the XSLFI_TIMETABLE_EXTRA
+	 * extension.
+	 *
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline bool HasR3RWaitDispatch() const
+	{
+		return this->IsType(OT_GOTO_STATION) && HasBit(this->GetXFlags(), 6);
+	}
+
+	/**
+	 * R3R: Set/clear the 「等待分配」marker of this station order.
+	 * @param wait_dispatch Whether the order carries the marker.
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline void SetR3RWaitDispatch(bool wait_dispatch)
+	{
+		if (HasBit(this->GetXFlags(), 6) == wait_dispatch && this->extra != nullptr) return;
+		AssignBit(this->GetXFlagsRef(), 6, wait_dispatch);
+	}
+
+	/**
 	 * Set the cause to go to the depot.
 	 * @param depot_order_type The reason to go to the depot.
 	 */
@@ -1141,7 +1208,7 @@ public:
 	bool ShouldStopAtStation(const Vehicle *v, StationID station, bool waypoint) const;
 	bool CanLeaveWithCargo(bool has_cargo, CargoType cargo) const;
 
-	TileIndex GetLocation(const Vehicle *v, bool airport = false) const;
+	TileIndex GetLocation(const Vehicle *v, bool airport = false) const; ///< R3R (KI-619): \a v may be nullptr for an ownerless schedule.
 	TileIndex GetAuxiliaryLocation(bool secondary = false) const;
 
 	/**
@@ -1581,6 +1648,14 @@ private:
 
 	Colours route_overlay_colour = Colours::White;
 
+	/* R3R (第 418 轮): schedule metadata managed by the schedule pool window. Kept
+	 * in a separate sparse chunk (R3SM) so the ORDL layout stays untouched: old
+	 * savegames load with an empty name / no owner / private visibility, and old
+	 * executables simply skip that chunk. */
+	std::string r3r_name;                       ///< User supplied schedule name, empty when unnamed.
+	CompanyID r3r_owner = CompanyID::Invalid(); ///< Company owning this schedule, invalid when not known yet.
+	bool r3r_public = false;                    ///< Whether other companies may point their trains at this schedule.
+
 	VehicleOrderID num_manual_orders = 0; ///< NOSAVE: How many manually added orders are there in the list.
 	uint num_vehicles = 0;                ///< NOSAVE: Number of vehicles that share this order list.
 	Vehicle *first_shared = nullptr;      ///< NOSAVE: pointer to the first vehicle in the shared order chain.
@@ -1757,6 +1832,20 @@ public:
 	 */
 	inline uint GetNumVehicles() const { return this->num_vehicles; }
 
+	/* R3R (第 418 轮 排程池): accessors for the schedule metadata.
+	 * A schedule no vehicle points at is called a "loose" (ownerless) schedule. Such a
+	 * list cannot ask any vehicle who owns it, so the owning company is stored in the
+	 * OrderList itself; for a schedule which is in use the owner of the shared chain is
+	 * authoritative and GetR3RScheduleOwner() falls back to it. */
+	inline bool IsR3RLooseSchedule() const { return this->first_shared == nullptr && this->num_vehicles == 0; }
+	inline const std::string &GetR3RScheduleName() const { return this->r3r_name; }
+	inline void SetR3RScheduleName(const std::string &name) { this->r3r_name = name; }
+	inline bool IsR3RSchedulePublic() const { return this->r3r_public; }
+	inline void SetR3RSchedulePublic(bool is_public) { this->r3r_public = is_public; }
+	inline CompanyID GetR3RScheduleStoredOwner() const { return this->r3r_owner; }
+	inline void SetR3RScheduleStoredOwner(CompanyID owner) { this->r3r_owner = owner; }
+	CompanyID GetR3RScheduleOwner() const;
+
 	/**
 	 * Adds the given vehicle to this shared order list.
 	 * @note This is supposed to be called after the vehicle has been inserted
@@ -1868,5 +1957,20 @@ inline bool R3RIsCoupleAirOrder(const OrderList *list, VehicleOrderID index)
 	}
 	return false;
 }
+
+/** R3R (第 418 轮 排程池): maximum byte length of a schedule name. */
+constexpr size_t R3R_SCHEDULE_NAME_MAX_BYTES = 128;
+
+/**
+ * R3R (第 418 轮 排程池): may @p company point its vehicles at @p list?
+ *
+ * The owning company always may; a public schedule may be used by every company; a
+ * schedule which records no owner at all (older savegame) is never locked away.
+ *
+ * @param list    Schedule to test, may be nullptr.
+ * @param company Company which wants to use the schedule.
+ * @return True when the schedule is usable by that company.
+ */
+bool R3RScheduleAccessibleBy(const OrderList *list, CompanyID company);
 
 #endif /* ORDER_BASE_H */

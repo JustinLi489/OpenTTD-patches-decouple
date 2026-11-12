@@ -147,6 +147,7 @@ public:
 		ADI_TRACERESTRICT_SLOT_MGMT,
 		ADI_TRACERESTRICT_COUNTER_MGMT,
 		ADI_COUPLE_GROUP_MGMT,             ///< R3R: open the couple group window (Q4).
+		ADI_R3R_SCHEDULE_MGMT,             ///< R3R (第 417 轮): open the schedule pool window.
 	};
 
 	static const VehicleTypeIndexArray<const StringID> vehicle_depot_name;

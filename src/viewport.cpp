@@ -420,6 +420,10 @@ private:
 	std::vector<DrawnPathRouteTileLine> route_paths;
 	std::vector<DrawnPathRouteTileLine> route_paths_last_mark_dirty;
 	Colours line_colour{};
+	/* R3R (KI-619): a loose schedule has no vehicle to hang the route on. When #route_orders is set,
+	 * this overlay draws that order list instead of a vehicle's schedule. */
+	const OrderList *route_orders = nullptr;
+	VehicleType route_vtype = VehicleType::Train;
 
 	struct PrepareRouteStepState {
 		robin_hood::unordered_flat_set<const Order *> visited;
@@ -434,7 +438,7 @@ private:
 		}
 	};
 
-	void PrepareRoutePathsConditionalOrder(const Vehicle *veh, const Order *order, PrepareRouteStepState &state, bool conditional, uint depth);
+	void PrepareRoutePathsConditionalOrder(const OrderList *orders, VehicleType vtype, const Order *order, PrepareRouteStepState &state, bool conditional, uint depth);
 	void PrepareRouteSteps(const Vehicle *veh);
 	void PrepareRoutePaths(const Vehicle *veh);
 	void PrepareRouteStepsAndMarkDirtyIfChanged(const Vehicle *veh, bool force_change);
@@ -442,6 +446,8 @@ private:
 
 public:
 	void PrepareRouteAndMarkDirtyIfChanged(const Vehicle *veh);
+	/** R3R (KI-619): prepare the route overlay for a schedule which has no vehicle (loose schedule editor). */
+	void PrepareOrderListRouteAndMarkDirtyIfChanged(const OrderList *orders, VehicleType vtype);
 	void DrawVehicleRouteSteps(const Viewport *vp);
 	void DrawVehicleRoutePath(const Viewport *vp, ViewportDrawerDynamic *vdd);
 
@@ -2653,6 +2659,25 @@ static inline Vehicle *GetVehicleFromWindow(const Window *w)
 	return nullptr;
 }
 
+/**
+ * R3R (KI-619): the ownerless schedule editor shows a schedule which no vehicle points at, so
+ * there is no vehicle to hang the route overlay on. Resolve that schedule from the window instead;
+ * every other window keeps the vehicle-based path unchanged.
+ * @param w Window to resolve, may be nullptr.
+ * @return The order list shown by \a w, or nullptr when \a w is not an ownerless schedule editor.
+ */
+static const OrderList *GetOwnerlessScheduleFromWindow(const Window *w)
+{
+	if (w == nullptr) return nullptr;
+
+	WindowClass wc = w->window_class;
+	WindowNumber wn = w->window_number;
+	if (wc == WindowClass::DropdownMenu) GetDropDownParentWindowInfo(w, wc, wn);
+	if (wc != WindowClass::R3RScheduleEditor) return nullptr;
+
+	return OrderList::GetIfValid(OrderListID(wn));
+}
+
 static bool ViewportVehicleRouteShouldSkipOrder(const Order *order)
 {
 	if (_settings_client.gui.show_vehicle_route_mode != 2) return false;
@@ -2667,12 +2692,12 @@ static bool ViewportVehicleRouteShouldSkipOrder(const Order *order)
 	}
 }
 
-void ViewportRouteOverlay::PrepareRoutePathsConditionalOrder(const Vehicle *veh, const Order *order, PrepareRouteStepState &state, bool conditional, uint depth)
+void ViewportRouteOverlay::PrepareRoutePathsConditionalOrder(const OrderList *orders, VehicleType vtype, const Order *order, PrepareRouteStepState &state, bool conditional, uint depth)
 {
 	/* Prevent excessive recursion */
 	if (depth >= 10) return;
 
-	for (; order != nullptr && state.lines_added < 16; order = veh->GetEffectiveOrders()->GetNext(order)) {
+	for (; order != nullptr && state.lines_added < 16; order = orders->GetNext(order)) {
 		if (!state.visited.insert(order).second) {
 			/* Already visited this order */
 			return;
@@ -2681,14 +2706,14 @@ void ViewportRouteOverlay::PrepareRoutePathsConditionalOrder(const Vehicle *veh,
 		if (ViewportVehicleRouteShouldSkipOrder(order)) continue;
 
 		if (order->IsType(OT_CONDITIONAL)) {
-			this->PrepareRoutePathsConditionalOrder(veh, veh->GetOrder(order->GetConditionSkipToOrder()), state,
+			this->PrepareRoutePathsConditionalOrder(orders, vtype, orders->GetOrderAt(order->GetConditionSkipToOrder()), state,
 					conditional || order->GetConditionVariable() != OrderConditionVariable::Unconditionally, depth + 1);
 			if (order->GetConditionVariable() == OrderConditionVariable::Unconditionally) return;
 
 			continue;
 		}
 
-		const TileIndex to_tile = order->GetLocation(veh, veh->type == VehicleType::Aircraft);
+		const TileIndex to_tile = order->GetLocation(nullptr, vtype == VehicleType::Aircraft);
 		if (to_tile == INVALID_TILE) continue;
 
 		DrawnPathRouteTileLine path = { state.from_tile, to_tile, conditional };
@@ -2703,7 +2728,10 @@ void ViewportRouteOverlay::PrepareRoutePaths(const Vehicle *veh)
 {
 	this->route_paths.clear();
 
-	if (veh == nullptr || !_settings_client.gui.show_vehicle_route) return;
+	/* R3R (KI-619): a loose schedule has no vehicle; fall back to the registered order list. */
+	const OrderList *const orders = (veh != nullptr) ? veh->GetEffectiveOrders() : this->route_orders;
+	const VehicleType vtype = (veh != nullptr) ? veh->type : this->route_vtype;
+	if (orders == nullptr || !_settings_client.gui.show_vehicle_route) return;
 
 	PrepareRouteStepState state;
 
@@ -2714,7 +2742,7 @@ void ViewportRouteOverlay::PrepareRoutePaths(const Vehicle *veh)
 
 		if (order->IsType(OT_CONDITIONAL) && from_tile != INVALID_TILE) {
 			state.reset(from_tile);
-			this->PrepareRoutePathsConditionalOrder(veh, order, state,
+			this->PrepareRoutePathsConditionalOrder(orders, vtype, order, state,
 					conditional || order->GetConditionVariable() != OrderConditionVariable::Unconditionally, 0);
 			if (order->GetConditionVariable() == OrderConditionVariable::Unconditionally) {
 				from_tile = INVALID_TILE;
@@ -2724,7 +2752,7 @@ void ViewportRouteOverlay::PrepareRoutePaths(const Vehicle *veh)
 			return false;
 		}
 
-		const TileIndex to_tile = order->GetLocation(veh, veh->type == VehicleType::Aircraft);
+		const TileIndex to_tile = order->GetLocation(nullptr, vtype == VehicleType::Aircraft);
 		if (to_tile == INVALID_TILE) return false;
 
 		if (from_tile != INVALID_TILE) {
@@ -2738,13 +2766,14 @@ void ViewportRouteOverlay::PrepareRoutePaths(const Vehicle *veh)
 
 		return true;
 	};
-	for (const Order *order : veh->Orders()) {
-		handle_order(order);
+	const uint num_orders = orders->GetNumOrders();
+	for (uint i = 0; i < num_orders; i++) {
+		handle_order(orders->GetOrderAt(static_cast<VehicleOrderID>(i)));
 	}
 	if (from_tile != INVALID_TILE) {
 		/* Handle wrap around from last order back to first */
-		for (const Order *order : veh->Orders()) {
-			if (handle_order(order)) break;
+		for (uint i = 0; i < num_orders; i++) {
+			if (handle_order(orders->GetOrderAt(static_cast<VehicleOrderID>(i)))) break;
 		}
 	}
 
@@ -2933,16 +2962,21 @@ void ViewportRouteOverlay::PrepareRouteSteps(const Vehicle *veh)
 {
 	this->route_steps.clear();
 
-	if (veh == nullptr || !_settings_client.gui.show_vehicle_route_steps || veh->GetNumOrders() == 0) return;
+	/* R3R (KI-619): a loose schedule has no vehicle; fall back to the registered order list. */
+	const OrderList *const orders = (veh != nullptr) ? veh->GetEffectiveOrders() : this->route_orders;
+	const VehicleType vtype = (veh != nullptr) ? veh->type : this->route_vtype;
+	if (orders == nullptr || !_settings_client.gui.show_vehicle_route_steps || orders->GetNumOrders() == 0) return;
 
-	this->line_colour = veh->GetEffectiveOrders()->GetRouteOverlayColour();
+	this->line_colour = orders->GetRouteOverlayColour();
 
 	/* Prepare data. */
 	uint16_t order_rank = 0;
-	for (const Order *order : veh->Orders()) {
+	const uint num_orders = orders->GetNumOrders();
+	for (uint i = 0; i < num_orders; i++) {
+		const Order *const order = orders->GetOrderAt(static_cast<VehicleOrderID>(i));
 		order_rank++;
 		if (ViewportVehicleRouteShouldSkipOrder(order)) continue;
-		const TileIndex tile = order->GetLocation(veh, veh->type == VehicleType::Aircraft);
+		const TileIndex tile = order->GetLocation(nullptr, vtype == VehicleType::Aircraft);
 		if (tile == INVALID_TILE) continue;
 		RouteStepOrderType type = RSOT_INVALID;
 		switch (order->GetType()) {
@@ -2977,7 +3011,13 @@ void ViewportPrepareVehicleRoute()
 	if (!_settings_client.gui.show_vehicle_route_steps && !_settings_client.gui.show_vehicle_route) return;
 
 	const Vehicle *focused_veh = GetVehicleFromWindow(_focused_window);
-	_vp_focused_window_route_overlay.PrepareRouteAndMarkDirtyIfChanged(focused_veh);
+	/* R3R (KI-619): an ownerless schedule has no vehicle; draw its route from the schedule itself. */
+	const OrderList *focused_orders = (focused_veh == nullptr) ? GetOwnerlessScheduleFromWindow(_focused_window) : nullptr;
+	if (focused_orders != nullptr) {
+		_vp_focused_window_route_overlay.PrepareOrderListRouteAndMarkDirtyIfChanged(focused_orders, VehicleType::Train);
+	} else {
+		_vp_focused_window_route_overlay.PrepareRouteAndMarkDirtyIfChanged(focused_veh);
+	}
 	for (auto &it : _vp_fixed_route_overlays) {
 		const Vehicle *v = Vehicle::GetIfValid(it.veh);
 		it.PrepareRouteAndMarkDirtyIfChanged(v);
@@ -5021,6 +5061,10 @@ void ViewportRouteOverlay::PrepareRoutePathsAndMarkDirtyIfChanged(const Vehicle 
 
 void ViewportRouteOverlay::PrepareRouteAndMarkDirtyIfChanged(const Vehicle *veh)
 {
+	/* R3R (KI-619): a vehicle takes over the overlay again, so drop any loose schedule registration. */
+	this->route_orders = nullptr;
+	this->route_vtype = (veh != nullptr) ? veh->type : VehicleType::Train;
+
 	bool force_change = false;
 	/* R3R (KI-465 修法 D): route overlay shows the schedule the train actually runs, which for a
 	 * follower lives in another vehicle's list while its own `orders` stays its own table. */
@@ -5033,11 +5077,34 @@ void ViewportRouteOverlay::PrepareRouteAndMarkDirtyIfChanged(const Vehicle *veh)
 	this->PrepareRouteStepsAndMarkDirtyIfChanged(veh, force_change);
 }
 
+void ViewportRouteOverlay::PrepareOrderListRouteAndMarkDirtyIfChanged(const OrderList *orders, VehicleType vtype)
+{
+	bool force_change = (this->route_orders != orders || this->route_vtype != vtype);
+	this->route_orders = orders;
+	this->route_vtype = vtype;
+
+	if (orders != nullptr) {
+		if (orders->GetRouteOverlayColour() != this->line_colour) force_change = true;
+		this->line_colour = orders->GetRouteOverlayColour();
+	}
+
+	this->PrepareRoutePathsAndMarkDirtyIfChanged(nullptr, force_change);
+	this->PrepareRouteStepsAndMarkDirtyIfChanged(nullptr, force_change);
+}
+
 void HandleViewportRoutePathFocusChange(const Window *old, const Window *focused)
 {
 	const Vehicle *old_v = (old != nullptr) ? GetVehicleFromWindow(old) : nullptr;
 	const Vehicle *new_v = (focused != nullptr) ? GetVehicleFromWindow(focused) : nullptr;
-	if (old_v != new_v) {
+	/* R3R (KI-619): moving between two ownerless schedule editors changes no vehicle at all,
+	 * so the schedule identity has to be part of the comparison. */
+	const OrderList *old_ol = (old_v == nullptr) ? GetOwnerlessScheduleFromWindow(old) : nullptr;
+	const OrderList *new_ol = (new_v == nullptr) ? GetOwnerlessScheduleFromWindow(focused) : nullptr;
+	if (old_v == new_v && old_ol == new_ol) return;
+
+	if (new_ol != nullptr) {
+		_vp_focused_window_route_overlay.PrepareOrderListRouteAndMarkDirtyIfChanged(new_ol, VehicleType::Train);
+	} else {
 		_vp_focused_window_route_overlay.PrepareRouteAndMarkDirtyIfChanged(new_v);
 	}
 }

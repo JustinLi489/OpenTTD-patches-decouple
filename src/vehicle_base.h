@@ -33,6 +33,19 @@
 #include <array>
 #include <vector>
 
+struct Vehicle;
+
+/**
+ * R3R (第 416 轮): hand a dispatch-pool schedule back to the vehicle's own schedule.
+ *
+ * Called from the order-index advance path: the moment the pool list's last order
+ * completes (i.e. `cur_real_order_index + 1` would wrap to 0), the vehicle must stop
+ * running the pool table and resume its own table at `orders_backup_real_index + 1`.
+ *
+ * @return true when the schedule was handed back (callers must not advance any index).
+ */
+bool R3RReturnDispatchPool(Vehicle *v);
+
 /** Vehicle state bits in #Vehicle::vehstatus. */
 enum class VehState : uint8_t {
 	Hidden         = 0, ///< Vehicle is not visible.
@@ -412,7 +425,22 @@ public:
 	GroupID group_id_backup = GroupID::Invalid(); ///< R3R (第 144 轮 / 需求伍): this segment head's own "列车分组" (the player-facing train group) while the consist is unified onto the control segment's group (R3RNormaliseChainGroups). Given back when the segment becomes a chain head again (R3RRestoreTrainGroupID). SAVED by the R3VP chunk.
 	VehicleOrderID orders_backup_real_index = INVALID_VEH_ORDER_ID;     ///< R3R: own real-order position while coupled (restored on decouple). SAVED by the R3VP chunk.
 	VehicleOrderID orders_backup_implicit_index = INVALID_VEH_ORDER_ID; ///< R3R: own implicit-order position while coupled. SAVED by the R3VP chunk.
+	VehicleOrderID orders_backup_timetable_index = INVALID_VEH_ORDER_ID; ///< R3R (第 416 轮): own timetable-order position while the vehicle runs a dispatch-pool schedule (restored when the pool schedule is handed back). SAVED by the R3VP chunk.
 	uint16_t r3r_priority = 1;                   ///< R3R: priority rank of this segment inside its consist (1..n, contiguous). The lowest value is the consist's "command owner": its schedule is the one shown/executed. Rebuilt on couple (passive-first) and on decouple (compacted). SAVED by the R3VP chunk.
+	bool r3r_follow_pool = false;               ///< R3R (第 416 轮): the followed schedule (r3r_follow_orders) is a *dispatch pool* entry, not another segment's schedule. It is handed back the moment its last order completes (see R3RReturnDispatchPool). SAVED by the R3VP chunk.
+	/**
+	 * R3R (第 429 轮 / 玩家需求壹): the dispatch-pool schedule which is *parked* while this
+	 * vehicle runs a schedule borrowed from a coupled consist.
+	 *
+	 * Borrowing is layered: own table (orders) -> dispatch pool table -> coupled
+	 * consist's table. A couple overwrites #r3r_follow_orders, so without this slot the
+	 * pool layer would be silently dropped and R3RReturnDispatchPool() would release the
+	 * wrong pool entry. Only the pointer needs parking: the own-table position lives in
+	 * orders_backup_real_index/implicit_index and is protected by the
+	 * R3RRefreshOrderBookmark() guard (`GetEffectiveOrders() != own`).
+	 * SAVED by the R3VP chunk.
+	 */
+	OrderList *r3r_pool_orders = nullptr;
 	bool r3r_orders_borrowed = false;            ///< R3R: this vehicle runs another segment's schedule (route A). Since KI-465 修法 D this is expressed by r3r_follow_orders; the flag is kept as the legacy/borrow marker and is also set for an old-style borrow where `orders` itself was swapped (patched on load; those saves are migrated away by R3RRebuildCouplePriorities()). A borrowed list is owned by its owner and must never be freed by this vehicle. SAVED by the R3VP chunk.
 	uint16_t r3r_segment_id = R3R_SEGMENT_NONE;  ///< R3R (第 152 轮): the segment this car belongs to, or #R3R_SEGMENT_NONE while its chain holds a single segment (then the chain head's own fields are the only authority and nothing is looked up). Storing it on *every* car is what makes moving the SegmentFront marker free: the identity data stays in the segment table, only the marker moves. SAVED by the R3VP chunk.
 	CoupleGroupMask couple_groups = COUPLE_GROUP_MASK_NONE; ///< R3R: couple groups of the segment which this vehicle heads (only meaningful on a segment head, see couple_group.h). A segment may be in several groups at once (Q5); an empty mask forms one implicit group with every other unassigned segment. SAVED separately by the CGVR chunk, so the vehicle table layout is untouched.
@@ -1083,6 +1111,11 @@ private:
 	 */
 	void SkipToNextRealOrderIndex()
 	{
+		/* R3R (第 416 轮): a dispatch-pool schedule is handed back the moment its last
+		 * order completes, i.e. right before the index would wrap to 0. Returning here
+		 * means "no index was advanced": the vehicle goes back to its own table. */
+		if (this->type == VehicleType::Train && this->r3r_follow_pool && R3RReturnDispatchPool(this)) return;
+
 		/* R3R: a GOTO_COUPLE locomotive must NOT advance its order index until it
 		 * has coupled. Advancing makes current_order and the index diverge
 		 * (observed: the index crept 3→0→1 every tick while entering the platform,
@@ -1112,6 +1145,11 @@ public:
 	 */
 	void IncrementImplicitOrderIndex()
 	{
+		/* R3R (第 416 轮): same hand-back as SkipToNextRealOrderIndex, but intercepted here
+		 * so the implicit-index advance below does not run against the new (own) table
+		 * with stale pool coordinates. */
+		if (this->type == VehicleType::Train && this->r3r_follow_pool && R3RReturnDispatchPool(this)) return;
+
 		/* R3R: lock a GOTO_COUPLE locomotive's implicit index too (see SkipToNextRealOrderIndex). */
 		if (this->type == VehicleType::Train && this->current_order.IsType(OT_GOTO_COUPLE)) return;
 
