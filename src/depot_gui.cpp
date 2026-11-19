@@ -1162,7 +1162,12 @@ struct DepotWindow : Window {
 				break;
 
 			case DepotGUIAction::StartStop: // click start/stop flag
-				StartStopVehicle(result.vehicle, false);
+				/* R3R: same stale-list problem as ShowVehicle above. The list entry may
+				 * no longer be the head of its chain (a reverse-group / couple / decouple
+				 * edit re-orders the chain without rebuilding this window's list), and
+				 * StartStopVehicle() requires a primary vehicle. Operate on the real
+				 * chain head so clicking the flag still acts on the visible train. */
+				StartStopVehicle(result.vehicle->First(), false);
 				break;
 
 			default: NOT_REACHED();

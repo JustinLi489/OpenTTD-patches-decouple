@@ -61,6 +61,25 @@ enum StationDispatchWidgets : WidgetID {
 	WID_SD_DELETE,       ///< Remove the selected pool entry.
 	WID_SD_SLOTS_DOWN,   ///< Decrease the slots of the selected entry.
 	WID_SD_SLOTS_UP,     ///< Increase the slots of the selected entry.
+	WID_SD_RULE,         ///< R3R (round 451): open the allocation rule program editor of this yard.
+};
+
+/** Widgets of the #DispatchProgramWindow class (R3R dispatch allocation rule program). */
+enum DispatchProgramWidgets : WidgetID {
+	WID_DP_CAPTION,      ///< Caption of the window.
+	WID_DP_LIST,         ///< The instruction list (drawn by hand, one line per instruction).
+	WID_DP_SCROLLBAR,    ///< Scrollbar of the instruction list.
+	WID_DP_INSERT,       ///< Insert a new instruction (if / or / else / endif / allow / deny).
+	WID_DP_DELETE,       ///< Delete the selected instruction.
+	WID_DP_CLEAR,        ///< Clear the whole program.
+	WID_DP_VAR,          ///< Condition variable of the selected if/else-if line.
+	WID_DP_OP,           ///< Toggle the comparison between >= and <=.
+	WID_DP_VALUE_DOWN,   ///< Decrease the threshold.
+	WID_DP_VALUE,        ///< Display the threshold.
+	WID_DP_VALUE_UP,     ///< Increase the threshold.
+	WID_DP_RESULT_KIND,  ///< Toggle the selected result between allow and deny.
+	WID_DP_SCHEDULE,     ///< Choose which dispatch schedule the selected result refers to.
+	WID_DP_RESIZE,       ///< Resize handle.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

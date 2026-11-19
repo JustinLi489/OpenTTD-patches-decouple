@@ -4026,9 +4026,14 @@ STR_ORDER_R3R_SEPARATION_TOOLTIP                                :{BLACK}Keep the
 STR_ORDER_R3R_WAIT_DISPATCH                                     :Wait for dispatch
 STR_ORDER_R3R_WAIT_DISPATCH_TOOLTIP                             :{BLACK}On arrival this train takes a schedule from the dispatch pool of the station yard and runs it once from its first order, then continues with its own orders after this one
 
+# R3R: stop-at-station marker on a station order (order window)
+STR_ORDER_R3R_STOP_AT_STATION                                   :Stop on arrival
+STR_ORDER_R3R_STOP_AT_STATION_TOOLTIP                           :{BLACK}The train stops when it arrives at this station: no loading or unloading (so it does not take part in cargo flow), the next order is not started on its own and the train is set to "stopped". It only continues when you start it again. Click to choose this marker, "Wait for dispatch" or "Auto sep."; the three are mutually exclusive, clicking the current one clears it
+
 # R3R: suffixes appended to a "go to station" order, mirroring "wait to unbunch" of depot orders
 STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX                            :{SPACE}(Wait for auto sep.)
 STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX                              :{SPACE}(Wait for dispatch)
+STR_ORDER_R3R_STOP_AT_STATION_SUFFIX                            :{SPACE}(Stop on arrival)
 
 # R3R: dispatch pool (station window)
 STR_R3R_DISPATCH_POOL_CAPTION                                   :{BLACK}Dispatch pool
@@ -4043,6 +4048,77 @@ STR_R3R_DISPATCH_POOL_DELETE_TOOLTIP                            :{BLACK}Remove t
 STR_R3R_DISPATCH_POOL_SLOTS_UP                                  :{BLACK}+
 STR_R3R_DISPATCH_POOL_SLOTS_DOWN                                :{BLACK}-
 STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP                             :{BLACK}How many trains may run this schedule at the same time
+STR_R3R_DISPATCH_RULE_SEL                                       :{BLACK}Rule: {STRING}
+STR_R3R_DISPATCH_RULE_VAR_NONE                                  :{BLACK}no limit
+STR_R3R_DISPATCH_RULE_VAR_SPEED                                 :{BLACK}max speed
+STR_R3R_DISPATCH_RULE_VAR_POWER                                 :{BLACK}power
+STR_R3R_DISPATCH_RULE_VAR_TE                                    :{BLACK}tractive effort
+STR_R3R_DISPATCH_RULE_VAR_RELIABILITY                           :{BLACK}reliability
+STR_R3R_DISPATCH_RULE_TEXT_SPEED                                :{STRING} {VELOCITY}
+STR_R3R_DISPATCH_RULE_TEXT_POWER                                :{STRING} {POWER}
+STR_R3R_DISPATCH_RULE_TEXT_TE                                   :{STRING} {FORCE}
+STR_R3R_DISPATCH_RULE_TEXT_RELIABILITY                          :{STRING} {COMMA}%
+STR_R3R_DISPATCH_RULE_OP_GE                                     :{BLACK}>=
+STR_R3R_DISPATCH_RULE_OP_LE                                     :{BLACK}<=
+STR_R3R_DISPATCH_RULE_TOOLTIP                                   :{BLACK}Which trains may take this schedule. An arriving train is only given a schedule whose rule its own performance satisfies; otherwise the next entry is tried
+STR_R3R_DISPATCH_RULE_OP_TOOLTIP                                :{BLACK}Switch between "at least" and "at most"
+STR_R3R_DISPATCH_RULE_STEP_TOOLTIP                              :{BLACK}Adjust the threshold
+
+# R3R (round 451 cont.): the dispatch rule is a single per-yard program, edited in its own window.
+STR_R3R_DISPATCH_RULE_BTN                                       :{BLACK}Rules...
+STR_R3R_DISPATCH_RULE_BTN_TOOLTIP                               :{BLACK}Edit this yard's dispatch rule program (if / else / or / allow / deny)
+STR_R3R_DP_CAPTION                                              :{BLACK}Dispatch rules: {STATION} {RAW_STRING}
+STR_R3R_DP_YARD_WHOLE                                           :{BLACK}whole station
+STR_R3R_DP_YARD_INDEX                                           :{BLACK}yard {NUM}
+STR_R3R_DP_INSERT_BTN                                           :{BLACK}Insert
+STR_R3R_DP_INSERT_TOOLTIP                                       :{BLACK}Insert a new instruction after the selected line
+STR_R3R_DP_DELETE_BTN                                           :{BLACK}Delete
+STR_R3R_DP_DELETE_TOOLTIP                                       :{BLACK}Delete the selected instruction
+STR_R3R_DP_CLEAR_BTN                                            :{BLACK}Clear
+STR_R3R_DP_CLEAR_TOOLTIP                                        :{BLACK}Remove every instruction (back to letting all trains take any schedule)
+STR_R3R_DP_INS_IF                                               :{BLACK}if
+STR_R3R_DP_INS_OR                                               :{BLACK}or
+STR_R3R_DP_INS_ELSE                                             :{BLACK}else
+STR_R3R_DP_INS_ENDIF                                            :{BLACK}end if
+STR_R3R_DP_INS_ALLOW                                            :{BLACK}allow schedule
+STR_R3R_DP_INS_DENY                                             :{BLACK}deny schedule
+STR_R3R_DP_VAR_NONE                                             :{BLACK}always
+STR_R3R_DP_VAR_SPEED                                            :{BLACK}max speed
+STR_R3R_DP_VAR_POWER                                            :{BLACK}power
+STR_R3R_DP_VAR_TE                                               :{BLACK}tractive effort
+STR_R3R_DP_VAR_RELIABILITY                                      :{BLACK}reliability
+STR_R3R_DP_VAR_POOL_ISSUED                                      :{BLACK}slots issued
+STR_R3R_DP_VAR_POOL_REMAINING                                   :{BLACK}slots left
+STR_R3R_DP_VAR_NUM_GREEN                                        :{BLACK}green signals
+STR_R3R_DP_VAR_NUM_RED                                          :{BLACK}red signals
+STR_R3R_DP_VAR_SIGNAL_STATE                                     :{BLACK}signal state
+STR_R3R_DP_VAR_COUNTER                                          :{BLACK}counter
+STR_R3R_DP_VAR_ENGINE_CLASS                                     :{BLACK}engine class
+STR_R3R_DP_CLASS_STEAM                                          :{BLACK}steam
+STR_R3R_DP_CLASS_DIESEL                                         :{BLACK}diesel
+STR_R3R_DP_CLASS_ELECTRIC                                       :{BLACK}electric
+STR_R3R_DP_CLASS_MONORAIL                                       :{BLACK}monorail
+STR_R3R_DP_CLASS_MAGLEV                                         :{BLACK}maglev
+STR_R3R_DP_OP_AT_LEAST                                          :{BLACK}at least
+STR_R3R_DP_OP_AT_MOST                                           :{BLACK}at most
+STR_R3R_DP_OP_IS                                                :{BLACK}is
+STR_R3R_DP_OP_IS_NOT                                            :{BLACK}is not
+STR_R3R_DP_OP_EQUAL                                             :{BLACK}equal to
+STR_R3R_DP_OP_NOT_EQUAL                                         :{BLACK}not equal to
+STR_R3R_DP_OP_GREATER                                           :{BLACK}greater than
+STR_R3R_DP_OP_LESS                                              :{BLACK}less than
+STR_R3R_DP_VALUE                                                :{BLACK}{NUM}
+STR_R3R_DP_COUNTER_SUFFIX                                       :{BLACK}#{NUM}
+STR_R3R_DP_EMPTY                                                :{BLACK}(no instructions - every train may take any schedule of this yard)
+STR_R3R_DP_NO_SCHEDULE                                          :{BLACK}(no schedule)
+STR_R3R_DP_SCHEDULE_TOOLTIP                                     :{BLACK}Which schedule this instruction refers to
+STR_R3R_DP_RESULT_ALLOW_BTN                                     :{BLACK}allow
+STR_R3R_DP_RESULT_DENY_BTN                                      :{BLACK}deny
+STR_R3R_DP_VAR_TOOLTIP                                          :{BLACK}Condition variable
+STR_R3R_DP_OP_TOOLTIP                                           :{BLACK}Switch between "at least" and "at most"
+STR_R3R_DP_STEP_TOOLTIP                                         :{BLACK}Adjust the value
+STR_R3R_DP_LIST_TOOLTIP                                         :{BLACK}The program is evaluated top to bottom; the first matching result decides which schedule the claiming train may take
+STR_R3R_DP_RESULT_KIND_TOOLTIP                                  :{BLACK}Switch this instruction between "allow" and "deny"
 STR_R3R_DISPATCH_POOL_BUTTON                                    :{BLACK}Dispatch pool
 STR_R3R_DISPATCH_POOL_BUTTON_TOOLTIP                            :{BLACK}Manage the dispatch pools of this station's yards: register a train's order list as a schedule which arriving trains may be given
 STR_R3R_DISPATCH_POOL_YARD_SEL                                  :{BLACK}Yard: {RAW_STRING}
@@ -4056,6 +4132,7 @@ STR_ERROR_R3R_DISPATCH_POOL_FULL                                :{WHITE}The disp
 STR_ERROR_R3R_DISPATCH_POOL_INVALID_TRAIN                       :{WHITE}That schedule no longer exists
 STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED                          :{WHITE}That schedule belongs to another company and is not public
 STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY                       :{WHITE}That schedule is no longer in the dispatch pool
+STR_ERROR_R3R_DISPATCH_NO_SCHEDULE                              :{WHITE}{VEHICLE} is waiting at a yard whose dispatch pool has no schedule at all
 
 # R3R: schedule pool (order list pool)
 STR_R3R_SCHEDULE_CAPTION                                        :{BLACK}Schedule pool
@@ -4885,6 +4962,7 @@ STR_ORDER_COUPLE_SIDE_TOOLTIP                                   :{BLACK}Which si
 STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}Temporary group: {RAW_STRING}
 STR_ORDER_COUPLE_TEMP_GROUP_NONE                                :None
 STR_ORDER_COUPLE_TEMP_GROUP_NAMED                               :Group {NUM}
+STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX                              : (group: {RAW_STRING})
 STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP                             :{BLACK}Couple group this train temporarily joins while it runs this order, on top of the groups its segment really belongs to. It couples onto that group's stock and loses the temporary membership once the coupling succeeded.
 
 # Order bottom buttons

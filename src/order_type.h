@@ -384,6 +384,7 @@ enum ModifyOrderFlags : uint8_t {
 	MOF_COUPLE_TEMP_GROUP, ///< R3R: change the couple group a GOTO_COUPLE order temporarily joins while it runs.
 	MOF_R3R_STATION_SEPARATION, ///< R3R: toggle the "自动调节班次" (automatic separation) marker of a station order.
 	MOF_R3R_WAIT_DISPATCH, ///< R3R: toggle the "等待分配" (wait for a dispatch pool schedule) marker of a station order.
+	MOF_R3R_STOP_AT_STATION, ///< R3R: toggle the "到达后停止" (stop at the station until started again) marker of a station order.
 	MOF_END
 };
 

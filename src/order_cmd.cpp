@@ -1954,15 +1954,22 @@ void InsertOrder(Vehicle *v, Order &&new_o, VehicleOrderID sel_ord)
  * list edits which do not go through InsertOrder() (moving, removing, re-ordering
  * orders) and loading an old save game can break that invariant, so it is
  * restored here.
- * @param v Vehicle owning (or following) the order list to check.
+ *
+ * R3R (KI-654): works on the list itself, so ownerless schedules (schedule pool
+ * entries, which have no vehicle and therefore no #GetEffectiveOrders()) are
+ * covered too. Previously such a list could get an #OT_GOTO_COUPLE order without
+ * any marker, which made R3RIsCoupleAirOrder() classify the *whole* schedule as
+ * the reference block -- every row was greyed out and suffixed "(auto-filled)".
+ *
+ * @param list Order list to check.
+ * @param v    Vehicle used for the window invalidation, may be nullptr.
  */
-void R3REnsureCoupleEndOrders(Vehicle *v)
+static void R3REnsureCoupleEndOrdersInList(OrderList *list, Vehicle *v)
 {
-	OrderList *const list = v->GetEffectiveOrders();
 	if (list == nullptr) return;
 
-	for (VehicleOrderID i = 0; i < v->GetNumOrders(); i++) {
-		const Order *const order = v->GetOrder(i);
+	for (VehicleOrderID i = 0; i < list->GetNumOrders(); i++) {
+		const Order *const order = list->GetOrderAt(i);
 		if (order == nullptr || !order->IsType(OT_GOTO_COUPLE)) continue;
 
 		/* The block is closed when the first boundary behind the opening order is
@@ -1971,8 +1978,9 @@ void R3REnsureCoupleEndOrders(Vehicle *v)
 		 * the reference block, which would silently turn all reference orders into
 		 * live commands again. */
 		bool closed = false;
-		for (VehicleOrderID step = 1; step < v->GetNumOrders(); step++) {
-			const Order *const o = v->GetOrder((VehicleOrderID)((i + step) % v->GetNumOrders()));
+		const VehicleOrderID num = list->GetNumOrders();
+		for (VehicleOrderID step = 1; step < num; step++) {
+			const Order *const o = list->GetOrderAt((VehicleOrderID)((i + step) % num));
 			if (o == nullptr) break;
 			if (o->IsType(OT_COUPLE_END)) {
 				closed = true;
@@ -2000,18 +2008,34 @@ void R3REnsureCoupleEndOrders(Vehicle *v)
 			if (parked) R3RAdjustBookmarkForInsert(u, at);
 		});
 
-		for (Order *order : v->Orders()) {
+		const VehicleOrderID new_num = list->GetNumOrders();
+		for (Order *order : list->Orders()) {
 			if (order->IsType(OT_CONDITIONAL)) {
 				const VehicleOrderID order_id = order->GetConditionSkipToOrder();
-				if (order_id >= at) order->SetConditionSkipToOrder((order_id + 1) % v->GetNumOrders());
+				if (order_id >= at) order->SetConditionSkipToOrder((order_id + 1) % new_num);
 			}
 		}
 
 		i++; // Skip the marker which was just inserted.
 	}
 
-	InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
-	InvalidateWindowClassesData(WindowClass::DepartureBoard);
+	if (v != nullptr) {
+		InvalidateWindowClassesData(GetWindowClassForVehicleType(v->type));
+		InvalidateWindowClassesData(WindowClass::DepartureBoard);
+	} else {
+		InvalidateWindowClassesData(WindowClass::R3RSchedule);
+		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
+	}
+}
+
+/**
+ * R3R (KI-541): vehicle wrapper of #R3REnsureCoupleEndOrdersInList().
+ * @param v Vehicle owning (or following) the order list to check.
+ */
+void R3REnsureCoupleEndOrders(Vehicle *v)
+{
+	if (v == nullptr) return;
+	R3REnsureCoupleEndOrdersInList(v->GetEffectiveOrders(), v);
 }
 
 /**
@@ -2703,7 +2727,7 @@ static CommandCost R3RModifyOrderHost(DoCommandFlags flags, R3ROrderHost &host, 
 	} else {
 		switch (order->GetType()) {
 			case OT_GOTO_STATION:
-				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_R3R_YARD && mof != MOF_R3R_STATION_SEPARATION && mof != MOF_R3R_WAIT_DISPATCH) return CMD_ERROR;
+				if (mof != MOF_NON_STOP && mof != MOF_STOP_LOCATION && mof != MOF_UNLOAD && mof != MOF_LOAD && mof != MOF_CARGO_TYPE_UNLOAD && mof != MOF_CARGO_TYPE_LOAD && mof != MOF_RV_TRAVEL_DIR && mof != MOF_R3R_YARD && mof != MOF_R3R_STATION_SEPARATION && mof != MOF_R3R_WAIT_DISPATCH && mof != MOF_R3R_STOP_AT_STATION) return CMD_ERROR;
 				break;
 
 			case OT_GOTO_DEPOT:
@@ -3146,6 +3170,17 @@ static CommandCost R3RModifyOrderHost(DoCommandFlags flags, R3ROrderHost &host, 
 			if (data > 1) return CMD_ERROR;
 			break;
 		}
+
+		case MOF_R3R_STOP_AT_STATION: {
+			/* R3R (第 455 轮, KI-648 / B-455-1=①'): 「到达后停止」标记落在
+			 * GOTO_STATION 命令上。列车进站停稳后不装卸、不推进排程，被置为
+			 * 「已停止」，需玩家手动启动才继续。与另外两个同下拉框的三选一
+			 * 标记互斥，互斥关系的维持放在 GUI 层（一次点击同时写三个标记）。 */
+			if (host.vtype != VehicleType::Train) return CMD_ERROR;
+			if (!order->IsType(OT_GOTO_STATION)) return CMD_ERROR;
+			if (data > 1) return CMD_ERROR;
+			break;
+		}
 	}
 
 	if (flags.Test(DoCommandFlag::Execute)) {
@@ -3281,6 +3316,15 @@ static CommandCost R3RModifyOrderHost(DoCommandFlags flags, R3ROrderHost &host, 
 				/* R3R (第 416 轮): 纯标记，不牵动其它车的状态；清掉时若列车正在
 				 * 借用池表（r3r_follow_pool）不打断，那一轮跑完自然归还。 */
 				order->SetR3RWaitDispatch(data != 0);
+				if (v != nullptr) SetTimetableWindowsDirty(v, STWDF_ORDERS);
+				break;
+			}
+
+			case MOF_R3R_STOP_AT_STATION: {
+				/* R3R (第 455 轮): 纯标记，落地行为在 TrainEnterStation（进站即停、
+				 * 不装卸、排程不推进）与 TrainLocoHandler 的 OT_LEAVESTATION 分支
+				 * （玩家停止时保持"待离开"不推进）。 */
+				order->SetR3RStopAtStation(data != 0);
 				if (v != nullptr) SetTimetableWindowsDirty(v, STWDF_ORDERS);
 				break;
 			}
@@ -4422,6 +4466,10 @@ CommandCost CmdR3RInsertLooseOrder(DoCommandFlags flags, const InsertLooseOrderC
 
 	if (flags.Test(DoCommandFlag::Execute)) {
 		list->InsertOrderAt(std::move(new_order), insert_at);
+		/* R3R (KI-654): InsertOrder() closes a fresh coupling order with an
+		 * #OT_COUPLE_END marker; an ownerless schedule has no vehicle, so the same
+		 * invariant has to be restored on the bare list here. */
+		R3REnsureCoupleEndOrdersInList(list, nullptr);
 		InvalidateWindowClassesData(WindowClass::R3RSchedule);
 		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
 	}
@@ -4536,6 +4584,9 @@ CommandCost CmdR3RDuplicateLooseOrder(DoCommandFlags flags, uint32_t ol_index, u
 		new_order.SetTravelFixed(false);
 		new_order.SetDispatchScheduleIndex(-1);
 		list->InsertOrderAt(std::move(new_order), static_cast<VehicleOrderID>(sel_ord) + 1);
+		/* R3R (KI-654): duplicating a coupling order must not create an unclosed
+		 * block either -- see CmdR3RInsertLooseOrder(). */
+		R3REnsureCoupleEndOrdersInList(list, nullptr);
 		InvalidateWindowClassesData(WindowClass::R3RSchedule);
 		InvalidateWindowClassesData(WindowClass::R3RScheduleEditor);
 	}
@@ -4661,6 +4712,12 @@ CommandCost CmdR3RAssignSchedule(DoCommandFlags flags, uint32_t veh_index, uint3
 		v->current_order.Free();
 		v->ResetDepotUnbunching();
 		v->StopSeparation();
+
+		/* R3R (KI-654): a pool schedule edited by an older build (or by an edit
+		 * path which did not restore the invariant) may still hold an unclosed
+		 * coupling block. Repair it before the list is adopted, so
+		 * Initialize() below registers the marker as well. */
+		R3REnsureCoupleEndOrdersInList(list, nullptr);
 
 		v->orders = list;
 		if (list->GetFirstSharedVehicle() == nullptr) {
@@ -5882,7 +5939,11 @@ bool ProcessOrders(Vehicle *v)
 	 * （trk 0x80）、vs:HD，正是本分支。 */
 	if (v->type == VehicleType::Train) {
 		const int r3r_oob_n = v->GetNumOrders();
-		if (r3r_oob_n > 0 && (int)v->cur_implicit_order_index >= r3r_oob_n) {
+		/* R3R (KI-653 / REG-456-C): the old `r3r_oob_n > 0 &&` guard skipped exactly
+		 * the "list became empty while the index still points at the old order"
+		 * case, which is one of the shapes the assert below fires on. Any index
+		 * which is not a legal slot of the list is worth a trace now. */
+		if ((int)v->cur_implicit_order_index >= r3r_oob_n) {
 			R3RWatchOrderIndexSite(Train::From(v), "process-orders-bad", "assert-4909");
 		}
 	}

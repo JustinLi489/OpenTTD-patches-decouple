@@ -76,6 +76,11 @@ void ClearOrderDestinationRefcountMap();
  *           "等待分配" marker (claim a schedule from the station dispatch pool on arrival).
  *           Same rationale as bit 5: bits 5-7 are a road-vehicle-only group and never shared
  *           with train order lists.
+ * Bit 7:    R3R: HasR3RStopAtStation(): OT_GOTO_STATION of a *train* order list carries the
+ *           "到达后停止" marker (stop at the station and wait for the player to start the
+ *           train again; no loading/unloading, the schedule does not advance).
+ *           Same rationale as bits 5-6. The three R3R markers are mutually exclusive, the
+ *           order window presents them as one three-way dropdown.
  */
 /*
  * xdata users:
@@ -712,6 +717,32 @@ public:
 	{
 		if (HasBit(this->GetXFlags(), 6) == wait_dispatch && this->extra != nullptr) return;
 		AssignBit(this->GetXFlagsRef(), 6, wait_dispatch);
+	}
+
+	/**
+	 * R3R: Does this station order stop the train and keep the schedule from advancing
+	 * until the player starts the train again?
+	 *
+	 * Storage: bit 7 of xflags (see the xflags comment at the top of this header).
+	 * No savegame format change; xflags is already saved with the XSLFI_TIMETABLE_EXTRA
+	 * extension.
+	 *
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline bool HasR3RStopAtStation() const
+	{
+		return this->IsType(OT_GOTO_STATION) && HasBit(this->GetXFlags(), 7);
+	}
+
+	/**
+	 * R3R: Set/clear the 「到达后停止」marker of this station order.
+	 * @param stop_at_station Whether the order carries the marker.
+	 * @pre IsType(OT_GOTO_STATION).
+	 */
+	inline void SetR3RStopAtStation(bool stop_at_station)
+	{
+		if (HasBit(this->GetXFlags(), 7) == stop_at_station && this->extra != nullptr) return;
+		AssignBit(this->GetXFlagsRef(), 7, stop_at_station);
 	}
 
 	/**

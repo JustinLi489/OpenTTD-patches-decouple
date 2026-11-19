@@ -792,6 +792,8 @@ enum class Commands : uint16_t {
 	AddR3RDispatchPoolEntry,                ///< R3R (第 416 轮): register a train's order list as a dispatch pool entry of a yard
 	RemoveR3RDispatchPoolEntry,             ///< R3R (第 416 轮): drop one dispatch pool entry of a yard
 	SetR3RDispatchPoolLimit,                ///< R3R (第 416 轮): change how many trains may use one dispatch pool entry at the same time
+	SetR3RDispatchPoolRule,                 ///< R3R (第 451 轮, KI-642): set the allocation rule (which trains may claim this entry) of one dispatch pool entry
+	SetR3RDispatchProgram,                  ///< R3R (第 451 轮续): replace the whole allocation rule program of a yard (empty = no restriction)
 	CreateR3RLooseSchedule,                 ///< R3R (第 417 轮): create an ownerless order list in the schedule pool
 	DeleteR3RLooseSchedule,                 ///< R3R (第 417 轮): delete an ownerless order list from the schedule pool
 	AssignR3RSchedule,                      ///< R3R (第 417 轮): re-point a train's schedule pointer (Vehicle::orders) at another order list

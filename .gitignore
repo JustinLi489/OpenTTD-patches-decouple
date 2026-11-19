@@ -17,3 +17,41 @@ docs/source/*
 
 # Compiler debug database
 *.pdb
+
+# ---- R3R local work products: logs, probe dumps, packaging, scratch scripts ----
+# Runtime/probe logs (build\R3R_debug.log, R3R_perf.log, r3r_raw.log, ...)
+*.log
+R3R_latency_*.txt
+r3r_resv_watch.txt
+R3R_shot_ocr_out.txt
+
+# Release packages
+/*.zip
+
+# Editor/build leftovers and file-level backups
+*.bak
+*.r3r_bak
+*.orig
+R3R_KNOWN_ISSUES.damaged_*.bak
+
+# Stray binaries / markers that must never be committed
+/ninja
+/INCREMENTAL
+
+# One-off diagnostic scripts and scratch output (kept in the work tree only)
+/_*.txt
+/_*.err
+/check_task*.ps1
+/cleanup*.ps1
+/diag_*.ps1
+/poll_batch_c.ps1
+/start_batch_*.ps1
+/cpu_delta.ps1
+/sys_info.ps1
+/test_vcvars.ps1
+/vcvars_test.*
+/rebuild_R3R.cmd
+/ R3R_release_build.cmd
+
+# Local snapshot/archive folders
+/R3R_archive_*/

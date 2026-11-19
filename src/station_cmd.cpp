@@ -2407,18 +2407,266 @@ bool Station::R3RDispatchPoolSetLimit(uint16_t yard, uint16_t index, uint16_t li
 	return true;
 }
 
-int Station::R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule) const
+bool Station::R3RDispatchPoolSetRule(uint16_t yard, uint16_t index, R3RDispatchRuleVariable var, R3RDispatchRuleOp op, int32_t value)
+{
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (pool_ptr == nullptr) return false;
+	std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	if (index >= pool.size()) return false;
+	R3RStationYard::R3RDispatchPoolEntry &e = pool[index];
+	e.rule_var = var;
+	e.rule_op = op;
+	/* 阈值夹到非负：性能指标没有负值，负数只可能是 UI 步进过冲。 */
+	e.rule_value = (var == R3RDispatchRuleVariable::None) ? 0 : std::max<int32_t>(0, std::min<int32_t>(value, 65535));
+	return true;
+}
+
+/* R3R (第 451 轮续, KI-642): 「分配规则」程序的求值器。
+ *
+ * 指令流语义照抄可编程信号机（src\programmable_signals.cpp 的 SignalVM / SignalIf），
+ * 只是把「置信号 Green/Red」换成「允许/拒绝分配调度 X」：
+ *   如果 <条件>   —— 条件真 → 进入本分支体；假 → 顺序试下一个「或者」，没有就试「否则」，
+ *                    再没有就跳到配对的「结束如果」之后；
+ *   或者 <条件>   —— elif：只在被上一个分支「落下来」时才跳过（落到即说明前面已执行）；
+ *   否则          —— 走到即跳到配对「结束如果」之后；
+ *   结束如果      —— 空操作，只用于配对；
+ *   允许/拒绝分配调度 X —— 立即终止求值并返回结果（X 不是本次要发的表就继续往下走）。
+ * 程序跑完没有任何结果指令命中 ⇒ 放行（与"空程序放行"一致，即第 451 轮之前的行为）。
+ */
+
+/** R3R: 取一个规则变量在「本次领取」上下文里的实际值。 */
+static uint32_t R3RDispatchRuleVariableValue(R3RDispatchRuleVariable var, const Station::R3RStationYard::R3RDispatchPoolEntry &e, const R3RDispatchClaimStats *stats)
+{
+	const bool have_stats = stats != nullptr && stats->valid;
+	switch (var) {
+		case R3RDispatchRuleVariable::MaxSpeed:          return have_stats ? stats->max_speed : 0;
+		case R3RDispatchRuleVariable::Power:             return have_stats ? stats->power : 0;
+		case R3RDispatchRuleVariable::MaxTractiveEffort: return have_stats ? stats->max_te : 0;
+		case R3RDispatchRuleVariable::Reliability:       return have_stats ? stats->reliability : 0;
+		case R3RDispatchRuleVariable::PoolIssued:        return e.issued;
+		case R3RDispatchRuleVariable::PoolRemaining:     return (e.limit > e.issued) ? (e.limit - e.issued) : 0;
+		/* 可编程信号机的「前方绿灯数 / 红灯数 / 另一信号的状态」在领表上下文没有信号格可看。
+		 * R3R (第 455 轮, KI-652): 已从编辑器下拉移除，求值改由 R3RDispatchConditionHolds 直接放行
+		 * （不再返回 0，否则「不超过 0」仍会成立、「至少 1」永远不成立，旧档规则行为随机）。 */
+		case R3RDispatchRuleVariable::NumGreen:
+		case R3RDispatchRuleVariable::NumRed:
+		case R3RDispatchRuleVariable::OtherSignalState:  return 0;
+		/* 计数器是全局池；站内没有槽/信号绑定，暂按 0 处理（TODO：接 tracerestrict）。 */
+		case R3RDispatchRuleVariable::Counter:           return 0;
+		case R3RDispatchRuleVariable::EngineClass:       return have_stats ? stats->engine_class : 0;
+		case R3RDispatchRuleVariable::None:
+		default:                                         return 0;
+	}
+}
+
+/** R3R: 一条 If/Or 的条件是否成立（var == None 表示无条件成立）。 */
+static bool R3RDispatchConditionHolds(const R3RDispatchInstruction &ins, const Station::R3RStationYard::R3RDispatchPoolEntry &e, const R3RDispatchClaimStats *stats)
+{
+	if (ins.var == R3RDispatchRuleVariable::None) return true;
+	/* R3R (第 455 轮, KI-652): 三个「恒 0」条件不参与判定 —— 旧档里可能还留着它们，
+	 * 若按 0 去比，玩家的规则会悄悄一半恒真一半恒假。一律当作「不设限」。 */
+	if (ins.var == R3RDispatchRuleVariable::NumGreen || ins.var == R3RDispatchRuleVariable::NumRed ||
+			ins.var == R3RDispatchRuleVariable::OtherSignalState) {
+		return true;
+	}
+	const uint32_t have = R3RDispatchRuleVariableValue(ins.var, e, stats);
+	/* 机车类型是枚举而不是可比较的量：只认「等于 / 不等于」（编辑器给「是 / 不是」）。
+	 * 旧档里这一类条件存的比较符是 AtLeast，按「等于」解释以保持第 455 轮的既有行为。 */
+	if (ins.var == R3RDispatchRuleVariable::EngineClass) {
+		const bool same = (have == ins.value);
+		return (ins.op == R3RDispatchRuleOp::NotEqual) ? !same : same;
+	}
+	switch (ins.op) {
+		case R3RDispatchRuleOp::AtMost:   return have <= ins.value;
+		case R3RDispatchRuleOp::Equal:    return have == ins.value;
+		case R3RDispatchRuleOp::NotEqual: return have != ins.value;
+		case R3RDispatchRuleOp::Greater:  return have > ins.value;
+		case R3RDispatchRuleOp::Less:     return have < ins.value;
+		case R3RDispatchRuleOp::AtLeast:
+		default:                          return have >= ins.value;
+	}
+}
+
+/** R3R: 从 @p pc 之后找本层下一个分支指令（或者/否则/结束如果）；找不到返回 size()。 */
+static size_t R3RDispatchNextBranch(const std::vector<R3RDispatchInstruction> &prog, size_t pc)
+{
+	uint depth = 0;
+	for (size_t i = pc + 1; i < prog.size(); i++) {
+		switch (prog[i].kind) {
+			case R3RDispatchInstructionKind::If:
+				depth++;
+				break;
+			case R3RDispatchInstructionKind::EndIf:
+				if (depth == 0) return i;
+				depth--;
+				break;
+			case R3RDispatchInstructionKind::Else:
+			case R3RDispatchInstructionKind::Or:
+				if (depth == 0) return i;
+				break;
+			default:
+				break;
+		}
+	}
+	return prog.size();
+}
+
+/** R3R: 找与 @p pc 配对的「结束如果」下标；找不到返回 size()。 */
+static size_t R3RDispatchMatchingEndIf(const std::vector<R3RDispatchInstruction> &prog, size_t pc)
+{
+	uint depth = 0;
+	for (size_t i = pc + 1; i < prog.size(); i++) {
+		if (prog[i].kind == R3RDispatchInstructionKind::If) {
+			depth++;
+		} else if (prog[i].kind == R3RDispatchInstructionKind::EndIf) {
+			if (depth == 0) return i;
+			depth--;
+		}
+	}
+	return prog.size();
+}
+
+/** R3R (第 451 轮续二): 把本场调度池换算成「去重后的调度序号」。
+ *  同一份调度可能登记在多条池条目上，而多选掩码只记一份 ⇒ 下标用去重序号，
+ *  不用条目下标（否则勾一次会在多条条目上生效，语义混乱）。 */
+static void R3RDispatchBuildScheduleSlots(const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> &pool, std::vector<int> &out)
+{
+	out.assign(pool.size(), -1);
+	std::vector<uint32_t> seen;
+	for (size_t i = 0; i < pool.size(); i++) {
+		const uint32_t schedule = R3RDispatchEntryScheduleIndex(pool[i]);
+		if (schedule == Station::R3R_DISPATCH_NO_SCHEDULE) continue;
+		auto it = std::find(seen.begin(), seen.end(), schedule);
+		if (it == seen.end()) {
+			out[i] = static_cast<int>(seen.size());
+			seen.push_back(schedule);
+		} else {
+			out[i] = static_cast<int>(it - seen.begin());
+		}
+	}
+}
+
+/** R3R: 执行一份规则程序，返回 true = 允许把第 @p slot 份调度发出去。
+ *  @param slot 这份调度在本场池「去重后」的序号（-1 = 不在池中，任何结果行都不匹配）。 */
+static bool R3RDispatchProgramRun(const std::vector<R3RDispatchInstruction> &prog, int slot, const Station::R3RStationYard::R3RDispatchPoolEntry &e, const R3RDispatchClaimStats *stats)
+{
+	const size_t n = prog.size();
+	size_t pc = 0;
+	/* 步数上限：合法程序每步至少前进一条；给跳转留 4 倍余量，防止旧档/坏程序死循环。 */
+	const uint max_steps = static_cast<uint>(R3R_DISPATCH_PROGRAM_MAX) * 4 + 8;
+	for (uint step = 0; pc < n; step++) {
+		if (step > max_steps) break;
+		const R3RDispatchInstruction &ins = prog[pc];
+		switch (ins.kind) {
+			case R3RDispatchInstructionKind::If:
+			{
+				/* 一次把整条「如果 / 或者… / 否则」链选完，避免把「或者」误当成可落下的位置。 */
+				size_t cur = pc;
+				bool chosen = false;
+				while (true) {
+					if (R3RDispatchConditionHolds(prog[cur], e, stats)) {
+						pc = cur + 1; // 进入该分支体
+						chosen = true;
+						break;
+					}
+					const size_t next = R3RDispatchNextBranch(prog, cur);
+					if (next >= n) { pc = n; chosen = true; break; } // 没有分支了，跳出整条链
+					if (prog[next].kind == R3RDispatchInstructionKind::Or) {
+						cur = next; // 试下一个「或者」
+						continue;
+					}
+					if (prog[next].kind == R3RDispatchInstructionKind::Else) {
+						pc = next + 1; // 进入「否则」体
+					} else {
+						pc = next; // 落到「结束如果」
+					}
+					chosen = true;
+					break;
+				}
+				if (!chosen) pc = n;
+				break;
+			}
+			case R3RDispatchInstructionKind::Or:
+			case R3RDispatchInstructionKind::Else:
+				/* 落到这里说明上面某个分支体已经执行完 ⇒ 跳过剩下所有分支。 */
+				pc = R3RDispatchMatchingEndIf(prog, pc) + 1;
+				break;
+			case R3RDispatchInstructionKind::EndIf:
+				pc++;
+				break;
+			case R3RDispatchInstructionKind::Result:
+				/* extra 是位掩码：bit i = 本场池去重后第 i 份调度（第 451 轮续二的多选）。
+				 * 掩码为 0 或 slot 不在池中 ⇒ 这条结果行不匹配任何调度。 */
+				if (slot >= 0 && slot < 32 && HasBit(ins.extra, static_cast<uint>(slot))) {
+					return ins.result == R3RDispatchResultKind::Allow;
+				}
+				pc++; // 这条结果不是给这份表的，继续往下
+				break;
+		}
+	}
+	return true;
+}
+
+std::vector<R3RDispatchInstruction> *Station::R3RDispatchProgramRef(uint16_t yard)
+{
+	if (yard == R3R_YARD_NONE) return &this->r3r_whole_program;
+	if (yard > this->R3RNumYards()) return nullptr;
+	return &this->r3r_yards[yard - 1].program;
+}
+
+const std::vector<R3RDispatchInstruction> *Station::R3RDispatchProgramRef(uint16_t yard) const
+{
+	if (yard == R3R_YARD_NONE) return &this->r3r_whole_program;
+	if (yard > this->R3RNumYards()) return nullptr;
+	return &this->r3r_yards[yard - 1].program;
+}
+
+bool Station::R3RDispatchProgramSet(uint16_t yard, const std::vector<R3RDispatchInstruction> &program)
+{
+	std::vector<R3RDispatchInstruction> *const prog = this->R3RDispatchProgramRef(yard);
+	if (prog == nullptr) return false;
+	if (program.size() > R3R_DISPATCH_PROGRAM_MAX) return false;
+	*prog = program;
+	return true;
+}
+
+bool Station::R3RDispatchProgramAllows(uint16_t yard, uint32_t schedule, const R3RDispatchClaimStats *stats) const
+{
+	const std::vector<R3RDispatchInstruction> *const prog = this->R3RDispatchProgramRef(yard);
+	const std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
+	if (prog == nullptr || pool_ptr == nullptr) return true; // 场越界 ⇒ 与「没有规则」同义
+	R3RStationYard::R3RDispatchPoolEntry dummy;
+	const R3RStationYard::R3RDispatchPoolEntry *entry = &dummy;
+	std::vector<int> slots;
+	R3RDispatchBuildScheduleSlots(*pool_ptr, slots);
+	int slot = -1;
+	for (size_t i = 0; i < pool_ptr->size(); i++) {
+		if (R3RDispatchEntryScheduleIndex((*pool_ptr)[i]) == schedule) {
+			entry = &(*pool_ptr)[i];
+			slot = slots[i];
+			break;
+		}
+	}
+	return R3RDispatchProgramRun(*prog, slot, *entry, stats);
+}
+
+int Station::R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule, const R3RDispatchClaimStats *stats) const
 {
 	out_schedule = R3R_DISPATCH_NO_SCHEDULE;
 	const std::vector<R3RStationYard::R3RDispatchPoolEntry> *const pool_ptr = this->R3RDispatchPoolRef(yard);
 	if (pool_ptr == nullptr) return -1;
+	const std::vector<R3RDispatchInstruction> *const prog_ptr = this->R3RDispatchProgramRef(yard);
 	const std::vector<R3RStationYard::R3RDispatchPoolEntry> &pool = *pool_ptr;
+	std::vector<int> slots;
+	if (prog_ptr != nullptr) R3RDispatchBuildScheduleSlots(pool, slots);
 	for (uint i = 0; i < pool.size(); i++) {
 		const R3RStationYard::R3RDispatchPoolEntry &e = pool[i];
 		const uint32_t schedule = R3RDispatchEntryScheduleIndex(e);
 		if (schedule == except_schedule) continue;      // 不能领自己的表
 		if (e.issued >= std::max<uint16_t>(1, e.limit)) continue; // 坑位已满
 		if (!R3RDispatchScheduleUsable(schedule)) continue;
+		/* 第 451 轮续：用本场的规则程序判断这份表能不能发给这列来车（空程序 = 无条件放行）。 */
+		if (prog_ptr != nullptr && !R3RDispatchProgramRun(*prog_ptr, slots[i], e, stats)) continue;
 		out_schedule = schedule;
 		return static_cast<int>(i);
 	}
@@ -2808,6 +3056,105 @@ CommandCost CmdR3RSetDispatchPoolLimit(DoCommandFlags flags, StationID station_i
 	if (flags.Test(DoCommandFlag::Execute)) {
 		if (!st->R3RDispatchPoolSetLimit(yard, index, limit)) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY);
 		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 451 轮, KI-642): 设置一条池条目的分配规则。
+ *
+ * 规则写在池条目上（C-11）：到站申请调度表的列车，用**它自己的性能**去比对，
+ * 满足才领到这份表。`var == None` 表示清掉规则（无条件发牌）。
+ */
+CommandCost CmdR3RSetDispatchPoolRule(DoCommandFlags flags, StationID station_id, uint16_t yard, uint16_t index, uint8_t var, uint8_t op, int32_t value)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+	if (var > static_cast<uint8_t>(R3RDispatchRuleVariable::EngineClass)) return CMD_ERROR;
+	if (op > static_cast<uint8_t>(R3RDispatchRuleOp::Less)) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		const R3RDispatchRuleVariable rule_var = static_cast<R3RDispatchRuleVariable>(var);
+		const R3RDispatchRuleOp rule_op = static_cast<R3RDispatchRuleOp>(op);
+		if (!st->R3RDispatchPoolSetRule(yard, index, rule_var, rule_op, value)) return CommandCost(STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY);
+		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
+	}
+	return CommandCost();
+}
+
+/**
+ * R3R (第 451 轮续): 整体替换某个场（yard == 0 时是整站那一份）的「分配规则」程序。
+ *
+ * 程序是定长指令序列，命令层用 `std::string` 承载字节流，每条指令 24 字节
+ * （6 个 32 位小端字）：
+ *   word0 = kind | (var << 8) | (op << 16) | (result << 24)
+ *   word1 = value
+ *   word2 = extra
+ *   word3..5 = 保留（恒 0，为将来扩展留位，读取时忽略）
+ * 空串 = 清空程序，回到「无条件放行」。
+ *
+ * 这里只做字段校验（条数上限、字段范围），**不做括号配对校验**——编辑器逐条插入，
+ * 必须允许中间态（半截 if）。求值在 R3RDispatchProgramAllows() 里现算，求值器对
+ * 不平衡程序已有防御（越界回退、depth 0 的 else/or 跳过）。
+ */
+CommandCost CmdR3RSetDispatchProgram(DoCommandFlags flags, StationID station_id, uint16_t yard, const std::string &blob)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE) return CMD_ERROR;
+	if (yard > st->R3RNumYards()) return CMD_ERROR;
+
+	static constexpr size_t R3R_INSN_STRIDE = 24;
+	if (blob.size() % R3R_INSN_STRIDE != 0) return CMD_ERROR;
+	const size_t count = blob.size() / R3R_INSN_STRIDE;
+	if (count > R3R_DISPATCH_PROGRAM_MAX) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	std::vector<R3RDispatchInstruction> program;
+	program.reserve(count);
+
+	for (size_t i = 0; i < count; i++) {
+		const uint8_t *p = reinterpret_cast<const uint8_t *>(blob.data()) + i * R3R_INSN_STRIDE;
+		uint32_t words[3];
+		for (int w = 0; w < 3; w++) {
+			const uint8_t *q = p + w * 4;
+			words[w] = static_cast<uint32_t>(q[0]) | (static_cast<uint32_t>(q[1]) << 8) |
+					(static_cast<uint32_t>(q[2]) << 16) | (static_cast<uint32_t>(q[3]) << 24);
+		}
+
+		R3RDispatchInstruction ins;
+		ins.kind = static_cast<R3RDispatchInstructionKind>(words[0] & 0xFF);
+		ins.var = static_cast<R3RDispatchRuleVariable>((words[0] >> 8) & 0xFF);
+		ins.op = static_cast<R3RDispatchRuleOp>((words[0] >> 16) & 0xFF);
+		ins.result = static_cast<R3RDispatchResultKind>((words[0] >> 24) & 0xFF);
+		ins.value = words[1];
+		ins.extra = words[2];
+
+		if (ins.kind > R3RDispatchInstructionKind::Result) return CMD_ERROR;
+		/* R3R (第 455 轮续二, KI-652): 上界必须跟着枚举末尾走 —— 第 455 轮把 EngineClass
+		 * 追加到 R3RDispatchRuleVariable 末尾时忘了放宽这里，导致「机车类型」条件一存就被
+		 * 整份程序拒绝（玩家看到的是「不能这样做」红框）。 */
+		if (ins.var > R3RDispatchRuleVariable::EngineClass) return CMD_ERROR;
+		if (ins.op > R3RDispatchRuleOp::Less) return CMD_ERROR;
+		if (ins.result > R3RDispatchResultKind::Deny) return CMD_ERROR;
+
+		/* Structural balance (if/or/else/end if pairing) is deliberately NOT enforced
+		 * here: the rule editor inserts one instruction at a time, so a half-written
+		 * program must be storable. The evaluator already tolerates unbalanced
+		 * programs (it skips forward to the matching end if and ignores stray
+		 * else/or at depth 0). */
+		program.push_back(ins);
+	}
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		if (!st->R3RDispatchProgramSet(yard, program)) return CMD_ERROR;
+		InvalidateWindowData(WindowClass::StationDispatch, st->index, 0);
+		InvalidateWindowClassesData(WindowClass::DispatchProgram, 0);
 	}
 	return CommandCost();
 }

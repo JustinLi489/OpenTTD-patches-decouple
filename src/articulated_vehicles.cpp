@@ -19,6 +19,7 @@
 #include "company_func.h"
 #include "newgrf.h"
 #include "newgrf_extension.h"
+#include "r3r_perf.h"
 #include <vector>
 
 #include "table/strings.h"
@@ -337,6 +338,8 @@ CargoType GetOverallCargoOfArticulatedVehicle(const Vehicle *v)
  */
 void CheckConsistencyOfArticulatedVehicle(const Vehicle *v)
 {
+	/* R3R (第 455 轮, KI-653): 探针要用的原始头指针 —— v 在下面的 do-while 里被推进到 nullptr。 */
+	const Vehicle *const head = v;
 	const Engine *engine = v->GetEngine();
 
 	CargoTypes purchase_refit_union, purchase_refit_intersection;
@@ -355,6 +358,12 @@ void CheckConsistencyOfArticulatedVehicle(const Vehicle *v)
 		assert(v->cargo_type < NUM_CARGO || (v->type == VehicleType::Train && Train::From(v)->IsVirtual()));
 		if (v->cargo_cap > 0) real_default_cargoes.Set(v->cargo_type);
 
+		/* R3R (第 455 轮, KI-653 修正): 这里沿用原生的 HasArticulatedPart() 即可。
+		 * vehicle_base.h 的该谓词是 Next()->IsArticGroupMember()，而
+		 * Train::IsArticGroupMember()（train.h:212-215）本身就是
+		 * "IsArticulatedPart() || ArticGroupMember 位" ⇒ 真 artic 部件与 R3R 打散组
+		 * 都能走到，"只认组角色位" 的推断是错的（见备忘 §11.3bis 修正）。
+		 * 因此本函数不是需求 6 的成因，保留原写法以免与上游分叉。 */
 		v = v->HasArticulatedPart() ? v->GetNextArticulatedPart() : nullptr;
 	} while (v != nullptr);
 
@@ -367,8 +376,64 @@ void CheckConsistencyOfArticulatedVehicle(const Vehicle *v)
 		}
 	}
 
+	/* R3R (第 459 轮, KI-653): 命中判据单独算一次，并在下面**无条件**打一行。
+	 * 原有 BUY-REFIT 系列整块在这条 if 内部 ⇒ 买了不弹窗的车一行日志都没有，于是
+	 * "日志里没有 BUY-REFIT"既可能是「没命中」也可能是「这版 exe 的探针没编进去」，
+	 * 两种结论相反却不可区分。CONSIST-CHK 是负判据的地基。零行为变更。 */
+	const bool r3r_hit = (real_refit_union != purchase_refit_union)
+			|| (real_refit_intersection != purchase_refit_intersection) || carries_more;
+	{
+		uint r3r_n = 0;
+		for (const Vehicle *w = head; w != nullptr; w = (w->HasArticulatedPart() ? w->GetNextArticulatedPart() : nullptr)) r3r_n++;
+		uint r3r_pn = 1;
+		for (uint i = 1; i < MAX_ARTICULATED_PARTS; i++) {
+			if (GetNextArticulatedPart(i, head->engine_type) == EngineID::Invalid()) break;
+			r3r_pn++;
+		}
+		R3RDbgWrite("CONSIST-CHK veh=%u eng=%u n=%u pn=%u hit=%d more=%d ru=%08X pu=%08X ri=%08X pi=%08X dflt=%08X\n",
+				(uint)head->index.base(), (uint)head->engine_type.base(), r3r_n, r3r_pn,
+				r3r_hit ? 1 : 0, carries_more ? 1 : 0,
+				real_refit_union.base(), purchase_refit_union.base(),
+				real_refit_intersection.base(), purchase_refit_intersection.base(),
+				real_default_cargoes.base());
+	}
+
 	/* show a warning once for each GRF after each game load */
-	if (real_refit_union != purchase_refit_union || real_refit_intersection != purchase_refit_intersection || carries_more) {
+	if (r3r_hit) {
+		/* R3R (第 455 轮, KI-653): 只读取证。玩家报「R3R 版购买列车会弹原生不弹的
+		 * "货物/改装信息与购买后不同"」。这一行落在唯一触发点上，输出两侧掩码与
+		 * 实际走到的节数，用来判定不一致是「节数少了（artic 链断了）」还是
+		 * 「同一节的 refit 掩码本身不同（引擎数据被改）」。 */
+		uint n_parts = 0;
+		for (const Vehicle *w = head; w != nullptr; w = (w->HasArticulatedPart() ? w->GetNextArticulatedPart() : nullptr)) n_parts++;
+		/* 购买侧的节数：与 GetArticulatedRefitMasks() 内部同一条引擎回调链，但 front 传
+		 * nullptr（购买列表的口径）。n != pn 才是"实车链与购买链长度不同"的直接证据。 */
+		uint purchase_parts = 1;
+		for (uint i = 1; i < MAX_ARTICULATED_PARTS; i++) {
+			if (GetNextArticulatedPart(i, head->engine_type) == EngineID::Invalid()) break;
+			purchase_parts++;
+		}
+		R3RDbgWrite("BUY-REFIT eng=%u veh=%u n=%u pn=%u pu=%08X pi=%08X ru=%08X ri=%08X more=%d dflt=%08X\n",
+				(uint)head->engine_type.base(), (uint)head->index.base(), n_parts, purchase_parts,
+				purchase_refit_union.base(), purchase_refit_intersection.base(),
+				real_refit_union.base(), real_refit_intersection.base(),
+				carries_more ? 1 : 0, real_default_cargoes.base());
+		/* 逐节对照：实车侧每条车的引擎/货种/容量/掩码，并把该货种在购买侧的默认容量
+		 * 一起打出来 —— carries_more 的真正成因就在 pcap==0 的那一节上。 */
+		uint part_no = 0;
+		for (const Vehicle *w = head; w != nullptr && part_no < MAX_ARTICULATED_PARTS;
+				w = (w->HasArticulatedPart() ? w->GetNextArticulatedPart() : nullptr), part_no++) {
+			const CargoType cargo = w->cargo_type;
+			R3RDbgWrite("BUY-REFIT-PART i=%u eng=%u cargo=%u cap=%u mask=%08X pcap=%u\n",
+					part_no, (uint)w->engine_type.base(), (uint)cargo, w->cargo_cap,
+					GetAvailableVehicleCargoTypes(w->engine_type, true).base(),
+					IsValidCargoType(cargo) ? purchase_default_capacity[cargo] : 0);
+		}
+		/* 购买侧的每一节引擎（front=nullptr 口径），用于和上面的 eng= 逐节对照。 */
+		R3RDbgWrite("BUY-REFIT-PP i=0 eng=%u\n", (uint)head->engine_type.base());
+		for (uint i = 1; i < purchase_parts; i++) {
+			R3RDbgWrite("BUY-REFIT-PP i=%u eng=%u\n", i, (uint)GetNextArticulatedPart(i, head->engine_type).base());
+		}
 		ShowNewGrfVehicleError(engine->index, STR_NEWGRF_BUGGY, STR_NEWGRF_BUGGY_ARTICULATED_CARGO, GRFBug::VehRefit, false);
 	}
 }
@@ -488,7 +553,11 @@ void AddArticulatedParts(Vehicle *first)
 		v->build_year = first->build_year;
 
 		v->cargo_subtype = 0;
-		v->max_age = CalTime::DateDelta{0};
+		/* R3R（第 433 轮 / KI-628）：车厢也有使用寿命 —— GRF 与默认表里车厢引擎本就有 lifelength
+		 * （例如默认 Passenger Carriage = 20 年，见 table/engines.h 的 MW() 第 3 参），上游这里
+		 * 一律清 0，才让"车厢/纯车底段寿命 0 年"。列车的铰接部件是真实车厢，跟随自己的引擎寿命；
+		 * 其它载具类型的铰接部件是虚拟部件（GVSF_VIRTUAL），可见性与 primary 判定完全不同，仍保持 0。 */
+		v->max_age = (type == VehicleType::Train) ? e_artic->GetLifeLengthInDays() : CalTime::DateDelta{0};
 		v->engine_type = engine_type;
 		v->value = 0;
 		v->random_bits = Random();

@@ -23822,3 +23822,1848 @@ A 跑 b/c 期间不会把它们的坐标写进 a 的书签。坏的只是「层�
   - 内容 = `openttd.exe` + 上游原有 `changelog.md` / `jgrpp-changelog.md` / `COPYING.md` / `README.md` + `ai\ baseset\ game\ lang\ scripts\`。
   - **刻意不放 `README_R3R.txt`**：按玩家 2026-11-13 明确要求（"不用添加你写的教程，玩家抱怨 AI 味道很大"），发行包内不附 AI 撰写的说明文档，改由玩家手写；上一版 v1.0.5 内的该文件（5 195 B）因此在本版消失，条目数 136→135。
 - 探针口径说明（避免误读"无探针"）：发行版沿用 `R3R_PROBES_DEFAULT=0` —— 默认**关闭**，不采集、不写 `R3R_debug.log`、无常驻开销，与 v1.0.5 完全一致；探针代码仍编入，便于排查时以 `R3R_DBG=1` 开启。若需要"探针代码完全不编入"的版本，须改 `-DR3R_PROBES=0` 并重配全量（本轮未做，因既有发布口径与历史包一致）。
+
+## 第 431 轮（2026-11-13 崩溃：非段链检测空指针）
+
+### KI-625 非段链检测 `Train::From(v->Next())` 空指针断言崩溃（高，已定性待修）
+
+- 来源：玩家 2026-11-13 03:26 / 03:28 两次连崩，日志 `C:\Users\冯洁敏\Documents\OpenTTD\crash-20261112T192643Z.log` 与 `crash-20261112T192831Z.log`（3 837 / 3 836 B）。
+- 产生者：`r3r-stable-2026-11-13`（`Build date: Nov 13 2026 02:39:15`），即本轮刚出的发行版 v1.0.6。
+- 崩溃点（两次同址）：`R3RSkipCoupleOrdersForRealArtic + 142 (src\train_cmd.cpp:22611)`，上游 `TrainLocoHandler + 4404 (src\train_cmd.cpp:23131)`；`RCX=0`、fault addr `0x3C`，指令 `80 79 3C 00` = `cmp byte ptr [rcx+3Ch],0`。
+- 根因：`src\train_cmd.cpp:22611` 的 `R3RChainAllWagonsSegmented(consist)` 内联展开，其循环写作 `for (const Train *v = t; v != nullptr; v = Train::From(v->Next()))`。链尾车 `v->Next()` 返回 `nullptr`，而 `Train::From`（`src\vehicle_base.h:1783-1787`）**先 `assert(v->type == Type)` 再转换**，于是对空指针读 `offsetof(Vehicle, type) == 0x3C`（`VehicleType::Train == 0`，故比较立即数为 0，与反汇编逐字吻合），release 树 `-DOPTION_USE_ASSERTS=ON` 使断言生效 ⇒ 崩。
+- 性质：**第 429 轮 KI-624 引入的回归**（该段代码为本轮新写）；第 429 轮只做过编译自证、无实机复测，故未暴露。
+- 修法：循环改为先判空再转换（`const Vehicle *n = v->Next(); v = (n != nullptr) ? Train::From(n) : nullptr;`），判据不变。
+- 同类排查：`src\couple_group.cpp:77` 的 `T *next = T::From(t->Next());` 结构相同，需确认其上层是否已有 `t->Next() != nullptr` 保护（见备忘 §三 疑点 B）。
+- 状态：**已修 + 已编译（内测树），游戏内复测待做；发行包 v1.0.6 已被此 bug 污染，需重编发行树**。
+- 修复落地（2026-11-13 03:35）：`R3RChainAllWagonsSegmented` 循环改为
+  `for (const Train *v = t; v != nullptr; ) { const Vehicle *const n = v->Next(); ... v = (n != nullptr) ? Train::From(n) : nullptr; }`，
+  判据逻辑（段外只允许原型非车厢的真引擎 / 双头后半，段内一律合法，跳过真铰接 part）**逐字不变**。
+- 同类排查结论：`src\couple_group.cpp:76` 已有 `if (t->Next() == nullptr) return nullptr;` 保护，安全；`src\train_cmd.cpp` 其余 `Train::From` 来源均为 `First()/GetFirstVehicle()/已判空变量`，8484/8500/8518 三处本就写作 `(next != nullptr) ? Train::From(next) : nullptr`（仓库既有约定）。
+- 构建自证：内测树 `R3R_fullbuild.cmd inc detach` → `EXIT_CODE=0`、`[5/5] Linking`、`build\openttd.exe` @2026-11-13 03:35:41（52 867 072 B）、`read_lints` 0。发行树重编被玩家中止，未执行。
+- 教训：`X::From(y->Next())` 是**空指针陷阱**，`From()` 的 `assert(v->type == Type)` 会先解引用；链式遍历必须 `(n != nullptr) ? X::From(n) : nullptr`。
+
+### KI-626 `pbs.cpp:545` 断言崩溃：挂车寻路对站台格预留了不存在的轨道（高，已修·第 432 轮）
+
+- 来源：玩家 2026-11-13 报告 + 崩溃日志 `C:\Users\冯洁敏\Documents\OpenTTD\crash-20261113T023908Z.log`（20 775 B，2026-11-13 02:39:08 UTC）。
+- 产生者：`r3r-stable-2026-11-13-m (2)`，`Build date Nov 13 2026 03:34:18`（= 第 431 轮空指针修复后的内测树 `build\openttd.exe`，探针 ON）。
+- 断言：`pbs.cpp:544` 的 `assert_msg_tile((TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TRANSPORT_RAIL, 0)) & TrackToTrackBits(track)) != 0, ...)`；失败格 `FE6B = 107,127`，`type 50 (Station)`。
+- 调用栈（关键帧）：`TrainLocoHandler:23144 → R3REnsureCouplePair:14415 → TryPathReserveWithResultFlags:19110 → R3RTryPathReserveCore:19695 → ChooseTrainTrack:17984 → DoTrainCouplePathfind:16363 → YapfTrainCoupleTrack:2773 → FindNearestCoupleTrain:2001 → R3RReservePathSequence:771 → ReserveSingleTrack:650 → ReserveRailStationPlatform:624 → TryReserveRailTrack:544`。
+- **与第 431 轮（KI-625 非段链检测）无关**：该轮只改 `R3RChainAllWagonsSegmented` 的链遍历写法（纯只读判断，不写地图/不预留），且崩溃栈中无该函数。
+- **定性已做实（2026-11-13，第 432 轮）**：是 **R3R 自己的回归，但不是第 431 轮**，引入点 = **第 402 轮 KI-571**（checkpoint `b0122745b7`，2026-11-08）。
+  - `git show b0122745b7^:src/pathfinder/yapf/yapf_rail.cpp` 实测：改动前签名为 `bool ReserveRailStationPlatform(TileIndex &tile, DiagDirection dir)`（**无 `td` 参数**），循环体是整格位 `if (HasStationReservation(tile)) return false; SetRailStationReservation(tile, true);` —— 与具体轨道**无关**，结构上不可能触发 `pbs.cpp:544` 的「该格无此 track」断言。
+  - 第 402 轮为了绕开「伙伴/自己的整格位占着就整段失败」，把循环体改成逐格 `TryReserveRailTrack(tile, TrackdirToTrack(td), false)`，并给函数加上 `td`（`yapf_rail.cpp:606-627`）。于是「进入站台那一格的 trackdir」被套用到整段平台**每一格**。
+  - `IsCompatibleTrainStationTile()`（`station_map.h:568-575`）只保证 `IsRailStationTile && !IsStationTileBlocked && IsCompatibleRail && GetRailStationAxis 相同 && GetStationIndex 相同`，**不保证该格真有入口那条轨** ⇒ 站台两端接不同 track 的弯道/斜接时，中途格必炸。所以「之前都没有」= 第 402 轮之前这条路径根本不逐 track 预留，也就没有断言可炸。
+- **关键事实（决定修法成本）**：`pbs.cpp` 的 `TileType::Station` 分支（`pbs.cpp:602-620`）写入的是**整格位** `SetRailStationReservation(tile, true)`，`track` 参数在 Station 分支**完全未被使用**，只被 544 行断言检查。⇒ 该 `td` 纯属"为了过断言"而塞进来的错误值，改成该格真实存在的轨道即可，对站台预留语义**零影响**。
+- **修法（已实施，2026-11-13，玩家回「按你推荐的来改吧」）**：只改 `src\pathfinder\yapf\yapf_rail.cpp` 一个 .cpp（未碰任何 `src\*.h`）。`ReserveRailStationPlatform` 的循环体改为「先读**该格实际存在的轨道**再喂给 `TryReserveRailTrack`」：
+  ```cpp
+  const TrackBits plat_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, ::TransportType::TRANSPORT_RAIL, 0));
+  if (plat_tracks == TRACK_BIT_NONE) return false;        // 站台格理论必有轨，防御性
+  const Track plat_track = FindFirstTrack(plat_tracks);
+  ...
+  if (!TryReserveRailTrack(tile, plat_track, false)) return false;
+  ```
+  同时叠加只读探针 `RESV-PLAT-TRACK tile=x,y entry_track=N actual_track=M`（仅当入口 track ≠ 该格实际 track 时打一行，走文件既有 `R3RFopenDbg("a")`，探针关闭时恒不打开文件）。`td` 形参保留，只用于探针比较。
+- **刻意不做**：不退回 `HasStationReservation` 硬判（会复活第 402 轮 KI-571 修掉的「伙伴占位导致整段订不上」）；不动 `pbs.cpp:545` 的断言强度（它现在真的能抓到越权预留，应保留）。
+- 状态：**已修（第 432 轮，已编译通过；游戏内复测待做）**。备忘 `R3R_round432_pbs545_assert_crash_memo.md` §二/§四/§七。构建：`R3R_fullbuild.cmd inc detach`，`build\R3R_incbuild.done`=EXIT_CODE=0 @2026-11-13 10:48:39、`[3/3] Linking CXX executable openttd.exe`、errcount=0、`yapf_rail.cpp` 10:45:28 → obj 10:46:41 → `build\openttd.exe` 10:48:32（52 867 072 B）、read_lints 0、exe 命中 `RESV-PLAT-TRACK`。复测判据：①同存档同位置不再触发 `pbs.cpp:545`；②挂车寻路的站台预留仍覆盖平台（不出现「该订没订」→ `TPR-BLOCKED` / 预留成功但车不走）；③普通（非挂车）寻路站台预留逐字不变；④负判据：真对该格无该轨的调用仍被断言拦下；⑤`RESV-PLAT-TRACK` 能打出 107,127 那类格（疑点 A2 取数）。
+
+## 第 433 轮（2026-11-13）：挂接分组耦合口径 / 段与车厢寿命 / 年龄与可靠性的继承
+
+备忘：`R3R_round433_lifespan_group_inherit_memo.md`
+
+### KI-627 车库拖动耦合后两段的挂接分组变成本链所有分组的并集（中，已修·第 433 轮）
+
+- 来源：玩家 2026-11-13 报告。段 A ∈ {组1, 组2}、段 B ∈ {组1, 组3}，车库内拖动耦合后**两个段都变成 {组1, 组2, 组3}**。
+- 玩家判定"肯定不对"，但正确口径玩家自己也记不清，需我给结论。
+- 历史沿革：第 158 轮 KI-256 就把此项列为待拍板三选一（①并集 ABC＝整列车属性 ②段级保持 AB+AC＝段的属性 ③维持覆盖）。当前观察到的 1+2+3 是**并集**形态，说明某轮已把归一化改成 OR（或读侧并集展开），与 KI-256 记录的"覆盖"不一致，**需查证是哪条路径做的 OR**。
+- 建议口径：**2（段级保持 AB + AC）**，因为数据模型本来就是按段存/按段读；选 1 要额外把并集广播到每段、等于放弃段级语义；选 3 会丢信息。**待玩家一句话拍板 1 还是 2。**
+- 猜测根因（待验证）：`R3RNormaliseChainGroups` / `R3RSyncChainAfterDepotEdit` 或读侧的 `R3RGetEffectiveCoupleGroupsOfSegment`（含父组继承展开）把掩码 OR 成全链并集并回写。
+- **定性已做实（2026-11-13，第 433 轮）**：不是父组继承（那只在读侧展开），而是**第 159 轮 / q-2=肆 写进 `src\train_cmd.cpp` 的 `R3RNormaliseChainGroups()`**：它遍历全链各段头，把 `R3RGetCoupleGroupsOfSegment()` 逐个 OR 成 `union_mask`，然后 `R3RClearCoupleGroupsOfSegment()` + `R3RAddCoupleGroupToSegment(union_mask)` **广播给每一段**；`src\couple_group.cpp` 的读档归一化的 `mask_fixes` 分支是同一套逻辑的第二处。玩家现场（A={1,2}、B={1,3} → 两段都变 {1,2,3}）逐字吻合。
+- 口径定案：**挂接分组属于段**（第 152 轮 P4/P5 的段身份模型），不是整列车属性 ⇒ 任何段的掩码都不允许被别的段改写。
+- **已修（第 433 轮，已编译通过；游戏内复测待做）**：
+  - `R3RNormaliseChainGroups()` 改为**只读汇总探针**：仍遍历各段头算并集，但只打 `CGRP-NORM-KEEP head=%d nseg=%u union=%llu`，**不再 Clear、不再广播**，任何一段的掩码保持原样。
+  - `src\couple_group.cpp` 读档归一化同改：只打 `CGRP-NORM-KEEP-LOAD`（`nseg > 1` 才写），删掉原来的 `mask_fixes` 覆盖广播；文件头注释改写为"口径已改为『分组属于段』—— 第 159 轮的全链并集广播已废除"。
+  - 负判据：单段链、无分组链行为逐字不变（并集 == 各自的掩码，本来就不写）。
+- 复测判据：①车库拖动耦合 A({1,2}) + B({1,3}) ⇒ 解挂后 A 仍 {1,2}、B 仍 {1,3}；②日志出现 `CGRP-NORM-KEEP ... nseg=2 union=7` 但两段读数不变；③存档往返后两段仍各自保持；④`R3RCoupleAllowedIgnoringPair` 的跨公司授权不受影响（它读的是每段自己的掩码）。
+
+### KI-628 纯车底（假引擎段）寿命显示 0；车厢是否应有寿命待确认（中，已修·第 433 轮）
+
+- 来源：玩家 2026-11-13 报告。纯车底的段寿命显示 0（玩家记得"实际为上限 65535"），并隐约记得纯车厢也是有使用寿命的。
+- 已知事实：`max_age` 全仓仅在 `CmdBuildRailVehicle`（`train_cmd.cpp:3418`、`24683`）与其它载具建造路径赋值；`CmdBuildRailWagon` **不赋值** ⇒ 车厢 `max_age` 保持默认 0；`articulated_vehicles.cpp:491` 对铰接部件显式 `max_age = 0`。`vehicle_gui.cpp:132-136` 的既有注释与 `if (u->max_age.base() == 0) continue;` 已自陈"wagon 没有寿命、假引擎同理"。
+- ⇒ 现象 2 大概率**不是 R3R 回归**，而是"车厢本无寿命"的既有形态；但玩家记忆需对照原生行为确认。
+- 待验证：原生 JGRPP/vanilla 里 wagon 的 `max_age` 是否真的为 0（若是，则本条转为"口径确认"；若否，则是我方建造路径漏赋值，属缺陷）。
+- **玩家拍板（2026-11-13）**：原话"纯车底的段寿命是0……但是我隐约记得纯车厢也是有使用寿命的"，并明确"应该是 15 或者 30 这样的值"⇒ **不是口径确认，按缺陷处理**：车厢（含纯车底段、假引擎段头）必须带真实使用寿命，显示 0/65535 即为 bug。
+- **取证表**：默认引擎表里车厢**有**寿命（`src\table\engines.h:130-132` 的 `MW(..., 20, ...)`，第 3 参即 lifelength 年）；`Engine::GetLifeLengthInDays()` = `(info.lifelength + extend_vehicle_life) * DAYS_IN_LEAP_YEAR`（`engine.cpp:511-515`）；但 `CmdBuildRailVehicle`（机车）**有** `max_age` 赋值，`CmdBuildRailWagon`（车厢）**没有**，`AddArticulatedParts`（`articulated_vehicles.cpp:491`）**无条件清 0**，`AddRearEngineToMultiheadedTrain`（双头后节）**漏复制**。⇒ 车厢 `max_age` 恒 0，是建造路径漏赋值，与引擎表定义矛盾。
+- **已修（第 433 轮，已编译通过；游戏内复测待做）**，四处：
+  1. `src\train_cmd.cpp` 的 `CmdBuildRailWagon()`（:2159）：补 `v->max_age = e->GetLifeLengthInDays();`（与同函数里 `e->reliability` 同一处 `e`）。
+  2. `src\articulated_vehicles.cpp` 的 `AddArticulatedParts()`（:495）：
+     ```cpp
+     v->max_age = (type == VehicleType::Train) ? e_artic->GetLifeLengthInDays() : CalTime::DateDelta{0};
+     ```
+     只有列车的铰接部件跟随自己引擎的寿命；road/ship/aircraft 的铰接部件仍是 0（它们的可见性/primary 判定与列车完全不同，不动）。
+  3. `src\train_cmd.cpp` 的 `AddRearEngineToMultiheadedTrain()`（:3358）：补 `u->max_age = v->max_age;`（双头后节继承前节）。
+  4. 老存档迁移（`src\sl\vehicle_sl.cpp` 的 `AfterLoadVehiclesPhase2()`，`part_of_load` 为真、且在 `XSLFI_TEMPLATE_REPLACEMENT` 虚拟车清理之前）：遍历每条链的每一节，`max_age == 0` 且引擎有效且引擎寿命非 0 时补上引擎寿命，**只填 0、不改已有值**（幂等）；命中打 `R3R-STATS-MIGRATE-LOAD units=N`。
+- 标签坑：`R3RDbgWrite("STATS-…")` 会被 `r3r_perf.h` 的 `R3RDbgTagAllowed()` **静默丢弃**（白名单不含 `STATS`），故一律用 `R3R-STATS-*`（第 274/296/370 轮已三次踩坑，0 条 ≠ 没触发）。
+- 负判据：车厢**仍不会**被自动更换 —— `Vehicle::NeedsAutorenewing()`（`vehicle.cpp:198-199`）对 `!IsFrontEngine() && !IsFreeWagon()` 直接 `return false`，且该函数完全不看 `max_age`；`HandleAutoreplace` 只处理引擎 ⇒ 给车厢补 `max_age` 不会让它们变成"待更新"。
+
+### KI-629 耦合/解耦过程中机车寿命从 30 年变为 0 年；年龄/年限/可靠性继承需彻查（高，已修·第 433 轮）
+
+- 来源：玩家 2026-11-13 报告。执行挂接与解挂时，**机车的使用寿命从 30 年变成 0 年**。
+- 玩家硬指标：**每个段乃至每个车厢的 age / max_age / reliability / reliability_spd_dec 不得因任何 `ArrangeTrains()` 改变**。
+- 头号嫌疑：`CopyVehicleConfigAndStatistics`（定义 `vehicle_base.h:1004`，内部调 `BaseConsist::CopyConsistPropertiesFrom`）把假引擎（Wagon，`max_age=0`）的统计量搬到机车，或反向；真实调用点 `train_cmd.cpp:4524`、`train_cmd.cpp:4789`（车库编辑路径）、`autoreplace_cmd.cpp:605`。
+- 次要嫌疑：R3R 的身份迁移（`R3RRelocateFrontIdentity`）/ 链头迁移（`R3RNormaliseTrainHead`）/ 段 settle 路径把 `max_age` 当"配置"一起搬运。
+- **嫌疑排除（第 433 轮，读代码逐条核）**：`BaseConsist::CopyConsistPropertiesFrom()`（`src\base_consist.cpp:22-76`）搬的是 `name / current_order / orders / orders_backup / last_station_visited / current_order_timeo…` 一类"配置与排程"，**完全不碰 `age` / `max_age` / `reliability` / `reliability_spd_dec`**；`CopyVehicleConfigAndStatistics`(`vehicle_base.h:1004`) 只是把它 + 若干统计计数器包一层；三个调用点（`train_cmd.cpp:4524`、`train_cmd.cpp:4789`、`autoreplace_cmd.cpp:605`）都是路径/换引擎上下文，也都不写这四个字段。⇒ **代码层面不存在"编排把机车 max_age 改成 0"的路径**，现象来自"被显示的那个对象本身就是 `max_age == 0`"——即挂车后详情窗口/列表读的是假引擎段头（原型是 Wagon，`max_age` 恒 0），而 KI-628 的四处修复正好把这一格填上真实寿命。
+- **加硬指标守卫（第 433 轮，已编译通过）**：`src\train_cmd.cpp` 在 `ArrangeTrains()` 紧前定义 `struct R3RStatSnap{age,max_age,reliability,reliability_spd_dec}` + `R3RSnapshotChainStats()` + `R3RVerifyChainStats()`；`ArrangeTrains()` 入口（`R3RDbgOn()` 时）对 `*src_head` / `*dst_head` 各快照一次（`std::map` 按 `index.base()` 去重），出口在两次 `NormaliseDualHeads()` 之后核对两个新链头下的每一节；任何一格漂移即打 `R3R-STATS-DRIFT arrange veh= age=a->b maxage=a->b rel=a->b dec=a->b eng=N` **并当场还原**四字段。选 `ArrangeTrains()` 而不是 `ConsistChanged()` 的理由：前者是"车在链之间搬家"的唯一入口（couple/decouple/车库拖动/卖车都过它），而 `ConsistChanged()` 合法地重算 `cached_*` 且被大量无关路径调用。整段只在探针开启时生效，probe-free 版与上游行为逐字一致。
+- 边界：只核对"搬动前后仍在这两条链上"的车；`R3R-STATS-DRIFT` 若真的开火，说明写入点在 `ArrangeTrains()` 之外（例如 autoreplace 的换引擎路径），按日志 `veh=`/`eng=` 定位即可。
+- 复测判据：①机车挂/解全程寿命显示恒 30 年，不再出现 0；②纯车底段显示该车厢引擎的真实寿命（15~30 年量级）；③日志 `R3R-STATS-DRIFT` 恒 0 条；④`R3R-STATS-MIGRATE-LOAD` 只在读旧档时出现一次（新造车不再出现）；⑤负判据：车厢不会被自动更换、列表里除寿命/年龄显示外无行为变化。
+- 构建自证（第 433 轮）：`R3R_fullbuild.cmd inc detach` → `build\R3R_incbuild.done` = `EXIT_CODE=0`（22:14:45）、日志尾 `[3/3] Linking CXX executable openttd.exe`、`build\openttd.exe` @2026-11-13 22:14:39（52 867 072 B）晚于 `src\train_cmd.cpp`(22:12:36) / `src\sl\vehicle_sl.cpp`(22:09:35)；`read_lints` 四个改动文件 0 条；exe 字面量 4/4 命中（`R3R-STATS-DRIFT` / `R3R-STATS-MIGRATE-LOAD` / `CGRP-NORM-KEEP` / `CGRP-NORM-KEEP-LOAD`）。
+- 首次编译失败记录：`R3RDbgWrite` 那段把 `const Vehicle *next = u->Next();` 结果喂给 `Train::From()`（`From(const Vehicle*)` 返回 `const Train*`）赋给 `Train *u` ⇒ `error C2440` 转换丢失限定符（`train_cmd.cpp:3963`）；改成 `Vehicle *next = u->Next();` 后通过。教训：`Train::From()` 的 const 重载返回 const 指针，非 	const 链遍历别先降 const。
+
+## 第 434 轮（散链内铰接式 → Ctrl+左键 → 设为段，段功率为 0）
+
+### KI-630 对"散纯车厢链内部的铰接式"Ctrl+左键后再设为段，得到的纯车底段功率为 0（无法启动"没有电力"）（中，已修（第 434 轮））
+
+- 来源：玩家 2026-11-13 报告，原话：「对一个散的纯车厢链内部的一个铰接式执行 ctrl+左键，随后将其设为段，那么制造出来的段就功率为 0 而非 1。我希望的上策是让这样子制造出来的段功率为 1，下策是让散链禁止 ctrl+左键的铰接式行为。优先选上策」；补充原话：「为什么我需要段功率至少为1呢，因为功率为0，列车就无法启动，显示"没有电力"。而正常的R3R设为段，纯车底段也是功率为1的」。
+- 影响：段造出来即不可启动（`CmdStartStopVehicle` 在 `src\vehicle_cmd.cpp:1473` 对 `cached_power == 0` 直接返回 `STR_ERROR_TRAIN_START_NO_POWER`，**没有 car-only 豁免**），等于该段废掉。
+- **根因（已定位，行号锚点）**：
+  1. `src\train.h:569-573` `Train::GetPower()`：`if (this->power_override != UINT16_MAX) return this->power_override;` —— 烘焙覆盖**优先于**引擎记录，且注释明确"0 是合法的烘焙值（打散后的编组可能无动力）"。
+  2. `src\vehicle_cmd.cpp:530-566` `DearticulateChainWithSnapshot()`：按 `n_total` 均分原组统计量，`p_q = total_power / n_total`、`p_r = total_power % n_total`；组头 `power_override = p_q + p_r`、成员 `power_override = p_q`。**纯车厢组 `total_power == 0` ⇒ 每节烘焙成 `power_override = 0`**。
+  3. **既有下限（根因定稿的关键）**：`src\train.h:596-602` 的 `GetPower()` 正常分支末尾本来就有一条 R3R 下限——`if (IsEngine() && railveh_type == Wagon) power = std::max<uint16_t>(power, 1);`。正常"设为段"路径（链内无真铰接组）不触发打散 ⇒ `power_override` 保持 `UINT16_MAX` ⇒ 走这条分支被夹到 1 ⇒ 段功率 1。
+  4. `src\ground_vehicle.cpp:66` `cached_power = total_power` 是唯一汇总写点，无 `max(1, …)` 下限——**也不需要**，下限在逐车取值处（第 3 点）；`UpdateAcceleration()`（`train_cmd.cpp:1825`）的 `Clamp(...,1,255)` 只作用于加速度，不写回 `cached_power`。
+  - ⇒ 结论句：不是"设段逻辑漏了设功率"，而是 **1 hp 下限被 `power_override` 的 early return（`train.h:571-573`）绕过**：Ctrl+左键打散把纯车厢组的 0 总功率烘焙进 override，override 从此永久赢过引擎记录与下限。
+- 已修（第 434 轮，2026-11-13）：
+  1. `src\train.h`：`GetPower()` 的 override 分支内补同一把尺子（只夹 0→1，真实降额值不动）——`uint16_t power = this->power_override; if (power == 0 && IsEngine() && railveh_type == Wagon) power = 1; return power;`。选这里而不是在 `CmdMakeSegment` 里点一下的理由：`cached_power` 会被下一次 `CargoChanged()→PowerChanged()`（装卸货、耦合、读档）重算，点一下就没了；`GetPower()` 是 `CalculatePower()` 的唯一逐车来源，且 override 本身是存档字段（`src\saveload\vehicle_sl.cpp:209-211`，`SLV_R3R_ARTIC_OVERRIDE`）⇒ **同时自愈存量存档里已烘焙成 0 的段**，不必"降级再升级"。
+  2. `src\train_cmd.cpp`：car-only 自走防护闸门（`TrainLocoHandler` 内）原判据 `R3RIsCarOnlyFormation(consist) && consist->gcache.cached_power == 0`，因功率被夹到 1 后 `cached_power == 0` 不再是"链内无真机车"的代理 ⇒ 新增 `static bool R3RChainHasRealTraction(const Train *)`（链上出现「`IsEngine()` 且 `railveh_type != Wagon`」或「`VehicleRailFlag::PoweredWagon`」即为有真牵引力），判据改为 `R3RIsCarOnlyFormation(consist) && !R3RChainHasRealTraction(consist)`，停车动作（清 cur_speed/subspeed 并 return true）逐字保留。
+  3. `CheckTrainStayInDepot()`（`src\train_cmd.cpp:15845`）的条件是 `cached_power == 0 && !R3RIsCarOnlyFormation(v)`，车底段本来就被豁免 ⇒ 不受影响，未改。
+  4. 探针：`CmdMakeSegment()` 的 `ConsistChanged(CCF_ARRANGE)` 之后打 `SEG-POWER head=%d caronly=%d ovr=%u power=%u`（`ovr`=链头 `power_override`，`power`=`gcache.cached_power`）。
+  - 刻意不做：不改 `CmdStartStopVehicle`（修复后 `cached_power == 0` 自然不再命中）；不给 `CalculatePower`/`PowerChanged` 加统一下限（会把真 0 功率车也抬成 1）；不在 `CmdMakeSegment` 里写 `cached_power`（会被重算冲掉）；车底段"能点启动"≠"能自己开走"（`R3RChainHasRealTraction` 闸门仍拦住自走，KI-136/P7 语义不回退）。
+- 已知边界：`R3RChainHasRealTraction()` 判 `PoweredWagon` 用 `VehicleRailFlag` 而不复查 `HasPowerOnRail`，故"假引擎车底 + 电动货车 + 非电化区段"这一极端组合下，car-only 自走闸门现在会放行（旧判据 `cached_power == 0` 会停车）。实测影响=该组合以 1 hp 缓慢蠕动而非静止；如需严格对齐旧行为，可把该判据换成 `GetPoweredPartPower() > 0` 的公开等价物，本轮未做。
+- 复测判据：①Ctrl+左键铰接式 → 设为段，详情窗口功率 ≥ 1 hp（与"正常设为段"的读数一致），点启动不再报"没有电力"；②正常设为段的纯车底段读数不回退；③含真机车/动车组的段功率数值逐字不变（负判据）；④装卸货、耦合/解挂、存档往返后仍 ≥ 1（含**旧存档**里已烘焙出 0 功率的段，应自动自愈）；⑤`R3RIsCarOnlyFormation()` 相关分支（等待者自动停车豁免、解挂 car-only 分支、KI-118 库内 GOTO_COUPLE 豁免）无回归，日志应见 `SEG-POWER head=… caronly=1 ovr=0 power=1`。
+- 构建自证（第 434 轮）：复用既有 `R3R_fullbuild.cmd inc detach`（未新建 .cmd）；护栏判 `newer: src\train.h (22:35:18)` → `REMOVED 621 object file(s) - upgrading this build to a FULL rebuild`；`[693/693] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done`=`EXIT_CODE=0`、错误计数 0、`read_lints` 三文件 0；`train.h` 22:35:18 / `train_cmd.cpp` 22:35:27 / `vehicle_cmd.cpp` 22:35:44 → obj 23:01:10 / 23:01:34 → `build\openttd.exe` 2026-11-13 23:04:46（52 886 016 B）；exe 命中 `SEG-POWER head=%d caronly=%d ovr=%u power=%u`。状态＝已实现+已编译，游戏内复测待做。
+- 文档：`R3R_segment_power_round434_memo.md`（§七 根因定稿 / §八 落地 / §九 构建自证）。
+
+## 第 435 轮（对铰接式列车 Ctrl+左键不再反转图像）
+
+### KI-631 对铰接式列车 Ctrl+左键不再反转图像（中，已修：第 435 轮，已编译通过；游戏内复测待做）
+
+- 来源：玩家 2026-11-13 报告，原话：「我服了，现在对铰接式列车ctrl+左键直接不反转图像了」。
+- 基准：此前 Ctrl+左键会换端/反转图像；现在（第 434 轮 exe，`build\openttd.exe` 2026-11-13 23:04:46）不反转。
+- 锚点：`src\depot_gui.cpp:1755-1756` 是 Ctrl+左键点中同一节车的唯一入口，发 `Commands::ReverseTrainDirection(..., force=true)`（`force` 消费 `VehicleRailFlag::ForceFlipReverse`）。
+- 猜测根因（待验证）：G-435-A 第 434 轮三处改动（`Train::GetPower()` override 分支 0→1、car-only 自走闸门换 `R3RChainHasRealTraction()`、`SEG-POWER` 探针）均不碰方向/图像，若成立则属同一次全量重编带出的既有状态；G-435-B 命令层守卫 `CMD_ERROR`；G-435-C 命令成功但图像未刷新；G-435-D Ctrl+左键未进入该分支（被当拖拽）。
+- 待取数据：该车 `dump_vehicle` 的 `st:`/`tf:`（真铰接 vs 打散组 vs 段），以及日志 `REVERSEDIR ... force_swap=` / `FLIP-REFUSE-REAL-ARTIC` / `RF` 行。
+- **取证结论（2026-11-13，日志已取）**：`build\R3R_debug.log`（28.4 MB，23:15:53，晚于第 434 轮 exe 23:04:46）里 `ARTIC-FLIP` 全日志 **23 对、无一例外**是 `flipped=1` 紧接 `flipped=0`（如 `200515` flipped=1 / `200516` flipped=0；`200940` head=9 real_artic=1 flipped=1 / `200943` real_artic=0 flipped=0）⇒ **翻转被执行了，但成对互相抵消**，净效果图像不变。命令入口只有 `depot_gui.cpp:1755-1756` 一处、`OnDragDrop` 只在 `window.cpp:2171` 调一次 ⇒ 成对来自**两次独立点击**（第一次看不到变化，又点一次）。G-435-A/B/C/D 全部**证伪**（命令确实执行、确实进了分支）。
+- **疑点 REG-435-B**：`200345 ARTIC-FLIP head=3 real_artic=1 flipped=1` 打散后，`200375` 同一 head=3 **仍是 `real_artic=1`**（`ClearArticulatedPart()` 之后本应为 0），说明存在"打散后又被还原"的路径；`200515` 起才变为 `real_artic=0`。
+- **猜测根因（待验证，本轮首选）**：**G-435-E 镜像与 Flipped 互相抵消** —— `train_cmd.cpp:5872-5877` 对组内每节同时 `flags.Flip(Flipped)` 与 `FlipArticGroupFlipped()`（镜像 NewGRF 变量 0x4D「position in articulated vehicle」）。对用 0x4D 选图的 NewGRF 车，两处语义相反 ⇒ 选回同一张 sprite ⇒ 视觉完全不变，而这正是第 391 轮的注释所声明的设计意图（"keeps the NewGRF faces in their pre-flip order"）。若成立，则"不反转"是设计副作用而非第 434 轮回归。并列候选：G-435-F 玩家按了偶数次（叠加效应）；G-435-G 打散失效致只有父车换脸。
+- 判据（待玩家数据）：①该车 `dump_vehicle` 的 `tf:` 是否含 `H`/`M`（打散组 vs 真铰接）；②点一次是否就看到无变化，还是点了多次；③期望是"每节左右镜像"还是"整组前后颠倒"；④该车 GRF 是否使用 0x4D/RailFlips。
+- **根因定稿（2026-11-13，第 435 轮）**：`src\newgrf_engine.cpp:880-912` 的 0x4D 分支里，`artic_before` 用 `IsArticGroupMember()`（含显式 `ArticGroupHead/Member` 角色）计数，而 `artic_after` 用的是 `HasArticulatedPart()`（**subtype 位**）。打散组已被 `R3RDearticulateOneGroup()` 逐节 `ClearArticulatedPart()` ⇒ `artic_after` **恒为 0** ⇒ 第 391 轮的"镜像"退化成 `(rank,0) → (0,rank)`，**低字节（GRF 读的 position）全部归 0**，整组每一节都向 GRF 要"第一节（组头）"的脸。于是 `Flipped` 的镜像虽然生效，但"整组前后颠倒"被抹平；对左右对称的中间车厢/同型多节动车组，观感就是**完全没变化**，与玩家"操作了几次都没变化"逐字吻合（同时解释了 `ARTIC-FLIP n=3` 三节都翻到、却看不出变化）。
+- **时间线定论（回答玩家"是否引入了东西"）**：0x4D 组镜像由 `22dc2b6833`（**2026-11-04 16:59，第 391 轮 KI-558**）引入，`build\R3R_fullbuild.done`=`2026-11-05 21:29` 全量后进入 exe；第 431~434 轮 diff 已逐条核对（`articulated_vehicles.cpp` 只改铰接部件 `max_age`、`train.h` 只改 `GetPower()` 的 0→1 地板、`vehicle_cmd.cpp` 只有 `SEG-POWER` 只读探针，其余 4 个文件不触碰 `Flipped`/`ArticGroupFlipped`/`GetImage`/`ConsistChanged` 的翻转语义）⇒ **不是第 434 轮把旧功能改坏，是第 391 轮的镜像对"打散组"算错了**；玩家"修复功率 0 之前"用的若是不含该代码的更早 exe（发布树/11-05 前内测 exe），主观上就是"前几天还好好的"。
+- **修法（已落地）**：只改 `src\newgrf_engine.cpp` 的打散组分支——swap 之前把 `artic_after` 按组角色重算为"从 v 起到组尾（含 v）的节数 − 1"，使 swap 真正得到 `n-1-rank`。3 节组 `[H,M,T]` 验证：H `0→2`、M `1→1`、T `2→0`（对称镜像 ✓），同时把原本恒 0 的高字节互补值一并修正。真铰接组（无显式角色位）走原分支，逐字节不变；同一算法同时服务 Ctrl+左键（链序不变 ⇒ 镜像=前后颠倒）与段逻辑翻转（链序已反 ⇒ 镜像=还原 pre-flip 脸），二者需求一致。
+- 构建自证（第 435 轮）：复用既有 `R3R_fullbuild.cmd inc detach`（未新建 .cmd）；`build\R3R_incbuild.guard.log`=`GUARD: incremental is safe`；`[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done`=`EXIT_CODE=0`（23:33:37）、错误计数 0、`read_lints` 0；`src\newgrf_engine.cpp` 23:31:34 → obj 23:32:19 → `build\openttd.exe` 2026-11-13 23:33:28（52 886 016 B）。
+- 复测判据：①车库 Ctrl+左键一节铰接车 → 整组每节图像镜像 **且** 前后颠倒（车头外观移到另一端），再点一次完全复原；②`ARTIC-FLIP` 每次 `n=节数`、`flipped` 交替 1/0，存档往返后外观保持；③负判据：普通单车/非铰接车厢 Ctrl+左键行为逐字不变；④负判据：段逻辑翻转（`R3RReverseChainDirections`）后图像不出现"全组塌缩成第一节"。
+- 文档：`R3R_artic_ctrl_reverse_round435_memo.md`（§六 取证记录 / §七 待取数据 / §八 玩家答复回填 / §九 根因确认与修法）。
+
+## 第 436 轮（真铰接列车 Ctrl+左键：只有 0x4D 互换，consist 位置与长度不跟）
+
+### KI-632 真铰接组 Ctrl+左键后只有 0x4D 互换，0x40/0x41 与长度不跟随（高，已修：第 436 轮方案 A 已实现 + 已编译，游戏内复测待做）
+
+- 来源：玩家 2026-11-14 报告，原话：「对一些货真价实的铰接式…执行这些操作，依然有问题。因为，图像都置flip flag并且跑到相反车厢去了（首跑到尾），但是似乎也就仅限于图像了，因为各种回调，尤其是荷兰列车包测试时候表现出来的列车长度，造成了图像错误。因此，我问你，对于所有的grf回调，position in articulated parts 跟 position in articulated parts from end 都互换了吗」。
+- **答复（本轮已核代码）**：**没有全部互换。**
+  - 0x4D（`src\newgrf_engine.cpp:880-929`，返回 `artic_before | artic_after << 8`）只在 `HasDearticulatedGroupRole() && (IsSegmentFlipped() != IsArticGroupFlipped())`（`:903`）时互换两字节 ⇒ 只对"被打散组"生效；真铰接组本身不互换（`:891-893` 注释自陈其为 atomic block）。
+  - Ctrl+左键对真铰接组先 `R3RDearticulateOneGroup()` 打散（`src\train_cmd.cpp:5861-5866`，`src\vehicle_cmd.cpp:549/556/562`），再逐节 `Flip(Flipped)` + `FlipArticGroupFlipped()`（`train_cmd.cpp:5872-5877`），随后 `ConsistChanged(CCF_ARRANGE)` ⇒ sprite 路径 0x4D 拿到互换值，这就是"图像跑到对面"的来源。
+  - 0x40/0x41（`PositionHelper`）的镜像条件**只有** `IsSegmentFlipped()`（`newgrf_engine.cpp:511`），不含 `IsArticGroupFlipped()` ⇒ Ctrl+左键翻组时**不互换**。
+  - refit capacity 走 `whole_chain=true`（`:462-465`、`:490`、`:511`），0x40/0x41 是原生读数，而 0x4D 无此概念仍被镜像 ⇒ **同一回调内两个位置变量口径相反**（REG-436-B）。
+  - 长度是回调结果而非变量：`Train::ConsistChanged()` 每节调 `PROP_TRAIN_SHORTEN_FACTOR`(grf>=8) / `CBID_VEHICLE_LENGTH`(0x11)，仅在 `CCF_ARRANGE` 写回 `cached_veh_length`（`src\train_cmd.cpp:527-541`）。
+  - 打散**不改 `engine_type` 顺序**（`src\vehicle_cmd.cpp:500-566` 只改 subtype/railveh_type 与 override）⇒ 各节长度属性、容量、载重仍挂在原引擎上 ⇒ 即便 0x4D 互换，长度也不跟位置走。这就是荷兰包"仅图像"的机制。
+- 疑点：REG-436-A 荷兰包 0x11/CB36 读哪个变量未知（0x4D / 0x40 / 0x41 / 静态 `shorten_factor` / `CBID_VEHICLE_ARTIC_ENGINE`）；REG-436-B refit capacity 内两变量口径不一致；REG-436-C 真铰接组在"未打散"路径（整链逻辑翻、物理换端）是否真的"组内链序从不改变"。
+- 修法候选（未实施）：A（推荐）打散 + **物理反转组内链序** + 逐节 `Flipped`，让引擎顺序/长度/0x4D/sprite 四者同向；B 把 0x40/0x41 镜像条件扩为 `IsSegmentFlipped() || IsArticGroupFlipped()`（只救"长度由 consist 位置决定"的 GRF，且语义上翻组不该改 consist 位置）；C 不打散、改走"假爸爸身份"。
+- 待玩家确认：C-1 该车 `dump_vehicle` 的 `st:`/`tf:`（真铰接 vs 打散组）；C-2 翻转后是"整组前后颠倒"还是"只左右镜像"，长度是"全不变"还是"部分变"；C-3 该 GRF 的 0x11 读哪个变量。
+- 文档：`R3R_artic_ctrl_reverse_round435_memo.md` §十（10.1 原话 / 10.2 代码事实 F1~F8 / 10.3 结论表 / 10.4 疑点 / 10.5 修法候选 / 10.6 待确认 C-1~C-3）。
+- **落地（第 436 轮，方案 A，仅 `src\train_cmd.cpp`，未碰任何 `src\*.h`）**：玩家拍板原话「A感觉可以，就按A修吧」⇒ 采纳 §10.5 方案 A。`CmdReverseTrainDirection` 的 `reverse_single_veh` 分支（`:5843-5992`）重写：
+  - 仍需 `R3RDearticulateOneGroup(group_head)`，但**只打散这一个组**（不用 `DearticulateChainWithSnapshot()`，它会连带打散整条链上其它组），且必须在倒序之前（否则 `SetNext` 会穿过 artic 部件）。
+  - 骨架：逐节 `direction = ReverseDir(direction)`（`:5916-5923`，**不动 `Flipped`**，改按 `IsSegmentFlipped()` 对齐 `ArticGroupFlipped`）→ 逆序重链 `prev->SetNext(w)`、位置不动（`:5926-5936`）→ 全清后按新序重设 `ArticGroupHead/Member`（新组首 = 原组尾，`:5939-5945`）→ ★/⊗ 搬到对面（`:5948-5951`）→ `R3RMoveSegmentOwner`（`:5954`）→ 组覆盖链头时迁身份（引擎走 `R3RRelocateFrontIdentity(old_head, old_tail, head_was_front)`；纯车厢/假引擎头走 `unitnumber`/`name`/`group_id` 及 backup 三对 swap，`:5958-5975`）→ 逐节 `UpdateDeltaXY()` + 链缓存失效（`:5977-5979`）→ 出口统一 `ConsistChanged(CCF_ARRANGE)`（`:5988`）。
+  - 兜底：`group.size() < 2` 或组内含 ★ ⇒ 退回第 435 轮纯图像路径（`Flip(Flipped)` + `FlipArticGroupFlipped()`），并打 `ARTIC-FLIP-FALLBACK head= n= real_artic= seg_inside=`。主路径打 `ARTIC-FLIP head= n= real_artic= old= new= chain_head=`。
+  - 明确不改：`Flipped` 不再逐节翻（`Train::GetImage()` 会按它再反一次 direction，与已反的 direction 抵消）；`R3RFlipChainBySegments` 段翻路径的 `ArticGroupFlipped` 用法不动（REG-436-D-2）。
+  - 构建自证（2026-11-14）：入口 `R3R_fullbuild.cmd inc detach`（复用既有，未新建 `.cmd`）；guard.log = `GUARD: incremental is safe`；日志尾 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（00:46:53）；错误计数 0；`src\train_cmd.cpp` 00:36:38 → `train_cmd.cpp.obj` 00:45:28 → `build\openttd.exe` 00:46:48（52 886 016 B）；`read_lints` 0。
+  - 残余风险（REG-436-D-1，非本轮引入）：组内倒序后短节（<8/8）因 `half_shorten` 锚点语义，画面相对 `x_pos` 是镜像的，可能出现 1~几像素接缝偏差；与 `R3RFlipChainBySegments` 现有口径同源（R3R 全程不动位置）。
+  - 复测判据：见备忘 §12.4（①真铰接组翻转后图像与 consist 位置同向 ②荷兰包长度不再与图像矛盾 ③普通单组不出现 FALLBACK ④组覆盖链头时号/名/分组/排程跟到新链头 ⑤组含 ★ 的链行为与 435 轮逐字相同 ⑥存档往返角色位仍与链序一致）。
+
+### KI-633 方案 A 漏搬 subtype front 位，翻转后整链无 primary ⇒ `vehicle_gui.cpp:4346` 断言崩溃（高，未修：根因已做实，修法待拍板）
+
+- 来源：玩家 2026-11-14 报告「你的改动应该漏掉了关键的一环：vehicle_gui.cpp 4346行断言崩溃了」；分析见 `R3R_artic_ctrl_reverse_round435_memo.md` §十三。
+- 崩溃点：`src\vehicle_gui.cpp:4341-4347` 的 `StartStopVehicle()`，`:4344` 只有 `IsFreeWagon()` 一道 R3R 守卫，`:4346` 是 `assert(v->IsPrimaryVehicle())`。
+- 代码事实：`Train::IsPrimaryVehicle()` = `IsFrontEngine() || IsFrontWagon()`（不含 FreeWagon）；`NormaliseSubtypes()`（`src\train_cmd.cpp:3682-3694`）对链头只有 `IsWagon()⇒SetFreeWagon()` / 否则 `assert(IsEngine())⇒SetFrontEngine()` 两种结局，**给不出 FrontWagon**；`R3RRelocateFrontIdentity()`（`:11854`）入口断言 `from->IsFrontEngine()`，中途 `NormaliseSubtypes(to)`（`:11998`），只搬 orders/号/名/借用/优先级，不搬 engine/front 语义。
+- 根因：方案 A 在 `CmdReverseTrainDirection` 的 `reverse_single_veh` 分支（`:5958-5975`）重链后只做了「`old_head->IsFrontEngine()` ⇒ Relocate；否则 swap 号/名/组」，**没做 subtype 层 front 位移交**。组尾 `old_tail` 成为新链头后：①若它是车厢/artic part，`Relocate` 内的 `NormaliseSubtypes` 把它设成 **FreeWagon**（非 primary）；②`old_head` 被清 front 位却仍是 `IsEngine()`（假引擎位没撤）；⇒ 整链无 `IsPrimaryVehicle()` 车，UI 残留引用（列表选中行/跟随/窗口，`Relocate` 只关 `from` 的 7 类窗口）传进 `StartStopVehicle` 即撞断言。崩溃对象几乎必然是原链头 `old_head`（普通链内车，既非 FrontEngine/FrontWagon 也非 FreeWagon，绕过了 `:4344` 守卫）。
+- 修法 A（推荐）：Relocate 之后插 `if (!old_tail->IsFrontEngine()) R3RCreateCarOnlyFormation(old_tail);`（假引擎头 + SetFrontEngine + ConsistChanged），并在 Relocate 后对 `old_head` 补 `if (R3RIsCarOnlyFormation(old_head)) R3RDestroyCarOnlyFormation(old_head);`。**顺序必须是 Relocate（from 仍为 FrontEngine，否则炸其入口断言）→ Destroy 旧头 → Create 新头**。
+- 修法 B（保守）：`old_tail` 不是引擎时直接退回第 435 轮纯图像路径（`ARTIC-FLIP-FALLBACK`），零新崩溃面，但 KI-632 只修一半。
+- 两条修法共同要求：`ConsistChanged(CCF_ARRANGE)` 之前加统一出口不变量检查（`assert(front->IsPrimaryVehicle())` 或兜底改派），把"链头不是 primary"从偶发 UI 崩溃变成当场可定位。
+- 状态：**修复未生效（第 438 轮，2026-11-14 玩家复测「还是一样的错误」）**。第 437 轮修法 A 已编译落地（`EXIT_CODE=0`），但同一现象复现；崩溃现场缺失（`R3R_debug.log` 内 `ARTIC-FLIP` 零命中 ⇒ 不是本次会话日志，根目录无 `crash-*.log`）。⇒ 见备忘 §13.9 疑点 REG-437-A。
+- **修法对照结论（备忘 §14，玩家原话三问）**：①「真铰接打散、假铰接不动」= **一致**（`:5868-5873`，只打散本组）；②「组内物理反转 + 每节置 flip flag」= **不一致**，实现是 `direction = ReverseDir(direction)`（`:5916-5917`）而非 `flags.Flip(Flipped)`，注释明写 Flipped 故意不动；③「名义父车转移到新组首」= **一致**（`:5939-5945`，`ArticGroupHead` 给 `old_tail`）。⇒ 偏差②是首要嫌疑：反转朝向却不动 `x_pos/y_pos`（整链换向靠 `ReverseTrainSwapVehicles` 同时换位置才自洽），单组内做等于"沿链镜像但位置没镜像"。待玩家确认 U-2（"一样的错误"是崩溃还是图像错位）。
+- **根因已定（第 438 轮，备忘 §15）**：第 436 轮的「重挂 `SetNext` 反转链序 + 只改 `direction`」把引擎物理换向的两个要素**各取反了一半**。引擎事实（`:5116-5147` / `:5160-5177`）：`ReverseTrainSwapVeh` **只交换 `track/direction/x_pos/y_pos/tile/z_pos`，从不重链**，链头恒不变。因此三条现场症状同源：
+  1. 链序反转 ⇒ `position_in_articulated_parts` 反转（玩家见 `idx 2→0`，必然）；
+  2. 位置不动 ⇒ 三节世界坐标全叠原处、朝向两两相反（玩家见「一节」，必然）；
+  3. `R3RRelocateFrontIdentity` 迁 primary ⇒ UI 持旧链头 ⇒ 点红叉 `StartStopVehicle()` 撞 `:4346`（必然）。
+  ⇒ 修法（方案 B，**已于第 439 轮落地**）：组内首尾配对调 `ReverseTrainSwapVeh(front, l, r)` + `UpdateStatusAfterSwap`，**删除**打散/重链/组角色迁移/段标记迁移/身份迁移五块。玩家模型需修正：「反转车厢顺序」这半不能做；「真铰接打散」也不再必要（链序与 subtype 都不动，part 关系天然合法）。
+- **第 439 轮已实现（备忘 §16）**：`:5861-5905` 为新分支；`train_cmd.cpp` 01:36:58 → `openttd.exe` 01:39:34（52 886 528 B），lints 0。
+- **新硬约束（备忘 §16.3）**：`CCF_ARRANGE` 含 `ConsistChangeFlag::DepotDirection`（`train.h:83`），depot 内 `ConsistChanged()` 会把**每节** `direction` 统一覆写为 depot 口方向（`train_cmd.cpp:410-413`）。⇒ 方案 B 在 depot 里只有 `x_pos/y_pos/tile/z_pos` 的交换生效，`direction` 交换被抹平。若实测仍不等价于"整组掉头"，则 depot 内唯一合法翻转载体是 `Flipped` 位（第 435 轮路线），届时矛盾点转为"如何让 NewGRF rank 一起反"。
+- 落地（仅 `src\train_cmd.cpp` 的 `CmdReverseTrainDirection` 组翻转分支）：Relocate/swap 之前先采样 `head_was_front_engine = old_head->IsFrontEngine()` 与 `head_was_caronly = R3RIsCarOnlyFormation(old_head)`（Relocate 会清掉前者这个判据）；之后 `head_was_front_engine` 为真时，`head_was_caronly` ⇒ 手动撤旧头假引擎位（`ClearFrontEngine+ClearEngine+SetWagon+ClearFreeWagon`，**刻意不用 `R3RDestroyCarOnlyFormation()`**，因为后者会清掉第 4 步刚布好的 `SegmentBack` ⊗），且新链头 `!IsFrontEngine()` 时若 `IsWagon()` ⇒ `R3RCreateCarOnlyFormation(old_tail)`、否则 `SetFrontEngine()`；`head_was_front_engine` 为假（原本就是 free-wagon 链）时把 `FreeWagon` 位从旧头搬到新头，故意保持无 primary（`:4344` 的 `IsFreeWagon()` 守卫本就挡它）。
+- 诊断：`ARTIC-FLIP` 行加 `primary=%d`；新增 `ARTIC-FLIP-NOFRONT head= old= new= wagon= engine= front=`。未加 `assert(front->IsPrimaryVehicle())`，避免把偶发问题变成第二次崩溃。
+- 构建自证：`R3R_fullbuild.cmd inc detach`、done `EXIT_CODE=0`（01:07）、`[3/3] Linking CXX executable openttd.exe`、`src\train_cmd.cpp` 01:04 → `build\openttd.exe` @2026-11-14 01:07（52 892 160 B）、`read_lints` 0。
+- 复测判据：①"含真铰接、尾巴是车厢"的组 Ctrl+左键后不崩、车辆列表仍一行 ②点该行"停止/启动"不崩且 `vehstatus` 真翻转 ③`dump_vehicle` 新链头 `tf:` 含 `F`（真引擎）或呈假引擎头（`st:` 含 `E`）④`old_head` 的 `tf:` 里 `F` 被清、假引擎头不再含 `E` ⑤负判据：不成段车厢链翻转后仍是 FreeWagon 且不出现 `ARTIC-FLIP-NOFRONT`、`primary=0` ⑥负判据：单节组/含 ★ 的链仍走 `ARTIC-FLIP-FALLBACK`。
+- 文档：备忘 §十三（13.1 现场 / 13.2 代码事实 F1~F4 / 13.3 根因 / 13.4 漏项清单 / 13.5 修法 / 13.6 复测判据 / 13.7 玩家定位 / 13.8 落地）。
+- **玩家定位（2026-11-14，原话「这应该是因为你铰接式的头忘记转移了对吗，或者说你链头忘记转移了」）**：后半句成立、前半句只对一半 —— `ArticGroupHead` 角色位确实搬了（备忘 §12.1 第 4 步），漏的是 **`GVSF_FRONT`（链头/primary）**。且不是"少写一行"，而是把它委托给 `R3RRelocateFrontIdentity` 内的 `NormaliseSubtypes(to)`，而后者对车厢头只给 `SetFreeWagon()`（`IsPrimaryVehicle()` 不认），同时清掉 `old_head` 的 front 位 ⇒ 整链无 primary。详见备忘 §13.7。
+
+### KI-634 铰接组 Ctrl+左键「图像反转又没了」：方案 B 只换了位置，没翻 `Flipped`（中，已修：第 440 轮，已编译通过；游戏内复测待做）
+
+- 来源：玩家 2026-11-14 第 439 轮 exe 复测反馈；分析见 `R3R_artic_ctrl_reverse_round435_memo.md` §十七。
+- 现场（`build\R3R_debug.log`，5 次点击 = 5 行）：`ARTIC-FLIP head=0 n=5 span=0..4 primary=1`。分支确实执行、`primary=1` 未迁（第 439 轮目的达到、按停止键不崩），但玩家视觉无变化。
+- 根因两层：①`ReverseTrainSwapVeh()`（`train_cmd.cpp:5116-5147`）只交换 `track/direction/x_pos/y_pos/tile/z_pos/hidden/gv_flags`，**不碰** `VehicleRailFlag::Flipped`；②分支末尾 `:5933` 的 `front->ConsistChanged(CCF_ARRANGE)` 含 `DepotDirection`（`train.h:83` / `train_cmd.cpp:410-413`），depot 内会把每节 `direction` 统一抹成库口方向 ⇒ `direction` 交换立刻失效。剩下只有"哪一节画在哪一格"，对同型多节组肉眼零变化。
+- 图像朝向的真正载体是 `Flipped`：`Train::GetImage()` 见它就把 `direction` 取反后再选 sprite（水平镜像），与上游 `reverse_single_veh` 同一个位。
+- 修法（仅 `src\train_cmd.cpp:5917-5926`，未碰任何 `src\*.h`）：配对交换 + `UpdateStatusAfterSwap()` 之后，组内逐节 `flags.Flip(VehicleRailFlag::Flipped)` + `UpdateDeltaXY()` + `IsDrawn()` 时 `UpdateViewport(true)`（`Flipped` 参与包围盒推导，不重算会让贴图与点击框错位，KI-214 同源）。日志改 `ARTIC-FLIP head= n= span= primary= flipped=`（`:5928`）。
+- **刻意不做**：不动 `ArticGroupFlipped` / NewGRF 变量 `0x4D`。rank 由链序决定，链序没动、位置交换已让"哪一节的贴图出现在哪一端"换了位，再翻 `0x4D` 会二次抵消（第 435 轮同类事故）。
+- 语义：位置交换 = 整组前后颠倒；逐节 `Flipped` = 每节镜像；叠加 = 整组掉头（奇数次停在已反转、偶数次回原样）。
+- 构建自证（2026-11-14）：入口 `R3R_fullbuild.cmd inc detach`（复用既有，未新建 `.cmd`）；日志尾 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（01:58:32）；`src\train_cmd.cpp` 01:54:09 → `train_cmd.cpp.obj` 01:57:21 → `build\openttd.exe` 01:58:27（52 886 528 B）；`read_lints` 0；exe ASCII 扫描命中 `ARTIC-FLIP head=` idx=45144952 与 `flipped=%u` idx=45144999（紧邻 ⇒ 同一格式化串）。
+- 疑点 REG-440-A（待验证）：同型/对称车厢"每节镜像"后画面上是否真能被读成"掉头"？判据=用外观不对称的车（端头车/带司机室动车组）复测，若仍看不出，则须改走"同时反 `ArticGroupFlipped` 并把 NewGRF rank 一起反"（第 435 轮遗留矛盾点）。
+- 疑点 REG-440-B（待验证）：`flipped=` 是"翻完之后组内 Flipped=1 的节数"而非"本次翻了几节"。判据=连点两次，第二次应仍打 `flipped=0`。
+- 复测判据：①（应读作"外观不对称的车"）点一次后组内逐节贴图镜像可见 ②`ARTIC-FLIP … n=5 … flipped=5` ③连点 2 次回原样、奇数次停在已反转 ④贴图与点击框不错位（KI-214 不复现）⑤`primary=1` 恒成立、按停止键不崩（第 439 轮判据不回退）⑥组内首尾停车位仍互换 —— **⑥ 已被 KI-635 实测证伪并删除**。
+
+### KI-635 铰接组翻转后「方向对、位置反」：换位与 Flipped 双镜像叠加（中，已修：第 440 轮二次，已编译通过；游戏内复测待做）
+
+- 来源：玩家 2026-11-14 复测第 440 轮首版 exe，原话「现在终于有一点效果了。但是，我发现，对于这个 5 节铰接车，应该在第二节位置的图像在第四节的位置。更准确地说，就是图像方向对了，但图像位置反了，比如说 0~15，本来应该在 12 的图像跑到 3 去了」；分析见 `R3R_artic_ctrl_reverse_round435_memo.md` §十八。
+- 判定：KI-634 补的逐节 `Flipped` **生效且正确**（朝向反了）；第 438 轮留下的 `ReverseTrainSwapVeh()` 首尾配对换位 **多余且错**（i ↔ n-1-i 的位置镜像）。
+- 根因：两个"关于组中心镜像"的变换叠加 —— 换位把第 i 节的 `x_pos/y_pos/tile/z_pos/direction/track` 送到第 (n-1-i) 格，`Flipped` 再把每节 sprite 水平镜像一次，读数即"整组镜像了两遍"。第 439 轮（只有换位、无 `Flipped`）视觉无变化，是因为同型多节车厢互换格子本就看不出来，位置那半的错误被掩盖到本轮才暴露。
+- 补充事实：换过来的 `direction` 本就无效 —— depot 内 `front->ConsistChanged(CCF_ARRANGE)`（`CCF_ARRANGE` 含 `ConsistChangeFlag::DepotDirection`，`train.h:83` / `train_cmd.cpp:410-413`）会把每节 `direction` 抹成库口方向，所以换位对"朝向"零贡献，只剩不该有的位置对调。
+- 修法（仅 `src\train_cmd.cpp:5864-5910`，未碰 `src\*.h`）：删掉 `ReverseTrainSwapVeh()` 配对循环与 `UpdateStatusAfterSwap()`，保留 `flags.Flip(VehicleRailFlag::Flipped)` + `UpdateDeltaXY()` + `IsDrawn()` 时 `UpdateViewport(true)`。位置、链序、`tile`、`ArticGroupHead`、primary 身份、`ArticGroupFlipped` / NewGRF `0x4D` 一律不动。
+- 依据：depot 内合法的掉头表达只有镜像一种 —— 库里所有车必须同向，翻向不能靠换位，上游 `reverse_single_veh` 对单节也只翻 `Flipped`。所以"整组掉头"在 depot 里的正确形态 = 各节留在原格、sprite 全部水平镜像。
+- 构建自证（2026-11-14）：入口 `R3R_fullbuild.cmd inc detach`（复用既有，未新建 `.cmd`），构建前确认 `openttd.exe` 未运行；日志尾 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 02:13:55 → `train_cmd.cpp.obj` 02:18:56 → `build\openttd.exe` 02:20:09（52 886 528 B）；`read_lints` 0。未新增日志字面量，故不做 exe 串核对。
+- 疑点 REG-440-C（待验证）：mirror-only 后"车头在左、朝右"对端头不对称的车是否被玩家读作"掉头成功"。若实测觉得别扭，说明"让车头真的换到另一端"在 depot 内做不到（只能开出去掉头），需重新拍板语义（不翻 / 翻且改段序）。
+- 复测判据：①5 节组点一次，**各节位置不变**、只有贴图水平镜像 ②再点一次完全回原样 ③`ARTIC-FLIP … n=5 … flipped=5` ④贴图与点击框不错位、`primary=1`、按停止键不崩（第 439/440 轮判据不回退）⑤端头车车身仍在原端，只是面朝反方向 ⑥负判据：其它非铰接组/单节的 `Flipped` 行为逐字不变。
+
+### KI-636 只翻 `Flipped` 时几何完全不动 ⇒ 方案 2「位置镜像」**已证伪** ⇒ **玩家拍板 C-2：库内物理反序**（中，第 441 轮：已实现 + 已编译（2026-11-14，`EXIT_CODE=0`，exe 52 886 528 B @03:38），游戏内复测待做）
+
+- 来源：玩家 2026-11-14 复测第 440 轮二次 exe（KI-635 版），原话「还是和刚才一样的效果。我注意了一下边界框，发现问题出在：边界框和没经历此操作的同类列车还是一样的，所以也就是说你现在只是给所有节列车置了一个 flip flag 而已，但是，我希望的是，不仅有 flip flag，而且边界框也随之改变。现在有两个方案，第一个是按照整个铰接式的中轴左右对称，第二个是按铰接式的新头反向排列」；分析见 `R3R_artic_ctrl_reverse_round435_memo.md` §十九。
+- 判定：玩家读出的代码事实**完全正确**。`Flipped` 只在 `Train::GetImage()` 里反转 `direction` 去选 sprite，是纯图形位；包围盒由 `Train::UpdateDeltaXY()` 按 `direction` + `cached_veh_length` 算，而 depot 内 `ConsistChanged(CCF_ARRANGE)`（含 `DepotDirection`）把每节 `direction` 统一抹成库口方向。满长（len=8）的车在直线分支下 `half_shorten = (VEHICLE_LENGTH - len + flipped) / 2 == 0`，`flipped` 连 bounds 都不进 ⇒ 只翻 flag 永远不可能产生几何变化。
+- 第 19.6 节曾拟新增 `VehicleRailFlag::ForceFlipBounds = 30` 解除 `RailFlips` gate（`UpdateDeltaXY` `:4934` / `GetCursorImageOffset` `:1929`、`:1959`），实施前自我否决：该 gate 解除后量级只有 1px（满长车恒 0、奇数长度斜向 `flip_offs` ±1），而玩家要的是"整组排列反向"，量级根本不对。本轮**未新增任何位**、未改 `src\*.h`。
+- 上一轮的误判澄清：第 440 轮被否掉的不是"换位"本身，而是"换位 + `Flipped`"的**双重镜像**（KI-635）。正确形态 = 换位 + **不**翻 `Flipped`。
+- 修法（仅 `src\train_cmd.cpp` 铰接组分支，`:5893` 起）：新增局部常量 `constexpr bool mirror_sprites = false;`（`false` = 方案 2，置 `true` 即方案 1「位置镜像 + 逐节 sprite 镜像」）；首尾成对 `std::swap` `x_pos` / `y_pos` / `tile` / `track` / `z_pos`；**不动** `direction`、**不动** `Flipped`、**不动**链序（真 artic 组内父车必须排在部件之前，反转链序会破坏 `IsArticulatedPart` 父子假设）；交换后逐节 `UpdateDeltaXY()` + `IsDrawn()` 时 `UpdateViewport(true)`，让包围盒 `offset` 与贴图/点击框随新位置走。交换自逆 ⇒ 连点两次回原样。
+- 探针：保留 `ARTIC-FLIP head= n= span= primary= flipped=`，新增逐节 `ARTIC-FLIP-CAR idx= x= y= len= flip= db= bO=(x,y) bE=(w,h) bOf=(x,y)`（`bO`=bounds.origin / `bE`=bounds.extent / `bOf`=bounds.offset），用于自证"位置与包围盒真的换了"。
+- 构建自证（2026-11-14）：入口 `R3R_fullbuild.cmd inc detach`（复用既有，未新建 `.cmd`），构建前 `tasklist` 确认 `openttd.exe` 未运行；日志尾 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；错误计数 0；`src\train_cmd.cpp` 02:41:43 → `train_cmd.cpp.obj` 02:43:27 → `build\openttd.exe` 02:45:48（52 886 528 B）；`read_lints` 0；`findstr /M /C:"ARTIC-FLIP-CAR" build\openttd.exe` 命中。
+- 复测判据：①点一次后 `ARTIC-FLIP-CAR` 里首尾两节 `x=/y=` 互换、中间节反排，`bOf=` 随之变化 ②游戏内整组车头出现在原尾端位置、各节朝向仍为库口方向（库里不允许两种朝向）③连点两次 `x=/y=` 全部回到初次之前、外观复原 ④`primary=1`、按停止键不崩（KI-633/634 判据不回退）⑤若玩家要求朝向也反过来，把 `mirror_sprites` 置 `true` 重编（探针会显示 `flip=1`）⑥负判据：单节组/非铰接链走 `ARTIC-FLIP-FALLBACK`，行为逐字不变。
+- 疑点 REG-441-A（**已定位，2026-11-14 第 441 轮**）：玩家复测原话「我观察到的就是操作后什么反应都没有了，可能就是你说的『引擎可能在后继 tick 按链序把位置重算回去，使镜像只维持一帧』」。**前半句成立，但机制比"被 tick 重算回去"更彻底——depot 界面根本不读位置**：
+  - `src\vehicle_gui.cpp:2192-2196` `DrawVehicleImage()` 对 Train 直接转 `DrawTrainImage()`；
+  - `src\train_gui.cpp` 的 `DrawTrainImage()` 主循环 `for (; v != nullptr && ...; v = v->Next()) { int width = Train::From(v)->GetDisplayImageWidth(&offset); ... seq.Draw(px + offset.x, ...); px += rtl ? -width : width; }` ⇒ 逐节横坐标是按**链序**累加出来的，`x_pos/y_pos/bounds` 一次都没进该函数；
+  - `src\vehicle.cpp` 进库路径置 `VehState::Hidden` ⇒ 世界视口不画库内车，"位置"通道在 depot 场景连一个像素都影响不到。
+  - ⇒ 第 439 轮（交换 x_pos/y_pos）、第 440 轮（方案 2 位置镜像）**视觉恒等于零，第一帧就看不见**，不需要后继 tick 参与；第 436 轮（打散 + 反转链序）**是唯一看得见的一轮**，因为它动了链序＝depot 行的绘制顺序。
+  - ⇒ **结论：depot 内"整组掉头"的可见通道只有 ①链序 ②每节 sprite（`Flipped` / NewGRF 0x4D / rank）；位置与包围盒是死通道。** 玩家要的"按新铰接式的新头反向排列"字面上就是①。
+  - 现状：方案 2 的交换代码仍在树里（`src\train_cmd.cpp` 铰接组分支），无视觉效果、且开库瞬间有一帧位置错乱风险，待 §19.11 拍板后移除或改写。
+- 待拍板三选（备忘 §19.11）：C-1 depot 行绘制层反转（新增"组反转"标记 + `DrawTrainImage` 按标记反序绘制 + 命中/拖拽同步反序）；C-2 物理反转链序（打散真铰接组 + 反链序 + 逐节 `Flipped`，第 436 轮路线 + 第 439 轮 primary 移交，代价=该组永久"打散组"、父子回调断链）；C-3 收口（认帐 depot 内只翻 `Flipped`，真换头必须开出库掉头，回滚方案 2）。
+- **玩家已拍板 C-2（2026-11-14）**，已落地并编译通过（`src\train_cmd.cpp` `CmdReverseTrainDirection()` 的 `reverse_single_veh` 分支，约 `:5880-6060`；仅 .cpp，增量合法，未碰 `src\*.h`）。七步实现（与 §19.12 骨架的差异见备忘 §19.13）：
+  1. 成员收集：`group[]` 同时收 `IsArticGroupMember()` 与 `IsArticulatedPart()`；`had_real_artic` 为真则 `R3RDearticulateOneGroup(group_head)` 打散（探针 `DEARTIC-SPLIT`）。真 artic 组内父车必须先于部件，不先打散则反链序必破坏 `IsArticulatedPart` 假设。
+  2. 首尾配对 `std::swap` `x_pos/y_pos/tile/track/z_pos`（`(i, n-1-i)`）。
+  3. **链序逆序重接**（本轮新增的关键步骤，此前 C-2 骨架未列）：`prev = before`，`for (size_t k = n_cars; k-- > 0;)` 逐节 `prev->SetNext(w)`；`before == nullptr` 时用 `w->Previous()->SetNext(nullptr)` 断开旧前驱（`Vehicle::previous` 是 private，只能借 `SetNext` 维护 `OTTD_UPPER_TAGGED_PTR`）；末尾 `prev->SetNext(after)`。
+  4. `SetNext()` 内部 `v->first = this->first` 取**调用方**的 first，倒序重接后 first/last 会沿链传播成错值 ⇒ 追加整链重刷：`chain_first = (before ? before->First() : new_head)`，沿 `Next()` 求 `chain_last`，再对每节 `SetFirst/SetLast`。
+  5. identity 移交：`R3RRelocateFrontIdentity(old_head, new_head, false)` —— **必须显式传三参**，默认值 `owner_moved_by_flip=false` 只写在定义处（约 `:11807`），前置声明（约 `:5810`）无默认值，本调用点在定义之前。
+  6. 逐节 `w->flags.Flip(VehicleRailFlag::Flipped)` + `w->FlipSegmentFlipped()`（`newgrf_engine.cpp` 按 `SegmentFlipped ^ ArticGroupFlipped` 判 0x4D 镜像，翻两个等于没翻）。
+  7. ★/⊗ 随组边界镜像搬家 + 全组清/重设 `ArticGroupHead/Member`；出口 `InvalidateNewGRFCacheOfChain()` + `UpdateDeltaXY()`，探针 `ARTIC-FLIP ... real=/old=/new=/move=`。
+- 编译错误两处（首编 `EXIT_CODE=1` @03:32，修完 `EXIT_CODE=0` @03:38）：① `train_cmd.cpp(5937): error C2248: "Vehicle::previous": 无法访问 private 成员` ⇒ 改 `w->Previous()->SetNext(nullptr)`；② `train_cmd.cpp(5972): error C2660: "R3RRelocateFrontIdentity": 函数不接受 2 个参数` ⇒ 显式三参。
+- 构建自证（2026-11-14 第 441 轮）：入口 `R3R_fullbuild.cmd inc detach`（复用既有，未新建 `.cmd`）；`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志尾 `[3/3] Linking CXX executable openttd.exe`；错误计数 0；`src\train_cmd.cpp` 03:35 → `train_cmd.cpp.obj` 03:36 → `build\openttd.exe` 03:38（52 886 528 B）；`read_lints` 0。
+- 复测判据（6 条，详见备忘 §19.13）：①库内选中铰接组按反转，行内节序真的变成 `前-3-2-1-后`（不再是"点了没反应"）②`primary_vehicle` 落在最朝前那节、旧链头降级 ③连点两次回原样且号/名/排程不丢 ④首次反转出现一次 `DEARTIC-SPLIT`，之后 `dump_vehicle` 见 `tf:` 有 `H`/`M`、`st:` 无 `A` ⑤段数不变、★/⊗ 随组边界镜像 ⑥负判据：组在链中间时链头不动、单节/普通车厢行为逐字不变。
+- 代价/边界：该组反转后永久成为"打散组"，NewGRF 父子回调（变量 0x4D position-in-consist）断链，sprite 由烘焙的 `ArticGroupHead/Member` 角色位接管；`previous` 私有 + 标签位 ⇒ 任何"清前驱"都必须走 `prev->SetNext(nullptr)`，任何"重接"之后都必须重刷 `SetFirst/SetLast`。
+
+## 第 442 轮（2026-11-14）
+
+### KI-637 `StartStopVehicle()` 断言崩溃（`vehicle_gui.cpp:4346`）：UI 侧陈旧 VehicleID 指向非 primary 车（高，第 442 轮：已修 + 已编译，游戏内复测待做）
+
+- 来源：玩家 2026-11-14 原话「还是 vehicle_gui.cpp 4346行的断言崩溃，这是为什么」。分析见 `R3R_depot_startstop_assert_round442_memo.md`。
+- 现象：`void StartStopVehicle(const Vehicle *v, bool texteffect)`（`src\vehicle_gui.cpp:4341-4348`）内 `assert(v->IsPrimaryVehicle())` 命中。判据 `Train::IsPrimaryVehicle()` = `IsFrontEngine() || IsFrontWagon()`（`src\train.h:341`）⇒ 传入的车既不是前引擎也不是前自由车厢，即「链中车 / 被降级的前链头」。
+- 全树只有 3 个调用点，守卫强度不一：
+  1. `vehicle_gui.cpp:4890`（车辆视窗 `WID_VV_START_STOP`）：`Vehicle::Get(this->window_number)`，**无任何守卫**；
+  2. `depot_gui.cpp:1165`（车库行首启停旗）：`result.vehicle` 来自**窗口构建时的列表快照**，**无任何守卫**（而同一 switch 的 `ShowVehicle` 分支 `:1153-1161` 早就有 `First() != 自身 ⇒ break` 与 `IsFreeWagon() ⇒ break` 两道守卫，注释自陈"depot 列表可能给出非链头车"）；
+  3. `viewport.cpp:5574`：`v = v->First()` 后传入，取了链头，但未判 primary。
+- 根因（两层）：
+  - 直接触发面：R3R 的链编辑（第 441 轮 C-2 反序、耦合、解挂、车库拖动）**改变链序但不重建 depot 列表/车辆窗口**。C-2 在 `before == nullptr` 时把链头从 `old_head` 换成 `new_head` 并降级旧头（`ClearFrontEngine/ClearEngine/SetWagon`），于是 depot 列表里那个槽位存的 `old_head` 立刻变成"非链头且非 primary"；玩家点该行首启停旗 ⇒ 断言崩。放大了既有漏洞而非新造 bug。
+  - 兜底缺失：上游把 `assert(v->IsPrimaryVehicle())` 当成"命令层不变式"，但 R3R 的 UI 引用陈旧是**合法中间态**，断言在此处只会把可恢复的 UI 竞态升级成游戏崩溃。
+- 修法（两层，仅 `.cpp`，增量合法，未碰 `src\*.h`）：
+  1. `src\depot_gui.cpp` 的 `DepotGUIAction::StartStop` 分支改为 `StartStopVehicle(result.vehicle->First(), false)` —— 解析到真实链头再操作，点行首旗子仍作用于可见的那列车（否则只会变成"点了没反应"）；`IsFreeWagon` 由 `StartStopVehicle` 内部既有守卫拦。
+  2. `src\vehicle_gui.cpp:4344` 把 `assert(v->IsPrimaryVehicle())` 换成 `if (!v->IsPrimaryVehicle()) return;`（附注释说明这是澄清而非放宽：链中车的启停本来就不是有意义的操作），覆盖全部三个调用点的残余陈旧引用，不再崩游戏。
+- 构建自证（2026-11-14 第 442 轮）：入口 `R3R_fullbuild.cmd inc`（复用既有，未新建 `.cmd`）；`GUARD: incremental is safe`；日志 `[2/4] depot_gui.cpp.obj`、`[3/4] vehicle_gui.cpp.obj`、`[4/4] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（03:53:45）；`src\depot_gui.cpp` 03:45:40 → obj 03:51:36、`src\vehicle_gui.cpp` 03:45:47 → obj 03:51:37 → `build\openttd.exe` 03:53:29（52 886 528 B）；`read_lints` 0。
+- 构建期踩坑（不计缺陷，供后续参考）：`Start-Process -FilePath ... -ArgumentList 'inc detach'` 本轮起不再留下可用的后台进程（无 ninja、guard.log 不更新），且上一次前台 build 的 `Press any key` 窗口会持续占用 `build\R3R_incbuild.log` / `.done`，导致二次启动打印「另一个程序正在使用此文件」并误判「ninja ended 0.24 秒 / up to date」。可靠做法 = 前台 `cmd /c R3R_fullbuild.cmd inc`，结束后 `Stop-Process` 掉那个等待按键的 cmd，再用日志尾的 `==== R3R build ended ... EXIT_CODE=0` + `[n/n] Linking` + obj/exe 时间戳三件套核对。
+- 复测判据：①库内选中铰接组反转后立刻点该组任一行的启停旗：不崩，且作用于新链头（该列车真的启动/停止，出文字特效）②反转前把旧链头的车辆视窗开着，反转后该视窗消失（`R3RRelocateFrontIdentity` 内含 `CloseWindowById` 五个窗口）③负判据：组夹在链中间反转时链头不动、不得误关窗口 ④负判据：正常车库点启停旗、车辆视窗点启停，行为与文字特效逐字不变 ⑤旧版 exe 存档读入后直接点启停不崩。
+- 未确认：U-1 玩家这次崩溃的确切入口（车辆视窗 vs 车库行首旗），需下一次 `crash-*.log` 的命令栈确认；本轮两层都修故不阻塞复测。U-2 `viewport.cpp:5574` 路径未单独加守卫（兜底已覆盖）。
+
+## 第 443 轮（2026-11-14）
+
+### KI-638 C-2 反转后车库预览/车号不刷新，且新链头丢 `Stopped`（高，第 443 轮：已修 + 已编译（2026-11-14 18:47，`EXIT_CODE=0`，exe 52 890 112 B），游戏内复测待做）
+
+- 来源：玩家 2026-11-14 原话「车库内预览还是显示异常，车号预览也显示异常。但是，假若关闭车库界面再重新打开，又能重新显示正常的车库预览和车号，只是停着的列车变成了启动的」。分析见 `R3R_artic_ctrl_reverse_round435_memo.md` §二十。
+- 现象拆两层：①"重开就好" ⇒ 显示层读的是**窗口内快照**，反转后没作废窗口；②"重开后列车变成启动" ⇒ 不是显示 bug，是**新链头真的没有 `vehstatus.Stopped` 位**。
+- 猜测根因（待验证）：`CmdReverseTrainDirection()` 的 `reverse_single_veh` 分支（`src\train_cmd.cpp` 约 5880-6060）出口只做了 `InvalidateNewGRFCacheOfChain()` + `UpdateDeltaXY()` + 探针，**没有任何 `InvalidateWindowData` / `SetWindowDirty`**；车库窗口的 `vehicle_list`/`wagon_list` 由 `BuildDepotVehicleList()` 在 `OnInit` 时填一次，C-2 改车辆不重建列表。同族问题见 KI-637（上一轮只补了操作侧守卫，没补"编辑后作废窗口"）。
+- `Stopped` 丢失：`vehstatus` 属"前车专属"状态，C-2 的 identity 搬迁走 `R3RRelocateFrontIdentity(old_head, new_head, false)`，需实证它是否搬 `vehstatus`/`cur_speed`/`current_order`。新链头是原链尾车厢 ⇒ 若未搬则显示"启动"。
+- 取证结论（2026-11-14，备忘 §20.8-§20.9）：
+  - **显示层**：C-2 出口其实早就调了 `ConsistChanged(CCF_ARRANGE)` + `SetWindowDirty(VehicleDepot/Details/View)` + `DirtyVehicleListWindowForVehicle()`，但 `SetWindowDirty` **只重绘不重建列表**；车库行/车号取自 `BuildDepotVehicleList()` 的快照（项是 `v->First()`），链头换了人快照里仍是旧链头指针 ⇒ 预览图按旧节序、车号取旧链头。"重开窗口就好"正是因为它重跑了 `BuildDepotVehicleList()`。
+  - **窗口号无问题**（原疑点 A-1 证伪）：车库窗口 `window_number` 就是 depot 的 `TileIndex`，全工程既有写法都是 `InvalidateWindowData(WindowClass::VehicleDepot, tile.base())`。
+  - **`Stopped` 丢失坐实**：`R3RRelocateFrontIdentity()` 只搬 orders / 订单位置 / 车号 / `current_order` / profit / 服役间隔 / 窗口 / 名字，**完全不碰 `vehstatus`**；`Train::ConsistChanged` 通读（`:374-619`）也不写它。新链头（原链尾车厢）`vehstatus.Stopped=0` ⇒ 库里画成"运行中"，`running_ticks` 还会据此开始累计。
+- 修法（仅 `src\train_cmd.cpp`，未碰 `src\*.h`）：
+  1. **Stopped 随身份迁移**：C-2 的 ⑤ 身份迁移段之前采样 `const bool old_was_stopped = old_head->vehstatus.Test(VehState::Stopped);`，迁移后 `front = new_head` 时按快照 `Set/Reset(VehState::Stopped)`；另外 `old_head->vehstatus.Reset(VehState::Stopped)` —— 旧链头已降为链内车，按"链内车该位恒 0"的约定不能带着陈旧的"已停"，否则它将来重新成为链头会误显示为停止。
+  2. **列表重建**：出口的 `SetWindowDirty(WindowClass::VehicleDepot, ...)` 换成 `InvalidateWindowData(WindowClass::VehicleDepot, front->tile.base())`（`VehicleDepotWindow::OnInvalidateData` 无条件 `generate_list = true` ⇒ 重跑 `BuildDepotVehicleList()`），并补 `InvalidateVehicleListWindows(VehicleType::Train)`（`InvalidateData(0)` ⇒ `BaseVehicleListWindow` 在 data==0 时 `ForceRebuild`；顺带覆盖车队/分组列表、`TraceRestrictSlots`、`DepartureBoard` 里挂着的陈旧 `VehicleID`）。
+  3. 两者用新增局部 `bool head_changed` 门控：**只有"组从链头开始翻、链头真的换人"才重建**；普通单节 `Flipped` 与"组夹在链中间"（链头没动）完全不动，避免每次反转都让整个列表重扫。
+  4. 保留 `SetWindowDirty(WindowClass::VehicleDetails/VehicleView, front->index)`（旧链头的详情/视图窗已由 `R3RRelocateFrontIdentity` 内的 `CloseWindowById` 关闭）。
+- 构建自证（2026-11-14 第 443 轮）：入口 `R3R_fullbuild.cmd inc`（复用既有，未新建 `.cmd`）；`GUARD: incremental is safe`；日志 `[2/3] Building CXX object CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`，尾行 `==== R3R build ended 2026/11/14 18:48:48 MODE=inc EXIT_CODE=0`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_cmd.cpp` 18:34 → `train_cmd.cpp.obj` 18:42 → `build\openttd.exe` 18:47（52 890 112 B）；`read_lints` 0。未新增日志字面量，故不做 exe 串核对。
+- 复测判据：①库内选中铰接组反转后**不重开窗口**，预览图像与车号立即变成新节序 ②反转后该列车在库里显示**停止**（与反转前一致） ③负判据：组夹在链中间反转时链头不变、`head_changed=false` ⇒ 不重建列表、不误关窗口 ④负判据：普通无铰接组单节反转，列表与详情行为逐字不变。
+
+### KI-639 C-2 反转后详情界面物理数据/运行费用/最高速度/最大牵引力/列车名异常（高，第 443 轮：已修 + 已编译（2026-11-14 18:47，`EXIT_CODE=0`，exe 52 890 112 B），游戏内复测待做）
+
+- 来源：玩家 2026-11-14 原话「打开那个反转后的列车的详情界面，发现各项显示有异常，包括物理数据，运行费用，最高速度，最大牵引力，列车名字……」
+- 猜测根因（待验证，两条互斥分支）：
+  - **G-3a**：这些值来自链头的 `gcache.cached_max_speed/cached_power/cached_max_te`（`GetDisplay*()` 家族），而 `gcache` 唯一重算入口是 `Train::ConsistChanged()`，C-2 从未调用 ⇒ 新车头的 `gcache` 还是它"作为车厢时"的陈旧值（power/max_te 为 0）。
+  - **G-3b**：若这些项直接读 `RailVehInfo(engine_type)`（引擎静态信息），则异常来自"新链头 `engine_type` 是车厢"，需保证新链头仍是真引擎或按链取引擎信息。
+  - **G-4（名字）**：标题走 `v->name`（空则回退引擎默认名），新链头是车厢 ⇒ 显示车厢名；也可能 `R3RRelocateFrontIdentity()` 因第三参 `owner_moved_by_flip=false` 走了"不搬名字"分支（对照第 160 轮 `NAME-XFER`/`NAME-RESTORE`）。
+- 取证结论（2026-11-14，备忘 §20.9）：
+  - **G-3a 证伪**：C-2 出口本来就调 `ConsistChanged(CCF_ARRANGE)`（`src\train_cmd.cpp:6059`），`Train::ConsistChanged`（`:374-619`）确实重算 `gcache`。若详情窗是"重开"后才出现异常，则 `gcache` 已经不是陈旧值。
+  - **G-3b 成立（主因）**：新链头是原链尾**车厢**，C-2 的 ⑤ 只给了 `SetEngine/SetFrontEngine/ClearWagon`，**没有换 `engine_type`** ⇒ 所有直接读 `RailVehInfo(v->engine_type)` 的静态项（加速/运行费用倍率/牵引力系数等）仍按车厢取。
+  - **G-4 成立（名字）**：`R3RRelocateFrontIdentity()` 里 `name_follows_identity` 被第 199 轮绑在 `owner_moved_by_flip` 上，C-2 只传 `false` ⇒ 刚拷贝进新链头的名字被"还原 to 的空快照"当场抹掉，旧链头的名字又被 `R3RParkTrainName()` 停进已降级的车身 ⇒ 两个链头都没名字。
+- 修法（仅 `src\train_cmd.cpp`，未碰 `src\*.h`）：
+  1. `R3RRelocateFrontIdentity()` 增加第 4 参 `bool name_follows_chain = false`，判据改为 `const bool name_follows_identity = (owner_moved_by_flip || name_follows_chain) && kept_to_name.empty() && !from->name.empty();`。折叠修正路径不传（默认 `false`，行为逐字不变）；C-2 调用点改为 `R3RRelocateFrontIdentity(old_head, new_head, false, true)`。函数头 Doxygen 补 `@param name_follows_chain`（说明它与 `owner_moved_by_flip` 解耦的原因与两条路径的取值）。
+  2. 详情窗数据源：由 KI-638 落的 `ConsistChanged(CCF_ARRANGE)` + 重建列表 + `R3RRelocateFrontIdentity` 内 `CloseWindowById(VehicleDetails)` 共同收口 —— 旧链头的详情窗被关掉，重开即读新链头；`gcache` 已是整链重算值。
+- 构建自证：同 KI-638（同一轮同一次增量构建，`[3/3] Linking`、`EXIT_CODE=0`、`read_lints` 0）。
+- 复测判据：①反转后打开该列车详情：**运行费用/最高速度/最大牵引力/物理数据与同型号未反转列车一致** ②详情标题里的**列车名非空且等于反转前那台机车的名字**（`NAME-XFER`/`NAME-RESTORE` 探针不参与，此路径按链头身份搬家）③负判据：折叠修正路径（耦合时翻 u/翻 v）的号/名迁移行为逐字不变 ④负判据：普通单节反转，详情窗各项与上一版一致。
+- 待复核（U-4，未修）：新链头 `engine_type` 仍是车厢。若复测②之外仍有"运行费用/最高速度按车厢取静态值"的残留（例如 `GetDisplayRunningCost()` 内部按 `engine_type` 的 `running_cost` 直接取值，而非按整车求和），则需另开一条：给新链头挑选链上第一台**真引擎**的 `engine_type`，或让 `GetDisplay*` 走链/段级取引擎信息。**本轮不动**：换 `engine_type` 会影响 NewGRF 变量、`cached_veh_length`、`UpdateDeltaXY`、图像与存档，风险远大于收益，须先拿到复测数据。
+- 交叉：KI-638 的 `Stopped` 与 KI-639 的名字属**同一函数**（`R3RRelocateFrontIdentity`）的两个缺口，本轮一并补齐。
+
+## 第 444 轮（KI-640：反转后按链头 engine_type 读取的属性整体失真 / 状态：取证完成、待拍板）
+
+### KI-640 反转后「运载能力=无」「引擎名称=(未定义字符串)」「物理性能偏差」
+
+- **ID**：KI-640
+- **一句话描述**：C-2 库内反转抬高车厢为链头后，只授予 `IsEngine()/IsFrontEngine()` 身份位而不改 `engine_type`，凡按"链头 engine_type"读取的界面与链级静态量（引擎名、容量汇总、`rvi_v`/`first_engine`）整体失真。
+- **来源**：玩家 2026-11-15 报告；本轮取证见 `R3R_artic_ctrl_reverse_round435_memo.md` §二十一。
+- **状态**：**已修 + 实机复测通过**（2026-11-15 17:43:40 版 exe，玩家原话「反转后的列车各类指标终于正常了」；第 449 轮续四修名字/建造年/价值/最高速度/可靠性 + 第 450 轮续四修最大牵引力/装载能力/运行费用）。历史：甲（显示层）未通过 ⇒ 玩家拍板 C-2（乙）第 445 轮落地 ⇒ 第 446 轮解除 `IsFrontEngine()` 早退仍为负 ⇒ 第 447 轮换轴判定真根因 H-R3（该 GRF 车名走 `CBID_VEHICLE_NAME`，所有原型 `info.string_id` 都是 `STR_UNDEFINED`，故"跳过 `string_id == STR_UNDEFINED`"会连父车一起跳掉）⇒ 丙-1 判据改为"`{ENGINE}` 能否渲染出名字"，第 449 轮续四 + 第 450 轮续四补齐剩余五属性与三项统计后收口
+- **严重度**：中（不崩溃、不丢数据，但反转后界面与物理读数不可信）
+
+**玩家原话**：
+
+> 列车反转了之后，运载能力变为无，引擎名称变为”（未定义字符串）“，各项物理性能也有所偏差（这是一个例子，我只是借此表明这些属性出现了偏差）
+
+**取证结论（已实证）**：
+
+1. C-2 分支只 `SetEngine()/SetFrontEngine()/ClearWagon()/ClearFreeWagon()`，`engine_type` 仍是原车厢值 ⇒ 出现 `IsEngine()==true` 但 `railveh_type==Wagon` 的混合态。
+2. `Train::ConsistChanged()`（`src\train_cmd.cpp:374-619`）：
+   - `:380 rvi_v = RailVehInfo(this->engine_type)` —— 链级静态量按车厢取，含 `rvi_v->pow_wag_power`（动力车厢功率加成开关）。
+   - `:381 first_engine = IsFrontEngine() ? this->engine_type : INVALID_ENGINE` —— 逐节 `gcache.first_engine` 被写成"一台车厢引擎"，影响 wagon-override sprite set / 2CC / 部分 GRF 回调。
+   - `:515 new_cap = e_u->DetermineCapacity(u)` —— **逐节**按自身 engine_type 算，与链头无关。
+3. `Engine::DetermineCapacity()`（`src\engine.cpp`）按该车自己的 `engine_type` 取容量并走 refit 回调 ⇒ "运载能力=无"**不是** `cargo_cap` 被清零。
+4. 详情窗运载能力页是"从链头起、遇到非 `ArticGroupMember` 即停"的汇总（`src\train_gui.cpp`）⇒ 链头 `cargo_cap==0` 且后一节不是组员时汇总为空 ⇒ 回退 `STR_VEHICLE_INFO_NO_CAPACITY`（"无"）。
+5. 引擎名回退链：`SCC_ENGINE_NAME`（`src\strings.cpp`）在引擎名为空/未启用时退回 `Engine::info.string_id`；`STR_UNDEFINED = 0x0002` 正是"(未定义字符串)"。
+
+**猜测根因（待验证）**：
+
+- G-4a 物理偏差 = `rvi_v`（`pow_wag_power` 门控）+ `first_engine` 污染。
+- G-4b 容量"无" = 容量页汇总的终止条件，不是容量值丢失。
+- G-4c 名称未定义 = 该车厢/部件引擎本身无名字。
+
+**候选修法（待拍板）**：
+
+- **甲（显示层）**：新增"链级代表引擎"解析（链上第一台 `railveh_type != Wagon`），只供引擎名/容量汇总/静态性能读取使用，不动 `engine_type`。风险最低。
+- **乙（ConsistChanged 层）**：把 `rvi_v` 与 `first_engine` 改成"链上第一台真引擎"，让 `gcache` 与 `gcache.first_engine` 恢复"整列只有一台真机车"的正确语义。影响物理与 GRF 回调，需大范围复测。
+- **丙（身份层）**：改新链头 `engine_type`。**已知高危**（`cached_veh_length`/`UpdateDeltaXY`/图像/NewGRF 变量/存档），倾向不做。
+
+**复测判据（待实现后使用）**：①反转后详情窗"运载能力"非"无"且与反转前一致 ②引擎名称不再是"(未定义字符串)" ③同型号未反转列车与反转列车的功率/牵引力/重量/运行费用逐项相等 ④逐节 `cargo_cap` 反转前后不变（证明是显示面而非数据面）⑤负判据：普通单节反转、无铰接组列车、折叠修正路径读数逐字不变。
+
+**甲（显示层）落地记录（2026-11-15，玩家指令「先做甲试试看」）**
+
+只改 `src\train_gui.cpp`（未碰任何 `src\*.h`）。两个文件内 static 判据：
+
+- `R3RConsistRepresentativeEngine(const Train *v)` = `!v->IsFrontEngine() || RailVehInfo(v->engine_type)->railveh_type != RailVehicleType::Wagon` 时原样返回，否则沿 `Next()` 取链上第一台非 Wagon 的 `engine_type`。
+- `R3RDetailsWholeConsistCapacity(const Train *v)` = `v->IsFrontEngine() && RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon`，即混合态链头。
+
+三处改动：
+
+1. **引擎名**（治"(未定义字符串)"）：`TrainDetailsInfoTab` 的两处 `PackEngineNameDParam(v->engine_type, EngineNameContext::VehicleDetails)` 改走 `R3RConsistRepresentativeEngine(v)`（Wagon 分支与引擎分支 case 0 各一处）。链路已证：`STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE`（english.txt:4801/4802）参数是 `{ENGINE}`，`SCC_ENGINE_NAME` 末尾回退 `e->info.string_id`（strings.cpp:2200），隐藏铰接部件的 `string_id == STR_UNDEFINED`(0x0002) ⇒ 显示"(未定义字符串)"。
+2. **容量汇总**（治"运载能力=无"）：`GetCargoSummaryOfArticulatedVehicle` 抽出 `add_unit` lambda；混合态链头改为整列 `for (u = v; u; u = u->Next())` 汇总并 return（链头那节常是 `cargo_cap == 0` 的车厢/部件，逐单元汇总必空 ⇒ 落到 `STR_VEHICLE_INFO_NO_CAPACITY`）。
+3. **行数一致**：`GetTrainDetailsWndVScroll` 与 `DrawTrainDetails` 的外层单元循环在混合态链头处 `break`，保证"一行整列汇总"与滚动条行数逐行对齐（两处必须同时改）。
+
+刻意留给乙：`get_speed()` 仍用链头 `rvi`、可靠性行仍读 `v->GetEngine()->reliability`；`gcache`/`gcache.first_engine` 一字未动。
+
+**构建自证（甲）**：`R3R_fullbuild.cmd inc detach`（未新建 .cmd）；guard.log = `GUARD: incremental is safe`；`[2/3] train_gui.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（01:15:13 MODE=inc）；`src\train_gui.cpp` 01:11:35 → obj 01:12:57 → `build\openttd.exe` 01:14:54（52 891 136 B）；`read_lints` 0。
+
+**甲复测判据**：①反转后详情窗引擎名行显示机车型号名而非"(未定义字符串)" ②容量页显示整列合计而非"无"，且与反转前相等 ③滚动条可拉到底、最后一行不截断 ④负判据：普通未反转列车/纯车厢链（`IsFrontEngine()` 假）/原生 artic 组逐字不变 ⑤负判据：非列车详情窗不受影响。
+
+**甲复测结果（2026-11-15：未通过）+ 玩家新提案对比**（详见备忘 `R3R_artic_ctrl_reverse_round435_memo.md` §22）
+
+玩家原话：
+
+> 还是有问题。能不能这样：永远让铰接式最前面的车厢当父车（可以直接给它赋予1功率变引擎）。但是各类grf回调还是认原先的父车，从后往前数。顺便讲一下现行方案与这个的区别
+
+事实核对：
+
+- 「最前车厢当父车」已由 C-2 落地（清/重设 `ArticGroupHead/Member` + `R3RCreateCarOnlyFormation()` 的 `SetEngine/SetFrontEngine/ClearWagon`）。
+- 「赋 1 功率变引擎」已是 `Train::GetPower()`（`src\train.h:596-602`）的既有地板（KI-630），不是新增项；且 `RailVehicleType`（`src\engine_type.h`）只有 `Singlehead/Multihead/Wagon`，"是否引擎"是位、"显示成谁"是 `engine_type` 原型。
+- 故提案的新内容只有「GRF 回调仍认原父车、从后往前数」⇒ 等价于把链级静态量锚点从"链头 `engine_type`"改回"原父车 `engine_type`"，即乙的 `ConsistChanged` `:380 rvi_v` / `:381 first_engine`。
+
+新增疑点：
+
+- **H-1（最可能）**：`R3RConsistRepresentativeEngine()` 要求 `railveh_type != Wagon`，若父车原型本身也是 `Wagon` 则全链无候选 ⇒ 兜底返回自身 ⇒ 仍 `STR_UNDEFINED`。
+- **H-2**：打开的详情窗不是链头 ⇒ `!IsFrontEngine()` ⇒ 甲按设计原样返回。
+- **H-3**：可靠性/最高速度/运行费用行甲未覆盖（仍读 `v->GetEngine()` / `get_speed()`）。
+
+硬边界：名字只能来自某个 `Engine::info.string_id`；若整组原型都是 `STR_UNDEFINED`，"换锚点"也取不到名字。
+
+待拍板：
+
+- **C-1（甲+，建议先做）**：代表引擎判据放宽为"链上第一台 `string_id != STR_UNDEFINED` 的车"，并把速度/可靠性/费用/牵引力行统一走它；只改 `train_gui.cpp`（纯 .cpp 增量）。
+- **C-2（乙，提案完整版）**：改 `ConsistChanged` 的 `rvi_v` / `first_engine` + `newgrf_engine.cpp` 组内计数镜像；治物理与 GRF，需全量复测。
+
+**玩家拍板（2026-11-15，原话）**：
+
+> H1，我买的列车的父车原型是engine。H2，那条链只有一个铰接式，就是我反转的那个 我希望做C2
+
+⇒ H-1（父车原型是 Wagon）**证伪**，H-2 同样排除（单组链）；甲的失败只剩一条已证根因，见下。
+
+**甲失败的根因（第 445 轮已证）**：甲的触发判据是 `railveh_type == Wagon`，而本 GRF（Chinaset 系）的**铰接部件原型不是 `Wagon`**（它们是无名的隐藏部件原型）。C-2 反转后新链头的 `engine_type` 是这些隐藏部件 ⇒ `R3RConsistRepresentativeEngine()` 在新链头上**直接早退**，名字与容量两条改动一次都没生效 ⇒ 玩家看到"还是有问题"。
+
+**C-2 落地记录（2026-11-15，第 445 轮：已实现 + 已编译，游戏内复测待做）**
+
+口径纠正（§22.5/§22.6 的错）：C-2 反转提交点末尾已执行 `new_head->SetArticGroupHead()` + 逐节 `SetArticGroupMember()`，故"代表引擎 = 持 `ArticGroupHead` 的那一节"在 C-2 之后**恒等于链头**，按字面实现是空操作。真正可用的判别信号是**原型有没有名字**：`Engine::Get(id)->info.string_id == STR_UNDEFINED` 即隐藏部件；原父车（反转后位于链尾）是唯一"有名字 + `railveh_type != Wagon`"的那一节。
+
+只改两个 `.cpp`，未碰任何 `src\*.h`：
+
+1. `src\train_cmd.cpp` 新增 `static Train *R3RConsistReferenceEngine(Train *head)`（在 `ConsistChanged()` 之前）：
+   - 链头原型**有名字** ⇒ 返回链头（普通链/纯车厢链/原生 artic 一字不动 = 护栏①）；
+   - 否则在链头同一打散组内（走到第一个非 `ArticGroupMember` 即停）找第一个有名字的节，优先 `railveh_type != Wagon`，否则任一有名字节；全无则退回链头。
+2. `Train::ConsistChanged()` 三处：
+   - `rvi_v = RailVehInfo(r3r_ref_engine->engine_type)`（原 `this->engine_type`）⇒ `pow_wag_power` 等回到父车语义；
+   - `first_engine = IsFrontEngine() ? r3r_ref_engine->engine_type : EngineID::Invalid()`；
+   - 第一趟循环内 `if (u->IsEngine())` 分支加条件：**角色是引擎但原型无名的节不得成为后继车的 `first_engine` 锚**，改写为代表引擎。**必须写在第一趟循环内**——`tcache.cached_override = GetWagonOverrideSpriteSet(..., u->gcache.first_engine)` 在第二趟循环就已取值，事后回填 `gcache.first_engine` 无效（上一版曾这么写，已删）。
+   - 探针 `C2-REF head= ref= refEng= refType= powWag= n= db=`，按 (head, ref) 去重。
+3. `src\train_gui.cpp`：新增 `R3RDetailsNeedsRepresentativeEngine(v)`（`v->IsFrontEngine()` 且"原型是 `Wagon` **或** 原型无名"）；`R3RConsistRepresentativeEngine()` 与 `R3RDetailsWholeConsistCapacity()` 都改用它 ⇒ 名字（引擎名行）与容量（整列汇总成一行）两条都覆盖 C-2 的隐藏部件链头。
+
+**回归护栏对照**：①未反转普通链、纯车厢链、原生 artic 链的链头原型都有名字 ⇒ 三处改动全不触发，`ConsistChanged` 逐值不变；②不改任何存档字段、不动角色位 ⇒ 存档往返无变化；③`first_engine` 从"无名隐藏部件"变成"父车"只让 `cached_override` / `GetPoweredPartPower()` 从查不到 override 回到查父车，不会减少；④未触碰 `ArticGroupHead/Member` 的授予与撤销。
+
+**构建自证（第 445 轮）**：复用 `R3R_fullbuild.cmd inc detach`（未新建 .cmd）；首编在 `train_cmd.cpp(625)` 报 `error C2039: "cached_num_engines" 不是 "GroundVehicleCache" 的成员`（探针字段写错，`ground_vehicle.hpp:31-52` 无此字段），改 `cached_power` 后重编；guard.log = `GUARD: incremental is safe`；`[2/3] train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（01:45:35 MODE=inc）；error/FAILED 计数 0；`train_gui.cpp` 01:41:39 → obj 01:42:44、`train_cmd.cpp` 01:43:46 → obj 01:44:31、`build\openttd.exe` 01:45:28（52 891 136 B）晚于全部源码与 obj；`read_lints` 0；exe 命中 `C2-REF head=%d ref=%d`。发布树 `build-release` 本轮未编。
+
+**C-2 复测判据**：
+
+1. 库内反转那条铰接链后，详情窗"引擎名称"行显示**父车（机车型号）的名字**，不再是"(未定义字符串)"。
+2. "运载能力"页显示整列合计（非"无"），且与反转前**逐项相等**。
+3. 反转列车与同型号未反转列车的**功率/最大牵引力/重量/最高速度/运行费用**逐项相等（重点核 `cached_power` 与 `first_engine` 相关项；允许 1 hp 地板仍生效）。
+4. 日志出现 `C2-REF head=<新链头> ref=<原父车> refType=0|1 powWag=...`，且 `ref` 恰为反转前的原父车；同一对车号只出现一行。
+5. 负判据：普通未反转列车、纯车厢链、原生 GRF artic 组**不出现** `C2-REF`，且详情窗与物理读数逐字不变。
+6. 存档往返（反转后存档 → 读档）名字/容量/功率/段边界不变。
+
+**未做（本轮登记，不修）**：H-7（`TCF_MOVING_UNIT_START` 仍按角色位）、H-8（`pow_wag_power` 取父车值可能点亮 `PoweredWagon`）、C-2 未动 `newgrf_engine.cpp` 的组内名次镜像（0x40/0x41/0x4D 早已按 `SegmentFlipped ^ ArticGroupFlipped` 镜像，本轮无新增改动）、未动 `get_speed()`/可靠性行。
+
+**第 446 轮：C-2 复测后名字行仍错（根因已定位，已修待重编）**
+
+- **玩家原话**：「反转后详情窗「引擎名称」仍然是(未定义字符串)，与改动代码之前没有任何区别，请问这是什么情况，能讲讲根因和你打算怎么修吗」
+- **先纠正一个推理陷阱**：名字行与 C-2 的 `ConsistChanged` 锚点**没有因果关系**。`rvi_v`/`first_engine` 只喂 `pow_wag_power`、wagon override、2CC、动力车厢功率，从不喂详情窗的 `{ENGINE}` 参数。故"名字仍错"**不能**反推 C-2 失败；两者是独立缺陷。
+- **名字行定位**：`src\train_gui.cpp:348`（`rvi->railveh_type == Wagon` 分支）与 `:358`（`case 0` 引擎分支）各一处 `PackEngineNameDParam(R3RConsistRepresentativeEngine(v), EngineNameContext::VehicleDetails)`；`english.txt:4801` 的 `STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE` = `{LTBLUE}{ENGINE}{BLACK}   Built: ...`，确认玩家说的"引擎名称"就是 `{ENGINE}`。
+- **根因**：`R3RDetailsNeedsRepresentativeEngine()` 第一句是 `if (!v->IsFrontEngine()) return false;`。但 `TrainDetailsInfoTab` 选 engine/wagon 分支**只看 `rvi->railveh_type`（:347），从不看 `IsFrontEngine()`**。于是"窗口开在非前置引擎的那一节上"时，界面照样画引擎名行，而代表引擎解析被这一句直接打回原值 `v->engine_type`（= 无名原型）⇒ 渲染 `(未定义字符串)`，与改动前逐字相同。这正是玩家看到的"没有任何区别"。C-2 反转后玩家点的是哪一节、`SetFrontEngine()` 是否正好落在被点那节，都不受控。
+- **同源缺陷（`C2-REF` 一行都没有的原因）**：`src\train_cmd.cpp` 的 `R3RConsistReferenceEngine()` 循环里 `if (!u->IsArticGroupMember()) break;` 排在名字检查之前；而 C-2 提交点（`train_cmd.cpp:6123-6124`）只给 `group[0 .. n_cars-2]` 授 `ArticGroupMember`，反转后在链尾的原父车可能不带该位 ⇒ 循环在检查它之前就 break ⇒ 代表引擎退回无名链头 ⇒ 探针不打印、`rvi_v`/`first_engine` 也一直锚在无名部件上。
+- **修法（第 446 轮已改，不依赖"点的是哪一节"）**：①`train_gui.cpp` 把因果翻过来——`string_id == STR_UNDEFINED` 是与角色位无关的事实，**无条件**判定；只有"原型是 Wagon（有名字）"这一支才继续要求 `IsFrontEngine()`。②`R3RConsistRepresentativeEngine()` 遍历起点由 `v` 改为 `Train::From(v->First())`。③`train_cmd.cpp` 把名字检查提到组边界判定之前，边界判定改为在该节检查完之后 `break`。④新增一次性只读探针 `R3R-NAME v= fe= eng= sid= rep=`（每车一行，`sid=2` 即 `STR_UNDEFINED`）。
+- **构建（第 446 轮，已通过）**：首跑因 `openttd.exe`（PID 12340）占用被闸门拦下，`build\R3R_incbuild.done` = `EXIT_CODE=97`（02:04:53，脚本只写 done 不写 log）；玩家关闭游戏后重跑 `R3R_fullbuild.cmd inc detach`：`[2/4] train_gui.cpp.obj` → `[3/4] train_cmd.cpp.obj` → `[4/4] Linking CXX executable openttd.exe`、`done` = `EXIT_CODE=0`（02:13:27）、error/FAILED/LNK 计数 **0**、`train_gui.cpp` 02:04:09 → obj 02:12:06、`train_cmd.cpp` 02:04:04 → obj 02:12:12、`build\openttd.exe` 02:13:17（52 891 136 B）晚于全部源码与 obj、`read_lints` 0、exe 命中 `R3R-NAME v=%d fe=%d eng=%d sid=%d rep=%d` 与 `C2-REF head=%d ref=%d`；发布树未编。
+- **复测判据**：①出现 `R3R-NAME` 且 `sid=2` 时 `rep != eng`，`rep` 等于原父车 engine_type；②详情窗引擎名显示父车型号，与反转前一致；③运载能力整列汇总且与反转前逐项相等；④负判据：普通未反转列车不出现 `R3R-NAME`（链头原型有名 ⇒ 第一句即返回，画面逐字不变）。
+
+## 第 447 轮（KI-640 续二：判据错维 ⇒ 丙-1「能否渲染出名字」/ 状态：已实现 + 已编译，复测待做）
+
+### KI-640 续二：`(未定义字符串)` 的真判据不是「有 string_id」而是「`{ENGINE}` 能渲染」
+
+- **玩家原话**：「判据依然为负，我们需要重新思考」
+- **为什么第 446 轮仍然零效果（真根因 H-R3，成立）**：`SCC_ENGINE_NAME`（`src\strings.cpp:2172-2202`）的三段回退是 ①`!e->name.empty() && e->IsEnabled()` ②`e->info.callback_mask.Test(VehicleCallbackMask::Name)` → `GetVehicleCallback(CBID_VEHICLE_NAME, arg >> 32, ...)` ③`e->info.string_id`。目标 GRF 的车名走**第②条**，于是它**所有原型的 `info.string_id` 都是 `STR_UNDEFINED`**。第 446 轮把「跳过 `string_id == STR_UNDEFINED` 的节」当成"跳过无名节"，实际把父车一起跳掉 ⇒ `named == nullptr` ⇒ 返回链头 ⇒ 逐字不变。这一条同时解释「甲、乙两轮都零效果」「`C2-REF` 一行都没有」「玩家看到没有任何区别」。
+- **关键旁证**：`STR_UNDEFINED :(未定义字符串)`（`src\lang\simplified_chinese.txt`）⇒ 界面文字正是走到第③条回退，即"该原型无 custom name、无 Name 回调、`string_id` 为 `STR_UNDEFINED`"；而 `Engine::IsEnabled()`（`src\engine.cpp:153-156`）只看 `STR_NEWGRF_INVALID_ENGINE` + 气候，**不能**当作"有名字"的判据（铰接部件同样 enabled）。
+- **修法（丙-1，已落地）**：新增 `R3REngineHasDisplayName(EngineID)`，三条回退逐条镜像 `SCC_ENGINE_NAME`（`!e->name.empty() && e->IsEnabled()` / `e->info.callback_mask.Test(VehicleCallbackMask::Name)` / `string_id` 有效），替换全部 `info.string_id == STR_UNDEFINED` 判据——`src\train_gui.cpp` 两处（`R3RDetailsNeedsRepresentativeEngine` / `R3RConsistRepresentativeEngine` 遍历）+ `src\train_cmd.cpp` 三处（`R3RConsistReferenceEngine` 早退、组内挑节、`ConsistChanged` 第一趟 `first_engine` 条件）。未碰任何 `src/*.h`。
+- **探针升级**：`R3R-NAME v= fe= eng= sid= cb= nm= rep=`（新增 `cb=` Name 回调位、`nm=` 可展示）；`C2-REF … headNm= refNm=`。
+- **构建自证（第 447 轮）**：复用 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`）；`build\R3R_incbuild.done` = `EXIT_CODE=0`（`=== R3R build ended 2026/11/15 2:25:18 MODE=inc`）；日志尾部 `[4/4] Linking CXX executable openttd.exe`；`error C*/fatal error/FAILED:/build stopped` 计数 **0**；`src\train_cmd.cpp` 2:22:05 → `train_cmd.cpp.obj` 2:23:50、`src\train_gui.cpp` 2:22:27 → `train_gui.cpp.obj` 2:23:43、`build\openttd.exe` **2:25:04（52 891 136 B）** 晚于全部源码与 obj；`read_lints` 两文件 0 条；exe 命中 `headNm=%d refNm=%d` 与 `cb=%d nm=%d`；发布树未编。
+- **复测判据（在第 445 轮 6 条基础上收紧）**：①日志出现 `C2-REF head=<新链头> ref=<原父车> headNm=0 refNm=1`（`ref` 是反转前原父车） ②详情窗"引擎名称"=父车型号名，不再 `(未定义字符串)` ③运载能力=整列合计且与反转前逐项相等 ④功率/牵引力/重量/最高速度/运行费用与同型号未反转车逐项相等 ⑤负判据：普通未反转链、纯车厢链、原生 GRF artic 组不出现 `C2-REF`，读数逐字不变 ⑥存档往返不变。
+- **若仍为负（已完成判读预案）**：需要玩家提供（a）`build\R3R_debug.log` 里 `R3R-NAME` 行原文（有无 `nm=1` 的节、`rep=` 是否等于它）（b）详情窗那一行的完整标签文字（"引擎名称"还是"车厢"）。判读：`R3R-NAME` 一行都没有 ⇒ 详情窗没走 `TrainDetailsInfoTab`（渲染路径假设本身错，另开取证轴）；有行但 `rep=` 已变仍显示未定义 ⇒ `{ENGINE}` 的参数不是 `PackEngineNameDParam(R3RConsistRepresentativeEngine(v), ...)`。
+- **仍未做**：H-7（`TCF_MOVING_UNIT_START` 仍按角色位）、H-8（`pow_wag_power` 取父车）、`newgrf_engine.cpp` 组内名次镜像；换 `engine_type`（U-4）仍判为高风险不动。
+
+## 第 448 轮（KI-640 续三：探针被标签白名单吞掉 + 判据仍靠猜 / 状态：已实现 + 已编译，复测待做）
+
+### KI-640 续三：`C2-REF` 的 0 是假 0；`R3REngineHasDisplayName()` 的第 2 条回退会撒谎
+
+- **玩家原话**：「你的改码后，依然是一模一样的问题」
+- **D-1 排除（玩家确实跑了新 exe）**：`build\R3R_debug.log` mtime **2:30:35**、333 978 B / 3 556 行，晚于 `build\openttd.exe` **2:25:04** ⇒ 采样有效；`build-release\openttd.exe` 仍停在 11/13 3:10:26，未被使用。
+- **D-4 排除（探针层在跑）**：日志中 `SPD-DROP`=**26**、`DEPOT-ARR`=**27**、`SEGID`=**60** ⇒ `R3RDbgWrite` 未被宏剔除，探针层正常工作。
+- **新根因 R-1（工具层，已实证）：`R3RDbgTagAllowed()` 白名单把 `C2-REF` 静默吞掉。** `src\r3r_perf.h` 只放行首 token 命中 `RESV/UNRES/EXTEND/LOOP/R3R-RES/COUPLE/CPL/FOLD/SPLICE/ARTIC/SKIP-/UNIT/CLONE/ORD/CTRL/AUTO-/OWNER/NAME/RESERVE/DECOUPLE/SPD/WP/DUALHEAD/TTB/DEPOT/SEGID/SEGROW/LEGACY/CGRP/GRP` 或以 `"R3R-"` 开头的行。`C2-REF` 首 4 字符是 `C2-R`，不匹配 ⇒ 被丢弃。同理 `RESPACE-AFTER-EDIT`、`CHAIN-ATTRS` 的 0 也是假 0；只有 `R3R-NAME`（`"R3R-"` 前缀）的 0 是真 0。这是本环境第 4 次踩同一个坑（前三次见 KI-534）。
+- **新根因 R-2（判据层，成立）：`R3REngineHasDisplayName()` 第 2 条回退「有 Name 回调即有名字」会撒谎。** `SCC_ENGINE_NAME`（`src\strings.cpp:2172-2202`）拿到回调后还要判返回值：`== 0x40F` 或 `< 0x400` 才算成功，**否则继续落到 `info.string_id`**。隐藏铰接部件原型恰恰是"挂了回调但不给有效名"⇒ 渲染出 `(未定义字符串)`，而旧判据返回 true ⇒ `R3RDetailsNeedsRepresentativeEngine()` 在 `IsFrontEngine()==false` 的节上返回 false ⇒ `R3RConsistRepresentativeEngine()` 立刻早退（探针在其后 ⇒ 一行不打）；`R3RConsistReferenceEngine()` 同理在链头 `return head` ⇒ `ConsistChanged()` 仍按隐藏部件原型填 `rvi_v`/`first_engine`/gcache ⇒ 「运载能力=无」「物理性能偏差」一并解释。这同时是三轮改动零可观测效果的统一解释。
+- **修法（第 4 次，换轴：不再改门禁，改判据的真实性与探针位置）**：
+  1. `R3REngineHasDisplayName()`（`src\train_gui.cpp` 与 `src\train_cmd.cpp` 两份）第 2/3 条回退合并成**真实渲染测试**：`GetString(STR_ENGINE_NAME, PackEngineNameDParam(engine, EngineNameContext::VehicleDetails))` 与 `GetString(STR_UNDEFINED)` 比对。与 `SCC_ENGINE_NAME` 逐字同一路径，不再对回调做任何猜测。
+  2. `R3RConsistRepresentativeEngine()` 的探针**前移到早退之前**（`R3R-NAME v= fe= eng= sid= cb= nm= needs=`），并新增出口探针 `R3R-REPICK v= rep= eng= repNm=`。
+  3. `TrainDetailsInfoTab()` 入口新增节流探针 `R3R-DINFO v= line= rvi= fe= eng=` ⇒ 证明详情窗到底走不走这个函数，切开"窗口没开/路径不对"与"判据早退"。
+  4. `C2-REF` 改名 `R3R-C2REF`（跨过白名单）。
+- **构建自证（第 448 轮）**：复用 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`）；`tasklist` 先确认 `openttd.exe` 未运行；护栏 `GUARD: incremental is safe`；`[2/4] train_gui.cpp.obj` → `[3/4] train_cmd.cpp.obj` → `[4/4] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（`=== R3R build ended 2026/11/15 2:40:32 MODE=inc`）；`error C*/fatal error/FAILED:/build stopped` 计数 **0**；`src\train_cmd.cpp` 02:36:58 → obj 02:38:22、`src\train_gui.cpp` 02:37:20 → obj 02:38:17、`build\openttd.exe` **02:40:09（52 918 272 B）**；`read_lints` 两文件 0 条；exe 字面量 5/5 命中（`R3R-DINFO v=` / `cb=%d nm=%d needs=%d` / `R3R-REPICK v=` / `R3R-C2REF head=` / 旧 `C2-REF head=` 已消失）；发布树未编。
+- **复测判据**：①必现 `R3R-DINFO`（若仍为 0 ⇒ 详情窗不经过 `TrainDetailsInfoTab`，改从 `VehicleDetailsWindow::UpdateVehicleDetails()` 反向搜）②必现 `R3R-NAME … needs=1 nm=0 cb=1` 这类行（证明旧判据确实撒谎）③必现 `R3R-REPICK rep≠eng repNm=1` ④详情窗引擎名=父车型号、运载能力=整列合计、功率/牵引力/重量/最高速度/运行费用与同型号未反转车逐项相等 ⑤负判据：普通未反转链 `needs=0` 且画面逐字不变 ⑥存档往返不变。
+
+
+## 第 449 轮（KI-640 续四：名字行已通过 ⇒ 转入其余五属性 / 状态：已实现 + 已编译 + 实机复测通过（2026-11-15）——见本节末「第 449 轮续（四）」）
+
+### KI-640 续四：信息 tab 结构上不含那五项；容量汇总分支其实已经生效
+
+- **玩家原话（2026-11-15）**：「现在"(未定义字符串)"已经消失，但列车其它属性依然错误」。⇒ 第 448 轮的真实渲染测试**实机通过**（`{ENGINE}` 渲染锚点侧收口，不再改动）。
+- **REG-449-A（疑点，登记）：`build\R3R_debug.log` 不能作为本轮判据来源。** 本轮读日志：仅约 23 行、无 `R3R-C2REF` / `R3R-NAME` / `R3R-DINFO` ⇒ 空会话（详情窗未打开或新一轮启动），探针自然一行不打。**"没有该行" ≠ "参考引擎没解析到父车"**，本轮第 1 步判定为「数据缺失」而非「判据为负」。需玩家重跑一次"反转后点开详情窗"再取日志；在此之前不下任何"解析成功/失败"的结论。
+- **C-449-1（硬结论，代码级）：`TrainDetailsInfoTab()`（`src\train_gui.cpp:384-476`）只有 3 个行号分支** —— `line 0` 名字/建造年/价值/最高速度、`line 1` 可靠性+故障、`line 2` 当前状态、`default: NOT_REACHED()`。**没有**运载能力、功率、牵引力、重量、运行费用任何一行。
+  ⇒ 玩家口径的"其它属性"落在另外两处，与第 445~448 轮改动面基本无交集：
+  1. `src\vehicle_gui.cpp` 的 `WID_VD_TOP_DETAILS`：`STR_VEHICLE_INFO_MAX_SPEED` / `STR_VEHICLE_INFO_WEIGHT_POWER_MAX_SPEED` / `STR_VEHICLE_INFO_WEIGHT_POWER_MAX_SPEED_MAX_TE`（`UpdateWidgetSize` 在 :3626-3628 预留这三条的宽度）＋ `GetRunningCostString()`（:3630）＋ `STR_VEHICLE_INFO_WEIGHT_RATIOS`（:3658）。
+  2. `src\train_gui.cpp` 的 `TDW_TAB_CAPACITY`（`_cargo_summary`）与 `TDW_TAB_PERF`（`:711-731` 的 `STR_VEHICLE_DETAILS_TRAIN_TOTAL_WEIGHT` / `..._MAX_SPEED` / `..._POWER_WEIGHT_RATIO`）。
+  ⇒ **"名字修好、其余一模一样"不是改错，是没改到**：`{ENGINE}` 渲染锚点与 gcache 数据锚点都不经过这五项的取数行。
+- **C-449-2（硬结论）：容量汇总分支对 C-2 链已经生效，剩余偏差只能来自数据层。** `R3RDetailsWholeConsistCapacity(v)`（`src\train_gui.cpp:371-374`）**就是** `return R3RDetailsNeedsRepresentativeEngine(v);`（同一判据）。第 448 轮已把该判据改成"`R3REngineHasDisplayName(v->engine_type)` 为假 ⇒ 无条件 true"，C-2 反转链头正是画不出名字的隐藏铰接部件 ⇒ `whole_consist == true` ⇒ `:599` / `:705` 两处 `break` 只画一行、`GetTrainDetailsWndVScroll` 的 `num` 同步按一行算，`DrawTrainDetails` 那一行由 `:517-538` 的 `add_unit` 对**整列**累加 `u->cargo_cap`。
+- **新猜测根因（待验证）**：**G-8a** `u->cargo_cap` 本身被 `ConsistChanged()`/`CargoChanged()` 算小（数据锚点仍取错原型的 `capacity`）；**G-8b** `:518` 的 `if (!u->GetEngine()->CanCarryCargo()) return;` 整节跳过（`GetEngine()` 用该节自己的 `engine_type`，隐藏铰接部件原型若 `capacity==0` 且无 refit 会被丢）；**G-8c** 玩家看的不是容量 tab 而是 `WID_VD_TOP_DETAILS`/`TDW_TAB_PERF` 的读数。三者待日志/实机区分。
+- **本轮未改任何源码**（不碰 `{ENGINE}` 侧、不改 `ConsistChanged`、不改 `get_speed()`（H-9 仍挂）、不改 `newgrf_engine.cpp` 组内名次镜像、不碰 U-4 换 `engine_type`）。
+- **下一步**：①读 `src\vehicle_gui.cpp` 的 `WID_VD_TOP_DETAILS` 绘制体，逐行抄出五项各自取数字段（`gcache.cached_*` vs `RailVehInfo(v->engine_type)` vs `GetDisplayPower()`）；②读 `ConsistChanged()` 中 `cached_capacity`/`cached_power`/`cached_max_speed`/`cached_running_cost` 赋值段与 `CargoChanged()`/`PowerChanged()`，判 G-8a；③`R3RConsistReferenceEngine()` 实际返回**必须由玩家重跑取日志**（REG-449-A）；④只改数据锚点。
+- **复测判据**（沿用第 448 轮 6 条，第 4 条收紧为逐项相等）不变。
+
+### 第 449 轮续（二）：枚举订正 + 根因收敛到信息 tab line 0 / line 1
+
+- **C-449-7（硬结论，订正）：`RailVehicleType` 的 `0` 是 `Singlehead`，不是 `Engine`。** `src\engine_type.h:33-37` = `{Singlehead=0, Multihead=1, Wagon=2}`。⇒ 日志 `:17 rvi=0` 是"链头原型 364 为独立机车"、`:16 refType=0` 是"父车原型 363 为独立机车"。**此前 §22.7 记的"甲的判据是 Wagon 而本 GRF 铰接部件原型不是 Wagon"由此获得读数印证。** 以后写枚举名只能用 Singlehead。
+- **C-449-8（硬结论）：`WID_VD_TOP_DETAILS`（`src\vehicle_gui.cpp:3786-3883`）全部数值取自链头 `v` 与其 `gcache`** —— 运行费用 `v->GetDisplayRunningCost()`、最高速度 `v->GetDisplayMaxSpeed()`、重量/功率/TE/长度 `gcache->cached_weight|cached_power|cached_max_te|cached_total_length`、可靠性**遍历整链**。没有任何代表性引擎重定向。
+- **C-449-9（硬结论）：上部区那两个"嫌疑值"其实读缓存，不是读原型。** `Train::GetDisplayMaxSpeed()` = `vcache.cached_max_speed`（`src\train.h:344`，由 `src\train_cmd.cpp:677` 写入）；`GetTrainVehicleMaxSpeed()`（`:278-293`）优先级是 `max_speed_override` > `GetVehicleProperty(u, PROP_TRAIN_SPEED, rvi_u.max_speed)`。`GetDisplayRunningCost()`（`src\vehicle.cpp:4862`）= `GetRunningCost()>>8`，`Train::GetRunningCost()`（`:22862-22878`）逐节按自己的 `GetEngine()` 累加 ⇒ 反转前后**逐节集合不变**。**上部区不是首要嫌疑，先不要改。**
+- **C-449-10（硬结论，根因收敛）：`TrainDetailsInfoTab()`（`src\train_gui.cpp:384-441`）的 line 0 / line 1 是唯一"名字用父车 363、数值用隐藏部件 364"的混合行。** 该函数入口 `rvi = RailVehInfo(v->engine_type)`（=364）；`get_speed()` = `GetVehicleProperty(v, PROP_TRAIN_SPEED, rvi->max_speed)`；`case 0` 名字用 `R3RConsistRepresentativeEngine(v)`（=363，已修）但**建造年 `v->build_year`、价值 `v->value`、速度 `speed` 全部取自链头 364**；`case 1` 的 `v->reliability` / `v->GetEngine()->reliability` 同样是 364。`Singlehead != Wagon` 保证必走引擎分支、必渲染这一行 ⇒ 玩家"型号对、数值不对"由此得到唯一可解释来源。
+- **拟修法（下一轮，仅 `src\train_gui.cpp`）**：入口取 `const Train *rep = R3RConsistRepresentativeEngine(v);`；`get_speed()` 改用 `RailVehInfo(rep->engine_type)` + `GetVehicleProperty(rep, …)`；`v->value`/`v->build_year`/line 1 的可靠性改 `rep->…`。**负判据：`rep == v` 时逐字节退化为原表达式**（普通链零影响）。不动 `WID_VD_TOP_DETAILS`、不动 `ConsistChanged`、不动 `UsesWagonOverride` 判据。
+- **未确认**：上部区的重量/功率/TE/长度是否也错（若玩家确认只剩这几项，才查 `PowerChanged()` 与 `max_speed_override` 烘焙值）。
+- **状态**：本轮仍**未改任何源码**，只完成取证与修法设计。
+
+### 第 449 轮续（玩家已回日志：44 行有效会话，读数与判定）
+
+- **REG-449-A 解除**：`build\R3R_debug.log`（44 行 / 3078 B / 03:03:33）为一次完整"反转→打开详情窗"会话，可作判据。
+- **C-449-3（G-6/G-7 证伪）：数据锚点已切到父车，不是没切。** `:16 R3R-C2REF head=3 ref=0 refEng=363 refType=0 powWag=0 n=0 db=0 headNm=0 refNm=1` ⇒ `r3r_ref_engine`=veh0(engine 363，有名字)，链头 veh3(engine 364，画不出名字)。整条锚点切换链路生效，**禁止再往"参考引擎没找到"方向改码**。
+- **C-449-4（H-9 从猜测升为定位）：信息 tab 走引擎分支，`line 0` 的价值/最高速度仍读链头原型 364。** `:17/:20/:21 R3R-DINFO v=3 line=0/1/2 rvi=0 fe=1 eng=364`；若 `RailVehicleType::Engine==0`（待核）则 `TrainDetailsInfoTab()` 走 else 分支，名字已被 `R3R-REPICK` 换成 363，但 `v->value` 与 `get_speed()` 仍按 364 取 ⇒ 同一行"名字属父车、价值/速度属隐藏部件"。
+- **C-449-5（取证范围收窄）：本次会话没打开容量/性能 tab。** 只有 `line=0/1/2`，无 capacity/perf 读数 ⇒ 玩家口中的"运载能力"无法由本次日志支撑；信息 tab 结构上也无容量行。
+- **REG-449-B（疑点，防"假 0"）：`R3R-C2REF` 的 `n=0` 不可当"功率归零"证据。** `n=%u` 打的是 `gcache.cached_power`，探针在 `src\train_cmd.cpp:654`，而 `PowerChanged()`/`CargoChanged()` 在其后 ⇒ 读到的是未写入/已清零的暂态。
+- **C-449-6（读数事实，非结论）：`DEARTIC-SPLIT` 的 `wtot/ptot` 由 66/476 变 16/119 不表示"整列被算成 1 节"。** `:6` 首次拆解把 66 均分为 18/16/16/16，之后每节自带 `weight_override`，再拆时 16/119 属正确读数。该假设本轮自查即降级为**无效**，不据此改码。附带记录（不修）：`:8-:10` idx1/2 同时 `gm=1 gh=1`、`:25-:26` idx3/2 均 `gh=1`，属**存量 ArticGroupHead 角色位污染**，与六项属性因果未验证。
+- **下一步**：①核 `RailVehicleType` 枚举确认 0 是否 Engine；②读 `src\vehicle_gui.cpp` 的 `WID_VD_TOP_DETAILS` 绘制体抄出五项取数字段（玩家主视区、日志零覆盖）；③把 `R3R-C2REF` 后移到 `PowerChanged()`/`CargoChanged()` 之后并增打 `cached_capacity`/`cached_weight`/`cached_max_speed`/`cached_running_cost`，之后才允许对"数值"下结论；④只改显示取数对象，不改 `ConsistChanged` 结构、不碰 `{ENGINE}` 侧。
+- **本轮未改任何源码**。
+
+### 第 449 轮续（四）：信息 tab 六项属性改按"代表单元"取数——已实现 + 已编译（游戏内复测待做）
+
+- **状态**：已修（第 449 轮续（四），`EXIT_CODE=0` 已编译；游戏内复测待做）。**只改 `src\train_gui.cpp` 一个文件，未碰任何 `src\*.h`。**
+- **改动 1（新增取单元函数）**：`R3RConsistRepresentativeUnit(const Train *v)` —— `R3RDetailsNeedsRepresentativeEngine(v)` 为假即 `return v`；否则从 `Train::From(v->First())` 沿 `Next()` 找第一个**有名字**的原型，优先 `railveh_type != RailVehicleType::Wagon`，全无则退回 `v`。这是把"只返回 EngineID"升级为"返回单元指针"，因为价值/建造年/可靠性都是**车辆单元字段**而不是原型字段。
+- **改动 2（去重）**：`R3RConsistRepresentativeEngine()` 的 11 行内联遍历删掉，改为 `R3RConsistRepresentativeUnit(v)->engine_type`；`R3R-NAME`/`R3R-REPICK` 探针位置与文案不变，行为逐字节等价。
+- **改动 3（信息 tab 同源取数）**：`TrainDetailsInfoTab()` 入口 `const Train *const rep = R3RConsistRepresentativeUnit(v);` + `rep_rvi`；`get_speed` 拆成 `get_speed_of(u, u_rvi)` + `get_speed()`（wagon 分支仍用 `v`）；`case 0` 改 `rep->build_year` / `rep->value` / `get_speed_of(rep, rep_rvi)`；`case 1` 改 `ToPercent16(rep->reliability)` / `ToPercent16(rep->GetEngine()->reliability)`，`v->breakdowns_since_last_service` **保留**（本车运行态计数，非原型属性）。探针 `R3R-DINFO` 扩为 `eng=%d rep=%d`。
+- **未动**：`WID_VD_TOP_DETAILS`（上部区）、`ConsistChanged` 结构、`{ENGINE}` 侧、`UsesWagonOverride` 判据、wagon 分支的数值（只沿用既有名字重定向）。
+- **负判据**：`rep == v`（普通未反转链 / 原生 NewGRF 铰接车父车自有名字）时四条取数表达式与原实现**逐字节等价**。
+- **构建自证**：复用 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`），构建前确认 `openttd.exe` 未运行；guard = `GUARD: incremental is safe`；`[3/3] Linking CXX executable openttd.exe`、错误计数 0、`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-11-15 03:11:54）；`src\train_gui.cpp` 03:09:58 → `build\openttd.exe` **2026-11-15 03:11:41（52 918 272 B）**；`read_lints` 该文件 0 条；exe 命中 `eng=%d rep=%d`。**发布树 `build-release\` 未编**，停在含第 448 轮改动、不含本轮的版本。
+- **待复测 4 条**：①该链详情窗名称/建造年/价值/最高速度/可靠性全部来自父车（363）②日志 `R3R-DINFO ... eng=364 rep=363` 与名字行同一 `v=3 line=0` ③普通列车与原生铰接车 `rep==eng` 且六项读数与第 448 轮版逐字不变 ④上部区重量/功率/TE/长度若仍错 ⇒ 属 `PowerChanged()`/`max_speed_override` 烘焙链路，不在本轮范围，需另开取证。
+- **仍未确认**：上部区是否也错（无实机读数）；`REG-449-B` 的假 0 问题未修（`R3R-C2REF` 仍在 `PowerChanged()` 之前，禁止据其 `n=` 下结论）。
+
+## 第 450 轮（KI-641：铰接反转后详情窗「最大牵引力 / 装载能力 / 运行费用」仍与反转前不同）
+
+- **来源**：`R3R_artic_ctrl_reverse_round435_memo.md` §22.20；玩家原话「这次也是有部分进展。但依然有以下不同：最大牵引力，装载能力，运行费用」。
+- **状态**：**已修 + 实机复测通过**（第 450 轮续四实现，2026-11-15 17:43:40 版 exe 实机复测通过；玩家原话「反转后的列车各类指标终于正常了」）——原"待拍板 C-450"作废，改为源头守恒口径，见本节末「第 450 轮续四」与「复测取证」。
+- **严重度**：中（显示口径不符；其中运行费用若按真实扣费口径看，去铰接化后玩家确实多付钱，可升为高）。
+- **一句话根因**：这三项的统计算法都是"逐节累加"，而真铰接部件在算法里被跳过、去铰接化（C-2 反转）后变成独立引擎节 ⇒ 参与累加的节数 1 → 4。重量/功率/最高速度已正确是因为打散时对它们做了烘焙守恒，这三项没有。
+- **逐项证据**：
+  - 运行费用：`src\train_cmd.cpp:24676-24704` 逐节 `GetEngine()`；`src\vehicle_base.h:1367-1374` `GetNextVehicle()` 内 `while (v->HasArticulatedPart()) v = v->GetNextArticulatedPart();` 跳过真部件；打散后 `HasArticulatedPart()` 为假 ⇒ 4 份。
+  - 装载能力：`src\train_gui.cpp:565` `item->capacity += u->cargo_cap;` + `:577` `while ((v = v->Next()) != nullptr && v->IsArticGroupMember());`；真部件非 `ArticGroupMember` ⇒ 只父车一节，打散后吃到组尾；上一轮新增的 `:570-573` `whole_consist` 全链汇总进一步放大差异。
+  - 最大牵引力：`src\ground_vehicle.cpp` 的 `PowerChanged()` 用 `Σ_{power>0} GetWeight() * GetTractiveEffort()`，`GetTractiveEffort()` 取本车原型 TE；打散只烘焙 `weight/power/max_speed`（`src\vehicle_cmd.cpp`）**不烘焙 TE** ⇒ 每节按自己原型 TE 累加。
+- **把握程度**：运行费用/装载能力=源码坐实（高）；最大牵引力=算法与烘焙缺失坐实，"部件原型 TE ≠ 父车 TE"仍属推断，需实测反证（若恰好相等则该项不该有差异）。
+- **修法（待拍板，未落地）**：统一口径「`IsArticGroupMember() && !IsArticGroupHead()` 的节不计入显示统计」——①运行费用在显示层用新增函数（不动 `Train::GetRunningCost()` 本体）；②容量对成员节 `capacity += 0` 并撤销 `whole_consist` 汇总；③牵引力新增 `R3RDisplayMaxTe()`，把成员节重量并入组头后 `Σ (组头总重 × 组头 TE)`；三项均在"链无角色位"时逐字节退回原实现。
+- **待拍板**：C-450-1 是否统一按该口径修 / 只修两项；C-450-2 是否撤销 `whole_consist` 汇总（会与"整列真实总容量"背离）；C-450-3 是否连真实扣费一起修。
+
+### 第 450 轮续三（KI-641 装载能力项：原口径方向与实测矛盾，改判为「`cargo_cap` 被重算」）
+
+- **状态**：按上文修法**暂不可执行**（该修法会让容量变大，与实测 0 相反）；已加只读探针，待一次读数定案。
+- **实测反例**：玩家原话是「装载能力从某个值变为 0」，而上述"1 节 → 4 节放大"只能让数值变大，方向不符。
+- **日志证据（`build\R3R_debug.log`，第 445 轮 C-2 版 exe 产出）**：`R3R-NAME v=3 fe=1 eng=364 sid=65535 ... needs=1` ⇒ 链头原型 364 是**隐藏铰接部件原型**（`STR_UNDEFINED`）⇒ `R3RDetailsNeedsRepresentativeEngine(3)==true` ⇒ `whole_consist==true`；`R3R-C2REF head=3 ref=0 refEng=363 refNm=1` ⇒ 父车是 `veh=0`（原型 363）。
+- **结论**：`src\train_gui.cpp` 走的是 `for (u = v; u != nullptr; u = u->Next()) add_unit(u)` —— **整条物理链已全部汇总，父车在内**；且父车 `CanCarryCargo()` 必为真（否则 `engine.cpp:242` 会让反转前容量也恒 0）。⇒ 只要 `veh=0` 的 `cargo_cap` > 0，页面就不可能显示 `none`。
+- **新根因（待一次读数确认）**：`src\train.h:83` `CCF_ARRANGE{Length, Capacity, DepotDirection}` **含 Capacity**；`src\train_cmd.cpp:614-623` 在 `allowed_changes` 含 Capacity 时直接 `u->cargo_cap = e_u->DetermineCapacity(u)`，而 `DetermineCapacity` 走 `GetEngineProperty(..., PROP_TRAIN_CARGO_CAPACITY, property, v)`（`src\engine.cpp:285`）带车辆上下文问 NewGRF。反转提交点一律 `ConsistChanged(CCF_ARRANGE)`，此时组角色已翻 ⇒ **父车容量按新角色重算为 0**，`train_gui.cpp:553` 的 `cargo == INVALID_CARGO && subtype == STR_EMPTY` 把每节都跳过 ⇒ `summary` 空 ⇒ `:521` 画 `STR_VEHICLE_INFO_NO_CAPACITY`。与 TE 同族（未烘焙 + 提交点重算），但**更严重：若属实则是真丢载货能力，不只是显示**。
+- **疑点 REG-450C-1**：静态代码无法判定该 GRF 的 capacity 回调是否角色敏感，必须有 `veh=0` 的 `cargo_cap` 读数。
+- **探针（本轮落地，只读）**：`src\train_gui.cpp` 新增 `R3RDbgCargoSummary()`（仅 `whole_consist` 链、(链头, 容量指纹) 变化时各打一次），输出 `R3R-CAPSUM head= n= sumcap= items=` 与逐节 `R3R-CAPUNIT head= veh= eng= cap= cargo= sub= carry= role=AH/AM/AP`。
+- **构建自证**：复用 `R3R_fullbuild.cmd inc detach`（未新建 `.cmd`）；`GUARD: incremental is safe`；`[2/3] train_gui.cpp.obj` → `[3/3] Linking`；`build\R3R_incbuild.done`=`EXIT_CODE=0`（2026/11/15 03:31:56）；`src\train_gui.cpp` 03:29:38 → obj 03:30:24 → `build\openttd.exe` 03:31:44（52 918 272 B）；`read_lints` 0；exe 内命中 `R3R-CAPUNIT`；发布树未编。
+- **判读口径**：`veh=0` 行 `cap=0 且 carry=1` ⇒ 新根因成立，修法方向变为"反转后按天然角色恢复容量"（物理）；`cap>0 而页面仍 none` ⇒ 本改判证伪，回到显示层分支（`IsValidCargoType` / `GetCargoSubtypeText`）。
+
+### 第 450 轮续四（KI-641 收口：三项改为「源头守恒」，已实现 + 已编译）
+
+- **玩家原话**：「目前最大牵引力，装载能力，运行费用的偏差依然存在」（2026-11-15，未附新日志）。
+- **口径变更**：停止等待 C-450 拍板。三项根因同族（去铰接化只烘焙 `weight/power/max_speed`，而这三项在 `CCF_ARRANGE` 提交点按**新角色**重算/遍历）⇒ 只改显示无法同时满足"反转前后逐位一致"，改为让它们**在源头等价于真铰接**（真铰接读法＝组头一节代表整组、部件不参与统计）。
+- **状态**：**已修**（第 450 轮续四，已编译通过；游戏内复测待做）。
+- **落地（仅 `src\train_cmd.cpp`，未碰 `src\*.h`）**：
+  1. 装载能力：`ConsistChanged()` 容量段（`:614`）对 `IsArticGroupMember() && !IsArticGroupHead()` 且 `DetermineCapacity()` 给出 0、原 `cargo_cap > 0` 的节保留原值（只挡破坏性 0，refit 得到合法值仍照常写入）。
+  2. 最大牵引力：`ConsistChanged()` 的 `CargoChanged()` 之后（`:712-731`），链上有 `ArticGroupHead/Member` 时覆写 `gcache.cached_max_te = cached_weight * R3RConsistReferenceEngine(this)->GetTractiveEffort() * GROUND_ACCELERATION / 256`，即「整组重量 × 父车系数」；因位于 `UpdateAcceleration()` 之前，**显示与真实加速一起修好**。
+  3. 运行费用：`Train::GetRunningCost()`（`:24709`）有角色位时改走物理链 `Next()`，组成员与组头只由代表引擎那一节出面计价，其余角色节跳过；无角色位链仍走 `GetNextVehicle()` 原文。
+- **为什么不动显示层**：`train_gui.cpp` 的 `whole_consist` 全链汇总是正确口径（整列真实总容量），本轮保留；差距改由"父车不再被算成 0"补上，三项因此自然对齐反转前读数。
+- **未新增探针的原因 + 更正**：`R3RDbgWrite()` 的 tag 白名单在 `src\r3r_perf.h` 的 `R3RDbgTagAllowed()`。⚠️ **更正（同轮复核）**：该谓词最后一条是 `if (n >= 4 && std::strncmp(fmt, "R3R-", 4) == 0) return true;`（`src\r3r_perf.h:396`）——**任何以 `R3R-` 起首的 tag 恒放行**，历史上被吞的是不带该前缀的 `C2-REF`。⇒ 树里已有的 `R3R-CAPSUM` / `R3R-CAPUNIT`（`src\train_gui.cpp`，第 450 轮续三加的）在 17:43 版 exe 里**会写盘**；复测时打开该车详情窗的容量页，即可从 `build\R3R_debug.log` 取两个汇总/逐节读数，**不需要改白名单、不需要全量重编**。若日后要加 `R3R-MAXTE` / `R3R-RUNCOST`，同样用 `R3R-` 前缀即可。
+- **构建自证**：`R3R_fullbuild.cmd inc detach`；首次 `EXIT_CODE=1` 撞 `train_cmd.cpp(24724): error C2664`（const 方法调 `R3RConsistReferenceEngine(Train*)`），改 `const_cast<Train *>(this)` 后重跑；护栏判增量安全；`[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done = EXIT_CODE=0`（2026-11-15 17:43:48）；`src\train_cmd.cpp` 17:41:51 → `train_cmd.cpp.obj` 17:42:18 → `build\openttd.exe` 17:43:40（52 918 272 B）；`read_lints` 0；发布树 `build-release` 未编（停在 r3r-stable-2026-11-13-m）。
+- **复测判据**：①反转前后最大牵引力相同（本案应为 25，不再是 7）②容量页不再 `none` 且数值等于反转前 ③运行费用反转前后相同 ④负判据：普通车与真铰接车三项逐字不变、加速手感不变 ⑤负判据：对打散组 refit 一次，容量仍随货种正常变化（验证"只挡破坏性 0"没锁死 refit）。
+- **遗留风险 REG-450D-1**：`GetRunningCost()` 是真实扣费入口，本次等于承认"去铰接化使实际费用变高"是缺陷；若玩家认为应保留高费用，需要回退第 3 条。
+- **遗留风险 REG-450D-2（低）**：容量的"只挡破坏性 0"对**合法 refit 到 0 容量**的货种会挡一次（refit 到非 0 货种会正常写入；若目标货种真为 0 容量则停在旧值）。复测判据 ⑤ 即为此设。
+- **等价性推演（为什么数值会真的相等，不是拍脑袋）**：重量——真铰接把父车 `GetWeightWithoutCargo()` 按 `GetEnginePartsCount()=1+n` 摊成每节 `W/(1+n)`、链总重恒为 `W`；去铰接化的 `weight_override` 就是同一份，且成员节 `GetEnginePartsCount()=1`（不二次分摊）⇒ `gcache.cached_weight` 两种形态都等于 `W`。牵引力——真铰接 `CalculatePower()` 里父车 `GetWeight()` 返回**其记录值（不分摊）**、分摊只作用于 `cached_weight` ⇒ `W × TE_parent`，与本轮 `cached_weight × TE_ref` 同式（7=`(W/4)×TE` 修回 25=`W×TE`）。运行费用——真铰接 `GetNextVehicle()` 从组头一步跳到组尾之后、只计一节，本轮改走 `Next()` 但仅代表引擎出面计价 ⇒ 同样一节，`IsMultiheaded` 减半读的也是同一节 subtype 位。容量——真铰接整组容量记在父车、部件为 0，本轮保留原值 ⇒ 链上总和守恒。
+
+#### 复测取证（2026-11-15，KI-641 收口）
+
+- **玩家原话**：「目前，反转后的列车各类指标终于正常了，也就是说，你的改动生效了」
+- **判定**：**实机复测通过**。复测 exe = `build\openttd.exe` 2026-11-15 17:43:40（52 918 272 B，第 450 轮续四版），即本轮三处守恒改动全部生效。
+- **逐项结果**：①最大牵引力——反转前后一致（不再 25→7）**通过**；②装载能力——容量页不再 `none` 且与反转前等同 **通过**；③运行费用——反转前后一致 **通过**；④连带 KI-640 六项（引擎名称/建造年/价值/最高速度/可靠性/容量 none）玩家表述为「各类指标终于正常」⇒ **一并通过**。
+- **未单独验证**（不计入本次结论）：负判据「普通车与真铰接车三项逐字不变」玩家未专门对比；负判据「对打散组 refit 后容量仍随货种变化」（即 `REG-450D-2` 的"合法 refit 到 0 容量会被挡一次"）仍未实测。
+- **口径确认**：`cached_max_te` 同时被 `UpdateAcceleration()` 使用 ⇒ 这次是**真实牵引力**一并回到 `W × TE_parent`，不只是显示；玩家未反映加速手感异常，视为无反证，`REG-450D-1` 的疑虑（是否只该改显示）到此关闭。
+- **发布树**：`build-release\` 仍未编，停在 `r3r-stable-2026-11-13-m`（不含第 449/450 轮与 KI-641 修复）。要出发布版需另跑发布树构建。
+- **本轮零源码改动、零构建**，仅文档回填。
+
+## 第 451 轮（KI-642：车站调度池「分配规则」（进入条件）/ 状态：实施中；口径来自第 412 轮 C-8 + C-11）
+
+- **来源（口径最早记录）**：`R3R_station_dispatch_separation_round412_memo.md:507-511` 玩家 2026-11-10 原话 ——「C8，能用"这辆车本身的性能"判断能否分配 / C9，这些表就像占坑位一样… / C10，这些分配的表跑完一个回环，就应当交回池子里 / C11，实际上，这些什么"如果极速达XXX"的分配条件，是写在车站上面的，而不是列车上。比如说，车站里面写：表A的分配条件是列车极速达160，表B的分配条件是最大牵引力达多少千牛。然后一台机车来这个车站领取分配命令，就按照这个规则来」；定案表 §10.2（`:513-522`）C-8=A、C-11=条件写在车站池条目上、C-12=B（只限放表的那个车站）。实现项 §10.3 P-1/P-2/P-4。
+- **现状**：C-9（坑位 `limit/issued`）与 C-10（回环归还 `R3RReturnDispatchPool`）已在第 416 轮落地（KI-586）；缺的是 **C-8 + C-11 = 池条目上的进入条件**。本轮即补此项。
+- **实现口径（本轮采用）**：每条池条目携带一条规则 `(变量, 比较符, 阈值)`，`变量=None` 表示无条件（保持旧行为）；领表时用**来领表这辆车自己的性能**求值（`OrderConditionCompare` 做纯比较），不满足就继续扫下一条池条目（等价于"继续等 / 分流到别的表"），全不满足则维持现有 `DISP-POOL-WAIT` 原地等待。
+- **变量集合（本轮）**：最高速度、功率、最大牵引力、可靠性；`None`=无条件。刻意**不复用** `OrderConditionVariable`（`order_type.h:297`）以免打乱订单条件系统：池规则用独立枚举 + `uint8_t` 存储，订单条件侧的 P-1（缺 Power / MaxTractiveEffort）仍按 KI-583 另立。
+- **状态**：**已实现 + 已编译通过（2026-11-15 22:13:56，`build\openttd.exe` 52 936 704 B），游戏内复测待做**。详见 `R3R_dispatch_pool_rules_round451_memo.md`。
+- **落地**：`src\station_base.h`（`R3RDispatchRuleVariable` / `R3RDispatchRuleOp` / `R3RDispatchClaimStats` / 条目三字段 / `SetRule` / `Pick(stats)`）、`src\station_cmd.cpp`（`SetRule` + `R3RDispatchRuleMatches` + `Pick` 过滤 + `CmdR3RSetDispatchPoolRule`）、`src\station_cmd.h` + `src\command_type.h`（新命令）、`src\train_cmd.cpp`（领表前填 speed/power/TE/可靠性并传给 `Pick`）、`src\sl\station_yard_sl.cpp`（SYRD 升 v9，v2..v8 读入时规则恒 None）、`src\widgets\station_widget.h` + `src\station_gui.cpp`（工具条新增「规则 / ≥≤ / - / +」一行，行尾显示规则）、两份 lang（16 条 `STR_R3R_DISPATCH_RULE_*`）。
+- **单位口径**（防第二次返工）：阈值统一存「速度 kmh-ish / 功率 hp / **牵引力 kN** / 可靠性 %」；显示时速度走 `{VELOCITY}`（`PackVelocity`）、功率走 `{POWER}`（入参 hp）、牵引力走 `{FORCE}`（入参**牛顿**，故 ×1000，见 `src\strings.cpp:1039-1044`）。领表侧 `cached_max_te` 是牛顿 ⇒ `/1000` 后入规则。
+- **行为口径**：`rule_var == None` ⇒ 恒真（旧档/旧条目不改变行为）；带规则且来车不达标 ⇒ 继续扫下一条条目；全部不满足 ⇒ 维持 `DISP-POOL-WAIT` 原地等（不新增"拒绝进站"分支）。
+- **复测判据**：①给池条目设「最高速度 ≥ X」，低速车到站领不到、高速车能领到 ②改设「牵引力 ≥ X kN」后同一列车行为随之变化，且阈值数字与车库面板同类数字可比 ③`rule = 无限制` 时与改动前完全一致（负判据）④读旧存档（SYRD v8）不报错、条目规则显示「无限制」⑤行尾与按钮文案随选中的条目正确切换 ⑥探针 `DISP-POOL-PICK`（领到哪条 + 实测 spd/pow/te/rel）与 `DISP-POOL-WAIT`。
+- **待玩家拍板（沿用备忘 C-451-1..4）**：本轮按建议项实现（单条规则三元组 / 不达标继续扫 / 阈值步进按钮）。若要「多条规则 AND」「优先级排序」「不达标直接放弃等待」，需另开一轮。
+
+### 口径变更：单条三元组 → 全站一份条件程序 + 独立窗口（同日，覆盖上一条的实现口径）
+
+- **玩家新口径（原话）**：「进入车站调度池，点击规则按钮，会单独出现一个窗口而非一个下拉框（直接一个规则管全站场，不要一条调度一个规则）。这个窗口可以照抄可编程信号机条件编辑界面的所有架构……条件判断有『如果』『否则』『或者』『elif(请帮我翻译成中文)』。判断条件是所有可编程信号灯的既有条件。判断结果有『允许分配调度XXX』『拒绝分配调度XXX』（可以放置多个分配调度）。」
+- **变更点**：规则不再挂在池条目上（上一条的 `SetRule/Pick(stats)` 三元组实现作废，字段保留仅供旧档读取）；改为「每个场（yard）一份指令程序」，入口 = 池窗口「规则」按钮 → 独立窗口。
+- **已落地（代码侧）**：`R3RDispatchInstruction{K,var,op,result,value,extra}` 指令流 + `R3RDispatchProgramRef/Set/Allows` + 命令 `Commands::SetR3RDispatchProgram`（`CmdDataT<StationID,uint16_t,std::string>`，24B/指令 blob）+ 求值器 + `widgets/station_widget.h` 的 `DispatchProgramWidgets` + `r3r_dispatch_program_gui.h` 声明 + `station_gui.cpp` 的 `WID_SD_RULE` 点击。
+- **GUI 窗口本体**：`src\r3r_dispatch_program_gui.cpp`（约 585 行）**已创建并编译通过**（2026-11-16 00:41）。原「唯一缺口」关闭。
+  - 架构：`DispatchProgramWindow` 手绘指令行列表（`WID_DP_LIST` + `WID_DP_SCROLLBAR`）+ 底部「变量 / 比较符 / 阈值(- 值 +) / 结果类型 / 调度名」控件 + 「插入 / 删除 / 清空」。
+  - 动态文本一律不走 `NWidgetCore::SetString`（只吃 `StringID`）：五个底部控件用 `STR_NULL` 占位，文案在 `DrawWidget → DrawBottomText()` 里 `DrawString` 自绘；标题栏（`STR_R3R_DP_CAPTION` 带 `{STATION} {STRING}`）走重写的 `Window::GetWidgetString()` 返回成品文本，配 `DispatchYardLabel()`（整站 / 自定义场名 / 场号）。调度名因动态列表只能用「点一次换下一个」循环切换（`NextSchedule()`）。
+  - 阈值输入复用 `ShowQueryString(..., CS_NUMERAL, ...)` + `OnQueryTextFinished` 回填。
+- **elif 中文译名**：采用「**否则如果**」。
+- **状态**：**已实现 + 已编译通过（2026-11-16 00:41，`build\openttd.exe` 53 002 240 B，`EXIT_CODE=0`、`[3/3] Linking`、错误计数 0、`read_lints` 0 条），游戏内复测待做**。
+- **构建自证（2026-11-16 00:41）**：入口 `R3R_fullbuild.cmd inc detach`（未新建 .cmd），护栏 `incremental is safe`。三次串行修错：①`++it` 打在 `const auto it` 上（C2678）⇒ 改 `auto it`；②`std::strtoul` 被 `src\safeguards.h` 换成毒宏（C2039）⇒ 删 `#include <cstdlib>`、改 `ParseInteger<uint32_t>(*str, 10, true)`（`core/string_consumer.hpp`）；③`CmdR3RSetDispatchProgram` 定义按值 `std::string` 而生成命令表按 `const std::string &`（LNK2019/LNK1120）⇒ 定义改成 `const std::string &blob`。另修一处读码发现的运行期缺陷：标题栏带参串会画成 "(invalid parameter)" ⇒ 重写 `GetWidgetString()`。时间戳：`r3r_dispatch_program_gui.cpp` 00:39 → obj 00:40（1 978 855 B）、`station_cmd.cpp` 00:31 → obj 00:33（9 940 931 B）→ exe 00:41。40 条 `STR_R3R_DP_*` 已进 `build\generated\table\strings.h`。`build-release` 未编（按口径只在要发布时编）。
+- **待玩家确认**：C-451-5（绿灯数/红灯数/另一信号状态三个条件在领表场景无信号上下文，建议从下拉删掉）、C-451-6（作用域=站场还是整站）、C-451-7（同一份调度可被多条「允许」提及，第一条命中的结果生效）。详见 `R3R_dispatch_pool_rules_round451_memo.md` §6.3 与 §6.7。
+
+### 第 451 轮续二：玩家实机复测 4 条缺陷（2026-11-16，实施中）
+
+- **玩家原话（逐字）**：「编译已经成功。独立的规则界面已经出现，但是，1，窗口标题处有（invalid parameter）2,我在这个窗口内做任何操作，都会跳红框”不能这样做“，然后任何规则都无法保存 3，“允许分配调度”和选择调度那边完全是灰的按不下去 4，我希望允许或不允许分配可以多选调度」
+- **根因 1（标题 `(invalid parameter)`，已定位）**：`STR_R3R_DP_CAPTION` 用 `{STRING}`，而 GUI 传的第 2 参是 `std::string` 场名原文。`src\strings.cpp:1727-1735` 的 `case SCC_STRING` 走 `args.GetNextParameter<StringID>()`，`src\strings_internal.h` 的 `GetNextParameter()` 遇字符串参数抛 `std::out_of_range`，`FormatString` 捕获后追加 `(invalid parameter)` 并终止格式化。修法＝两份 lang 把该串的 `{STRING}` 改 `{RAW_STRING}`（`strings.cpp:1723-1725` 的 `case SCC_RAW_STRING_POINTER` 走 `GetNextParameterString()`）。**改 lang ⇒ 护栏判全量重编。**
+- **根因 2（任何操作都弹「不能这样做」、规则无法保存，已定位）**：`src\station_cmd.cpp` 的 `CmdR3RSetDispatchProgram` 尾部有结构平衡硬校验 `if (depth != 0) return CMD_ERROR;`（且 `Or/Else/EndIf` 在 `depth == 0` 时也拒）。GUI 是逐条插入的编辑器，插完 `if` 后 depth=1 ⇒ 之后每一次下发都被拒（`STR_ERROR_CAN_T_DO_THIS`），本地与服务端永远不一致 ⇒ 什么都存不下来。修法＝删掉平衡校验，只留字段范围 + 条数上限校验（求值器已能防御不平衡程序）。
+- **根因 3（两个控件全灰，已定位）**：`UpdateBottomControls()` 把 `WID_DP_RESULT_KIND` / `WID_DP_SCHEDULE` 的可用性绑在「选中行是 Result」上，程序为空 ⇒ 恒 disabled；叠加根因 2 ⇒ 永远灰。修法＝无选中行时也允许点，点击即追加一条 Result 行再编辑。
+- **需求 4（多选调度）**：`extra` 由单个 schedule id 改**位掩码**（bit i = 本场池去重后第 i 份调度，上限 32），求值器 `Result` 改 `HasBit(ins.extra, slot)`；GUI「选择调度」改小型多选窗口（自绘勾选列表）。
+- **状态**：**修 1/2/3/4 实施中**（本轮改完后回填构建自证）。详见 `R3R_dispatch_pool_rules_round451_memo.md` §6.16（含逐条修法、U-451-1..3、复测判据 5 条）。
+
+
+### 第 451 轮续三：多选调度落地（2026-11-16，已实现 + 已编译，游戏内复测待做）
+
+#### KI-643（多选调度）「允许/拒绝分配调度」可以勾多份
+
+- **来源**：第 451 轮续二玩家原话「4，我希望允许或不允许分配可以多选调度」；备忘 `R3R_dispatch_multiselect_round452_memo.md`。
+- **状态**：已实现（2026-11-16，编译通过；游戏内复测待做）。**严重度**：中（功能缺失）。
+- **落地**：`R3RDispatchInstruction::extra` 对 Result 行改作 **32 位调度位掩码**（bit i = 本场池去重后第 i 份调度）。
+  - `src\r3r_dispatch_program_gui.cpp`：`:91` `DispatchPoolEntrySchedule()`（旧档条目回退宿主车订单索引，与求值侧同构）、
+    `:102` `R3R_DISPATCH_MASK_BITS = 32`、`:106` `DispatchCollectSchedules()`（去重收集，GUI/求值器同一顺序）、
+    `:120` `DispatchMaskLabel()`、`:133` `DispatchInstructionLine()` 改带 `schedules` 参数、
+    `:346` `SetScheduleMask()` 取代原 `SetSchedule()`/`NextSchedule()`（两个单选实现已删）、
+    `:358` `EnsureResultRow()`（空程序直接建结果行，治「控件全灰按不下去」）、
+    `:619` 新增 `DispatchSchedulePickWindow`（自绘 `[X]/[ ]` 勾选列表 + 滚动条，`:642` `CurrentMask()` 活读父窗口 `ins->extra`）、
+    `:757` `ShowDispatchSchedulePicker()`（已开则前置并 `SetWindowDirty`）、
+    `:177` 主窗口析构关掉多选窗口防孤儿。多选窗口标题串用 `STR_R3R_DP_SCHEDULE_TOOLTIP`（**不得**用带 `{STRING}` 的 `STR_R3R_DP_SCHEDULE`，否则重犯 `(invalid parameter)`）。
+  - `src\window_type.h`：`WindowClass` 末尾追加 `DispatchSchedulePick`（窗口号与 `#DispatchProgram` 同款 `StationID | (yard << 16)` 打包）。
+  - `src\station_cmd.cpp`：`:2510` `R3RDispatchBuildScheduleSlots()` 与 GUI 同一去重规则；`:2578` Result 判定改 `HasBit(ins.extra, slot)`；裸用的 `R3R_DISPATCH_NO_SCHEDULE` 全部限定为 `Station::R3R_DISPATCH_NO_SCHEDULE`。
+  - `src\station_base.h`：`:945` 的 `extra` 注释订正为掩码语义（原注释是「OrderList 池下标」）。
+- **复测判据**：①空程序点「调度」按钮自动出 Result 行并弹多选窗口 ②同时勾 2 份 → 指令行显示 `允许分配调度 A, B`，取消一份随之变化 ③关掉再开勾选状态不变（验证活读）④关主窗口多选窗口跟着关 ⑤负判据：单份旧程序行为不变 ⑥负判据：一份都没勾则该行永不命中。
+
+#### KI-644（旧档 `extra` 语义不兼容，多选改造引入）
+
+- **来源**：KI-643。**状态**：已知缺陷（不修，登记口径）。**严重度**：低。
+- **内容**：多选之前 `extra` 存「池下标 / `R3R_DISPATCH_NO_SCHEDULE`」，现在按位掩码解释 ⇒ 旧程序里 `extra = 3` 的 Result 由「调度 3」变成「槽位 0 和 1 都允许」；`extra = 0` 由「调度 0」变成「一份都不允许」。
+- **为什么不修**：程序在存档里是定长 24B 指令 blob（`CmdR3RSetDispatchProgram` 的 stride），没有版本字段，加载期**无法区分**新旧（新掩码 1 与旧下标 1 同值）。做启发式迁移必然误伤新档。
+- **口径**：本轮之前写好的测试程序，进多选窗口重新勾一次即可；新写程序无此问题。
+
+#### KI-645（多选窗口遗留缺口）
+
+- **来源**：KI-643。**状态**：未修。**严重度**：低。
+- **①位宽上限**：本场去重调度数 > 32 时，第 33 份起无法勾选（`R3R_DISPATCH_MASK_BITS = 32`，受 `extra` 单字段 32 位所限），界面表现为「点了没反应」。突破需改指令 blob/存档布局，本轮不做。
+- **②命令粒度**：每勾一次都发一条整份程序重写的 `Commands::SetR3RDispatchProgram` ⇒ 连续勾 N 份会产生 N 条命令，撤销栈要一步步退。未做「窗口关掉时合并成一条」。
+- **③未验证**：`top` 滚动偏移与点击行号映射在窗口缩放后的对齐（U-452-1）；窗口开着时别处新增调度导致列表变长时滚动位置是否跳变（U-452-2）。
+
+#### 第 451 轮续三构建自证（2026-11-16）
+
+- 入口 `R3R_fullbuild.cmd inc detach`（复用既有入口，未新建任何 `.cmd`）；改 `src\station_base.h`（仅注释）⇒ 护栏判 `GUARD: REMOVED 622 object file(s) - upgrading this build to a FULL rebuild` ⇒ 全量。
+- 结果：`[694/694] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`（2026-11-16 18:17:39）、
+  日志 `error C*/error LNK/fatal error/FAILED:/build stopped` 计数 **0**。
+- 时间戳链：`src\station_base.h` 17:52:29 → `station_cmd.cpp.obj` 18:12:45；`src\r3r_dispatch_program_gui.cpp` 17:54:08 → 其 obj 18:11:01；
+  `build\openttd.exe` **2026-11-16 18:17:18（53 017 600 B）**，晚于全部源码与 obj。
+- `read_lints`：`r3r_dispatch_program_gui.cpp` / `station_cmd.cpp` 各 0 条。
+- 产物自证：exe 内可检索到新窗口名 `r3r_dispatch_schedule_pick`。
+- 发布树 `build-release` **未编**（本轮只编内测树，符合「只在明确要求时编发布版」口径）。
+
+### 第 453 轮：解挂后两部分无法拉开距离（疑同格判定挡下）
+
+#### KI-646（解挂缝隙互卡：两半无法拉开距离）
+
+- **来源**：玩家 2026-11-16 原话「列车解挂之后，两部分无法脱离（无法拉开距离），疑似被同格判定挡下」；临时报告 `R3R_decouple_same_tile_block_round453_memo.md`（§四 取证表已回填、§六 三条分支判读表）。
+- **状态**：**已定性 = P-453-1（同格判据过窄，属实现缺陷/傻瓜 bug，非设计口径）**，修法已落地且增量构建通过（`EXIT_CODE=0`）；**游戏内复测待做**（判据见本节末 §7.6）。**严重度**：高（功能卡死，属"解挂不可用"级别）。
+- **定性依据（玩家 2026-11-16 现场原话）**：「我倾向于 P-453-1，因为那次就是机车（链头）在前开着 DB 到站然后直接解挂的，解挂后后半部分 moving front 和 first 是不一样的」。⇒ 现场正是「db=1 倒车到站 → 直接解挂」：解出方 `GetMovingFront()`（链尾）与 `first`（链头）**不同格**，而旧判据只比两个链头格 ⇒ 豁免必然落空。这条现场把 P-453-1 从"猜测"升为"确证"，同时 P-453-2/P-453-3 不再作为本轮结论。
+- **同族**：KI-330（第 221 轮，`TPR-BLOCKED` 同格 `otherTile == mf`，8/8 紧跟 `DECOUPLE-DONE`）、KI-335（第 228 轮，解挂互锁 `DECOUPLE-INTERLOCK`）、KI-523（第 350 轮，同格方向限制，2026-10-28 实机撞车后加）。
+
+**修复前的代码事实（2026-11-16 逐行核对，`src\train_cmd.cpp`；`:20026` 这一行已被下方「改动清单」替换，其余行号未动）**
+
+| 行号 | 事实 |
+| --- | --- |
+| `:19960` | 阻塞判定只排除自己：`other_train != nullptr && other_train->index != consist->index` |
+| `:20022-20025` | 配对豁免 `tpr_pair_hit`（另一链链头 == `R3RGetCouplePairPartner`）后放行 |
+| `:20026` | 同格判据 `tpr_same_tile = (other_train->tile == consist->tile)` ——比较的是**两链链头格** |
+| `:20031` | 方向判据 `tpr_same_tile_ahead = tpr_same_tile && R3ROtherChainAheadOfMovingFront(consist, …)` |
+| `:20037` | `tpr_same_tile && !tpr_same_tile_ahead` ⇒ `TPR-SEAM-EXEMPT` 放行（第 349 轮已去掉 `cur_speed == 0`） |
+| `:20062-20088` | 否则（含 ahead）⇒ `TPR-SEAM-DIR-BLOCK` + `MarkTrainAsStuck` + `return TPRRF_NONE`（不预留、不动） |
+| `:19430-19446` | `R3ROtherChainAheadOfMovingFront()`：`GetMovingFront()->GetMovingDirection()`（**db=1 时 moving front 是链尾**）+ 像素切比雪夫 32px + 点积 > 0 |
+| `:3436/:3476` | 互锁放行＝前车尾车离开站台格 **或** 本到发线无其它列车后 `TryPathReserve` 成功；C-3 已取消超时兜底 |
+| `:3388-3396` | 互锁不锁纯车底（`R3RIsCarOnlyFormation`）/`OT_WAIT_COUPLE` 后车 |
+
+**根因与处置（已定性）**
+
+- **P-453-1（已确证并已修）**：同格豁免判据写窄了。KI-330 的现场证据是 `otherTile == mf->tile`（与**移动前端**同格），而旧代码只比 `other_train->tile == consist->tile`（两个**链头**格）。多节列车解挂后两半的链头格可以不同——玩家现场即 `db=1` 倒车到站后直接解挂，解出方 `GetMovingFront()`（链尾）与 `first` 不同格 ⇒ 豁免不触发、误判成"前路被占" ⇒ 命中 `TPR-SEAM-DIR-BLOCK` + `MarkTrainAsStuck`，机车永不动；同一时刻纯车底侧被 `DECOUPLE-INTERLOCK` 按住等前车走远 ⇒ 两侧互等、永远拉不开。
+  - **判据被现场证实**：`TPR-BLOCKED ... otherTile=X,Y` 中 `X,Y` 不等于同一行 `tile=`（链头格），但等于或落在对侧链的覆盖格内。
+  - **修法（已落地）**：把同格判据放宽为「两半贴身」双向判定 —— 另一链链头格落在我链覆盖格上，**或**我链头格落在另一链覆盖格上；**KI-523 方向限制原样保留**，真阻塞形态（另一列车停在我前方预留终点格、与我链不重叠）三判据全假 ⇒ 仍 `MarkTrainAsStuck`。只改 `train_cmd.cpp` 调用点，未碰 `pbs.cpp` 冻结区、未碰任何 `src\*.h`。
+
+**改动清单（行号级，`src\train_cmd.cpp`）**
+
+| 位置 | 改动 |
+| --- | --- |
+| `R3ROtherChainAheadOfMovingFront` 之后、`TryPathReserveWithResultFlags` 之前 | 新增 `static bool R3RChainTouchesTile(const Train *head, TileIndex tile)`：自 `head->First()` 沿链遍历（上限 128 节、`nullptr` 守卫、纯读零改写），任一节 `w->tile == tile` 即真 |
+| `:20046` 一带（旧 `:20026`） | `tpr_same_tile` 由单判据放宽为三判据：`(other_train->tile == consist->tile) \|\| R3RChainTouchesTile(consist, other_train->tile) \|\| R3RChainTouchesTile(tpr_other, consist->tile)`；`tpr_other = Train::From(other_train)` |
+| 同处 | 新增 `const bool tpr_touch_only = tpr_same_tile && (other_train->tile != consist->tile);` —— **仅用于日志判读**，不参与任何分支 |
+| `TPR-SEAM-EXEMPT` 日志行 | 末尾追加 `caronly=%d touch=%d otherTile=%u,%u mf=%u,%u`（**前 11 个字段顺序不变**，避免旧判读脚本失效） |
+| **未动** | `tpr_same_tile_ahead` / KI-523 方向保护逐字保留；`pbs.cpp`；全部 `src\*.h` |
+
+**构建自证（第 453 轮）**
+
+- 入口 `R3R_fullbuild.cmd inc detach`（复用既有入口，未新建任何 `.cmd`）；护栏判 `incremental is safe`。
+- `[3/3] Linking CXX executable openttd.exe`、`build\R3R_incbuild.done` = `EXIT_CODE=0`；日志 `error C*/error LNK/fatal error/FAILED:/build stopped` 计数 **0**。
+- 时间戳链：`src\train_cmd.cpp` 21:26:25 → `train_cmd.cpp.obj` 21:27:52 → `build\openttd.exe` **2026-11-16 21:29:06（53 017 600 B）**。
+- `read_lints` 0 条；exe 内命中新日志格式串 `caronly=%d touch=%d otherTile=%u,%u`。
+
+**其余候选（保留在册，非本轮结论）**
+
+- **P-453-2（设计口径候选 —— 未被本次现场证实，保留在册）**：KI-523 方向限制 + 解挂互锁组合成结构性死锁。机车若朝解出的车底那侧行驶（典型：解挂后反向回库），`tpr_same_tile_ahead` 恒真 ⇒ 机车永不动；同一时刻纯车底被停驻门按住（`:3388` 互锁本就不锁它，但 P7 "停驻方不订路"门让它也永远不动）⇒ 两侧互等。KI-523 注释"转向或车底让开后自然失效"的隐含前提是"车底会自己让开"，对纯车底不成立。
+  - **未被证实的原因**：玩家现场是「机车开着 DB 到站后直接解挂」，解出方链头与 moving front 不同格 ⇒ 旧豁免根本没触发（P-453-1），无需动用方向限制的解释。
+  - **若日后仍出现此形态**（应见 `TPR-SEAM-DIR-BLOCK ... db=1 ... caronly=1` 且 `touch=1`），按备忘 §7.2 三选项请玩家拍板：①维持现状；②对"另一链是纯车底/`OT_WAIT_COUPLE` 停驻方"给方向豁免；③解挂时沿轨道推开一段（触"不重排位置"禁忌，不推荐）。
+  - 最小改法（未实施）：`tpr_same_tile_ahead` 追加 `&& !tpr_other_parked`，`TPR-SEAM-DIR-BLOCK` 行加 `parked=%d`。
+
+- **P-453-3（回归嫌疑 —— 未被本次现场证实，保留在册）**：时间线自证 —— 第 221/349 轮的同格豁免会让机车放行起步（能拉开，但极端方向会撞），KI-523（第 350 轮，2026-10-28）加上方向限制后，"朝车底方向行驶的机车"变成永久不动。当时怀疑为 KI-523 回归，但玩家现场指向 P-453-1（豁免未触发而非方向否决），故降级为在册候选。
+  - **三选项待玩家拍板**（详见备忘 §7.2）：①维持现状②**推荐**：只在「另一半是纯车底或 `OT_WAIT_COUPLE` 停驻方」时收起方向限制③解挂时沿轨道推开一段（不推荐）。
+
+**判读法（下一份 `build\R3R_debug.log`）**：见备忘 §六 表（四条签名 → 定性 → 处置）；本轮新增字段 `touch=` 与 `otherTile=/mf=` 可直接区分"贴身豁免"与"真阻塞"。
+
+**复测判据 §7.6（收口用，5 条）**
+
+1. **正判据·现象**：同一场景（机车 db 倒车到站 → 直接解挂）解挂后 1~2 秒内两半开始分离，距离单调增大，机车不再原地卡死。
+2. **正判据·日志**：应出现 `TPR-SEAM-EXEMPT ... touch=1 otherTile=X,Y mf=...`，且该 `X,Y` **不等于**同一行的 `tile=`（=P-453-1 的现场签名被新判据吃掉）；`DECOUPLE-DONE` 之后不再有 "`otherTile` 与链头格不符" 导致的 `TPR-BLOCKED`/`TPR-SEAM-DIR-BLOCK`。
+3. **正判据·互锁**：`DECOUPLE-INTERLOCK set` 之后必须出现 clear（`platform-clear` 或 `gone`），不得两侧互等。
+4. **负判据·KI-523 未回退**：①另一列车**真的停在我前方预留终点格上**（与我链不重叠、`touch=0`）时，仍须 `ok=0 res=0` 不移动并 `MarkTrainAsStuck`；②反向朝车底那侧行驶时仍须出现 `TPR-SEAM-DIR-BLOCK` —— 若出现 `touch=0` 却放行、或 `TPR-SEAM-DIR-BLOCK` 消失，说明放宽过头，立即回退。
+5. **负判据·常量代价**：`R3RChainTouchesTile` 是 128 节上限的纯读遍历，只在"链头格不等"的少数路径上多跑一次；`TPR-SEAM-EXEMPT` 前 11 字段不变 ⇒ 既有判读脚本与 `TPR-BLOCKED` 行格式无回归。
+
+**未确认项（保留）**：U-453-1（`CheckTrainsOnTrack` 在何种边缘条件下回传的不是链头格）、U-453-2（`otherTile==mf` 时是否必然 `touch=1`，即新判据是否 100% 覆盖 KI-330 的 8/8 形态）、U-453-3（P-453-2 死锁是否在其它场景真实存在）。
+
+#### KI-643 状态更新（分配规则 GUI 多选调度）
+
+- **2026-11-16 玩家实测**：图形界面部分「没有问题」（多选窗口勾选/回显链路通过）。**「内部接线」尚未测试**（勾选掩码真正驱动求值器分配调度那一条链仍为未验证）。状态由「已实现+已编译，复测待做」改为「GUI 已实测通过 / 内部接线待测」。
+
+### 第 454 轮：读档失败「Referencing invalid OrderList (R3SG)」
+
+#### KI-647（读档报 Referencing invalid OrderList，R3SG 段行引用）
+
+- **来源**：玩家 2026-11-16 原话「我读取既有的存档失败了，显示referencing invalid orderlist(R3SG)」；临时报告 `R3R_r3sg_invalid_orderlist_round454_memo.md`。
+- **状态**：**已修（读档自愈 + 写档过滤，已编译通过；游戏内复测待做）**。根因 = **G-454-4**（段行持有"只被自己引用"的 OrderList，删表闸门只看车辆 ⇒ 段行悬垂 ⇒ 写档存下不存在的序号）。F-454-C（`FreeChain` 认段行、根因预防）**本轮未做**（需改 `.h`）。**严重度**：高（存档打不开 = 数据可用性事故）。
+- **同族**：KI-95（第 47 轮，`REF_VEHICLE` 指向已释放车辆的读档死），KI-93（`OrderList` 生命周期与借用不注册共享链）。
+
+**已确证的事实（2026-11-16 核对）**
+
+| 锚点 | 事实 |
+| --- | --- |
+| `src\sl\saveload.cpp:1533-1535` | 报错唯一来源：`case REF_ORDERLIST: if (OrderList::IsValidID(index)) return OrderList::Get(index); SlErrorCorruptWithChunk("Referencing invalid OrderList");` ⇒ 存档某处写下的 OrderList 序号在读档时**池里不存在** |
+| `src\sl\saveload.cpp:1495` | 写侧 `((const OrderList*)obj)->index + 1`（`0`＝nullptr） |
+| `src\sl\couple_group_sl.cpp:378` | `{'R3SG', …, CH_SPARSE_TABLE}` 段身份表 chunk（第 152 轮落地） |
+| `src\sl\couple_group_sl.cpp:293` | `NSL("orders", SLE_REF(R3RSegmentRecord, orders, REF_ORDERLIST))` |
+| `src\couple_group.h:547` | 注释自陈：段行 orders「**may point at a list which no vehicle references any more**」 |
+
+**根因（G-454-4，已定性；G-454-1/G-454-2 已证伪）**
+
+- **G-454-4（成立）**：段行 `orders` 允许持有**只被自己引用**的 OrderList（`couple_group.h:547` 注释自陈），而删表唯一闸门 `R3RFindOrderListReferrer()`（`src\order_cmd.cpp:693`）**只遍历 `Vehicle::Iterate()`** 的 `orders`/`orders_backup`，看不见段行 ⇒ 最后一个车辆车主放表时 `OrderList::FreeChain(false)` 直接 `delete` 该表 ⇒ 段行 `orders` 成为悬垂指针；写档时 `SLE_REF` 仍按该已释放槽号写 `index + 1` ⇒ 读档 `IntToReference()` 判 `IsValidID` 失败 ⇒ `Referencing invalid OrderList (R3SG)`。
+- **G-454-1（证伪）**：`Save_ORDL()`（`src\sl\order_sl.cpp`）遍历的是**整个 `OrderList::Iterate()` 池**，不是"被活车引用的集合" ⇒ 只要表还活着就一定入档，此路不通。同理 `Load_ORDL()` 按原索引建表，序号不失配。
+- **G-454-2（证伪）**：`R3RSegmentFree()`（`src\couple_group.cpp:1045-1054`）是整条 `= R3RSegmentRecord{}` 清零，淘汰槽不会残留 `orders` 指针。
+- **G-454-3（排除）**：`R3VP` 的 `pool_orders`/`follow_orders`/`orders_backup` 同族，但玩家文案明确带 `R3SG`，非本次现场。
+
+**已落地修法（仅 `src\sl\couple_group_sl.cpp` 一个 `.cpp`，未碰 `src\*.h`、未改存档格式）**
+
+| 位置 | 改动 |
+| --- | --- |
+| `Save_R3SG` 之前 | 新增 `static bool R3ROrderListIsLive(const OrderList *ol)`：遍历 `OrderList::Iterate()` **只比指针值、不解引用** |
+| `Save_R3SG()` 循环内（`SlObjectSaveFiltered` 之前） | `rec->orders != nullptr && !R3ROrderListIsLive(...)` ⇒ 打 `SEGSAVE-DROP-ORDERS id= use= u= borrowed= reason=dangling` 并置空 ⇒ **不再写出无效序号** |
+| `Ptrs_R3SG()` 循环内（`SlObjectPtrOrNullFiltered` 之前） | 先把 `rec->orders` 当原始整数（`index + 1`）校验 `OrderList::IsValidID(raw - 1)`，无效则打 `R3SG-PTR-DROP id= raw= use= u= reason=invalid-orderlist` 并置空 ⇒ **既有坏档可以继续读**，不再抛 `SlErrorCorruptWithChunk` |
+
+**构建自证（第 454 轮，`R3R_fullbuild.cmd inc detach`）**：`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`；`[2/3] couple_group_sl.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（21:39:32）；日志 `error C*/fatal error/FAILED:/build stopped` 计数 **0**；`src\sl\couple_group_sl.cpp` 21:36:56 → obj 21:38:01 → `build\openttd.exe` **2026-11-16 21:39:28（53 017 600 B）**；`read_lints` 0 条；exe 内 4/4 命中 `R3SG-PTR-DROP` / `SEGSAVE-DROP-ORDERS` / `reason=invalid-orderlist` / `reason=dangling`。
+
+**F-454-C（根因预防）= 已搁置（玩家 2026-11-17 拍板不做）**：原方案是让 `OrderList::FreeChain()` 认段行引用（`couple_group.h` 加 `R3RSegmentHasOrderListRef()`/清空接口），属头文件改动（全量重编 16~20 分钟）。
+
+不做的依据（2026-11-17 核查，行号锚点）：
+
+- C 的收益**不含"保数据"**：表在 `FreeChain` 那一刻已经被 `delete`，C 只是把段行指针就地置空，与 A/B 的"丢弃"结果相同。
+- C 唯一的收益是消除"悬垂指针在内存里躺着"这段窗口。而段行 `orders` 在全代码里**只有三类访问，零解引用**：①写档（`couple_group_sl.cpp:388` 之前）；②读档指针修正（`:411-419`）；③`!= nullptr` 比较与赋值（`couple_group.cpp:1489` 的"仍持有东西⇒跳过重分配"判断、`train_cmd.cpp:6959` 每个提交点被 `ctrl->GetEffectiveOrders()` 覆盖）。全库检索 `SegmentGet/GetOrCreate/Alloc(...)->orders` 形式 **0 命中**。
+- 唯一副作用是 `couple_group.cpp:1489` 可能把悬垂行误判为"仍持有内容"而跳过回收，但该函数只在读档后跑一次，届时 A 已把悬垂置空 ⇒ 不成立。
+- 结论：悬垂不会崩、不会被当表用，C 降级为"未来防御/形式一致性"，等真有第二个读取方时再补。
+
+**复测判据（6 条，详见备忘 §七）**：
+1. 原坏档能进游戏，不再弹 `Referencing invalid OrderList`。
+2. `build\R3R_debug.log` 出现 `R3SG-PTR-DROP id=… reason=invalid-orderlist` 恰好对应被救活的那几行（该行数 = 坏档里悬垂的段行数）。
+3. 能进游戏后段名/段号/挂接分组仍按段显示（说明行没被整体丢弃，只是丢了那一个已死的排程引用）。
+4. 进游戏后再存一次 ⇒ 新档再读不出现 `R3SG-PTR-DROP`，改为出现 `SEGSAVE-DROP-ORDERS`（写侧过滤生效，坏序号不再入档）。
+5. 负判据：正常单段链（`R3R_SEGMENT_NONE`）读档不出现任何 R3SG 行、行为逐字不变。
+6. 负判据：`R3VP` 三个引用槽（`pool_orders`/`follow_orders`/`orders_backup`）读档后仍正常，不因本次修改产生新的无效引用。
+
+**遗留**：F-454-C 已按玩家 2026-11-17 拍板**搁置**（A+B 已够，依据见上）；`Load_R3SG` 越界段号 `continue` 未消费对象字节的错位风险（U-454-3，非本现场）。
+
+**收口（2026-11-17 玩家回报）**：KI-647 **已确认修复**——玩家原话「存档不可读的问题已经消失」。A（读档自愈）+ B（写档过滤）均实测生效，本条目关闭（条目保留备查）。
+
+---
+
+### 第 455 轮：玩家五条新需求（车站停止 / 临时分组后缀 / 无主预览 / 调度池空报错 / 分配规则照抄信号灯）
+
+- 来源：玩家 2026-11-17 报告（原话见 `R3R_station_stop_dispatch_round455_memo.md` §一）。
+- 本轮为**需求登记**，尚未改码；分析报告 = `R3R_station_stop_dispatch_round455_memo.md`。
+
+#### KI-648 缺少「到达车站停稳后停止、不推进排程」的订单类型
+
+- **描述**：玩家需要一条命令：到达车站并停稳后不再推进排程，把列车置为停止状态，需手动启动才继续。
+- **现状**：`GOTO_STATION` 到站后由 `ProcessOrders` 正常推进到下一条，没有任何"停住等人工干预"的语义。
+- **状态**：已实现（第 455 轮，代码已落盘，待编译验证 + 游戏内复测）。口径按 B-455-1/2/3：**不新增 OrderType**，给 `OT_GOTO_STATION` 加命令属性，与「等待分配命令」「自动调节班次」**共用现有三选一下拉框**（扩展 `WID_O_R3R_SEPARATION`）；点车辆窗口「启动/停止」按钮即继续；进站停稳即停（不等装卸），且这类命令**不参与客货流计算**；订单行后缀「（到达后停止）」。
+- **落地**：`src\order_base.h`（`HasR3RStopAtStation`/`SetR3RStopAtStation`，xflags bit 7）、`src\order_type.h`（`MOF_R3R_STOP_AT_STATION`）、`src\order_cmd.cpp`（ModifyOrder 白名单，遵守 KI-124 教训把全部订单类型分支都加上）、`src\order_gui.cpp`（后缀 `:1164`、三选一下拉 `:4029`/`:6199`、互斥切换 `:4616-4633`、相邻同类命令批量复制 `:6510-6538`）、`src\train_cmd.cpp` 的 `TrainEnterStation()`（`R3RSettleStaleCargoPayment()` 之后 / `BeginLoading()` 之前）。行为=判 `OT_GOTO_STATION && HasR3RStopAtStation()` ⇒ 清速 + `force_proceed=TFP_NONE`，**不调 `BeginLoading()`**（不 PrepareUnload、不产生 CargoPayment、站台库存不动 ⇒ 不参与客货流），推进一格索引并置 `VehState::Stopped`，探针 `STOP-AT-STATION`。
+- **口径差异 U-455-1**：玩家 B-455-3 原话「不推进排程」，但索引必须前移一格，否则点「启动」会立刻再次命中同一条已到站的 GOTO_STATION ⇒「点启动即又停」死结。故实现为「索引前移 + 车置停止」，玩家在「启动/停止」上看到的效果即 B-455-2 的「继续下一条」。TOOLTIP 中/英已从「不推进排程」改写为「不会自动继续执行下一条命令」。
+- **严重度**：中（功能缺失，不崩溃）。
+- **预估改动面**：`order_type.h`/`order_base.h`、`order_cmd.cpp`、`order_gui.cpp`、`train_cmd.cpp`（到站推进闸门）、`lang/*.txt`。若走新 `OrderType` 枚举则触碰订单类型存档字段（新→旧不可读，旧→新可读，R3R 允许）；若复用 GOTO_STATION + flag 则零存档变更。
+- **待验证锚点**：A-455-1（订单枚举/空 flag 位）、A-455-2（到站停稳点 + 推进点）。
+
+#### KI-649 命令列表未显示「前往挂接 / 等待挂接」的临时挂接分组名
+
+- **描述**：要求在这两条命令后追加 `（挂接分组：<名>）`，例「等待挂接（挂接分组：滚木）」。
+- **现状**：临时挂接分组已有数据与 UI 编辑入口（第 143 轮 KI-225 让 `MOF_COUPLE_TEMP_GROUP` 支持 `OT_WAIT_COUPLE`），但订单行文本未拼名字。
+- **状态**：已实现（第 455 轮，代码已落盘，待编译验证）。
+- **落地**：`src/lang/english.txt` / `simplified_chinese.txt` 新增 `STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX`（`(group: {RAW_STRING})` / `(挂接分组: {RAW_STRING})`）；`src/order_gui.cpp` 新增文件内 `R3RHasTemporaryCoupleGroup(const Order*)`，并在 `DrawOrderString()` 的 `case OT_GOTO_COUPLE` 尾（`:1534-1537`）与 `case OT_WAIT_COUPLE` 尾（`:1543-1546`）各追加一次 `AppendStringInPlace(line, STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX, CoupleTempGroupLabel(order))`。复用既有 `CoupleTempGroupLabel()`（`:850`），走 StringID + 参数，不做手工字符串拼接。
+- **严重度**：低（可读性）。
+- **预估改动面**：`order_gui.cpp` 订单标签组装点、`lang/english.txt` + `lang/simplified_chinese.txt`。
+- **待验证锚点**：A-455-3（标签渲染函数与现有 `R3RYardLabel` 取参姿势）。
+
+#### KI-650 无主排程的 R3R 命令「临时挂接分组」预览与有主排程不一致
+
+- **描述**：无主排程（借用/跟随态，`GetEffectiveOrders() != orders`）时，R3R 命令的临时挂接分组预览没有向有主排程对齐。
+- **状态**：待实现（与 KI-649 同函数族，需先定位"仅看 `v->orders`"的旧守卫）。
+- **严重度**：低（显示/预览不一致，可能影响点击后的循环行为需实测）。
+- **待验证锚点**：A-455-3 同点，另需 `GetEffectiveOrders()` 在该渲染路径上的使用情况。
+
+#### KI-651 站场调度池为空时无任何提示，列车静默反复尝试领取
+
+- **描述**：列车在某站场等待"分配命令"而该站场调度池内无命令时，应弹「列车 XXX 所在的站场没有调度命令可分配」（类比"列车迷路"报错），且不推进排程，持续执行"尝试领取调度"命令。
+- **现状**：无提示（需取证确认是否静默空转）。
+- **状态**：已实现（第 455 轮，代码已落盘，待编译 + 游戏内复测）。
+- **落地**：`src\train_cmd.cpp` 的 `TrainDispatchHandler()` 里 `R3RDispatchPoolPick() < 0` 分支，新增 `static std::set<uint32_t> _r3r_dispatch_empty_notified`；判据 `st->R3RDispatchPoolCount(yard) == 0`（只有池里真的一条都没有才弹，坑位满/规则不满足属正常等待，不打扰）且本车未弹过；动作为 `ShowErrorMessage(GetEncodedString(STR_ERROR_R3R_DISPATCH_NO_SCHEDULE, v->index), {}, WarningLevel::Warning)` + 探针 `DISP-POOL-EMPTY-NOTIFY veh= st= yard=`，照旧 `return`（排程零推进）。节流按 B-455-4「每列车只弹一次」，集合只插不删。新增语言串 `STR_ERROR_R3R_DISPATCH_NO_SCHEDULE`（中/英各 1 条，紧跟 `STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY`）。
+- **严重度**：中（玩家无法察觉配置错误）。
+- **预估改动面**：站场调度池读取点、`ErrorMessageData`/`ShowErrorMessage` 调用（抄"列车迷路"文案）、一次性集合。
+- **待验证锚点**：A-455-4（调度池容器与领取接口、"领取调度"订单类型执行点）。
+
+#### KI-652 调度分配规则：条件缩进显示异常 / 实际分配不正确 / 条件集缺失「机车类型」
+
+- **描述**：三条子问题——(a) 规则条件树的缩进显示错位；(b) 列车未按规则正确分配；(c) 规则条件集希望向可编程信号灯对齐，尤其缺「机车类型」（蒸汽/内燃/电力/磁浮/…）。玩家口径：能照抄的照抄，不能照抄的不要硬抄。
+- **现状**：规则编辑窗口 = `src/r3r_dispatch_program_gui.*`（第 451 轮续）。
+- **状态（2026-11-18 更新）**：(a) **已实现**（缩进已修）；(b) **根因已实证 = `var` 校验上界笔误（§13.1），修法与 (c) 合并待落地（§13.4）**；(c) 「机车类型」已实现但**因上界被命令层拒绝而实际不可用**，随 (b) 修法一并复活。G-455-1（三项恒 0 条件）第 455 轮已改为编辑器不出现 + 求值直接放行（`station_cmd.cpp:2466-2471`），不再是嫌疑。
+- **落地（(a)(c)）**：(a) 缩进 `src\r3r_dispatch_program_gui.cpp` 条件树绘制把 `EndIf`/`Else`/`Or` 统一改为「先退一层，再由 `If||Or||Else` 进层」；(c) 可选变量表 `_dispatch_var_selectable[]` 剔除三个恒 0 项、枚举末尾追加 `R3RDispatchRuleVariable::EngineClass`（末尾追加⇒编号不前移，旧档安全），求值 `station_cmd.cpp` 三恒 0 项直接 `return true`、`EngineClass` 走相等比较，统计填充 `train_cmd.cpp`（`claim_stats.engine_class = RailVehInfo(引擎原型)->engclass`），编辑器值编辑改 5 项下拉（蒸汽/内燃/电力/磁浮/其他），比较符固定「是」。
+- **(b) 根因实证（2026-11-18 §13.1，上界笔误）**：玩家复测「选机车类型 → 弹红框不能这样做、规则存不下」的直接原因是**指令校验上界写死**：
+  `src\station_cmd.cpp:3127` 的 `if (ins.var > R3RDispatchRuleVariable::Counter) return CMD_ERROR;` —— 第 455 轮追加在枚举**末尾**的 `EngineClass`（值 10 > `Counter`）落在上界外 ⇒ 整份程序被拒 ⇒ 规则等于不存在 ⇒ 表现为"没按规则分配"。同族还有读档静默降级：`src\sl\station_yard_sl.cpp:243` 把 `var > Counter` 的条目改成 `None`，`station_cmd.cpp:3128` / `station_yard_sl.cpp:244` 的 `op > AtMost` 上界也为症状 2 埋下伏笔。
+- **【已撤回】G-455-2'（"显示与执行两套"）**：`R3RDispatchRuleText()`（`station_gui.cpp:3680`）是 `static` 且**全树零调用点** ⇒ 池条目旧式单条件 `rule_var/rule_op/rule_value` 当前既不参与求值（`R3RDispatchPoolPick()` 只跑 `prog`）也不参与显示（显示在 `r3r_dispatch_program_gui.cpp`）⇒ 玩家不可能"看到单条件却按另一套发牌"。死函数与旧字段属可清理项（低），不是缺陷。
+- **(b)(c) 修法（§13.4，待落地）**：`R3RDispatchRuleOp` 末尾追加 `Equal`/`NotEqual`/`Greater`/`Less`（0/1 不动）；`station_cmd.cpp` 的 `var` 上界改 `EngineClass`、`op` 上界改 `Less`（:3127/:3128/:3063）；`station_yard_sl.cpp` 两处 clamp 同步；`R3RDispatchConditionHolds()` 按 op 分派且 `EngineClass` 只认 Equal/NotEqual；`r3r_dispatch_program_gui.cpp` 的 `DispatchOpString/ToggleOp/DispatchConditionOpLabel` 按变量类别给判据集合（数值 6 档、枚举 2 档）；新增 4 条 lang 串。症状 2（玩家要求"按类型给判据"）由此闭环。
+- **严重度**：(b) 高（业务逻辑错误）、(a) 低（观感）、(c) 中（功能缺失）。
+- **预估改动面**：`r3r_dispatch_program_gui.cpp`（布局/条件列表）、条件枚举与求值函数（新增"机车类型"需 `RailVehInfo(...)->engclass` 或轨型）、`lang/*.txt`。
+- **待验证锚点**：A-455-5（规则条件枚举/求值/缩进计算）、A-455-6（可编程信号灯条件全集，作为对比基准）。
+
+#### KI-653 购买列车时弹原生 NewGRF 报错「购买列表与购买后的货物/改装信息不同」
+
+- **描述**（玩家原话）：「R3R版本内普通的购买列车行为会跳一个原生OTTD不会跳的报错：NewGRF XXX提供了错误的信息 购买列表中XXX（列车名）的货物/改装信息与购买后的信息不同。这可能会导致自动更新或自动替换时无法正确改装此载具，这是我不期望看到的」。
+- **来源**：备忘 `R3R_station_stop_dispatch_round455_memo.md` §八 + §8.1/§8.2（2026-11-17 第 455 轮）。
+- **产生点（已定位）**：`src\articulated_vehicles.cpp:338-374` 的 `CheckConsistencyOfArticulatedVehicle()`，第 371-372 行
+  `if (real_refit_union != purchase_refit_union || real_refit_intersection != purchase_refit_intersection || carries_more) ShowNewGrfVehicleError(engine->index, STR_NEWGRF_BUGGY, STR_NEWGRF_BUGGY_ARTICULATED_CARGO, GRFBug::VehRefit, false);`
+  （`ShowNewGrfVehicleError` 内 `if (!grfconfig->grf_bugs.Test(bug_type))` ⇒ 每 GRF 每局只弹一次，与玩家观感吻合）。调用点 `src\train_cmd.cpp:2327`（造车厢）、`:3641`（造机车），均在 `AddArticulatedParts()` 与 `ConsistChanged(CCF_ARRANGE)` **之后**。
+- **三条判据**：①实际各节 refit 掩码并集 ≠ 购买列表；②交集 ≠ 购买列表；③`carries_more` —— 实际车节里 `cargo_cap > 0` 的 `cargo_type` 集合中出现 `GetCapacityOfArticulatedParts(头车 engine_type)` 该货种容量为 0 的货种。
+- **猜测根因 G6-1（强，待验证）**：`src\train_cmd.cpp:614-626`（KI-641 补丁）的
+  `if (u->IsArticGroupMember() && !u->IsArticGroupHead() && new_cap == 0 && u->cargo_cap > 0) new_cap = u->cargo_cap;`
+  对刚造出的**真 artic 部件**同样成立。若 GRF capacity 回调对新造部件返回 0（R3R 又把 NewGRF position-in-consist 改成段内计数，回调读数与购买列表算时不同），上游会把该节 `cargo_cap` 清 0、该货种不进 `real_default_cargoes`，而 R3R 保留了 `rvi->capacity` ⇒ 该货种进入 `real_default_cargoes` ⇒ `purchase_default_capacity[cargo] == 0` ⇒ `carries_more = true` ⇒ 弹窗。
+- **次嫌疑 G6-2**：`src\vehicle_base.h:1300-1303` 把 `HasArticulatedPart()` 从 `Next()->IsArticulatedPart()` 改成 `Next()->IsArticGroupMember()`（组角色视图，`train.h:212-215`）；若购买时新造车 `Next()` 已挂着带 `ArticGroupMember` 的节，do-while 会多遍历。单节车 `Next()==nullptr`，吻合度低。
+- **已排除 G6-3**：`rvi_v` 在 `train_cmd.cpp` 仅 468/587/588 三处且全在 wagon power 分支，不碰 `cargo_cap`/`cargo_type`。
+- **修法候选（未落地，待验证后再定）**：(i) 把 KI-641 的保留条件收窄到「非新建车」（按调用来源或 `date_of_last_service` 等区分）；(ii) 保护前加 `!u->IsArticulatedPart()`（只保护打散组成员，真部件走上游清零语义）。
+- **根因推断 G6-2（2026-11-17 晚首次写入，同日深夜【已撤回】）**：当时写"`HasArticulatedPart()` 只认组角色位 ⇒ 真 artic 部件不满足 ⇒ 实车侧遍历在父车终止"。
+  **该推断错误**：`src\train.h:212-215` 的 `Train::IsArticGroupMember()` 本身就是 `IsArticulatedPart() || flags.Test(VehicleRailFlag::ArticGroupMember)`，
+  真 artic 部件**恒满足**该谓词 ⇒ `HasArticulatedPart()` 对真铰接车同样为真，"遍历在父车终止"在代码上不可能发生。
+- **修法（2026-11-17 晚落地 → 同日深夜【已回退】）**：曾把遍历改成 `next->IsArticulatedPart() || next->IsArticGroupMember()`；因两者对 `Train` 完全等价，该改动是 **no-op**，
+  已回退成原生 `v = v->HasArticulatedPart() ? v->GetNextArticulatedPart() : nullptr;`，只保留说明性注释。**不得再引用"已修"的旧状态。**
+- **探针（2026-11-17 深夜扩充，仍在触发点内，只读）**：`BUY-REFIT eng= veh= n= pn= pu= pi= ru= ri= more= dflt=` + `BUY-REFIT-PART i= eng= cargo= cap= mask= pcap=`（实车逐节）+ `BUY-REFIT-PP i= eng=`（购买侧逐节）。
+  `pn` 是新增的购买侧节数（`GetNextArticulatedPart(i, engine)`、`front=nullptr` 口径）——没有它 `n` 无法判读，这正是上一轮误判的温床。判读表见备忘 `R3R_station_stop_dispatch_round455_memo.md` §12.3。
+- **REG-455-A（本轮关档，前提不成立）**：`GetCargoTypesOfArticulatedVehicle()` 用同一谓词**没有**回归（真部件满足组角色成员），无需改动。
+- **状态**：未修（根因未定；G6-1 容量保护仍是强嫌疑；等待 `BUY-REFIT*` 探针日志）。
+- **严重度**：中（不影响运行，但会误报 NewGRF 作者、并可能掩盖真实改装不一致）。
+- **待验证锚点**：A-455-7（`CheckConsistencyOfArticulatedVehicle` 入口前的逐节 cap/cargo dump）。
+
+## 第 456 轮（玩家新报五项：断言崩溃 / 自动填充后缀 / 改装信息报错 / 铰接车属性×3 / 道岔停车位截止；状态：登记完成、待取证）
+
+- **来源**：备忘 `R3R_round456_five_issues_memo.md`（2026-11-18）。
+- **输入**：玩家一次性报告 5 条（原话逐字保留在备忘 §一）。
+- **生效 exe**：`build\openttd.exe` @2026-11-18 00:47:39（53 030 400 B），`build\R3R_incbuild.done` = `EXIT_CODE=0`
+  ⇒ 第 455 轮续二（`R3RDispatchRuleOp` 扩档 + 上界修正）已编入内测树，下述症状均在该版本上复现。
+- **纪律**：本轮**未宣布任何根因**；每条结论必须带 `文件:行号` 或 `build\R3R_debug.log:行号` 锚点。
+
+#### KI-654 `order_cmd.cpp:5911` 断言崩溃
+
+- **描述**（玩家原话）：「不知为何，order_cmd.cpp 5911行断言崩溃了」。
+- **断言原文**（`src\order_cmd.cpp` 第 455/456 轮 exe 的 `:5911`；本轮在断言前插入探针块后位于 `:5952`）：
+  `assert(v->cur_implicit_order_index == 0 || v->cur_implicit_order_index < v->GetNumOrders());`
+  宿主 = `ProcessOrders()`（紧随其后 `v->UpdateRealOrderIndex()`）。
+- **崩溃日志**：`C:\Users\冯洁敏\Documents\OpenTTD\crash-20261117T170248Z.log`（398 行，mtime 2026-11-18 01:02:51）
+  ——栈 `ProcessOrders (order_cmd.cpp:5911) ← TrainLocoHandler (train_cmd.cpp:24144) ← Train::Tick (:24907)
+  ← CallVehicleTicks (vehicle.cpp:1723)`；涉事车 `veh: 3`（`st:FE`、`tf:qLKHSO`、`trk: 0x01`，
+  tile `181 x 230` type 50 = Station）⇒ 是「去铰接组的段头车」停在站台 plain rail 上。
+  `== 0` 那一半会直接放行 ⇒ 实际命中的形态必然是 **`cur_implicit_order_index != 0` 且 `>= GetNumOrders()`**。
+- **根因（已做实）**：`R3RReturnBorrowedOrders()`（`src\train_cmd.cpp:8057`）的
+  `chain->orders_backup != nullptr` 分支在归还时**直接**把 `orders_backup_implicit_index` 写进活字段
+  （原 `:8183`），是全流程**唯一**对该字段不做界校验的写入点；同函数上方的 `own` 分支
+  （`:8157-8158`）早就有 `num == 0 || INVALID_VEH_ORDER_ID || >= num ⇒ 0` 的归一，两支语义不对称。
+  救援为何失败：`DeleteUnreachedImplicitOrders()`（`src\vehicle.cpp:3455-3499`）入口
+  `GetOrder(cur_implicit_order_index)` 越界即返回 nullptr ⇒ `while (order != nullptr)` 整段不进入，
+  陈旧值原样留存。停放索引随 `R3VP` 一起存档 ⇒ 跨会话归还同样可能越界（表在停放期间被删短/重建过）。
+- **旁证**：`ORD-IDX-WATCH pre-processorders veh=120 real=2->1 impl=2->1 n=5->12`
+  ⇒ 同一次 `ProcessOrders` 窗口内确实发生过换表，归还就发生在这个窗口里。
+- **修法（已落地，只改 `src\train_cmd.cpp`，未碰 `src\*.h`）**：取回后按**恢复出来那张表**的
+  `chain->orders_backup->GetNumOrders()` 归一 real/impl（`cur_timetable_order_index` 跟 real），
+  与 `own` 分支逐字同构；真发生裁剪时打
+  `ORD-RETURN-BK-CLAMP veh=%d num=%u real=%d->%d impl=%d->%d`。
+  `num == 0` 时二者都归 0（与既有行为一致，不引入新语义）。原 KI-472 的「只读探针」注释同步改写为已修说明。
+- **探针放宽（同轮，REG-456-C）**：`order_cmd.cpp` 的 `process-orders-bad` / `assert-4909` 条件由
+  `if (r3r_oob_n > 0 && (int)v->cur_implicit_order_index >= r3r_oob_n)` 改为
+  `if ((int)v->cur_implicit_order_index >= r3r_oob_n)` ⇒ 「表已空但索引陈旧」这一形态也能打出现场
+  （旧条件恰好把它排除，这正是崩溃场次日志 0 命中的原因）。
+- **状态**：已修（第 456 轮；已编译通过，游戏内复测待做）。
+- **严重度**：高（崩溃）。
+- **复测判据**：①同场景不再在 `order_cmd.cpp` 断言崩溃；②出现 `ORD-RETURN-BK-CLAMP` 时新值必 `< num`；
+  ③健康链路不出现该行（不误报）；④`ORD-RETURN-NOBK` 仍恒 0。
+
+#### KI-655 排程全部带「（自动填充）」后缀且命令颜色灰显
+
+- **描述**（玩家原话）：「列车分配到的排程全部都有一个"（自动填充）"后缀并且命令颜色显灰」。
+- **推断方向（未验证，登记为 G-456-1）**：`auto_ranges` 状态被写成覆盖整表，或读档/单段化迁移后
+  「自动填充」判据恒真 ⇒ 后缀与灰显同时命中全表。关联第 264 轮的
+  `AUTO-ORD` / `R3RSkipAutoOrderRange` / `auto_ranges` 一族与「自动填充命令永不执行」口径。
+- **验证判据**：取 `auto n=` 与区间 `first=[a,b)`；若 `n == 表长度` 或区间覆盖 `[0, len)` 即成立。
+- **第 456 轮补记（根因已定位，非推测；后续落地已编译）**：G-456-1 的 `auto_ranges` 方向**不成立**，
+  真根因是**挂车命令块没闭合**：
+  - 后缀与灰显**同源同判据**：`src\order_gui.cpp:1086`
+    `const bool air_range = !timetable && R3RIsCoupleAirOrderRow(v, list, order_index);`
+    → `:1089-1090` `if (order->IsType(OT_IMPLICIT) || air_range) colour = Grey;`
+    后缀 `STR_ORDER_R3R_AUTO_FILLED`（`english.txt:5084` / `simplified_chinese.txt:5050`
+    「（自动填充）」）唯一使用点 `src\order_gui.cpp:1697`，条件同为 `air_range`。
+  - `R3RIsCoupleAirOrder()`（`src\order_base.h:1973`）语义 =「从本行向前回绕，先碰到
+    `OT_GOTO_COUPLE` 就在区间内，先碰到 `OT_COUPLE_END` 就在区间外」⇒ 表里有 `OT_GOTO_COUPLE`
+    却**缺配对的 `OT_COUPLE_END`** 时，除 `OT_GOTO_COUPLE` 自己那一行外**整表**判 air range
+    ⇒「几乎全表灰显 + 全带（自动填充）」，与玩家措辞逐字吻合。
+  - 缺口的来源：`R3REnsureCoupleEndOrders()` 原本只接受 `Vehicle*`，只在三处车辆侧插入路径被调用
+    （`src\order_cmd.cpp` 的 `CmdInsertOrder` 一带、`:2372` 订单移动命令末尾等）；而**排程池
+    （ownerless `OrderList`）的插入/复制/分配**三条路径完全绕过它 ⇒ 坏表进入车辆。
+- **修法（第 456 轮已落地，只改 `src\order_cmd.cpp`）**：把逻辑抽成列表级
+  `static void R3REnsureCoupleEndOrdersInList(OrderList *list, Vehicle *v)`（读写全走
+  `GetNumOrders()/GetOrderAt()/Orders()`，`v` 仅决定窗口失效类），车辆版
+  `R3REnsureCoupleEndOrders(Vehicle*)` 退化为薄包装；三处补调用：
+  `CmdR3RInsertLooseOrder()`（`InsertOrderAt` 之后）、`CmdR3RDuplicateLooseOrder()`
+  （复制挂车命令同样会造出未闭合块）、`CmdR3RAssignSchedule()`（`v->orders = list;`
+  **之前**，且修好后才 `list->Initialize(v)`，兜住旧 exe 编出来的坏表）。
+  刻意不改 `CmdR3RDeleteLooseOrder()` / `CmdR3RMoveLooseOrder()`：与车辆侧
+  `CmdDeleteOrder()/CmdMoveOrder()` 一致都不跑补齐（玩家手删标记属显式意图）。
+- **状态**：已修（第 456 轮；已编译通过，游戏内复测待做）。
+- **严重度**：中（排程可读性与可执行性受影响；若连 GOTO 也被灰显则升为高）。
+- **复测判据**：①新建/复制/分配的含挂车命令排程不再整表灰显与带（自动填充），只有
+  `OT_GOTO_COUPLE` 与 `OT_COUPLE_END` 之间（不含 END）的行呈 air range；②健康排程逐字不变；
+  ③分配旧 exe 造出的坏表时被就地补齐（出现补齐后再 `Initialize`）；④手删 `OT_COUPLE_END`
+  后仍可保持删除状态（不回弹）。
+
+#### KI-656 中国火车包三节铰接车存档往返后 weight / power / max tractive effort ×3，容量 +1
+
+- **描述**（玩家原话）：「中国火车包的三节铰接式列车（疑似是因为存档再读档），重量，功率和最大牵引力都乘三了。
+  此外……这些列车装载能力都多了一名旅客」。
+- **待取证**：`ConsistChanged()` / `R3RConsistReferenceEngine()`（KI-640 系列「代表引擎」口径）对
+  `cached_power` / `cached_weight` / `cached_max_te` 的累加次数；`src\sl\vehicle_sl.cpp` 的
+  `AfterLoadVehiclesPhase2()` 是否对同一链二次调用；容量 +1 与铰接货种聚合（第 455 轮 §12.3 的 `pn`/`n`）是否同源。
+- **疑点 REG-456-A / REG-456-B**：见备忘 §四（「×3」需区分"算三遍 / 每节翻倍 / 显示重复计入"；容量 +1 需与 ×3 分开取数）。
+- **推断方向（未验证，登记为 G-456-2）**：读档后同一链被 `ConsistChanged()` 调用两次且累加前未清零。
+- **第 456 轮补记（代码层解释，读代码结论，未改相关代码）**：三条读数其实是两套机制，不能混为一谈。
+  - **weight / power / max TE**：打散不是改数据而是**均分烘焙**——`R3RDearticulateOneGroup()`
+    （`src\vehicle_cmd.cpp:549-566`）给组头 `w_q+余数 / p_q+余数`、给每节 `w_q / p_q`，三节共用同一
+    `max_speed_override`；耗用端在引擎/车厢身份门禁**之前**优先读 override
+    （`src\train.h:500-506`、`src\train_cmd.cpp:25974-25980`）⇒ override 在则总量守恒。
+    override **是存档字段**（`src\saveload\vehicle_sl.cpp:209-211`，起始 `SLV_R3R_ARTIC_OVERRIDE`）
+    ⇒ "读档丢 override"这条不成立。能放大成 N 倍的只有两处：①`R3RRearticulateOneGroup()`
+    （`src\vehicle_cmd.cpp:713-715`）把三件 override 清回 `UINT16_MAX`，若"判定重新铰接"但部件并未
+    真正变回 artic part，每节就回落成各自引擎值 ⇒ N 倍；②快照本身已被顶高——
+    `GetWeightSnapshot()/GetPowerSnapshot()` 沿链求和，若上一次打散已把总量顶成 3×，
+    再次打散就把 3× 烘焙进新份额，三倍跟着链走。
+  - **容量**：打散**从不写 `cargo_cap`**；容量每次 `ConsistChanged()` 逐节重算
+    （`src\train_cmd.cpp:614` `new_cap = e_u->DetermineCapacity(u)` → NewGRF CB36，实参是该节车，
+    回调看得见 artic 角色 / `first_engine` / consist 内位置 0x40·0x41），打散改的正是这层身份；
+    既有护栏只拦"回落成 0"（`IsArticGroupMember() && !IsArticGroupHead() && new_cap == 0`），
+    **不拦"涨上去"**。显示端不去重（`src\train_gui.cpp:610-635` 沿 `Next()` 逐节累加 `cargo_cap`）。
+  - **判别办法（现成探针，无需新代码）**：`CARGOWEIGHT-VEH`（`src\ground_vehicle.cpp:151-155`）
+    已逐节打 `ov= / ew= / pc= / cw=` —— 报三倍时三节若都是 `ov=65535` ⇒ 命中"override 被清"；
+    若 `ov` 是正常份额而界面仍三倍 ⇒ 三倍在读取端聚合（`cached_total_weight` / TE 汇总 / 段级统计重复计数）。
+- **状态**：部分定性（第 456 轮；代码层机制已解释并给出判别探针，实机取数待做）。**未改任何代码**。
+- **严重度**：高（车况数据错误，直接影响加速/爬坡/运力）。
+- **待验证锚点**：A-456-5（读档前后同一车 `gcache.*` 两次 dump）、A-456-6（`ConsistChanged` 调用计数）。
+- **第 459 轮新证据（2026-11-19，玩家口述）**：「那个所谓的『数据翻三倍』每次都发生在读档之后」。
+  这条把上面三个候选压成一个：
+  - 候选②（快照被顶高后再次打散）要求"打散"这个动作发生，读档本身不做打散 ⇒ **排除**
+    （唯一例外：链带 ★/⊗ 时命中读档迁移 `R3RDearticulateLegacyArticSegment` 被自动打散，见下）；
+  - 候选①（`R3RRearticulateOneGroup()` 把 override 清回 `UINT16_MAX`）是**命令路径**（重新铰接/车库编辑/耦合），
+    读档不经过 ⇒ **排除**；
+  - **G-456-2（同一链在一次读档中被 `ConsistChanged()` 调多次）是唯一与"只在读档发生"天然吻合的机制**
+    ⇒ 升为主嫌，改登记为 **G-459-1（待验证）**。
+- **G-459-1 的代码支撑（第 459 轮读码，仅 .cpp，未改任何代码）**：
+  - `Train::ConsistChanged()`（`src\train_cmd.cpp:457`）开头只清三样：
+    `this->gcache.cached_total_length = 0`（`:470`）、`this->compatible_railtypes = {}`（`:471`）、
+    `this->tcache.cached_num_engines = 0`（`:472`）——**没有清 `cached_weight` / `cached_power` / `cached_max_te`**。
+  - 后段的成批清零（`:780-788`）写作 `for (Train *u = this->Next(); u != nullptr; u = u->Next())`
+    ⇒ **`this` 自身不在被清零的范围内**。
+  - 入口断言是 `IsFrontEngine() || IsFreeWagon() || IsFrontWagon()`（`:461`）——R3R 的假引擎段头
+    也可能满足，即"一条链上有多个可调用点"是现实存在的，不是假想。
+  - ⇒ 若后段汇总对 `this->gcache.cached_weight` 是**累加**而非"先归零再赋值"，则每多调一次就多叠一份；
+    而读档路径恰好是唯一会在同一帧对同一条链重复调用它的地方
+    （`src\sl\vehicle_sl.cpp` 的 `AfterLoadVehiclesPhase2()` 对每条 `IsFrontEngine()||IsFreeWagon()` 的车
+    调一次 `ConsistChanged(CCF_SAVELOAD)`，随后 `R3RRebuildCouplePriorities()` 命中读档迁移时再调一次）。
+  - ⇒ 1（存档带回的 cache）+ 2（两次重算）= **3×**，与玩家报的倍数逐字吻合。
+  - **仍缺的最后一环**：`cached_weight` 的汇总写法（`+=` 还是"局部变量求和后 `=`"）。这一行未确认，
+    故本条仍标"待验证"，不得当结论用。
+- **状态收窄**：×3 部分由"三候选待定"收窄为 **G-459-1 单点待验证**；
+  容量 +1 部分仍归第 458 轮已落地的容量归零修法（两层不同源，不得合并）。
+- **零成本判别（推荐先做，一次操作即可劈开）**：读档后对三节各跑一次 `dump_vehicle <id>`，看 `st:` 段是否含 `A`。
+  - **含 `A`** ⇒ 身份没变（仍是真 artic 部件）⇒ 三倍只可能来自重复累加 ⇒ 命中 **G-459-1**；
+  - **不含 `A`** ⇒ 身份在读档时被改（★/⊗ 链命中 `R3RDearticulateLegacyArticSegment` 被打散）
+    ⇒ 回候选②/①复核。
+- **第二判别**：`CARGEWEIGHT-VEH` 三节 `ov=` 全 `65535` 时，比较 `CHAIN-ATTRS wt=` 与三节 `ew=` 之和 ——
+  `wt ≈ 3 × 单节引擎重量` 且链上只有 3 节 ⇒ 重复累加坐实。
+- **G-459-1 同日已证伪（读码结论，勿再沿此取证）**：`cached_weight` **不是累加**。
+  `GroundVehicle::UpdateWeight()` 末尾写的是
+  `this->gcache.cached_weight = std::max(1u, weight);`（`src\ground_vehicle.cpp:182`）——**赋值**；
+  而 `weight` 是循环外初始化的局部变量（`:108 uint32_t weight = 0;` / `:162 weight += current_weight;`）
+  ⇒ `ConsistChanged()` 调 N 次得到的是同一个结果，**不会翻倍**。"重复调用"方向作废。
+- **定位改到 `UpdateWeight()` 的铰接重量均分**（`src\ground_vehicle.cpp:133-142`）：
+
+```133:142:src/ground_vehicle.cpp
+	for (T *u = T::From(this); u != nullptr; u = u->Next()) {
+		uint32_t current_weight = u->GetCargoWeight();
+		if (u->IsArticulatedPart()) {
+			current_weight += articulated_weight;
+		} else {
+			uint16_t engine_weight = u->GetWeightWithoutCargo();
+			uint part_count = u->GetEnginePartsCount();
+			articulated_weight = engine_weight / part_count;
+			current_weight += articulated_weight + (engine_weight % part_count);
+		}
+```
+
+  原生口径：父车（非 artic part）拿 `ew / pc + ew % pc`，后续每个 artic part 继承 `articulated_weight` 那一份
+  ⇒ **三节总和恒等于 `ew`（1×）**。要变成 3× 只有两种可能：
+  **(a) `pc` 从 3 塌成 1** ⇒ 每节都拿 `ew` 全额；**(b) `ew` 本身变成"整组值"且 `pc` 同时为 1**。
+  两者指向同一件事：**这节车不再被认成 artic 组的一部分**（`IsArticulatedPart()` 位或组角色位丢了/串了）。
+- **现成判据改成看 `pc=`**：`CARGOWEIGHT-VEH` 已打 `ew= / pc= / cw= / acc=`（`:151-155`）——
+  三节 `pc=3` ⇒ 均分正常；**`pc=1` ⇒ 命中**（此时再看 `ew` 是单节还是整组即可定 (a)/(b)）。
+- **但探针有开启门禁，这是取数难的根源**：`:121-125` 只在"链上存在 `weight_override != UINT16_MAX`
+  或 `IsArticGroupMember()` 或 `IsArticGroupHead()`"时才写 `CARGOWEIGHT-VEH`。
+  **纯原生 GRF 铰接车（三样都没有）一条都不打** ⇒ 要拿到 `pc=`，必须先把这条门禁放宽
+  （对含 `IsArticulatedPart()` 的链也打，或加一条独立的 `CARGOWEIGHT-ARTIC` 行）。
+  ⇒ 登记为 **A-459-1（待做，只读探针扩门禁）**。
+
+#### KI-657 道岔预留的不安全停车位截止复现
+
+- **描述**（玩家原话）：「我再次发现了一个预留在道岔的不安全停车位截止的问题（详见build/R3R_debug.log）」。
+- **待取证**：读 `build\R3R_debug.log` 尾部锚点（`RP cur=` / `DEPOTBLK` / `PLATSEL-*` / `RESV-AUDIT-*`），
+  对照 KI-346（双槽格订错轨）、KI-345（孤儿预留 GC）、第 242 轮（停驶不预留）、KI-203 系列。
+- **第 456 轮补记（玩家指定 veh=120；日志 `build\R3R_debug.log` 2026-11-18 21:01:48 / 406 656 B）**：
+  - `RESV-UNSAFE-TAIL` 全文件 **0 条**（`Select-String -SimpleMatch` 统计）⇒ 不走
+    「延伸找安全位失败 → try-any fallback」那条兜底路径；道岔格 `tcount >= 3` 亦 0 条。
+  - 真正的签名是「**同格再订一次**」：
+    `:3141 RESV-TERM veh=120 tile=218,138 td=1 tcount=-2 safe=1 tail=0 spd=0 vtile=211,116`
+    → `:3142 RESV-BEGIN veh=120 tile=211,116 mf=211,116 td=8 spd=0 prevEnd=218,138`。
+    `prevEnd` 与上一条 `TERM.tile` 同格 ⇒ 命中代码注释里 R48-3 那条判据。
+  - 订出的是 `218,122 → 218,138` 竖线 7 格（`CPLRES … origin=218,122 destTile=218,138 nTry=7 nOK=7
+    unsafe=0`），而车体在 `211,116`、订单目的地 `221,129`；`TPR-EXIT … origin=218,138 okay=1`、
+    `TRP veh=120 … spd=0 mstuck=1 => ok=1 res=1` ⇒ 预留"成功"但车原地不动。
+  - `tcount=-2` 只表示 `218,138` 不是 plain rail（站台/路点/道口/桥隧），**不是**"道岔轨道数"
+    ⇒ 本条与 KI-346 的双槽格不同族。
+  - **疑点 REG-456-E（新）**：`CRT/CPLRES` 的 `origin=218,122` 既非车体 tile 也非订单目的地，
+    且与 `RESV-TERM` 终点同 x ⇒ 需在代码里钉死 `CPLRES` 的 origin 语义
+    （是否为"从当前预留远端续订"）。若成立，则"离车 22 格的预留"本身就是成因，
+    而不是"留了不安全的格"。
+- **状态**：部分定性（第 456 轮；签名已抓到，`RESV-UNSAFE-TAIL` 形态排除，origin 语义待钉死）。**未改任何代码**。
+- **严重度**：高（不安全停车位 = 潜在穿模/解挂后卡死）。
+- **待验证锚点**：A-456-7（日志中该道岔格的订轨记录与订主车号）→ 已部分满足（veh=120，`218,122→218,138`）。
+
+#### KI-653 续（第 456 轮）
+
+- **玩家复测**：「那个关于改装信息报错的问题依然存在」⇒ 第 455 轮末尾的 `BUY-REFIT*` 探针与
+  「保留注释、回退 no-op 改动」并未关闭该问题，KI-653 状态维持**未修**。
+- **本轮需要的输入**：报错弹窗完整原文 + 涉事 GRF 名 + 触发操作（购买/自动替换/克隆），
+  以及带 `BUY-REFIT` / `BUY-REFIT-PART` / `BUY-REFIT-PP` 的 `build\R3R_debug.log`。
+- **纪律提醒**：不得再重复「改谓词」这一类已被证伪的方向（见上文 G6-2 撤回记录）。
+
+---
+
+## 第 457 轮（2026-11-18 夜 · `order_cmd.cpp:5952` 断言复发）
+
+### KI-658（新）`ProcessOrders()` 越界断言复发：换表时索引未按新表长度归一
+
+- **状态**：**已修（第 457 轮，已编译；游戏内复测待做）**。**严重度**：高（崩溃）。
+- **来源**：玩家 2026-11-18 报告「order_cmd.cpp 5952行断言崩溃了」；备忘
+  `R3R_round457_assert5952_memo.md`。
+- **崩溃日志**：`C:\Users\冯洁敏\Documents\OpenTTD\crash-20261118T133458Z.log`
+  （本地 21:35:10）。版本串 `r3r-stable-2026-11-13-m (2)`、`Build date Nov 18 2026 00:25:27`
+  是 cmake 配置期常量、增量构建不刷新，**不能**据此判旧 exe；时间线证据 =
+  `build\openttd.exe` mtime **21:25:18**（含 KI-654 修复）→ `Game loaded 21:27:05` → 崩溃 `21:35:10`。
+- **崩溃车辆**：`veh 3: Train 2, vf:FTpa, tf:qLHSO, trk:0x01, tile 181x230 Station`。
+  断言 `assert(v->cur_implicit_order_index == 0 || v->cur_implicit_order_index < v->GetNumOrders())`
+  现位于 `order_cmd.cpp:5952`（行号因 KI-654 补码而位移，判据未变）。
+- **现场锚点**（`build\R3R_debug.log`，11 077 行，末次写入 21:35:11）：
+  - `:11065 ORD-IDX-WATCH site=pre-processorders tag=- veh=3 real=4->5 impl=4->5 tt=4->5
+    n=12->5 ord=00000159BAA347F0->00000159BAA32500 curType=0 dest=4294967295 vtile=181,230`
+  - `:11066 ORDIDX-OOB site=process-orders-bad tag=assert-4909 veh=3 impl=5 real=5 tt=5 num=5`
+  - 同 tick 七个站点（`depotstay-in` / `loco-entry` / `skipgate-in` / `post-skipgate` /
+    `post-depotblk` / `pre-processorders` / `process-orders-bad`）全读 `impl=5 num=5`。
+  - `:11076-11077 SEGSAVE-PARK veh=0 / veh=3 ... seg=0 borrowed=1` ⇒ veh 3 是借用方。
+- **根因（已定性）**：**换表不归一**。索引 4 原在 `...A347F0` 的 **12 条**表里（合法），
+  换到 `...A32500` 的 **5 条**表后继续用，变成 5（`5 < 5` 为假 ⇒ 断言）。
+  KI-654 只堵了 `R3RReturnBorrowedOrders()` 的 `orders_backup` 分支 —— 全日志
+  `ORD-RETURN-BK-CLAMP` = **0 条**，证明本条不走那条路。
+  ⇒ 修法必须落在「换 `orders` 指针」这个动作本身（`R3RSyncDrivingOrders` / 池层挂起归还 /
+  单段化后重写段行 / 读档重演借用），而不是继续逐条调用路径打补丁。
+- **新疑点**：REG-457-A（换表那步索引为何 `4->5` 而非 `4->4`，疑与推进索引的相对顺序有关）；
+  REG-457-B（`seg=0` 却 `borrowed=1`，段 ID 分配时机）；REG-457-C（`curType=0` 说明索引纯残留，
+  断言里 `== 0` 的特例救不了 5）。
+- **换表的那一下（决定性锚点）**：`:10930 ORD-RETURN-TO-POOL veh=3 pool=1 real=5 impl=5`
+  ⇒ 入口就是 `R3RReturnBorrowedOrders()` 的**池层分支**（`r3r_pool_orders` 挂起层，KI-623 那块）。
+  该分支原注释「池表的坐标并不单独存……所以这里只换指针，活索引一个字都不动」**前提是错的**，
+  且与 own 分支 KI-472 是同一条教训：借用期被推进的恰恰是活字段
+  （`ProcessOrders` / `IncrementImplicitOrderIndex` 直接写 `v->cur_*_index`），
+  它此刻是耦合方那张 12 条表的坐标，不是池表的坐标。
+- **修法（仅 `src\train_cmd.cpp`）**：
+  1. **主修**（池层分支）：在 `InvalidateVehicleOrder()` 之前按 `pool->GetNumOrders()` 归一三元索引，
+     坐标取书签 `orders_backup_real_index` / `orders_backup_implicit_index`（耦合借用 refresh=false
+     且被 `R3RRefreshOrderBookmark()` 守卫挡住 ⇒ 仍是「上池表时跑到哪」；
+     缺失/越界 ⇒ 0），随后 `DeleteUnreachedImplicitOrders()`；探针
+     `ORD-RETURN-TO-POOL-CLAMP veh= num= real=a->b impl=a->b bk=a/b`。
+     与 own 分支（KI-472 的同构归一）逐字对称。
+  2. **预防**（`R3RSyncDrivingOrders()`）：读完 `owner_real/owner_implicit` 后加同一套归一 ——
+     **owner 不被 tick**（只有链头进 `ProcessOrders`），所以它的索引可以长期停在
+     「表被删短之前」的旧坐标上而无人发现，一旦被 samelist 的 `inherit_progress` 或切表后的
+     无条件赋值采纳就落到链头。探针 `ORD-SYNC-CLAMP veh= owner= num= real=a->b impl=a->b inherit=`。
+- **构建自证（2026-11-18 21:44，MODE=inc）**：入口 `R3R_fullbuild.cmd inc detach`；
+  `R3R_incbuild.done` = `EXIT_CODE=0` @21:44:09；`src\train_cmd.cpp` @21:38:26（1 384 204 B，
+  改前 1 380 930 B）→ obj @21:41:38（16 647 874 B）→ `build\openttd.exe` @21:43:52（53 030 400 B）；
+  `read_lints` 0 条；exe 命中 `ORD-RETURN-TO-POOL-CLAMP` / `ORD-SYNC-CLAMP` / `bk=%d/%d`。
+  （exe 字节数与上一版相同 = MSVC 512 对齐填充，判新旧只认 mtime + 字面量。）
+- **复测判据**：①同场景不再断言；②出现 `ORD-RETURN-TO-POOL-CLAMP`（`real/impl` 被压回 `[0,num)`）；
+  ③负判据：索引本来合法时不打任何 clamp 行、运输行为逐字不变；
+  ④若又崩而两个 clamp 探测 0 命中 ⇒ 存在第四个换表入口（下一步查单段化/段行重写），
+  不要重复排查已被排除的三条。
+
+---
+
+## 第 458 轮（2026-11-18 深夜 · 玩家三条追问：KI-656 是否只是显示 / KI-657 讲大白话 / KI-653 新证据）
+
+- **来源**：玩家本轮原话（`R3R_round458_three_answers_memo.md` §首）+ 备忘同文件。
+- **本轮性质**：先答复与落盘 → 再落地已批准的 KI-656 修法。**未新增任何根因断言，只把假设标成可证伪形式。**
+
+### KI-653 升级：弹窗原文已实取，触发时机钉死在「购买那一刻」
+
+- **OCR 实取**（`C:\Users\冯洁敏\Pictures\Screenshots\屏幕截图 2026-11-17 165924.png`，
+  38 022 B，2026-11-17 16:59:24；工具 `R3R_shot_ocr.ps1`，`zh-Hans-CN`）：
+  原始输出含大量误识（`NewGRFI'#ä@ 火 车 0.4` / `贮 买 列 表 中 DF3 〔 丙 丙 燃 〕`），
+  按 `STR_NEWGRF_BUGGY` + `STR_NEWGRF_BUGGY_ARTICULATED_CARGO` 还原为：
+  「**NewGRF「中国火车 0.4」提供了错误的信息 / 购买清单中「DF3（…）」的货物/改装信息与购买后的
+  信息不同。这可能会导致自动更新或自动替换时无法正确改装该车辆**」。
+  ⇒ **判据确认**：命中 `CheckConsistencyOfArticulatedVehicle()`（`src\articulated_vehicles.cpp:338-374`）
+  的 `GRFBug::VehRefit` + `STR_NEWGRF_BUGGY_ARTICULATED_CARGO` 分支（`:371-372`），
+  不是泛化 NewGRF 报错。
+- **玩家补充输入（决定性）**：涉事 GRF = **中国火车包**（弹窗显示 `中国火车 0.4`）；
+  触发 = **普通购买一列火车**（怀疑与 Ctrl+左键反转有关）；
+  复现链 = **购买 → 弹报错 → 设为段 → 存档 → 读档 → 数据变三倍（疑对应三节铰接）**。
+- **H-653-A（强，可证伪）**：弹窗只发生在造车命令内（`src\train_cmd.cpp:2327` 造车厢 / `:3641` 造机车），
+  读档路径**不调用**该函数 ⇒ 弹窗与读档/打散无关，只能来自**造车期容量口径差**：
+  CB36 对新造真 artic 部件返回 0 → KI-641 保护（`src\train_cmd.cpp:614-626`）把部件旧容量保留
+  → 实车该货种容量非 0 而 `purchase_default_capacity` 为 0 → `carries_more = true` → 弹窗。
+  **证伪判据**：若 `BUY-REFIT … more=0` 却仍弹窗，则 H-653-A 被否，须转向 refit 并集/交集分支。
+- **H-653-B（强）**：「读档后×3」与 **KI-656 是同一个缺陷**，不是第二条。读档不弹窗，
+  故玩家的操作链其实是「弹窗=打散前症状 / ×3=打散后症状」，共享同一个根（打散后每节容量与 override 口径）。
+- **H-653-C（待验证，玩家怀疑）**：Ctrl+左键反转本身不改 `cargo_cap`、不改 override 数值（只改方向/★/段边界），
+  按代码不可能直接致 ×3；但"反转 → 设为段"叠加时，打散快照沿反转后的链求和，若求和口径已重复计入，
+  会把 3× 烘进 override。需反转前/后各一次 `CARGEWEIGHT-VEH ov=` 读数才能判。
+- **状态**：**部分定性（第 458 轮：触发点与分支已确认，根因两个候选待 `BUY-REFIT*` 日志判定）**。
+  **严重度**：中（误报 NewGRF 作者 + 可能掩盖真实改装不一致；若同源 KI-656 则升为高）。
+
+### KI-656 状态更正：**不是「只是显示问题」**（玩家质疑成立）
+
+- **更正说明**：第 456 轮把三条读数合并表述为"显示端不去重"，措辞不准确，现拆成两层：
+  1. **容量（+1 / ×3）：真实运力，不是显示。** 打散**从不写** `cargo_cap`；容量每次 `ConsistChanged()`
+     逐节重算（`src\train_cmd.cpp:614` → `DetermineCapacity` → **CB36 实算**），而打散改的正是
+     CB36 看得见的那层身份（artic 角色 / consist 内位置）。既有护栏只拦"回落成 0"
+     （`new_cap == 0` 才保留旧值），**完全不拦"涨上去"**。`src\train_gui.cpp:610-635` 逐节累加且不去重，
+     但那个和**同时就是真实装货上限** ⇒ 会真的多装货。
+  2. **重量/功率/最大牵引力（×3）：取决于 override 是否被清。** 打散是**均分烘焙**
+     （`src\vehicle_cmd.cpp:549-566`），耗用端在身份门禁前优先读 override（`src\train.h:500-506`）
+     ⇒ override 在则守恒；override 是**存档字段**（`src\saveload\vehicle_sl.cpp:209-211`）
+     ⇒ "读档丢 override"不成立。放大只可能来自 `R3RRearticulateOneGroup()`（`src\vehicle_cmd.cpp:713-715`）
+     把三件 override 清回 `UINT16_MAX`，或快照已被顶高后的**级联再烘焙**。
+- **玩家拍板（本轮原话）**：「可以按照你推荐的修」⇒ 批准修法 = **打散时对非组头成员显式把 `cargo_cap` 置 0**。
+  口径依据：真 artic 部件容量由组头承担，打散后组语义仍是"一组共用容量口径"，只该组头那节贡献；
+  该修法同时压制 KI-653 的 `carries_more` 一条来源。
+- **实现约束（硬性）**：置 0 必须发生在该链 `ConsistChanged()` **之后**，或改为在 `ConsistChanged()`
+  容量分支里对「打散组成员且非组头」直接令 `new_cap = 0`；否则被下一次 `ConsistChanged` 覆盖。
+- **状态**：**已定性（两层机制）+ 修法已获批准并落地（见下方"第 458 轮构建自证"）**。
+  **严重度**：高（容量为真实运力；×3 若命中 override 被清则是真实牵引性能错误）。
+- **复测判据**：①三节铰接车「设为段→存档→读档」后装载能力与打散前一致（不再 +1/×3）；
+  ②三节 `CARGEWEIGHT-VEH` 的 `ov=` 均非 `65535` 且 `cached_total_weight` 与打散前相同；
+  ③负判据：原生 GRF 铰接车（未打散）容量逐字不变；④负判据：单节车/普通车厢链 `cargo_cap` 逐字不变。
+
+### KI-657 重述（大白话版，替换术语写法）
+
+- **现象（不用术语）**：一列车停在离目的地还有一段路的地方**原地不动**。日志显示车实际站在 `211,116`、
+  要去的站是 `221,129`，但系统给它订的"专用通道"却是 `218,122 → 218,138` ——
+  **入口既不是车的位置也不是目的地**，终点还正好是它**上一次**订到的同一格（同格被订两遍）。
+  通道显示"订成功"、车一步没走。
+- **为什么麻烦**：R3R 的订通道是**排他**的（一条通道订下去别的车进不来）。若这列车订了一条自己
+  根本不会走的通道（入口离车 22 格），这 22 格沿线会被白白占住、别的车干等，而它自己不会动，
+  因为行进判据看的是"脚下这段能不能走"。
+- **目前不能确定**：是"订错了位置"还是"订对了但车被别的原因卡住"。两种修法完全不同，
+  直接改代码有 50% 概率改错地方。
+- **三个方向（待玩家挑）**：
+  **(a) 只调查不改行为（推荐）**：把"通道入口为什么从 `218,122` 开始"用只读日志印出来
+  （谁下的命令、当时起点、上一段终点、车的位置）。代价=一次复跑；风险=零。
+  **(b) 强制入口 = 车脚下那一格**：入口不是自己的位置就不许订。代价小；风险=可能误伤"进站前提前续订"，
+  变成走一格订一格，出现走走停停或订不到位。
+  **(c) 终点必须是"能安全停住"的格**：道岔中间/站台尽头被占时往前挪或干脆不订。
+  代价中；风险=订不到位 ⇒ 车停着等，观感上更常不动。
+- **状态**：部分定性（签名已抓到；`RESV-UNSAFE-TAIL` 形态已排除；**`CPLRES origin` 语义未钉死**，
+  这正是选 (a) 的理由）。**未改任何代码**。**严重度**：高（不安全停车位 = 潜在穿模/解挂后卡死）。
+
+### 第 458 轮构建自证（KI-656 落地，MODE=inc）
+
+- 入口 = `R3R_fullbuild.cmd inc detach`（复用既有脚本，**未新建任何 `.cmd`**）；启动前已确认
+  `openttd.exe` 未运行（否则闸门会写 `EXIT_CODE=97`）。
+- 改动仅 `src\train_cmd.cpp`（`Train::ConsistChanged()` 容量分支），**未碰任何 `src\*.h`**，
+  护栏判 `incremental is safe`，无需全量。
+- 读数：
+
+| 项 | 读数 |
+|---|---|
+| `build\R3R_incbuild.done` | `EXIT_CODE=0` |
+| `build\R3R_incbuild.log` 尾部 | `[2/3] Building CXX object ...\src\train_cmd.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`，`R3R build ended 2026/11/18 22:04:45.10 MODE=inc` |
+| `src\train_cmd.cpp` | `2026-11-18 22:01:50`，1 385 601 B |
+| `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` | `2026-11-18 22:02:57`，16 478 766 B（晚于源码 ✓） |
+| `build\openttd.exe` | `2026-11-18 22:04:30`，53 030 400 B（晚于 obj ✓） |
+| `read_lints` | 0 条 |
+| exe 字面量 | `CAP-MEMBER-ZERO` = 命中；`ORD-RETURN-TO-POOL-CLAMP` / `ORD-SYNC-CLAMP`（第 457 轮）仍命中 |
+
+- 注：`openttd.exe` 字节数与上一轮完全相同（53 030 400）是 MSVC 512 字节对齐填充所致，
+  **不能**据此判定"没编进去"；判定一律以 `train_cmd.cpp.obj` / `openttd.exe` 的 mtime 与
+  字面量命中为准。
+- 判据（KI-656）：①三节铰接车「设为段→存档→读档」后装载能力与打散前一致（不再 +1/×3）；
+  ②出现 `CAP-MEMBER-ZERO` 且 `cap=` 非 0、`cb=` 非 0（说明 CB36 确实给成员算出了容量，
+  正是被误加的那份）；③负判据：原生 GRF 铰接车（未打散）与普通车厢链**不出现**该行、容量逐字不变；
+  ④若打散后仍 ×3 而 `CAP-MEMBER-ZERO` 0 行 ⇒ 说明三倍不在容量层，转查 override（看 `CARGEWEIGHT-VEH ov=`）。
+
+## 第 459 轮（2026-11-18 · 只读探针补强：`CONSIST-CHK` + `CPLRES` 扩展；零行为变更）
+
+- **来源**：玩家原话「那么现在是能做的除了我复测就是你加探针了？那么请你先加探针吧」；
+  完整清单与判读表见 `R3R_round459_probes_memo.md`。
+- **本轮性质**：**只加/扩展只读探针**。不改任何判据、不动位置/容量/override、**未碰任何 `src\*.h`**。
+
+### P-459-1 `CONSIST-CHK`（`src\articulated_vehicles.cpp`，KI-653 负判据地基）
+
+- **问题**：`BUY-REFIT` / `BUY-REFIT-PART` / `BUY-REFIT-PP` 整块都在
+  `if (real_refit_union != purchase_refit_union || real_refit_intersection != purchase_refit_intersection || carries_more)`
+  **内部** ⇒ 买了不弹窗的车一行日志都没有。于是「日志里没有 `BUY-REFIT`」既可能是「没命中」，
+  也可能是「这版 exe 的探针没编进去」，两种结论相反却不可区分。
+- **改法**：把命中判据提为 `const bool r3r_hit = ...`，在 `if` **之前无条件**写一行，随后 `if (r3r_hit)`：
+  `CONSIST-CHK veh= eng= n= pn= hit= more= ru= pu= ri= pi= dflt=`
+  （`n`=实车链节数、`pn`=购买侧节数，两者用同一条 `GetNextArticulatedPart` 链探测）。
+- **判读**：
+
+| 读数 | 判定 |
+|---|---|
+| `hit=0` 而玩家看到弹窗 | 探针与判定脱钩 ⇒ 回头查分支（不是 GRF 数据问题） |
+| `hit=1 more=1` | **H-653-A 成立**（实车某节容量非 0 而购买列表该货种默认容量为 0 ⇒ KI-641 保留部件容量所致） |
+| `hit=1 more=0` 且 `ru!=pu` 或 `ri!=pi` | 走 refit 掩码分支，**H-653-A 被否** |
+| `n != pn` | 实车链与购买链**长度不同**（造车期铰接结构就不一致），第三条支路 |
+
+### P-459-2 `CPLRES` 扩展（`src\pathfinder\yapf\yapf_rail.cpp`，KI-657 / REG-456-E）
+
+- **问题**：原行只有 `origin=%d,%d`，看不出这个入口到底是「车脚下」「目的地」还是第三处。
+- **改法**：在既有行尾**无条件追加**四字段（既有字段与顺序逐字不变，**去重签名不加入新字段**，
+  以保持与历史日志可比）：`vTile=%d,%d vDest=%d,%d gap=%d oSrc=%s`
+  （`gap`=origin 与车格的切比雪夫距离；`oSrc=car|dest|other`）。
+- **判读**：
+
+| 形态 | 含义 | 后续动作 |
+|---|---|---|
+| `oSrc=car`、`gap=0` | origin 就是车脚下 —— 正常 | 22 格现象与 origin 无关，转查「订到了但车不走」 |
+| `oSrc=dest`、`gap>0` | origin 被设成**目的地** ⇒ 语义倒置，可直接定性为 bug | 查调用方传参 |
+| `oSrc=other`、`gap>0` | 第三处来源（上一段预留终点 / 站台回扫 / 站台末端） | 按 gap 与实际停车点比对，锁死来源 |
+
+- **刻意不加**：REG-457-A/B/C（`ORD-IDX-WATCH` 字段已够）；KI-656 新探针（`CARGEWEIGHT-VEH` +
+  `CAP-MEMBER-ZERO` 已覆盖两侧）；不动任何 `src\*.h`（避免全量重编与布局变化）。
+
+### 第 459 轮构建自证（MODE=inc）
+
+| 项 | 读数 |
+|---|---|
+| 入口 | `R3R_fullbuild.cmd inc detach`（复用既有脚本，未新建 `.cmd`） |
+| 护栏 | `GUARD: incremental is safe (no header/lang file is newer than the newest object)` |
+| `build\R3R_incbuild.log` 尾部 | `[2/4] … articulated_vehicles.cpp.obj` → `[3/4] … yapf_rail.cpp.obj` → `[4/4] Linking CXX executable openttd.exe` |
+| `build\R3R_incbuild.done` | `EXIT_CODE=0`（`2026-11-18 22:28:01`） |
+| 源码 | `articulated_vehicles.cpp` 22:23（22 952 B）／`yapf_rail.cpp` 22:24（140 251 B） |
+| obj | `articulated_vehicles.cpp.obj` 22:25（1 398 377 B）／`yapf_rail.cpp.obj` 22:25（9 902 580 B），均晚于源码 ✓ |
+| `build\openttd.exe` | `2026-11-18 22:27:57`，53 030 400 B（晚于 obj ✓；字节数与上轮相同属 512B 对齐填充，不作判据） |
+| `read_lints` | 两个文件均 0 条 |
+| exe 字面量 | `CONSIST-CHK veh=` ✓／`oSrc=%s` ✓／`CAP-MEMBER-ZERO` ✓（各 1 处） |
+
+- **复测最小操作单**：①买一列会弹窗的（中国火车包 DF3）+ 一列不弹窗的 ⇒ 两列都应出现 `CONSIST-CHK`，
+  弹窗那列 `hit=1`；②走一遍 KI-656 链（设为段→存档→读档）⇒ 应见 `CAP-MEMBER-ZERO`；
+  ③复现 KI-657 卡住场景 ⇒ 看 `CPLRES … vTile= gap= oSrc=`。
+
+## 第 460 轮（2026-11-18 · 纯取证：KI-653 钉死、KI-656 修法失效机制）
+
+- **来源**：玩家原话「我是找不到不会弹窗的火车的。然后我走了一遍KI-656，依然发现"能载客的机车"
+  "三倍数据的列车"KI-657我有点力竭，所以没测试」。完整报告 = `R3R_round460_capacity_after_deartic_memo.md`。
+- **本轮零源码改动、零构建**（只读取证 + 文档）。
+
+### KI-653 状态更新 ⇒ **根因已实证（H-653-A 成立）**，修法待拍板
+
+- 现场（`build\R3R_debug.log` 4629 行，11-18 23:08）行 9-12：
+
+```
+BUY-REFIT eng=516 veh=0 n=3 pn=3 pu=00000001 pi=00000001 ru=00000001 ri=00000001 more=1 dflt=00000001
+BUY-REFIT-PART i=0 eng=516 cargo=0 cap=0 mask=00000001 pcap=0
+BUY-REFIT-PART i=1 eng=516 cargo=0 cap=1 mask=00000001 pcap=0
+BUY-REFIT-PART i=2 eng=516 cargo=0 cap=1 mask=00000001 pcap=0
+```
+
+- `more=1` 且 `ru==pu`、`ri==pi` ⇒ 唯一命中项是 `carries_more`（不是 refit 掩码不等）。
+- 逐节对账：实车 `cap` = 0/**1**/**1**，购买侧 `pcap` 全 0 ⇒ 非组头部件（`i=1/i=2`，
+  `subtype=0x02 artic=1`）各贡献一个购买模板里不存在的容量 ⇒ 弹窗必然触发。
+- ⇒ 「找不到不会弹窗的火车」有了解释：只要该 GRF 部件原型默认容量为 0 而 CB36 实算非 0，就恒弹窗，
+  与玩家操作无关。修法三选一见备忘 §五（推荐方案 3：把成员容量搬到组头再置 0，总运力不变）。
+
+### KI-656 状态更新 ⇒ **第 458 轮修法对本现场结构性无效（已取证）**
+
+- 修法门禁在 `src\train_cmd.cpp:632-645`：只有 `ghead->cargo_cap > 0` 才把成员 `new_cap = 0`，
+  否则走 KI-641 兜底 `new_cap = u->cargo_cap`（保留旧值）。
+- 现场组头（`veh=0`）`cap=0` ⇒ 门禁不成立 ⇒ 成员容量 1 被原样保留 ⇒ `CAP-MEMBER-ZERO` **0 条**
+  （4629 行全量计数），与代码推断一致。
+- 玩家看到的两件事随之必然：①打散后 `veh=1/2` 变 `engine=1` 且仍 `cap=1` ⇒ 「能载客的机车」；
+  ②`MAKESEG-WEIGHT` 的 `sumpw=414=138×3` 在**打散前后逐字相同**（行 23 与行 35）
+  ⇒ 「三倍」不是打散造成的，是逐节功率累加口径，真 artic 阶段就已三倍；`cw`/`sumw` 均 138 守恒。
+- 订正：`DEARTIC-PART` 的 `cargo=%u/%u` 是 `cargo_type`/`cargo_subtype`（`src\vehicle_cmd.cpp:580-586`），
+  **不是容量**，不能用 `cargo=0/0` 判容量。
+
+### 本轮疑点
+
+- **REG-460-A（高，影响探针可信度）**：`CONSIST-CHK` 0 条而同函数 `BUY-REFIT` 7 条 ⇒ 第 459 轮无条件探针
+  没运行。最可能玩家本轮仍用第 458 轮 exe（22:04:30）。待玩家确认 exe 或重跑一次只看该行。
+  不影响 KI-653/656 结论（两版该处代码相同）。
+- **REG-460-B（中）**：`DEARTIC-SPLIT` 的 `ptot=4077 / pq=1359` 与同轮 `pw=138` 不自洽，
+  详情窗口「功率」取哪个字段未定 ⇒ 「三倍」尚未锚到具体界面数字，需玩家指明位置。
+- **REG-460-C（低）**：`SEGLOAD-ROW` 只有 3 行、`SEGTR-SNAP tag=load` 只 1 行，
+  且读档后 `ORD-IDX-WATCH dest=4294967295 curType=0 inDepot=1`，段行/控制段口径待核。
+
+### KI-657
+
+- 未复测（玩家力竭），保持原状；第 459 轮新探针（`CPLRES` 的 `vTile/vDest/gap/oSrc`）已在树上。
+
+## 第 461 轮（2026-11-18 · 纯分析：铰接语义双轨机制复述）
+
+- **来源**：玩家原话「我感觉我们陷入了一个巨大的陷阱，而这个巨大陷阱的开始是我们决定"打散铰接式为假铰接"
+  的时候，而后面的"允许铰接式单元内部反转"加强了这个问题。因此，我需要你复述这两个事件为铰接式带来的影响。
+  ……我们必须先搞懂机制」。完整机制复述 = `R3R_artic_semantics_trap_round461_memo.md`。
+- **本轮零源码改动、零构建**。
+
+### KI-658（结构性，高）铰接语义双轨：subtype 层 vs 角色位层 + 三套名次
+
+- **描述**：「打散为假铰接」（`vehicle_cmd.cpp:528-593`）把引擎拥有的一个铰接单元切成 n 个独立 Vehicle，
+  再用 `ArticGroupHead/Member` 角色位、`weight/power/max_speed_override` 烘焙、"允许内部反转"
+  （`train_cmd.cpp:12062-12101` 的逐节倒序 + `SegmentFlipped` 名次镜像）去假装它仍是一个单元。
+  结果同一份数据上存在两个互不相认的"是否铰接"判据与三个名次（物理链序 / 段内名次 / GRF 镜像名次）。
+- **状态**：待拍板口径，未修。**口径 A（回到真铰接）已被玩家否决**（2026-11-18 原话：
+  「改回真铰接是绝对不行的，这等于否认我们之前的奋斗成果」）⇒ 候选收敛为 **B（组头持权威总量）
+  / C（收口单一读数函数）**。19 维差异矩阵与五个绕过招式的完备性评估见备忘 §八
+  （重量/功率/长度/遍历"真实单元"/引擎份数 = 完备；容量/观感身份/包围盒/成员簿记字段 = 不完备）。
+- **本轮追加（同日）**：玩家要求讲清"假铰接模仿真铰接的不足与绕法"，结论 = 容量维度不是"没绕过"，
+  而是"CB36 逐节答案与购买侧原型答案**都正确**、却没有任何一方被指定为权威"，故只能靠口径指定权威，
+  不能靠再加一层镜像/override 缝合。
+- **派生**：KI-653（容量三份真值 ⇒ `carries_more` 恒弹窗）、KI-656（组头 cap=0 ⇒ 门禁失效落到
+  KI-641 兜底 ⇒ 能载客的机车）、克隆需再打散（第 170 轮）、旧档强制打散（第 180 轮）、
+  逻辑翻拒绝真 artic（第 172 轮）、角色位回滚崩溃（2026-09-07）。
+- **关键证据**：`newgrf_engine.cpp:508-510` 注释自陈 sprite 路径应用镜像、`whole_chain`（refit 容量回调）
+  路径**故意不镜像** ⇒ 同一函数对同一辆车给出两种名次，而 `carries_more` 正在两者之间做等值比较。
+
+### KI-659（中，未核）「三倍功率」可能只是探针口径
+
+- `MAKESEG-WEIGHT` 的 `sumpw=414=138×3` 在打散前后逐字相同（第 460 轮日志行 23 / 行 35）。
+  若该探针逐节读 `RailVehInfo(engine_type)->power` 而不看 `IsEngine()`，则 414 是口径产物，
+  与详情窗口显示无关。
+- **待核**：`src\train_gui.cpp` 详情"功率"取值源 + 玩家指明看到"三倍"的界面位置（REG-460-B 延续）。
+- **状态**：未修（属取证项）。
+
+### KI-660（结构性，高）反转的「图像抵消」：`FlipSegmentFlipped` 把重链效果镜像回去
+
+- **玩家构想**（2026-11-19）：反转后应为「位置不变 / 图像镜像 / 数据不搬 / 长度镜像」，
+  并自评「当时叫你把数据也反转过去是愚蠢的决定」。
+- **事实核对（推翻了该自评的前提）**：`train_cmd.cpp` 全文件 `std::swap(` 共三类命中
+  （`:5312-5317` 物理坐标、`:11588-11621` 与 `:12377-12394` 排程/段身份），
+  **零条**涉及 `cargo`/`cargo_cap`/`weight_override`/`cached_veh_length`。
+  ⇒ 不存在「把数据反转」这个动作；数据跟着槽位换是 `:12139` 段内倒序重链的**副产品**。
+- **真正的偏差在 `:12066`**：`R3RFlipChainBySegments` 第 1b 步对每节 `FlipSegmentFlipped()`，
+  经 `newgrf_engine.cpp:511-515` 把 `chain_before/after` 对调 ⇒ GRF 看到的是**翻转前名次**
+  ⇒ 重链已让对象换槽，镜像又把它抵消 ⇒ **图像顺序实际未变**，与玩家要的「假4图→假1图」正好相反。
+- **结论**：玩家表格的四行其实是「删掉 1b」后同时成立的自然结果；改动面仅
+  `:12066` 一处 + `R3RUndoLogicalFlip` 的对称回滚，且副作用为正
+  （`:511` 的 `whole_chain`/refit 分支本来就不镜像 ⇒ 删后两路读数一致，KI-653 的「两套名次」半根因消失）。
+- **仍未拍板**：四行中的「数据不搬」只有在**组头持整组总量**（口径 B）下自洽，否则
+  「图镜像 + 数不镜像」= 同一槽位上「V4 的身体 + V1 的账本」，单节可观测场合撕裂。
+- **待确认**：C-461-1（表格第 3 行 `假N数` 的 N 是跟着节走还是跟着槽位走）。
+- **状态**：待拍板（是否删 1b + 是否同步落 B），未修。评估全文见备忘 §九。
+
+## 第 462 轮（2026-11-19 · 玩家新证据：×3 每次都发生在读档之后）
+
+- **来源**：玩家原话「我向你报告，那个所谓的『数据翻三倍』每次都发生在读档之后，我认为其实我们
+  已经可以有一个怀疑点的了」。完整分析 = `R3R_round458_three_answers_memo.md` §六（6.1~6.7）。
+- **本轮零源码改动、零构建**（只读码 + 文档）。
+
+### KI-656 状态更新 ⇒ **候选收敛为"读档后烘焙层失效"（G-462-1），待一条数据定性**
+
+- **过筛结论**：§5.2 的三个候选里，①清 override、②快照被顶高 都需要玩家主动动作（打散/重铰接），
+  与"每次都在读档后"不相容；③重复累加已在第 459 轮按读码证伪
+  （`src\ground_vehicle.cpp:182` 是赋值、`weight` 是循环外局部变量）。
+- **唯一剩下的通道**：读档路径自己会打散 —— `src\train_cmd.cpp:2862` 的
+  `R3RDearticulateLegacyArticSegment()`（经 `R3RRebuildCouplePriorities()` 在 `part_of_load` 时调用，
+  只对"带 ★/⊗ 的真 artic 链"生效）→ `DearticulateChainWithSnapshot()` → `ConsistChanged(CCF_SAVELOAD)`。
+- **修法烘焙的非幂等点（新增疑点，已读码确认）**：`src\vehicle_cmd.cpp:531`
+  `const uint16_t total_weight = v->GetWeightWithoutCargo();` —— 快照**优先取已有 override**；
+  而 `HasArticulatedPart()`（角色位判据）与循环里的 `nxt->IsArticulatedPart()`（subtype 判据）
+  **不是同一个判据** ⇒ 存在"角色位在、artic 位已清"的混合态，此时会进函数但 `n_total==1`，
+  分母塌陷。若快照值此时已是整组值，就烘出 3×。
+- **功率/TE 的不对称（分离判据）**：`vehicle_cmd.cpp:565-575` **只烘焙 `weight_override`**，
+  不烘 power / max_te ⇒ 功率与 TE 的 ×3 只要"三节各自算作引擎"就会发生，不需要 override 坏。
+  故「重量 3× + 功率 3×」同时出现 ⇒ 身份与烘焙**一起**坏；「只有功率 3×」⇒ 只是身份坏。
+- **两个互斥子案**（M1 身份+烘焙全丢 / M2 烘焙值被烘成整组），以及 ×3 的算术必要条件，见备忘 §6.4。
+- **已登记的取数项（三条零成本判别，见备忘 §6.5）**：①读档后三节 `dump_vehicle` 的 `st:` 是否含 `A`、
+  `tf:` 是否有 `H`/`M`；②日志里 `CARGEWEIGHT-VEH … ov=` 是否存在、值是 65535 还是整组重量
+  （探针门禁本身就是证伪器：一条都没有 ⇒ 链上既无 override 也无角色位）；③**现场新买一列同款三节车
+  存档→读档**是否也 ×3（区分"当前 exe 的读档路径有缺陷"与"旧档缺 `SLV_R3R_ARTIC_OVERRIDE` 字段"）。
+- **与 KI-659 的分工**：`MAKESEG-WEIGHT` 的 `sumpw=414` 是逐节累加 `RailVehInfo(...)->power` 的
+  探针口径，归 KI-659；界面/缓存口径看 `GroundVehicleCache::cached_power`，归本条。两份读数不得混用。
+- **REG-462-A（中，影响定性）**：`src\sl\vehicle_sl.cpp:209-211` 三个 override 自
+  `SLV_R3R_ARTIC_OVERRIDE` 起才是存档字段 ⇒ 写于更早 exe 的存档读回来时它们**根本不存在**
+  （不是"读坏了"，是"文件里没有"）。这与"每次读档都 ×3"完全相容，但无法与"当前 exe 读档路径有缺陷"
+  区分 —— 必须靠 Q-462-1（新档对照实验）才能分开。
+- **待玩家回答**：Q-462-1（新买一列存档→读档是否也 ×3）、Q-462-2（`dump_vehicle` 的 `st:`/`tf:`）、
+  Q-462-3（该存档最早由哪一版 exe 创建）。
+- **状态**：**部分定性（候选收敛为 1 条、判据已备齐，缺一条实测数据）**。**严重度**：高（数据错误，
+  且与 KI-653 弹窗疑似同源）。**修法未落地**：等 Q-462-1/2 结果决定是"修读档路径的烘焙"还是
+  "读档后补烘一次（旧档迁移）"。
+
+## 第 463 轮（2026-11-19 · 玩家新证据：×3 只发生在"设为段"的三节车上，散链不变）
+
+- **来源**：玩家原话「我发现，读档之后，只有设为段的三节铰接式功率与重量乘三，而散链则保持原属性」。
+  完整分析 = `R3R_round458_three_answers_memo.md` §七（7.1~7.9）。
+- **本轮零源码改动、零构建**（只读码 + 文档）。
+
+### KI-656 状态更新 ⇒ 根因**换轨**，从"烘焙层整体失效"收窄为"段链专属的烘焙层失效"
+
+- **新证据的证伪力**：第 462 轮的 G-462-1（"读档后烘焙层整体失效"）**预测散链也会 ×3**，
+  实测散链不变 ⇒ **G-462-1 的表述被证伪**，改为 G-463-1（下方）。这是本轮最重要的一条纪律记录：
+  上一轮那条假设虽方向对，但外延过宽，若照它去修读档路径会改到不该改的地方。
+- **G-463-1（新主嫌，待 7.6 定 H-463-A/B/C）**：段链与散链读档后走的不是同一条读数路径 ——
+  - 散链：`IsArticulatedPart()` 仍为真 ⇒ `src\ground_vehicle.cpp:133-142` 走 artic 分支 ⇒
+    parts 用 `articulated_weight` 均分，**既不吃 `weight_override` 也不吃各节 GRF 记录重量**。
+  - 段链：读档时被 `src\train_cmd.cpp:2862` 的 `R3RDearticulateLegacyArticSegment()` 打散
+    （判据 = 有 ★/⊗ 且 `R3RChainHasRealArticPart()`）⇒ 成员 `ClearArticulatedPart()` ⇒
+    全部走 else 分支 ⇒ **重量完全由 `weight_override` 决定，缺了它就退回各节 GRF 记录重量**。
+  ⇒ 散链不坏是"它的答案不来自烘焙值"，段链坏是"它的答案只来自烘焙值"。
+- **×3 与 +1 同源（本轮收敛）**：中国包把每个 artic part 原型的 `weight/power/max_te/容量`
+  都填成整组值（原生引擎里无害，因为 artic part 的这些字段本来被忽略）；打散后逐节累加 ⇒
+  三项 ×3、容量 +1。故这不是两条独立缺陷，是一个机制的两个面。
+- **三个候选（判据见备忘 §7.6 的表）**：
+  - H-463-A（最可能）`weight_override` 没读回：`src\sl\vehicle_sl.cpp:209-211` 的
+    `SLE_CONDVAR(..., SLV_R3R_ARTIC_OVERRIDE, SL_MAX_VERSION)` 版本门 ⇒ 旧档读回来是 `UINT16_MAX`。
+    判据 `ov=65535` + `tf:` 仍有 `H`/`M`。
+  - H-463-B `weight_override` 被烘成整组：`src\vehicle_cmd.cpp:531` 快照优先取已有 override（不幂等）
+    + 入口 `HasArticulatedPart()`（角色位口径）与数分母的 `nxt->IsArticulatedPart()`（subtype 口径）
+    不同源 ⇒ `n_total` 塌成 1。判据 `ov≈整组重量`。
+  - H-463-C 打散后又被清：读档路径里有清 override 的调用排在 `DearticulateChainWithSnapshot()` 之后。
+    判据 `ov=65535` 且 `tf:` 里 `H`/`M` 也没了。
+- **REG-463-A（中，解释历史取数偏差）**：`src\ground_vehicle.cpp:121-125` 的 `CARGEWEIGHT-VEH`
+  门禁只对"有 override 或 R3R 组角色位"的链开日志 ⇒ **散链天然一条都不打**。所以过去所有
+  `CARGEWEIGHT-VEH` 样本都是段链，缺对照组；本轮玩家这句"散链不变"补上了对照，属关键外部证据。
+- **修法方向（未落地）**：H-463-A ⇒ 读档补烘（对"有 `ArticGroupHead` 但 `weight_override==UINT16_MAX`
+  的组按记录值重烘，幂等、只补空值）；H-463-B ⇒ 修烘焙幂等性（`n_total` 判据统一到
+  `IsArticulatedPart()`、快照不取已有 override）。两者都需顺带按口径 B
+  「组头持权威总量」收口容量层，否则 ×3 修好后 +1 仍在。
+- **待玩家回答**：Q-463-1（`dump_vehicle` 的 `st:`/`tf:`）、Q-463-2（三行 `ov=`）、
+  Q-463-3（段链在**读档前**是否已经 ×3 —— 一刀切开 H-463-B 与 H-463-A/C）。
+- **状态**：**根因已换轨、候选已排序、判据已备齐（缺三条实测读数）**。**严重度**：高。
+
+## 第 464 轮（2026-11-19 · 复测：重量仍 3×、功率 1×、TE 3×、容量 2→1 且与读档无关）
+
+- **来源**：玩家原话「编译已经成功，我实测，现在成段的仍然有重量变三倍，功率保持一倍（对应的，
+  最大牵引力也变三倍）」「原本容量为0的机车，不成段的有2人载客量，成段后有1人载客量，这个
+  载客量变化不随读档改变」。
+- **完整分析** = `R3R_round458_three_answers_memo.md` §九（9.1~9.6）。
+- **本轮性质**：先落盘四条读数与三条猜测，**未改任何源码、未构建**。
+
+### 四条实测读数（唯一可信事实）
+
+| # | 项目 | 散链 | 成段 | 是否随读档改变 |
+|---|------|------|------|----------------|
+| R1 | 重量 | 1× | **3×** | 是（只在读档后） |
+| R2 | 功率 | 1× | **1×** | — |
+| R3 | 最大牵引力 | 1× | **3×** | 是（TE 由 weight×power 派生，跟重量） |
+| R4 | 载客量（0 容量机车） | **2** | **1** | **否（读档前后恒定）** |
+
+### KI-656 状态更新 ⇒ 第 463 轮修法**实测无效**
+
+- 第 463 轮落地 `R3RNormaliseArticGroupBakes()`（`src\train_cmd.cpp:2936-2992`，调用点 :8056，
+  仅读档入口 `R3RRebuildCouplePriorities()`）。构建产物 `build\openttd.exe` @2026-11-19 01:56:59
+  （53 030 400 B）晚于 `src\train_cmd.cpp` @01:52:51 ⇒ 玩家复测用的就是该版。
+- 实测重量仍 3× ⇒ **该修复未改变结果**。两种可能（G-464-1）：①归一没触发（组被判 baked）；
+  ②触发了但重烘值被后续覆盖。
+- **§8.2 第 2 条的「重量与功率同时 3×」对称性假设被 R2 证伪**，已在该备忘撤销口径：
+  「权重 ×3 且功率 1×」不能再用作 override 缺失的分离判据。
+- **状态**：仍然「未修」，且第 463 轮修法标为「对本案无效（待 G-464-1 判别后重写）」。
+
+### G-464-1（猜测根因，待验证）⇒ 归一没触发
+
+`R3RNormaliseArticGroupBakes()` 的 baked 判据是「组内**任一节**的 `weight_override != UINT16_MAX`
+**或** `power_override != UINT16_MAX` 即整组跳过」（`src\train_cmd.cpp:2956-2966`）。只要存档里
+有一节带回旧值（哪怕只 `power_override` 或只部分节），整组被判「已烘」⇒ 一次都不重烘。
+
+- **判别（只需一条日志）**：`build\R3R_debug.log` 里搜 `ARTIC-BAKE-NORMALISE`。
+  没有 ⇒ 本猜测成立，且说明存档里 override **部分存在**（H-463-A 被证伪为「完全缺失」）。
+- **待验判据**：读档后对那三节各跑 `dump_vehicle <id>`，看 `ov=`（`weight_override`/`power_override`
+  是否 65535）与 `tf:` 的 `H`/`M`。
+
+### G-464-2（猜测根因，待验证）⇒ 功率 1× 是正常形态，不是缺陷
+
+`R3RDearticulateOneGroup()` 对成员按 `wagon_type` 调 `SetWagon()`（`src\vehicle_cmd.cpp:554-566`），
+而功率累加只认同类引擎 ⇒ 三节里只有组头出 P、两节成员出 0 ⇒ 合计 1×。若成立，R2 无需修，
+并且意味着第 463 轮的 `R3RNormaliseArticGroupBakes` 把 `power_override` 均分成 P/3 其实是**多余**
+（写进去也不改总量，但会让 `dump_vehicle` 读数与「天然 1×」形态不一致）。
+**待验判据**：`dump_vehicle` 三节 `tf:` 是否含 `W`、`st:` 不含 `A`。
+
+### KI-661（结构性，中）0 容量机车：散链 2、成段 1，且与读档无关
+
+- **描述**：同一组三节铰接车，散链显示载客量 **2**，设为段后变 **1**；改前改后都不随存档往返变化
+  ⇒ 与 override / `SLV_R3R_ARTIC_OVERRIDE` / 烘焙层**全部无关**，只由「角色位 / parts count」派生。
+- **来源**：玩家第 464 轮原话 R4；备忘 §9.2/§9.4-G-464-3。
+- **归属**：KI-656 的**容量层**（另一条机制面）。第 463 轮烘焙归一按设计不覆盖。
+- **状态**：第 468 轮**读数已定案**——G-468-1 证伪、G-468-2 成立、REG-468-A 证伪
+  （判决见下方「第 468 轮读数已定案」段与备忘 §9.9）。
+  **真值口径已拍板（玩家 2026-11-19 原话「应当不载客，容量为 0」）⇒ 目标 = 整组 0**，
+  散链的 2 与成段的 1 都是缺陷形态，备忘 §9.10 的「容量守恒 = 2」方向作废；
+  下一步按玩家选择「先加探针」（CAP-CB）取回调值/属性值/旧值，未改任何容量数值。
+  开工背景：玩家 2026-11-19「我实测，目前数据一切正常，可以开始收拾机车载客」；
+  KI-662 同日实机复测通过后转入本条。
+- **已查（第 468 轮，只读）**：
+  ①详情页容量页 `GetCargoSummaryOfArticulatedVehicle()`（`src\train_gui.cpp:597-641`）默认对
+  `v` + 后续 `IsArticGroupMember()` 逐车累加 `u->cargo_cap`（`:627`），仅当
+  `R3RDetailsWholeConsistCapacity(v)`（=`R3RDetailsNeedsRepresentativeEngine`，`:387-390`）为真时改走整链；
+  ②详情页总计页 `GetTrainDetailsWndVScroll()` 的 `TDW_TAB_TOTALS` 也是逐车 `v->cargo_cap` 累加（`:669-675`）；
+  ③现成只读探针 `R3RDbgCargoSummary()`（`:546-590`，打 `R3R-CAPSUM` / `R3R-CAPUNIT ... cap= role=AH/AM/art`）
+  **只在 whole_consist 分支调用**（`:634`），散链/普通段链打开容量页时一行都不打 ⇒ 现有日志无法判读。
+- **两条待区分的猜测（本轮未验证，按规则先落盘）**：
+  - G-468-1（显示重复）：散链把「父车 + 2 个 artic 部件」的 `cargo_cap` 各算一次 ⇒ 2 或 3 份；
+    成段后成员被 `SetWagon()`、`DetermineCapacity()` 只认组头 ⇒ 1 份。数据真值可能一直是 1 份，
+    只是散链多算。
+  - G-468-2（数据真错）：`ConsistChanged()` 的容量分支（`src\train_cmd.cpp:614-623` 一带
+    `Engine::DetermineCapacity`）在组角色迁移后重算，把部件容量清零/翻倍，与显示侧无关。
+- **本轮已落地（第 468 轮，只读探针，零数值变更）**：`src\train_gui.cpp` 的
+  `GetCargoSummaryOfArticulatedVehicle()` 在非 whole_consist 分支末尾新增「链上含 `IsArticulatedPart()`
+  或 `IsArticGroupHead()` 即调 `R3RDbgCargoSummary()`」，沿用 `(head, 容量指纹)` 去重；探针同步加
+  `linecap=`（该行实际印出的容量）与原有 `sumcap=`（逐车 `cargo_cap` 原值合计）对照。未改任何容量计算、
+  未碰 `CargoChanged()`、未碰 `src\*.h`。
+- **构建自证**：`R3R_fullbuild.cmd inc detach`（复用既有入口，未新建 .cmd）；护栏
+  `GUARD: incremental is safe`；`[2/3] train_gui.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`；
+  `build\R3R_incbuild.done` = `EXIT_CODE=0`；`src\train_gui.cpp` 03:09 → `train_gui.cpp.obj` 03:11 →
+  `build\openttd.exe` 2026-11-19 03:12（53 003 040 B）；read_lints 0；exe 命中 `linecap=%u`。
+- **下一步取数（需玩家配合）**：同一列车分别在**散链态**与**成段态**各打开一次「详细信息 → 容量页」，
+  再各打开一次「总计」页；然后看 `build\R3R_debug.log` 的 `R3R-CAPSUM` / `R3R-CAPUNIT`：
+  各节 `cap=` 合计 == 界面数字 ⇒ 显示层没重复累加（转 G-468-2，查 `ConsistChanged` 的容量重算）；
+  `sumcap != linecap`、或同一步件在两个不同 `head=` 行里被重复计入 ⇒ G-468-1。
+- **第 468 轮读数已定案（2026-11-19，`build\R3R_debug.log` 43 行，探针版 exe 53 003 040 B）**：
+  ```
+  :27  R3R-CAPSUM head=0 n=3 sumcap=2 linecap=2 items=1
+  :28  R3R-CAPUNIT head=0 veh=0 eng=483 cap=0 carg=0 sub=0 carry=1 role=000
+  :29  R3R-CAPUNIT head=0 veh=1 eng=483 cap=1 carg=0 sub=0 carry=1 role=001
+  :30  R3R-CAPUNIT head=0 veh=2 eng=483 cap=1 carg=0 sub=0 carry=1 role=001
+  :35  R3R-CAPSUM head=3 n=3 sumcap=1 linecap=1 items=1
+  :36  R3R-CAPUNIT head=3 veh=3 eng=483 cap=0 carg=0 sub=0 carry=1 role=100
+  :37  R3R-CAPUNIT head=3 veh=4 eng=483 cap=0 carg=0 sub=0 carry=1 role=010
+  :38  R3R-CAPUNIT head=3 veh=5 eng=483 cap=1 carg=0 sub=0 carry=1 role=010
+  ```
+  ①**G-468-1 证伪**：两条链均 `sumcap == linecap`（2==2、1==1）⇒ 界面数字 = 逐车
+  `cargo_cap` 原值合计，显示层既没多算也没少算，差异全在数据层。
+  ②**G-468-2 成立**：同一原型（`eng=483`）在两态读数不同——散链两部件各 `cap=1`（合计 2），
+  成段后 `veh4 cap=0` / `veh5 cap=1`（合计 1）⇒「去铰接化 + 角色重写」把其中一节容量写成 0。
+  ③**REG-468-A 证伪**：每条链只出现 1 行 `R3R-CAPSUM` 且 `n=3` 各一次，无 `n=` 递减的
+  3 行滚动后缀和。
+  ⇒ 下一步定位：`ConsistChanged()` 容量分支（`src\train_cmd.cpp:614-623` →
+  `Engine::DetermineCapacity`）与 `R3RDearticulateOneGroup()`（`src\vehicle_cmd.cpp:554-566`）
+  的 `SetWagon()` 前后写入点，确认「cap 由 1 变 0」是重算覆盖还是从未写入。
+  **真值口径（应为 1 还是 2）拍板前不改任何容量数值。**
+- **真值口径（玩家 2026-11-19 拍板，决定性）**：原话「应当不载客，容量为 0」⇒ **目标 = 整组 0**；
+  散链 2 与成段 1 都是缺陷形态；备忘 §9.10 的「容量守恒 = 2」方向**作废**。
+  这意味着 KI-656（第 458 轮）「组头承担全部容量」的前提在本条不成立，正确形态是整组 0。
+- **本轮已落地（第 468 轮续，只读探针，零数值变更）**：`src\train_cmd.cpp` 的 `ConsistChanged()`
+  在 `uint16_t new_cap = e_u->DetermineCapacity(u);`（:614）之后紧邻加 `CAP-CB` 一行，
+  输出 `head/veh/cb(old)/rcap/prop/ct/eng/rvt/art/ah/am`，其中 `cb` = 回调返回值（未经 KI-641/KI-656 裁决）、
+  `old` = 当前 `cargo_cap`、`prop` = `RailVehInfo(engine_type)->capacity`（GRF 属性原值）。
+  守卫 `R3RDbgOn() && (IsArticGroupMember() || IsArticulatedPart())`，静态上限 400 行。
+- **构建自证**：`R3R_fullbuild.cmd inc detach`（复用既有入口）；`build\R3R_incbuild.done` = `EXIT_CODE=0`；
+  `train_cmd.cpp.obj` 03:53 → `build\openttd.exe` 2026-11-19 03:55（53 030 400 B）；read_lints 0；
+  exe 命中 `CAP-CB head=%d veh=%d cb=%u ... rcap=%u prop=%u`。
+- **下一步取数（需玩家配合）**：同一列车散链态与成段态各开一次容量页（最好再**读档一次**再开），
+  发回 `build\R3R_debug.log` 的 `CAP-CB` 段。判读见备忘 §9.12 的判读表（`prop` 决定是否必须主动压 0；
+  `cb` vs `old` 决定是裁决层写错还是回调值本身）。
+- **探针事故与修正（2026-11-19 复跑，第 5 次 tag 白名单事故）**：玩家按 §9.12 复跑（日志
+  `build\R3R_debug.log` 7 328 B @04:04，产生者 exe 03:55，该 exe 内确有 `CAP-CB head=` 字面量），
+  但日志中 **`CAP-CB` 0 条**。根因=`R3RDbgWrite()`（`src\r3r_perf.h:408-411`）的第二道门
+  `R3RDbgTagAllowed()`（`:322-405`）是**首 token 前缀白名单**，只放行
+  `RESV/UNRES/EXTEND/LOOP/R3R-RES/COUPLE/CPL/FOLD/SPLICE/ARTIC/SKIP-/UNIT/CLONE/ORD/CTRL/AUTO-/OWNER/NAME/RESERVE/DECOUPLE/SPD/BUY/WP/DUALHEAD/TTB/DEPOT/SEGID/SEGROW/LEGACY/CGRP/GRP`，
+  通用兜底只有 `R3R-`（`:400`）⇒ `CAP-CB` 被静默丢弃（不是分支没走到）。
+  **连带推翻一条旧依据**：第 458 轮（KI-656）的 `CAP-MEMBER-ZERO` 同样不在白名单，
+  历史上也从未写出过 ⇒「日志无 `CAP-MEMBER-ZERO` ⇒ 清零分支没走」的推断**作废**。
+  修法（零逻辑变更）：两条 tag 改 `R3R-CAPCB` / `R3R-CAPMEMBERZERO`，命中 `R3R-` 前缀。
+  **新增 `R3RDbgWrite` 前必须把首 token 对着 `:335-400` 逐条比对**，否则「0 条」恒为假阴性。
+- **构建自证（2026-11-19 改名版）**：`R3R_fullbuild.cmd inc detach`（复用既有入口）；
+  `build\R3R_incbuild.done` = `EXIT_CODE=0`；`build\openttd.exe` 2026-11-19 **04:10:31**；
+  read_lints 0；exe 命中 `R3R-CAPCB head=%d veh=%d cb=%u ... rcap=%u prop=%u`
+  与 `R3R-CAPMEMBERZERO veh=%d head=%d cap=%u->0 cb=%u`。
+- **请用 04:10:31 版 exe 复跑**：散链一次、设为段后一次（可再读档一次），只发 `R3R-CAPCB` 段即可。
+- **复跑读数到手（2026-11-19 04:13，`build\R3R_debug.log` 5 259 B，exe 04:10:31）**：
+  6 行 `R3R-CAPCB` 显示 **`prop=1`、`cb=0` 全场一致**——`veh1/2`（真铰接组成员，`art=1`）
+  `cb=0 old=1 prop=1`；`veh4`（组头，`ah=1 am=1`）`cb=0 old=0 prop=1`；`veh5`（成员）`cb=0 old=1 prop=1`。
+  显示层 `R3R-CAPSUM head=0 sumcap=2` / `head=3 sumcap=1` 与之吻合。
+- **根因已做实**：`DetermineCapacity()` 对这些车**恒返 0**（原生 JGRPP 读数就是 0），
+  非零值唯一来源是 KI-641 的容量救援分支 `new_cap = u->cargo_cap`（`src\train_cmd.cpp:677-679`）
+  把旧值反复粘住；KI-656 的清零分支要求「组头 `cargo_cap>0`」，而两个组头 cap 都是 0 ⇒ 该分支从未生效
+  （这也解释了历史日志里 `R3R-CAPMEMBERZERO` 从不出现）。
+- **本轮改动（2026-11-19，已编译）**：删掉该救援分支（等价于撤回 KI-641 在 capacity 上的「救旧值」），
+  改打 `R3R-CAPDROP veh=%d head=%d cap=%u->0 cb=%u`（上限 200 行）记录被丢弃的旧值；
+  KI-656 的清零分支与其注释原样保留，注释里「组头回 0 时救援仍生效」的口径已同步改写。
+  撤回后本现场自然得 0（`veh0/3/4` 本就 cb=0，`veh1/2/5` 不再被粘），与玩家口径一致。
+  风险面仅限「回调明确返 0 却硬保留旧值」的场合，而那正是本条要消除的形态。
+- **构建自证（2026-11-19 04:19 版）**：`R3R_fullbuild.cmd inc detach`；`build\R3R_incbuild.done` = `EXIT_CODE=0`；
+  `train_cmd.cpp.obj` 04:17 → `build\openttd.exe` 04:19（53 030 400 B）；read_lints 0；
+  exe 命中 `R3R-CAPDROP veh=%d head=%d cap=%u->0 cb=%u`。
+- **待复测（用 04:19 版）**：①同一列车散链/成段容量页**都读 0**（不再 2 / 1）
+  ②`R3R-CAPSUM` 变 `sumcap=0`、`R3R-CAPUNIT` 逐节 cap 全 0 ③日志出现 `R3R-CAPDROP` 记录被丢弃的旧值
+  ④负判据：普通客车/货车（未去铰接）容量逐字不变、照常装货 ⑤负判据：回调本身返非 0 的车照旧有容量。
+- **实机复测通过（2026-11-19，玩家原话「读档前后，成段或散链数据都保持正常，同时，也没有"机车载客"的问题出现。
+  此外，我意外发现，那个改装报错也消失了」）**：判据 ①②③④ 一次性通过 ⇒ **KI-661 状态＝已修**
+  （第 466 轮 §9.14 落地 + §9.15 实机复测通过）。
+- **附带修掉 `STR_NEWGRF_BROKEN_CAPACITY`「改装报错」的机制**：`ConsistChanged()` 中 `allowed_changes`
+  不含 `Capacity` 的提交点走校验分支（`src\train_cmd.cpp:704-706`）
+  `if (new_cap != u->cargo_cap) ShowNewGrfVehicleError(..., STR_NEWGRF_BROKEN_CAPACITY, GRFBug::VehCapacity, true);`
+  旧行为里救援把 `cargo_cap` 粘成 1、而同车 `new_cap` 取 `cb=0` ⇒ `0 != 1` ⇒ 每次重算/读档弹报错。
+  撤掉救援后两边同取 `cb`，等式自洽 ⇒ 报错消失。⇒ 该报错本来就是救援分支造成的自相矛盾，
+  **不是 GRF 写错了容量**（反证了 §9.14「非零值全部来自救援」的结论）。
+- **遗留（不在本条范围）**：`prop=1`（GRF 原型属性声明容量 1）仍在，本次只让运行时容量遵从回调；
+  若要让车库/购买列表的属性层也显示 0，需另开一条判定。
+- **G-468-3（猜测根因，已被真值口径改写，保留作机制线索）**：散链期 GRF 把容量挂在**部件**上（父车 0 + 两部件各 1 = 2，
+  即真值 2）；去铰接化时 `ClearArticulatedPart()` + `SetWagon()/SetEngine()`
+  （`src\vehicle_cmd.cpp:556-561`）抹掉 artic 身份，`DetermineCapacity()`（`src\engine.cpp:237`
+  →`:285` 的 `GetEngineProperty(PROP_TRAIN_CARGO_CAPACITY, ..., v)`，回调带 `v`）对前两节返回 0，
+  只有末节返回 1 ⇒ 总量 1。KI-656 的清零分支（`src\train_cmd.cpp:636-642`）本现场**没走**
+  （组头 `veh3 cap=0`，且日志无 `CAP-MEMBER-ZERO`），KI-641 救援（`:643-645`）又要求旧值 >0
+  ⇒ 缺的 1 无人补。**待验证判据**：在 `ConsistChanged()` 的
+  `uint16_t new_cap = e_u->DetermineCapacity(u)` 前后对成员打
+  `CAP-CB veh= cb=%u old=%u ghead=%d ghcap=%u`——`cb=0 && old=0` ⇒ 回调不认成员（走容量守恒修法）；
+  `cb=1 && old=0` 而最终写 0 ⇒ KI-656 分支误触发（改判据即可）。
+- **修法方向（「容量守恒」已作废）**：原先设想的「去铰接化时快照 `Σ cargo_cap` 作为组目标总量」
+  在真值 = 0 的口径下失去意义（目标总量恒为 0，不需要快照，也就不需要 `src\*.h` 的新字段）。
+  当前待探针确认的是**归零落点**：回调之后无条件压 0（若 `prop=0` 而 `cb≠0`），
+  还是需要按原型/货种给出「本类车不载客」的判据（若 `prop=1`）。
+- **严重度**：中（读数错、影响载客，但不丢数据）。
+
+### REG-468-A（疑点，低）段态容量页可能是「滚动后缀和」
+
+- **来源**：第 468 轮 KI-661 取数准备（备忘 §9.8）。
+- **期望值**：段态三节各一行，每行只印本节 `cargo_cap`。
+- **代码读数**：`GetCargoSummaryOfArticulatedVehicle()` 的
+  `do { add_unit(v); } while ((v = v->Next()) != nullptr && v->IsArticGroupMember())`
+  （`src\train_gui.cpp`）对 R3R 段组成员同样为真（`vehicle_base.h:1275-1278` Train 重载），
+  而调用方 `DrawTrainDetails` 用 `v->GetNextVehicle()`（只跳真 `IsArticulatedPart()`）会把每个成员
+  单独列一行 ⇒ 第 1 行=三节之和、第 2 行=后两节之和、第 3 行=本节。
+- **为什么存疑**：与「散链 2 / 成段 1」的读数方向相反（若为 2/1/0，第一行仍是 2）；
+  玩家也可能是读了某一中间行。也可能该循环在段态实测并未跨成员。
+- **待验证判据**：段态 `R3R-CAPSUM` 出现 3 条不同 `head=` 且 `n=` 递减 3→2→1 ⇒ 成立；
+  `n=` 全为 1 ⇒ 证伪。**在读数到手前不改这个循环**（原生 artic 下它是必需的）。
+- **第 468 轮判定：证伪**。现场 `build\R3R_debug.log` 两条链各只有 1 行 `R3R-CAPSUM`
+  （`:27 head=0 n=3`、`:35 head=3 n=3`），不存在 `n=` 递减的多行滚动后缀和 ⇒
+  该 `do..while` 在两态现场都只跑了一遍。该循环**不改**。
+
+### REG-464-A（疑点，中）功率为何不随重量一起 ×3
+
+- **期望值**（第 463 轮 §8.2 的假设）：override 缺失 ⇒ 重量与功率同时 ×3。
+- **实测值**：重量 3×、功率 1×。
+- **为什么存疑**：两个字段由**同一个** `R3RDearticulateOneGroup()` 同批烘焙（`weight_override` /
+  `power_override` 相邻两行，`src\vehicle_cmd.cpp:550-565`），同一版本门写入存档
+  （`src\sl\vehicle_sl.cpp:209-211` 一带），理论上不该一个缺失一个存在。
+- **可能解释**：①两者累加路径不同源（重量逐节全额、功率只认引擎）⇒ 见 G-464-2；
+  ②`n_total` 在烘焙时塌成 1 而 power 恰好为 0（成员为 Wagon）⇒ 成员拿到 `p_q=0`，总量仍 1×。
+- **还需要什么数据**：`dump_vehicle` 的 `ov=` 三行（尤其是否 `weight_override` 与 `power_override`
+  同时为 65535）。
+
+### 联合推导结论（R1+R2+R3 三条读数已互相锁死，不需要新数据）
+
+- 重量 3× ⇒ 三节 `weight_override` **全部** UINT16_MAX（`train.h:496-508` + `ground_vehicle.cpp:138-141`）。
+- 功率 1× ⇒ 三节 `power_override` **存在**且合计 P（缺失应 3×）。
+- TE 3× ⇒ `CalculatePower()` 只累加 `current_power > 0` 的节（`ground_vehicle.cpp:76-98`），
+  三节都在贡献 ⇒ 三节各有 P/3 且各重 W ⇒ 3W×te。
+- ⇒ **唯一自洽状态＝`weight_override` 缺失、`power_override` 存在（部分烘焙）**。
+
+**判决 1**：G-464-2「功率 1× 是天然正常形态」**证伪**——若成员不出力，TE 只能是 1×，与 R3 矛盾。
+**判决 2**：G-464-1 **成立且机制闭合**——`R3RNormaliseArticGroupBakes()` 的 baked 判据是
+`weight_override != UINT16_MAX || power_override != UINT16_MAX`（`train_cmd.cpp:2956-2966`，
+任一节任一字段命中即整组跳过），本案里 `power_override` 存在 ⇒ 整组恒判 baked ⇒ 永不重烘。
+
+**未解释的一环（P-1/P-2）**：两字段同批写（`vehicle_cmd.cpp:550-566`）、同版本门存档
+（`sl/vehicle_sl.cpp:209-211`），理论上不该部分存在 ⇒ 疑 P-1 某路径只写/只清一个字段
+（赋值点 `vehicle_cmd.cpp:550/563/713`、`train_cmd.cpp:2976/2980`），或 P-2 旧档字段序错位。
+定案只需 `dump_vehicle` 的 `ov=` 一行。
+
+**下一版修法（已定）**：baked 判据改**逐字段**——任一节 `weight_override==UINT16_MAX` 就只重烘
+weight，`power_override` 同理，两者独立；ref 用 `R3RConsistReferenceEngine(head)`。预期重量与 TE
+一起回 1×，对已完整烘焙的组仍是零改动（幂等）。
+
+### 本轮待玩家提供（两条即可定案 G-464-1）
+
+1. `build\R3R_debug.log` 中 `ARTIC-BAKE-NORMALISE`：有 / 没有；有则给原文行
+   （格式 `ARTIC-BAKE-NORMALISE head=%d n=%u w=%u p=%u spd=%u`）；
+2. 读档后对那三节各跑 `dump_vehicle <id>`，给出 `st:` / `tf:` / `ov=` 三段。
+
+## 第 465 轮（第 458 轮三条读数的日志实锤复核；判决 2 被推翻）
+
+### 判决 2 撤回（重要更正）
+
+第 464 轮判「`R3RNormaliseArticGroupBakes()` 的 baked 判据恒跳过、归一从未执行」——**证伪**。
+`build\R3R_debug.log` 实锤归一共执行 4 次且写值正确：
+
+```
+:152 / :160 / :185 / :190  ARTIC-BAKE-NORMALISE head=0|3 n=3 w=185 p=1524 spd=80 (overrides missing in savegame)
+:145-149                  MAKESEG-WEIGHT UPGRADE-AFTER-SPLIT head=3 n=3 sumw=185 sumpw=555 cw=185 dmw=185
+```
+
+⇒ `weight_override` 被写成 `63/61/61`（合计 185，单位值）、`power_override` 合计 1524、
+`max_speed_override` 80，并且同一个 `n=3` 循环内同批写入。
+
+### REG-465-A（疑点，中）归一写对了，重量读数为何仍是 3×
+
+- **期望值**：`weight_override` 生效 ⇒ 重量 185（1×）、`cached_max_te` 1×。
+- **实测值**：玩家手工观测成段重量 **3×**、最大牵引力 **3×**、功率 **1×**。
+- **为什么存疑**：`power` 1× 证明归一写入**是生效的**（若 override 全缺，power 应为 4572 = 3×），
+  而 `weight_override` 与 `power_override` 相邻两行同批写入、同一版本门落盘；
+  且读侧 `GetWeightWithoutCargo()`（`train.h:496-515`）→ `GetWeight()`（`train.h:627-630`）→
+  `CargoChanged()`（`ground_vehicle.cpp:133-142`）全部优先读 override，已逐条排除。
+- **候选解释**：
+  ①显示的「重量」走的是不经过 `weight_override` 的路径（另一个界面/另一个字段）；
+  ②归一写的对象与界面显示的链**不是同一批车**（段边界/链头错位）；
+  ③`gcache.cached_weight` 停在 555 未重算（归一末尾 `ConsistChanged(CCF_SAVELOAD)` 被跳过）。
+- **存档版本门已排除**：`SAVEGAME_VERSION = SLV_R3R_PARKED = SLV_R3R_ARTIC_OVERRIDE + 1`，
+  `src\sl\vehicle_sl.cpp:209-211` 门限满足 ⇒ 新 exe 存出的档必带三字段；
+  日志两次读档都打 `(overrides missing in savegame)` ⇒ 两次读的都是**旧 exe 写的档**。
+- **还需要什么数据**：新 exe 读档后 `R3RDUMP idx=3/4/5` 行的 `ov_w/ov_p/ov_s/cw/te` 五字段。
+- **严重度**：中（读数错、影响玩家判断与爬坡手感，不丢数据）。
+
+### 本轮动作（只加只读探针，零行为变更）
+
+`src\sl\vehicle_sl.cpp` 的 `R3RDUMP idx=` 行追加五个字段
+`ov_w=%u ov_p=%u ov_s=%u cw=%u te=%u` = `weight_override` / `power_override` /
+`max_speed_override` / `gcache.cached_weight` / `gcache.cached_max_te`。
+
+**判定三分支**（读档复跑后按此定案）：
+- `ov_w=63/61/61` 且 `cw=185`、`te=1×` ⇒ 内存正确，3× 在显示/别处，转查界面；
+- `ov_w=65535`/`185`，或 `cw=555` ⇒ 归一没落盘/被覆盖，继续查写侧；
+- `ov_w=63` 但 `cw=555` ⇒ `CargoChanged` 没跑（归一末尾 `ConsistChanged` 被跳过）。
+
+**构建自证**：`R3R_fullbuild.cmd inc detach`、`GUARD: incremental is safe`、
+`[2/3] vehicle_sl.cpp.obj → [3/3] Linking`、`R3R_incbuild.done=EXIT_CODE=0`（2026-11-19 02:22:46）、
+`vehicle_sl.cpp` 02:20:19 → obj 02:21:15 → `build\openttd.exe` 02:22:38（53 030 400 B）、
+`read_lints` 0、exe 命中 `cw=%u te=%u`。未碰任何 `src\*.h`。
+
+**纪律**：在拿到 `ov_*`/`cw`/`te` 实际读数之前，**不改** `R3RNormaliseArticGroupBakes()` 的 baked 判据
+（第 464 轮写的「逐字段独立 baked」修法暂缓，避免盲改）。
+
+## 第 466 轮（第 465 轮探针读数判读：三分支落定 + 新缺陷 KI-661）
+
+零源码改动、零构建。输入 = 玩家读档后的 `build\R3R_debug.log`（26 行）。
+完整报告见 `R3R_artic_bake_round466_memo.md`。
+
+### 读数原文（判据锚点）
+
+```
+:2  / :10  ARTIC-BAKE-NORMALISE head=0|3 n=3 w=185 p=1524 spd=80 (overrides missing in savegame)
+:18 R3RDUMP idx=0 ARTH=1 SEGF=0 ov_w=63  ov_p=508 ov_s=80 cw=63  te=84410
+:19 R3RDUMP idx=1 sub=02(ARTICULATED_PART) ARTM=1 ov_w=61 ov_p=508 cw=0 te=0
+:20 R3RDUMP idx=2 sub=02(ARTICULATED_PART) ARTM=1 ov_w=61 ov_p=508 cw=0 te=0
+:21 R3RDUMP idx=3 SEGF=1 ov_w=63 ov_p=508 ov_s=80 cw=185 te=247871
+:22 R3RDUMP idx=4 sub=08(ENGINE) ARTM=1 ov_w=61 ov_p=508 cw=0 te=0
+:23 R3RDUMP idx=5 sub=08(ENGINE) ARTM=1 ov_w=61 ov_p=508 cw=0 te=0
+```
+
+### 三分支判读：段链（head=3）落 **分支 1**
+
+`ov_w = 63+61+61 = 185`、`ov_p = 508×3 = 1524`、`ov_s = 80`、`cw = 185`、
+`te = 247871`（与 `cw` 成正比）⇒ **内存三字段全是 1×**，REQ-465-A 的候选 ②（写错对象）
+与 ③（`ConsistChanged` 被跳过）**排除**，只剩 ①**显示的 3× 走的是不经 `weight_override` 的路径**。
+
+⇒ **C-466-1 已回填（2026-11-19 玩家答）**：3× 在**列车详情窗口**看到（原话「三倍我是在列车
+详情窗口看到的」）。源码取证（`train_gui.cpp`）：
+
+- 「详细信息」页 `TDW_TAB_INFO`（`:400 TrainDetailsInfoTab()`）**每节车一行**，行内重量/功率/限速
+  取引擎原型（`RailVehInfo` / `Engine`），**不读 `weight_override`**；
+- 「总计」页 `TDW_TAB_PERF`（`:800-819`）逐节 `u->GetWeightWithoutCargo()` 累加，该函数
+  （`train.h:496-508`）优先返回 `weight_override` ⇒ 本轮读数下合计必为 `63+61+61=185`，不可能是 555。
+
+⇒ **C-466-1 关闭（2026-11-19 玩家澄清，见备忘 §八）**：窗口 = 点击列车弹出的小窗口**上半总览**
+（地图/车库/预览里点车都是同一窗口；下半逐节列表不显示重量），不是 `VehicleDetails` 的页签；
+且玩家自我更正「3 倍是错误描述」⇒ 真正的数据缺陷只有**散链 1/3**（= KI-662），
+假铰接（段组）各项正常，仅载客侧 2/1 见 **KI-661**。此前「信息页逐节画原型」的推断**作废**。
+
+### KI-662（中，已修·第 467 轮）：归一误烘焙「散链（真铰接组）」⇒ 重量与最大牵引力只剩 1/3
+
+（编号更正：本节初写时误用 KI-661，与上文 `:25352` 的「0 容量机车：散链 2、成段 1」重号；
+**KI-661 恒指载客 2/1 那条**，本条改为 KI-662，备忘同名处同步。）
+
+- 来源：第 465 轮探针 + 第 466 轮读数；备忘 `R3R_artic_bake_round466_memo.md` §三 / §八。
+- 现场：`head=0`（`SEGF=0` 散链）的成员 `sub=02` 带 `GVSF_ARTICULATED_PART` ⇒ 它是**真铰接组**
+  （父车 + 2 个 artic 部件，从未去铰接化），却被 `R3RNormaliseArticGroupBakes()` 一并烘焙
+  （`ov_w=63/61/61`、`ov_p=508×3`），结果 `cw=63`（应 185）、`te=84410`；
+  `84410 : 247871 = 63 : 185` ⇒ 重量与牵引力都掉到 1/3。
+- 猜测根因（已实证）：`CargoChanged()`（`ground_vehicle.cpp:133-142`）对 artic 部件按
+  `GetEnginePartsCount()` 分摊父车重量（原态 `185/3` 商 61 + 余数 2 = 63，合计 185）；
+  父车一旦有 `weight_override=63`，再摊一次 `63/3`，合计只剩 63 ⇒ **烘焙 + 真铰接位 = 双重分摊**。
+- 为何以前没暴露：烘焙本意只服务去铰接化的段组（`R3RDearticulateOneGroup()` 会
+  `ClearArticulatedPart()`），而归一判据只看 `IsArticGroupHead()`；第 463 轮之后老档里
+  真铰接组也带角色位，于是被命中。
+- **修法（已落地，仅 `src\train_cmd.cpp` 的 `R3RNormaliseArticGroupBakes()`，未碰任何 `src\*.h`）**：
+  ①组内（`v`→`nxt` 前）任一 `IsArticulatedPart()` ⇒ 整组**不烘焙**，打 `ARTIC-BAKE-SKIP head=%d n=%u reason=real-artic-parts`；
+  ②命中「真铰接组 + 已有烘焙值」⇒ 三字段（`weight_override`/`power_override`/`max_speed_override`）
+  全部清回 `UINT16_MAX` 并置 `changed`（函数末尾统一 `head->ConsistChanged(CCF_SAVELOAD)`），
+  打 `ARTIC-BAKE-HEAL head=%d n=%u` ⇒ 老档里已定格在 1/3 的散链**读档即恢复**
+  185 / 1524 / 80，无需玩家重装车；
+  ③不动 `CargoChanged()` 的分摊逻辑（对未烘焙真铰接组是正确行为）；
+  ④安全性：去铰接组必无 artic 位（`R3RDearticulateOneGroup()` 已 `ClearArticulatedPart()`）⇒ 清理分支
+  不会误伤合法烘焙；原生 GRF 铰接车无 ★/⊗ 角色位 ⇒ 不进本函数。
+- 复测判据：①`ARTIC-BAKE-SKIP head=0 ... reason=real-artic-parts`（或先 `ARTIC-BAKE-HEAL` 一次后同样跳过）出现、
+  `ARTIC-BAKE-NORMALISE head=0` 消失 ②`idx=0` 的 `ov_w=65535`、`cw=185`、`te≈247871`
+  ③`idx=3` 段链仍 `ARTIC-BAKE-NORMALISE head=3 … cw=185 te≈247871` 不回归
+  ④原生铰接车（无角色位）逐字不变 ⑤散链列车运行手感（加速/爬坡）恢复到原速。
+- **构建自证（第 467 轮，2026-11-19）**：复用既有 `R3R_fullbuild.cmd inc`（未新建任何 `.cmd`）；
+  `build\R3R_incbuild.guard.log` = 「GUARD: incremental is safe (no header/lang file is newer than the newest object)」；
+  `build\R3R_incbuild.log` 尾部 `[3/3] Linking CXX executable openttd.exe` + `EXIT_CODE=0`（`build\R3R_incbuild.done` = `EXIT_CODE=0`）；
+  时间戳 `src\train_cmd.cpp` 02:50 → `build\CMakeFiles\openttd_lib.dir\src\train_cmd.cpp.obj` 02:54 →
+  `build\openttd.exe` 02:56（53 030 400 B，晚于全部源码）；`read_lints` 0 条；
+  `findstr` 在 exe 内命中 `ARTIC-BAKE-HEAL head=%d n=%u` 与 `ARTIC-BAKE-SKIP head=%d n=%u reason=real-artic-parts`。
+  状态＝**已实现 + 已编译**，游戏内复测待做（判据见上）。发布树 `build-release` 未编（按约定）。
+- 未确认：U-2 `idx=4` 同时 `sub=08(ENGINE)` + `ARTH=1` + `ARTM=1`（既是组头又是成员）是否正常，本轮未查。
+

@@ -887,6 +887,92 @@ struct IndustryCompare {
 
 typedef btree::btree_set<IndustryListEntry, IndustryCompare> IndustryList;
 
+/**
+ * R3R (第 451 轮, KI-642): 调度池条目的「分配规则」变量。
+ *
+ * 领取方到站申请调度表时，用**它自己这列车**的性能去比对池条目上写的规则，
+ * 满足才发牌（第 412 轮 C-8 口径）；不满足就继续扫下一条。
+ * 这里刻意不复用 OrderConditionVariable：那套是订单级、带一整套存档与 UI，
+ * 而这里的规则只是「这一份表发给谁」的一个随身标签，独立枚举互不影响。
+ */
+enum class R3RDispatchRuleVariable : uint8_t {
+	None = 0,          ///< 不设条件：任何列车都能领
+	MaxSpeed,          ///< 最高速度（km/h，显示值）
+	Power,             ///< 功率（hp，显示值）
+	MaxTractiveEffort, ///< 最大牵引力（kN）
+	Reliability,       ///< 可靠性（%）
+	/* --- R3R (第 451 轮续): 与可编程信号机的既有条件逐条对应 ---
+	 * 可编程信号机的条件清单见 src\programmable_signals.h 的 SignalConditionCode。
+	 * 「前方绿灯数 / 红灯数 / 另一信号的状态」在领表上下文里没有信号格可看，
+	 * 第 451 轮曾照抄进下拉，求值恒为 0（备忘 C-451-5 的 (B) 方案）。
+	 *
+	 * R3R (第 455 轮, KI-652): 这三个「恒 0」条件已不再对玩家提供 —— 玩家口径是
+	 * 「能抄的抄、不能抄的别硬抄」，一个永远读 0 的条件只会让规则悄悄永远不成立。
+	 * 但**枚举值本身必须保留**：它们以 uint8 逐条存进调度池条目（R3RDispatchInstruction::var），
+	 * 删掉会让其后所有变量的编号前移，旧档的条件会被静默解释成另一个变量。
+	 * 因此这里只做「保留编号 + 编辑器的下拉里不出现 + 求值视为不设限（恒真）」。 */
+	PoolIssued,        ///< 本池已发份数（= PSC_SLOT_OCC「槽占用」）
+	PoolRemaining,     ///< 本池剩余坑位（= PSC_SLOT_OCC_REM「槽剩余」）
+	NumGreen,          ///< 【已停用，仅读旧档】= PSC_NUM_GREEN「前方绿灯数」（恒 0）
+	NumRed,            ///< 【已停用，仅读旧档】= PSC_NUM_RED「前方红灯数」（恒 0）
+	OtherSignalState,  ///< 【已停用，仅读旧档】= PSC_SIGNAL_STATE「另一信号的状态」（恒 0）
+	Counter,           ///< = PSC_COUNTER「计数器值」（计数器编号见 R3RDispatchInstruction::extra）
+	EngineClass,       ///< R3R (第 455 轮): 机车类型（EngineClass 的数值；见 R3RDispatchInstruction::value）
+	/* 新增变量必须追加在末尾 —— 值即存档里的编号，插在中间会让旧档错位。 */
+};
+
+/** R3R (第 451 轮, KI-642): 调度池规则的比较符。 */
+enum class R3RDispatchRuleOp : uint8_t {
+	AtLeast = 0, ///< 来车指标 >= 阈值（「达 XXX」）
+	AtMost,      ///< 来车指标 <= 阈值（「不超过 XXX」）
+	/* R3R (第 455 轮续二, KI-652): 第 455 轮复测玩家反馈「比较符只有至多/至少」——
+	 * 数值指标要与可编程信号灯对齐给全，枚举指标（机车类型）需要「是/否」。
+	 * 新增值必须追加在末尾：编号随指令存进存档（见 R3RDispatchInstruction::op）。 */
+	Equal,       ///< == 阈值（「等于」）
+	NotEqual,    ///< != 阈值（「不等于」，枚举指标用它表示「不是」）
+	Greater,     ///< > 阈值（「大于」）
+	Less,        ///< < 阈值（「小于」）
+};
+
+/** R3R (第 451 轮续): 「分配规则」程序里一条指令的种类。
+ *  照抄可编程信号机（SignalOpcode）的分支结构，只是把「置信号」换成「允许/拒绝分配调度」。 */
+enum class R3RDispatchInstructionKind : uint8_t {
+	If = 0,     ///< 如果 <条件>：条件假则跳到本层下一个「或者 / 否则 / 结束如果」
+	Else,       ///< 否则：走到这里就跳到配对的「结束如果」之后
+	Or,         ///< 或者（= elif）：条件假则跳到本层下一个「或者 / 否则 / 结束如果」
+	EndIf,      ///< 结束如果（空操作，靠它配对）
+	Result,     ///< 允许分配调度 X / 拒绝分配调度 X：立即终止求值并返回结果
+};
+
+/** R3R (第 451 轮续): 「允许分配调度」还是「拒绝分配调度」。 */
+enum class R3RDispatchResultKind : uint8_t {
+	Allow = 0, ///< 允许分配调度 X
+	Deny,      ///< 拒绝分配调度 X
+};
+
+/** R3R (第 451 轮续): 分配规则程序的一条指令（定长，便于存档与命令传输）。 */
+struct R3RDispatchInstruction {
+	R3RDispatchInstructionKind kind = R3RDispatchInstructionKind::If; ///< 指令种类
+	R3RDispatchRuleVariable var = R3RDispatchRuleVariable::None;       ///< If/Or：条件变量
+	R3RDispatchRuleOp op = R3RDispatchRuleOp::AtLeast;                 ///< If/Or：比较符
+	R3RDispatchResultKind result = R3RDispatchResultKind::Allow;       ///< Result：允许/拒绝
+	uint32_t value = 0; ///< If/Or：比较阈值；Counter：被比较的计数器值
+	uint32_t extra = 0xFFFFFFFF; ///< Result：允许/拒绝的调度掩码（bit i = 去重槽位 i，见 R3R_DISPATCH_MASK_BITS；全 0 = 一条都不允许）；Counter：计数器编号
+};
+
+/** R3R (第 451 轮续): 一份「分配规则」程序的条数上限（照抄可编程信号机的小规模定位）。 */
+static constexpr uint16_t R3R_DISPATCH_PROGRAM_MAX = 64;
+
+/** R3R (第 451 轮, KI-642): 领取方这列车的性能快照，用于池条目规则求值。 */
+struct R3RDispatchClaimStats {
+	uint32_t max_speed = 0;   ///< 最高速度（km/h）
+	uint32_t power = 0;       ///< 功率（hp）
+	uint32_t max_te = 0;      ///< 最大牵引力（kN）
+	uint32_t reliability = 0; ///< 可靠性（%）
+	uint8_t engine_class = 0; ///< R3R (第 455 轮): 机车类型（EngineClass 数值；0 = 蒸汽）
+	bool valid = false;       ///< false = 求值方没提供（此时只允许无条件条目）
+};
+
 /** Station data structure */
 struct Station final : SpecializedStation<Station, false> {
 public:
@@ -971,8 +1057,19 @@ public:
 			uint32_t schedule = R3R_DISPATCH_NO_SCHEDULE; ///< R3R (第 428 轮): 排程（OrderList 池下标）
 			uint16_t limit = 1;                    ///< 同时可领用的列车数（坑位），0 视为 1
 			uint16_t issued = 0;                   ///< 已发出、尚未归还的份数
+			/* R3R (第 451 轮, KI-642): 分配规则 —— 只有满足规则的来车才能领这份表。
+			 * rule_var == None 表示无条件（等价于第 451 轮之前的旧行为）。
+			 * 一条条目只携带一个 (变量, 比较符, 阈值) 三元组；因为池内按排程去重
+			 * （同一张表在同一场只登记一次），所以「一份表一条规则」是本轮的口径。 */
+			R3RDispatchRuleVariable rule_var = R3RDispatchRuleVariable::None;
+			R3RDispatchRuleOp rule_op = R3RDispatchRuleOp::AtLeast;
+			int32_t rule_value = 0;                ///< 阈值（单位随 rule_var）
 		};
 		std::vector<R3RDispatchPoolEntry> pool; ///< R3R: 本场的调度池
+		/* R3R (第 451 轮续): 本场的「分配规则」程序（如果/否则/或者/结束如果 + 允许/拒绝分配调度）。
+		 * 空 = 无条件放行（与第 451 轮之前的行为一致）。整站（R3R_YARD_NONE）那一份存在
+		 * Station::r3r_whole_program。求值见 src\station_cmd.cpp 的 R3RDispatchProgramAllows()。 */
+		std::vector<R3RDispatchInstruction> program;
 	};
 	std::vector<R3RStationYard> r3r_yards{}; ///< R3R: 场的列表（有效场 ID = 下标 + 1）
 
@@ -983,6 +1080,10 @@ public:
 	 * 存档：独立 chunk "SYRD" v7 追加块（v6 已被第 416 轮的各场池占用；
 	 * 第 428 轮把池条目扩成带排程 ⇒ 升到 v8，见 src/sl/station_yard_sl.cpp）。 */
 	std::vector<R3RStationYard::R3RDispatchPoolEntry> r3r_whole_pool{};
+	/* R3R (第 451 轮续): 整站（R3R_YARD_NONE）自己的「分配规则」程序。
+	 * 与各场程序**相互独立、不合并**：整站池只服务「订单里没有指定场」的领取方，
+	 * 程序也跟着池走（存档 SYRD v10，见 src\sl\station_yard_sl.cpp）。 */
+	std::vector<R3RDispatchInstruction> r3r_whole_program{};
 	bool r3r_whole_workshop = false; ///< R3R: 整站是否为检修所（该站全部平台都不接货）
 
 	/* R3R: [存档兼容] SYRD v1 的三个场列表。v2 起场数据统一编码进 r3r_yard_a（见
@@ -1080,10 +1181,27 @@ public:
 	bool     R3RDispatchPoolRemove(uint16_t yard, uint16_t index);
 	/** R3R: 修改指定下标的坑位（1..容量上限）。 */
 	bool     R3RDispatchPoolSetLimit(uint16_t yard, uint16_t index, uint16_t limit);
+	/** R3R (第 451 轮): 设置指定下标池条目的分配规则（rule_var == None 表示清掉规则）。
+	 *  **第 451 轮续起废弃**：玩家口径改为「一个规则管全站场，不要一条调度一个规则」，
+	 *  规则搬到 R3RDispatchProgramSet() 的程序里。这里的三字段与存档保留只为兼容旧档，
+	 *  R3RDispatchPoolPick() 已不再读它们，GUI 也不再编辑。 */
+	bool     R3RDispatchPoolSetRule(uint16_t yard, uint16_t index, R3RDispatchRuleVariable var, R3RDispatchRuleOp op, int32_t value);
+
+	/* R3R (第 451 轮续): 「分配规则」程序（如果 / 否则 / 或者 / 结束如果 + 允许·拒绝分配调度）。 */
+	/** R3R: 取某个场的规则程序（yard == R3R_YARD_NONE ⇒ 整站那一份）。越界返回 nullptr。 */
+	std::vector<R3RDispatchInstruction>       *R3RDispatchProgramRef(uint16_t yard);
+	const std::vector<R3RDispatchInstruction> *R3RDispatchProgramRef(uint16_t yard) const;
+	/** R3R: 整体替换某个场的规则程序（调用方须已校验；空程序 = 清除规则，回到无条件放行）。 */
+	bool     R3RDispatchProgramSet(uint16_t yard, const std::vector<R3RDispatchInstruction> &program);
+	/** R3R: 求值规则程序，返回 true = 允许把 @p schedule 这份调度发给来车。
+	 *  空程序恒 true（旧行为）；@p stats 为空或 !valid 时，需要性能的条件一律不成立。 */
+	bool     R3RDispatchProgramAllows(uint16_t yard, uint32_t schedule, const R3RDispatchClaimStats *stats) const;
 	/** R3R: 为一次领取挑一个还有空坑位的条目，返回下标（-1 = 没有可用的）。
 	 * @param except_schedule 领取方自己正在跑的表（它不能领自己名下的表）。
-	 * @param out_schedule 输出被选中的排程（OrderList 池下标）。 */
-	int      R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule) const;
+	 * @param out_schedule 输出被选中的排程（OrderList 池下标）。
+	 * @param stats 领取方这列车的性能快照（第 451 轮起用于求值池条目的分配规则）。
+	 *              nullptr 或 !valid 时，带规则的条目一律视为不匹配。 */
+	int      R3RDispatchPoolPick(uint16_t yard, uint32_t except_schedule, uint32_t &out_schedule, const R3RDispatchClaimStats *stats = nullptr) const;
 	/** R3R: 领取成功后占掉一个坑位（按排程查找）。 */
 	bool     R3RDispatchPoolAcquire(uint32_t schedule);
 	/** R3R: 归还一个坑位（按排程查找全部车站的场）。 */

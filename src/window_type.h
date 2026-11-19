@@ -869,6 +869,19 @@ enum class WindowClass : uint16_t {
 	StationDispatch,
 
 	/**
+	 * R3R (第 451 轮续) dispatch allocation rule program (分配规则程序) editor; %Window numbers:
+	 *   - StationID | (yard << 16), i.e. encode as `uint32_t(station_id) | (uint32_t(yard) << 16)`
+	 */
+	DispatchProgram,
+
+	/**
+	 * R3R (第 451 轮续二) multi-select picker for the dispatch schedules a rule result
+	 * refers to (一条结果可勾选多份调度); %Window numbers:
+	 *   - StationID | (yard << 16), same packing as #DispatchProgram
+	 */
+	DispatchSchedulePick,
+
+	/**
 	 * R3R (第 417 轮) schedule pool (排程池) management window; %Window numbers:
 	 *   - 0 = #R3RScheduleWidgets (the window is per company, one instance only)
 	 */

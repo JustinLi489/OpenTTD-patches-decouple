@@ -269,6 +269,127 @@ static void TrainDetailsCargoTab(const CargoSummaryItem *item, int left, int rig
 }
 
 /**
+ * R3R (KI-640, 第 447 轮): can {ENGINE} be rendered for this prototype at all?
+ *
+ * Mirrors the three fallbacks of SCC_ENGINE_NAME (src/strings.cpp): the cached
+ * custom name, the CBID_VEHICLE_NAME callback, and info.string_id. Testing
+ * info.string_id alone was wrong: a NewGRF vehicle whose name comes from the
+ * name callback keeps string_id == STR_UNDEFINED, so every vehicle prototype of
+ * such a set was classified as "nameless" and the representative-engine lookup
+ * found no candidate at all (the whole fix was a no-op, byte for byte identical
+ * to the behaviour before it).
+ *
+ * @param engine Prototype to test.
+ * @return True if {ENGINE} can produce a real name for it.
+ */
+static bool R3REngineHasDisplayName(EngineID engine)
+{
+	const Engine *e = Engine::Get(engine);
+	/* Fallback 1: a cached (custom) name, only used while the engine is enabled. */
+	if (!e->name.empty() && e->IsEnabled()) return true;
+
+	/* Fallbacks 2+3, 4th attempt (2026-11-15): run {ENGINE} for real instead of
+	 * guessing from callback_mask. A hidden NewGRF articulated-part prototype may
+	 * register CBID_VEHICLE_NAME and still return no usable name; SCC_ENGINE_NAME
+	 * then falls through to info.string_id == STR_UNDEFINED and this very window
+	 * renders "(undefined string)". Testing the callback bit alone therefore
+	 * reported "named" for exactly the prototypes that cannot render a name. */
+	const std::string rendered = GetString(STR_ENGINE_NAME, PackEngineNameDParam(engine, EngineNameContext::VehicleDetails));
+	return !rendered.empty() && rendered != GetString(STR_UNDEFINED);
+}
+
+static bool R3RDetailsNeedsRepresentativeEngine(const Train *v)
+{
+	/* R3R (KI-640): a promoted hidden articulated part. Its prototype cannot
+	 * render a name at all, so {ENGINE} yields "(undefined string)" regardless of
+	 * which unit of the chain the details window was opened on -- and the info tab
+	 * picks the engine/wagon branch from railveh_type alone (TrainDetailsInfoTab),
+	 * it never requires the front-engine role. Test this unconditionally: gating it
+	 * behind IsFrontEngine() made the whole fix a no-op whenever the window was
+	 * opened on a section that does not hold the head role. */
+	if (!R3REngineHasDisplayName(v->engine_type)) return true;
+
+	/* A (named) wagon promoted to the engine role by an in-depot reversal. */
+	return v->IsFrontEngine() && RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon;
+}
+
+/**
+ * R3R (KI-640, round 449): the *unit* that represents the chain in the details
+ * window -- the original articulated parent after a C-2 reversal, else v itself.
+ *
+ * R3RConsistRepresentativeEngine() only exposes its prototype. The info tab also
+ * renders build year / value / max speed / reliability on the very same row, and
+ * all of them were still read from v (the promoted hidden articulated part)
+ * while the name already came from the parent, so one row mixed two prototypes.
+ */
+static const Train *R3RConsistRepresentativeUnit(const Train *v)
+{
+	if (!R3RDetailsNeedsRepresentativeEngine(v)) return v;
+
+	const Train *named = nullptr;
+	/* Walk from the chain head, not from v: the details window may have been
+	 * opened on any section, while the named prototype (the original articulated
+	 * parent) sits at the tail after a reversal. */
+	for (const Train *u = Train::From(v->First()); u != nullptr; u = u->Next()) {
+		if (!R3REngineHasDisplayName(u->engine_type)) continue;
+		/* Prefer a real engine prototype, fall back to any named section. */
+		if (RailVehInfo(u->engine_type)->railveh_type != RailVehicleType::Wagon) { named = u; break; }
+		if (named == nullptr) named = u;
+	}
+	return named != nullptr ? named : v;
+}
+
+static EngineID R3RConsistRepresentativeEngine(const Train *v)
+{
+	const bool needs = R3RDetailsNeedsRepresentativeEngine(v);
+
+	/* R3R (KI-640 probe): must sit BEFORE the early return. It used to sit after
+	 * it, so "no R3R-NAME line in the log" could not be told apart from "returned
+	 * v->engine_type immediately" -- that ambiguity cost three rounds. needs= now
+	 * separates "function never called" from "called but no representative needed".
+	 * fe = head role, sid = prototype string id (2 == STR_UNDEFINED, nameless),
+	 * cb = has a name callback, nm = R3REngineHasDisplayName()'s verdict. */
+	{
+		static uint32_t seen[16] = {};
+		static int n_seen = 0;
+		bool known = false;
+		for (int i = 0; i < n_seen; i++) {
+			if (seen[i] == v->index.base()) { known = true; break; }
+		}
+		if (!known && n_seen < 16) {
+			seen[n_seen++] = v->index.base();
+			R3RDbgWrite("R3R-NAME v=%d fe=%d eng=%d sid=%d cb=%d nm=%d needs=%d\n",
+					(int)v->index.base(), v->IsFrontEngine() ? 1 : 0, (int)v->engine_type.base(),
+					(int)v->GetEngine()->info.string_id,
+					v->GetEngine()->info.callback_mask.Test(VehicleCallbackMask::Name) ? 1 : 0,
+					R3REngineHasDisplayName(v->engine_type) ? 1 : 0, needs ? 1 : 0);
+		}
+	}
+
+	if (!needs) return v->engine_type;
+
+	const EngineID rep = R3RConsistRepresentativeUnit(v)->engine_type;
+	R3RDbgWrite("R3R-REPICK v=%d rep=%d eng=%d repNm=%d\n",
+			(int)v->index.base(), (int)rep.base(), (int)v->engine_type.base(),
+			R3REngineHasDisplayName(rep) ? 1 : 0);
+	return rep;
+}
+
+/**
+ * R3R (KI-640, 口径甲): is this unit a mixed chain head, i.e. a wagon (or a hidden
+ * articulated part) that was promoted to the engine role by an in-depot reversal?
+ *
+ * The capacity tab normally lists one line per unit. For a mixed head the head
+ * unit alone usually carries nothing (or is an articulated part with a zero
+ * capacity), so its line came out empty and fell back to "none". In that case
+ * the whole chain is summarised on the single head line instead.
+ */
+static bool R3RDetailsWholeConsistCapacity(const Train *v)
+{
+	return R3RDetailsNeedsRepresentativeEngine(v);
+}
+
+/**
  * Draw the details info tab for the given vehicle at the given position
  *
  * @param v     current vehicle
@@ -279,11 +400,40 @@ static void TrainDetailsCargoTab(const CargoSummaryItem *item, int left, int rig
 static void TrainDetailsInfoTab(const Train *v, int left, int right, int y, uint8_t line_number)
 {
 	const RailVehicleInfo *rvi = RailVehInfo(v->engine_type);
+	/* R3R (KI-640, round 449): this row already takes its NAME from the
+	 * representative unit (the original articulated parent), while build year,
+	 * value, max speed and reliability were still read from v -- the promoted
+	 * hidden articulated part. One row therefore mixed two prototypes. Read all
+	 * four from the same unit the name comes from. rep == v for every ordinary
+	 * vehicle, so both paths stay byte-for-byte identical there. */
+	const Train *const rep = R3RConsistRepresentativeUnit(v);
+	const RailVehicleInfo *const rep_rvi = RailVehInfo(rep->engine_type);
 
-	auto get_speed = [&]() -> uint16_t {
-		const bool show_speed = !UsesWagonOverride(v) && (_settings_game.vehicle.wagon_speed_limits || rvi->railveh_type != RailVehicleType::Wagon);
-		return show_speed ? GetVehicleProperty(v, PROP_TRAIN_SPEED, rvi->max_speed) : 0;
+	/* R3R (KI-640 probe): proves the details window really draws through here.
+	 * Without it, "R3R-NAME never shows up" could equally mean "the window was
+	 * never opened", which is exactly the doubt left after round 448.
+	 * rep= is the representative unit resolved above (== eng= when no redirect). */
+	{
+		static uint32_t seen[16] = {};
+		static int n_seen = 0;
+		const uint32_t key = v->index.base() * 4 + line_number;
+		bool known = false;
+		for (int i = 0; i < n_seen; i++) {
+			if (seen[i] == key) { known = true; break; }
+		}
+		if (!known && n_seen < 16) {
+			seen[n_seen++] = key;
+			R3RDbgWrite("R3R-DINFO v=%d line=%d rvi=%d fe=%d eng=%d rep=%d\n",
+					(int)v->index.base(), (int)line_number, (int)rvi->railveh_type,
+					v->IsFrontEngine() ? 1 : 0, (int)v->engine_type.base(), (int)rep->engine_type.base());
+		}
+	}
+
+	auto get_speed_of = [&](const Train *u, const RailVehicleInfo *u_rvi) -> uint16_t {
+		const bool show_speed = !UsesWagonOverride(u) && (_settings_game.vehicle.wagon_speed_limits || u_rvi->railveh_type != RailVehicleType::Wagon);
+		return show_speed ? GetVehicleProperty(u, PROP_TRAIN_SPEED, u_rvi->max_speed) : 0;
 	};
+	auto get_speed = [&]() -> uint16_t { return get_speed_of(v, rvi); };
 
 	format_buffer buffer;
 	auto draw = [&]<typename... T>(StringID str, T&&... params) {
@@ -292,7 +442,7 @@ static void TrainDetailsInfoTab(const Train *v, int left, int right, int y, uint
 	};
 
 	if (rvi->railveh_type == RailVehicleType::Wagon) {
-		auto name_param = PackEngineNameDParam(v->engine_type, EngineNameContext::VehicleDetails);
+		auto name_param = PackEngineNameDParam(R3RConsistRepresentativeEngine(v), EngineNameContext::VehicleDetails);
 		uint16_t speed = get_speed();
 		if (speed > 0) {
 			draw(STR_VEHICLE_DETAILS_TRAIN_WAGON_VALUE_AND_SPEED, name_param, v->value, speed);
@@ -302,18 +452,22 @@ static void TrainDetailsInfoTab(const Train *v, int left, int right, int y, uint
 	} else {
 		switch (line_number) {
 			case 0: {
-				auto name_param = PackEngineNameDParam(v->engine_type, EngineNameContext::VehicleDetails);
-				uint16_t speed = get_speed();
+				auto name_param = PackEngineNameDParam(R3RConsistRepresentativeEngine(v), EngineNameContext::VehicleDetails);
+				/* R3R (KI-640): year / value / speed belong to the unit named on
+				 * this row, i.e. the representative unit -- not to v. */
+				uint16_t speed = get_speed_of(rep, rep_rvi);
 				if (speed > 0) {
-					draw(STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE_AND_SPEED, name_param, v->build_year, v->value, speed);
+					draw(STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE_AND_SPEED, name_param, rep->build_year, rep->value, speed);
 				} else {
-					draw(STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE, name_param, v->build_year, v->value);
+					draw(STR_VEHICLE_DETAILS_TRAIN_ENGINE_BUILT_AND_VALUE, name_param, rep->build_year, rep->value);
 				}
 				break;
 			}
 
 			case 1:
-				draw(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(v->reliability), ToPercent16(v->GetEngine()->reliability), v->breakdowns_since_last_service);
+				/* R3R (KI-640): reliability is a prototype property, so it must come
+				 * from the same prototype as the name; breakdowns stay per vehicle. */
+				draw(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, ToPercent16(rep->reliability), ToPercent16(rep->GetEngine()->reliability), v->breakdowns_since_last_service);
 				break;
 
 			case 2: {
@@ -374,6 +528,74 @@ static void TrainDetailsCapacityTab(const CargoSummaryItem *item, int left, int 
 }
 
 /**
+ * R3R (KI-640, round 450C-3 probe): after a depot reversal the capacity tab came
+ * out as "none" while weight and power stayed correct.
+ *
+ * Every display-side explanation was ruled out: whole_consist is true for such a
+ * chain (its head prototype is a nameless articulated part), so the summary in
+ * #GetCargoSummaryOfArticulatedVehicle already walks the whole physical chain and
+ * the parent unit is included. What is left is the data itself -- CCF_ARRANGE
+ * allows ConsistChangeFlag::Capacity (train.h:83), so the reversal commit points
+ * re-derive u->cargo_cap from Engine::DetermineCapacity(u) (train_cmd.cpp:614-623)
+ * while the group roles have already moved. This prints the raw per-unit state
+ * once per (head, capacity fingerprint), so the log alone decides whether the
+ * zero is display-only or a real loss of cargo capacity.
+ *
+ * Read-only.
+ */
+static void R3RDbgCargoSummary(const Train *v, const CargoSummary &summary)
+{
+	if (!R3RDbgOn()) return;
+
+	/* Fingerprint the raw capacities so redrawing an unchanged window stays
+	 * silent, while any real change (before/after the reversal) is logged once. */
+	uint32_t fp = 2166136261u;
+	uint32_t sumcap = 0;
+	uint32_t n = 0;
+	for (const Train *u = v; u != nullptr && n < 64; u = u->Next(), n++) {
+		fp = (fp ^ (uint32_t)u->engine_type.base()) * 16777619u;
+		fp = (fp ^ (uint32_t)u->cargo_cap) * 16777619u;
+		fp = (fp ^ (uint32_t)u->cargo_type) * 16777619u;
+		sumcap += u->cargo_cap;
+	}
+	uint32_t linecap = 0;
+	for (const CargoSummaryItem &item : summary) {
+		fp = (fp ^ (uint32_t)item.cargo) * 16777619u;
+		fp = (fp ^ (uint32_t)item.capacity) * 16777619u;
+		linecap += item.capacity;
+	}
+
+	static uint32_t seen[24] = {};
+	static uint32_t seen_fp[24] = {};
+	static int n_seen = 0;
+	for (int i = 0; i < n_seen; i++) {
+		if (seen[i] == v->index.base() && seen_fp[i] == fp) return;
+	}
+	if (n_seen < 24) {
+		seen[n_seen] = v->index.base();
+		seen_fp[n_seen] = fp;
+		n_seen++;
+	}
+
+	/* linecap = the number the capacity tab actually prints for this line,
+	 * sumcap = the raw sum of cargo_cap over the walked units. They differ when
+	 * a unit's prototype cannot carry cargo (CanCarryCargo() == false). */
+	R3RDbgWrite("R3R-CAPSUM head=%d n=%u sumcap=%u linecap=%u items=%u\n",
+			(int)v->index.base(), (unsigned)n, (unsigned)sumcap, (unsigned)linecap,
+			(unsigned)summary.size());
+	uint32_t i = 0;
+	for (const Train *u = v; u != nullptr && i < 64; u = u->Next(), i++) {
+		R3RDbgWrite("R3R-CAPUNIT head=%d veh=%d eng=%d cap=%u carg=%u sub=%u carry=%d role=%d%d%d\n",
+				(int)v->index.base(), (int)u->index.base(), (int)u->engine_type.base(),
+				(unsigned)u->cargo_cap, (unsigned)u->cargo_type, (unsigned)u->cargo_subtype,
+				u->GetEngine()->CanCarryCargo() ? 1 : 0,
+				u->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
+				u->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
+				u->IsArticulatedPart() ? 1 : 0);
+	}
+}
+
+/**
  * Collects the cargo transported
  * @param v Vehicle to process
  * @param summary Space for the result
@@ -381,13 +603,22 @@ static void TrainDetailsCapacityTab(const CargoSummaryItem *item, int left, int 
 static void GetCargoSummaryOfArticulatedVehicle(const Train *v, CargoSummary &summary)
 {
 	summary.clear();
-	do {
-		if (!v->GetEngine()->CanCarryCargo()) continue;
+
+	/* R3R (KI-640, 口径甲): a mixed chain head (engine role on a wagon
+	 * prototype, see R3RDetailsWholeConsistCapacity) is summarised over the
+	 * whole chain, and its callers only emit that single line. The head unit of
+	 * such a chain is a carriage -- frequently an articulated part with
+	 * cargo_cap 0 -- so the per-unit summary used to come out empty and the
+	 * capacity tab showed "none". */
+	const bool whole_consist = R3RDetailsWholeConsistCapacity(v);
+
+	auto add_unit = [&summary](const Train *u) {
+		if (!u->GetEngine()->CanCarryCargo()) return;
 
 		CargoSummaryItem new_item;
-		new_item.cargo = v->cargo_cap > 0 ? v->cargo_type : INVALID_CARGO;
-		new_item.subtype = GetCargoSubtypeText(v);
-		if (new_item.cargo == INVALID_CARGO && new_item.subtype == STR_EMPTY) continue;
+		new_item.cargo = u->cargo_cap > 0 ? u->cargo_type : INVALID_CARGO;
+		new_item.subtype = GetCargoSubtypeText(u);
+		if (new_item.cargo == INVALID_CARGO && new_item.subtype == STR_EMPTY) return;
 
 		auto item = std::ranges::find(summary, new_item);
 		if (item == std::end(summary)) {
@@ -399,10 +630,38 @@ static void GetCargoSummaryOfArticulatedVehicle(const Train *v, CargoSummary &su
 			item->source = StationID::Invalid();
 		}
 
-		item->capacity += v->cargo_cap;
-		item->amount += v->cargo.StoredCount();
-		if (item->source == StationID::Invalid()) 		item->source = v->cargo.GetFirstStation();
+		item->capacity += u->cargo_cap;
+		item->amount += u->cargo.StoredCount();
+		if (item->source == StationID::Invalid()) item->source = u->cargo.GetFirstStation();
+	};
+
+	if (whole_consist) {
+		for (const Train *u = v; u != nullptr; u = u->Next()) add_unit(u);
+		R3RDbgCargoSummary(v, summary);
+		return;
+	}
+
+	/* R3R (第 468 轮, KI-661 probe): previous rounds only dumped the
+	 * whole-consist line, so the 散链 (native articulated group) state produced
+	 * no R3R-CAP* read-out at all and "散链 2 / 成段 1" could not be decided
+	 * from the log. Dump every line of a chain that still carries real
+	 * articulated parts or R3R group roles. Read-only: nothing below changes a
+	 * single capacity value; the probe is compiled out at runtime when the
+	 * R3R probes are off. */
+	const Train *const dbg_head = v;
+	bool dbg_artic = false;
+	if (R3RDbgOn()) {
+		uint dbg_n = 0;
+		for (const Train *u = dbg_head; u != nullptr && dbg_n < 128; u = u->Next(), dbg_n++) {
+			if (u->IsArticulatedPart() || u->IsArticGroupHead()) { dbg_artic = true; break; }
+		}
+	}
+
+	do {
+		add_unit(v);
 	} while ((v = v->Next()) != nullptr && v->IsArticGroupMember());
+
+	if (dbg_artic) R3RDbgCargoSummary(dbg_head, summary);
 }
 
 /**
@@ -451,6 +710,10 @@ int GetTrainDetailsWndVScroll(VehicleID veh_id, TrainDetailsWindowTabs det_tab)
 
 			uint length = GetLengthOfArticulatedVehicle(v);
 			if (length > (uint)ScaleSpriteTrad(TRAIN_DETAILS_MAX_INDENT)) num++;
+
+			/* R3R (KI-640, 甲): a mixed head contributes exactly one line that
+			 * already covers the whole chain, mirroring DrawTrainDetails. */
+			if (R3RDetailsWholeConsistCapacity(v)) break;
 		}
 		if (det_tab == 1) num += 2 * Train::Get(veh_id)->tcache.cached_num_engines;
 	}
@@ -552,6 +815,11 @@ void DrawTrainDetails(const Train *v, const Rect &r, int vscroll_pos, uint16_t v
 				}
 				vscroll_pos--;
 			}
+
+			/* R3R (KI-640, 甲): the mixed head line already summarises the whole
+			 * chain, so the remaining units are not listed. Must match the line
+			 * count produced by GetTrainDetailsWndVScroll. */
+			if (R3RDetailsWholeConsistCapacity(v)) break;
 		}
 	} else if (det_tab == TDW_TAB_PERF) {
 		int y = r.top;

@@ -430,6 +430,8 @@ add_files(
     progress.h
     provider_manager.h
     querystring_gui.h
+    r3r_dispatch_program_gui.cpp
+    r3r_dispatch_program_gui.h
     r3r_schedule_gui.cpp
     r3r_schedule_gui.h
     rail.cpp

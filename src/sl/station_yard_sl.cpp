@@ -79,7 +79,14 @@
  *     CreateAtIndex 原样重建），但**运行期**表被释放后下标可能被别的表复用，
  *     此时条目会静默指向新表 —— 与 VehicleID 复用同一类限制，由 Prune 兜底。
  *
- * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v8/v7/v6/v5/v4/v3/v2 解码；否则按 v1 迁移（任一
+ * v9：池条目新增「分配规则」三元组（第 451 轮，KI-642）。每组从 4 个字变成
+ *     7 个字，多出的三个字是规则变量、比较符、阈值：
+ *         word   : 规则变量（R3RDispatchRuleVariable，0 = None 无条件）
+ *         word   : 比较符（R3RDispatchRuleOp，0 = >=，1 = <=）
+ *         word   : 阈值（0..65535）
+ *     读取 v8 及更早的存档时规则恒为 None（= 旧行为：任何来车都能领）。
+ *
+ * 读档：yard_a 以 MAGIC 开头 ⇒ 按 v9/v8/v7/v6/v5/v4/v3/v2 解码；否则按 v1 迁移（任一
  * v1 列表非空时构造场 1/2/3，保证旧存档里订单引用的场 ID 仍然有效）。
  *
  * 注意：本 chunk 的加载顺序与车辆池(VEHS)没有保证，因此解码阶段**绝不能**校验
@@ -93,6 +100,9 @@ static constexpr uint32_t SYRD_V5_MAGIC = 0xFFFFFF04;
 static constexpr uint32_t SYRD_V6_MAGIC = 0xFFFFFF05;
 static constexpr uint32_t SYRD_V7_MAGIC = 0xFFFFFF06;
 static constexpr uint32_t SYRD_V8_MAGIC = 0xFFFFFF07;
+static constexpr uint32_t SYRD_V9_MAGIC = 0xFFFFFF08;
+/** R3R (第 451 轮续): v10 在每个场块末尾与整站块末尾各追加一份「分配规则」程序。 */
+static constexpr uint32_t SYRD_V10_MAGIC = 0xFFFFFF09;
 
 /** R3R: 读档时对池条目数量的硬上限（防御损坏的编码，正常不超过设置上限 256）。 */
 static constexpr uint32_t SYRD_MAX_POOL_ENTRIES = 4096;
@@ -150,32 +160,92 @@ static void R3RPackPool(std::vector<TileIndex> &out, const std::vector<Station::
 		out.push_back(static_cast<TileIndex>(e.issued));
 		/* v8: 排程（OrderList 池下标 + 1，0 = 未记录）。 */
 		out.push_back(static_cast<TileIndex>(e.schedule == Station::R3R_DISPATCH_NO_SCHEDULE ? 0 : e.schedule + 1));
+		/* v9: 分配规则三元组（变量 / 比较符 / 阈值）。 */
+		out.push_back(static_cast<TileIndex>(static_cast<uint8_t>(e.rule_var)));
+		out.push_back(static_cast<TileIndex>(static_cast<uint8_t>(e.rule_op)));
+		out.push_back(static_cast<TileIndex>(e.rule_var == R3RDispatchRuleVariable::None ? 0 : static_cast<uint32_t>(std::max<int32_t>(0, e.rule_value))));
 	}
 }
 
 /** R3R: 从 SYRD word 流解出调度池，并把 \a p 推进到池块之后。
- * @param has_schedule v8+ 的池条目多一个「排程」word；更早的格式没有。 */
-static std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> R3RUnpackPool(const std::vector<TileIndex> &in, size_t &p, bool has_schedule)
+ * @param has_schedule v8+ 的池条目多一个「排程」word；更早的格式没有。
+ * @param has_rule v9+ 的池条目再多三个「分配规则」word；更早的格式没有。 */
+static std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> R3RUnpackPool(const std::vector<TileIndex> &in, size_t &p, bool has_schedule, bool has_rule)
 {
 	std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> pool;
 	if (p >= in.size()) return pool;
 	const uint32_t pc = std::min<uint32_t>(in[p++].base(), SYRD_MAX_POOL_ENTRIES);
-	const size_t words = has_schedule ? 4 : 3;
+	const size_t words = has_rule ? 7 : (has_schedule ? 4 : 3);
 	for (uint32_t k = 0; k < pc; k++) {
 		if (p + words > in.size()) break;
 		const uint32_t hw = in[p++].base();
 		const uint32_t lim = in[p++].base();
 		const uint32_t iss = in[p++].base();
 		const uint32_t sw = has_schedule ? in[p++].base() : 0;
+		uint32_t rv = 0, ro = 0, rval = 0;
+		if (has_rule) {
+			rv = in[p++].base();
+			ro = in[p++].base();
+			rval = in[p++].base();
+		}
 		Station::R3RStationYard::R3RDispatchPoolEntry e;
 		if (hw != 0) e.host = VehicleID(static_cast<uint32_t>(hw - 1));
 		/* 纯数值钳制：这里不能问车辆池/排程池（加载顺序不保证）。 */
 		e.limit = static_cast<uint16_t>(std::clamp<uint32_t>(lim == 0 ? 1 : lim, 1, 256));
 		e.issued = static_cast<uint16_t>(std::min<uint32_t>(iss, e.limit));
 		e.schedule = (sw != 0) ? static_cast<uint32_t>(sw - 1) : Station::R3R_DISPATCH_NO_SCHEDULE;
+		/* 规则字段同样是纯数值钳制：越界的变量/比较符按「无条件」处理，
+		 * 避免损坏存档把一条永远不匹配的规则钉在池里。 */
+		e.rule_var = (rv <= static_cast<uint32_t>(R3RDispatchRuleVariable::Reliability)) ? static_cast<R3RDispatchRuleVariable>(rv) : R3RDispatchRuleVariable::None;
+		e.rule_op = (ro <= static_cast<uint32_t>(R3RDispatchRuleOp::AtMost)) ? static_cast<R3RDispatchRuleOp>(ro) : R3RDispatchRuleOp::AtLeast;
+		e.rule_value = static_cast<int32_t>(std::min<uint32_t>(rval, 65535));
 		pool.push_back(e);
 	}
 	return pool;
+}
+
+/** R3R (第 451 轮续): 把一份「分配规则」程序打包进 SYRD word 流（v10）。
+ * 编码 = 条数 + 每条 3 个 word（kind/var/op/result 各占 1 字节打包成 word0，
+ * 之后是 value、extra）。 */
+static void R3RPackProgram(std::vector<TileIndex> &out, const std::vector<R3RDispatchInstruction> &program)
+{
+	out.push_back(static_cast<TileIndex>(program.size()));
+	for (const R3RDispatchInstruction &ins : program) {
+		const uint32_t packed = static_cast<uint32_t>(static_cast<uint8_t>(ins.kind)) |
+				(static_cast<uint32_t>(static_cast<uint8_t>(ins.var)) << 8) |
+				(static_cast<uint32_t>(static_cast<uint8_t>(ins.op)) << 16) |
+				(static_cast<uint32_t>(static_cast<uint8_t>(ins.result)) << 24);
+		out.push_back(static_cast<TileIndex>(packed));
+		out.push_back(static_cast<TileIndex>(ins.value));
+		out.push_back(static_cast<TileIndex>(ins.extra));
+	}
+}
+
+/** R3R: 从 SYRD word 流解出一份「分配规则」程序，并把 \a p 推进到程序之后。
+ * 纯数值钳制：越界的枚举按最保守的取值处理，截断的编码安全停止。 */
+static std::vector<R3RDispatchInstruction> R3RUnpackProgram(const std::vector<TileIndex> &in, size_t &p)
+{
+	std::vector<R3RDispatchInstruction> program;
+	if (p >= in.size()) return program;
+	const uint32_t count = std::min<uint32_t>(in[p++].base(), R3R_DISPATCH_PROGRAM_MAX);
+	program.reserve(count);
+	for (uint32_t i = 0; i < count; i++) {
+		if (p + 3 > in.size()) break;
+		const uint32_t packed = in[p++].base();
+		R3RDispatchInstruction ins;
+		ins.kind = static_cast<R3RDispatchInstructionKind>(packed & 0xFF);
+		ins.var = static_cast<R3RDispatchRuleVariable>((packed >> 8) & 0xFF);
+		ins.op = static_cast<R3RDispatchRuleOp>((packed >> 16) & 0xFF);
+		ins.result = static_cast<R3RDispatchResultKind>((packed >> 24) & 0xFF);
+		ins.value = in[p++].base();
+		ins.extra = in[p++].base();
+		if (ins.kind > R3RDispatchInstructionKind::Result) continue;
+		if (ins.var > R3RDispatchRuleVariable::EngineClass) ins.var = R3RDispatchRuleVariable::None;
+		if (ins.op > R3RDispatchRuleOp::Less) ins.op = R3RDispatchRuleOp::AtLeast;
+		if (ins.result > R3RDispatchResultKind::Deny) ins.result = R3RDispatchResultKind::Allow;
+		program.push_back(ins);
+	}
+	return program;
 }
 
 static const NamedSaveLoad _r3r_station_yard_desc[] = {
@@ -195,9 +265,9 @@ static void R3REncodeYards(Station *st)
 	st->r3r_yard_b.clear();
 	st->r3r_yard_shared.clear();
 
-	if (st->r3r_yards.empty() && st->r3r_whole_pool.empty() && !st->r3r_whole_workshop) return;
+	if (st->r3r_yards.empty() && st->r3r_whole_pool.empty() && !st->r3r_whole_workshop && st->r3r_whole_program.empty()) return;
 
-	out.push_back(static_cast<TileIndex>(SYRD_V8_MAGIC));
+	out.push_back(static_cast<TileIndex>(SYRD_V10_MAGIC));
 	out.push_back(static_cast<TileIndex>(st->r3r_yards.size() & 0xFFFF));
 	for (const Station::R3RStationYard &y : st->r3r_yards) {
 		out.push_back(static_cast<TileIndex>(y.shared_with));
@@ -207,10 +277,14 @@ static void R3REncodeYards(Station *st)
 		R3RPackPool(out, y.pool);
 		out.push_back(static_cast<TileIndex>(y.tiles.size()));
 		out.insert(out.end(), y.tiles.begin(), y.tiles.end());
+		/* v10: 本场的「分配规则」程序（追加在场块末尾，旧版本不读即忽略）。 */
+		R3RPackProgram(out, y.program);
 	}
 	/* v7: 整站块（场 ID 0 的检修所标志 + 调度池）。 */
 	out.push_back(static_cast<TileIndex>(st->r3r_whole_workshop ? SYRD_WHOLE_FLAG_WORKSHOP : 0));
 	R3RPackPool(out, st->r3r_whole_pool);
+	/* v10: 整站自己的「分配规则」程序。 */
+	R3RPackProgram(out, st->r3r_whole_program);
 }
 
 /** R3R: decode a v8..v2 yard buffer into \a st->r3r_yards. Returns false if \a in is none of them. */
@@ -218,16 +292,19 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 {
 	if (in.empty()) return false;
 	const uint32_t magic = in[0].base();
-	if (magic != SYRD_V8_MAGIC && magic != SYRD_V7_MAGIC && magic != SYRD_V6_MAGIC && magic != SYRD_V5_MAGIC && magic != SYRD_V4_MAGIC && magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
+	if (magic != SYRD_V10_MAGIC && magic != SYRD_V9_MAGIC && magic != SYRD_V8_MAGIC && magic != SYRD_V7_MAGIC && magic != SYRD_V6_MAGIC && magic != SYRD_V5_MAGIC && magic != SYRD_V4_MAGIC && magic != SYRD_V3_MAGIC && magic != SYRD_V2_MAGIC) return false;
 	const bool legacy_v2 = (magic == SYRD_V2_MAGIC);
-	const bool has_flags = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC || magic == SYRD_V4_MAGIC);
-	const bool has_names = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC);
-	const bool has_pool = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC);
-	const bool has_whole = (magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC);
-	const bool has_schedule = (magic == SYRD_V8_MAGIC);
+	const bool has_program = (magic == SYRD_V10_MAGIC);
+	const bool has_rule = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC);
+	const bool has_flags = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC || magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC || magic == SYRD_V4_MAGIC);
+	const bool has_names = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC || magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC || magic == SYRD_V5_MAGIC);
+	const bool has_pool = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC || magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC || magic == SYRD_V6_MAGIC);
+	const bool has_whole = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC || magic == SYRD_V8_MAGIC || magic == SYRD_V7_MAGIC);
+	const bool has_schedule = (magic == SYRD_V10_MAGIC || magic == SYRD_V9_MAGIC || magic == SYRD_V8_MAGIC);
 
 	st->r3r_yards.clear();
 	st->r3r_whole_pool.clear();
+	st->r3r_whole_program.clear();
 	st->r3r_whole_workshop = false;
 
 	size_t p = 1;
@@ -247,7 +324,7 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 		std::string name;
 		if (has_names) name = R3RUnpackName(in, p);
 		std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> pool;
-		if (has_pool) pool = R3RUnpackPool(in, p, has_schedule);
+		if (has_pool) pool = R3RUnpackPool(in, p, has_schedule, has_rule);
 		if (p >= in.size()) break; // 截断的编码，安全停止
 		const uint32_t m = in[p++].base();
 		Station::R3RStationYard &y = st->r3r_yards.emplace_back();
@@ -261,13 +338,16 @@ static bool R3RDecodeYards(Station *st, const std::vector<TileIndex> &in)
 		y.name = std::move(name);
 		y.pool = std::move(pool);
 		for (uint32_t i = 0; i < m && p < in.size(); i++) y.tiles.push_back(in[p++]);
+		/* v10: 本场的「分配规则」程序（老版本没有这一段，读到立即忽略）。 */
+		if (has_program) y.program = R3RUnpackProgram(in, p);
 	}
 
 	/* v7: 全部场组之后的整站块。截断的编码按「没有整站数据」处理。 */
 	if (has_whole && p < in.size()) {
 		const uint32_t whole_flags = in[p++].base();
 		st->r3r_whole_workshop = (whole_flags & SYRD_WHOLE_FLAG_WORKSHOP) != 0;
-		st->r3r_whole_pool = R3RUnpackPool(in, p, has_schedule);
+		st->r3r_whole_pool = R3RUnpackPool(in, p, has_schedule, has_rule);
+		if (has_program) st->r3r_whole_program = R3RUnpackProgram(in, p);
 	}
 
 	if (legacy_v2) {

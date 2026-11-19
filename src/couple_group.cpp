@@ -864,7 +864,8 @@ uint R3RSetSegmentGroupID(Train *v, GroupID new_g);
  * R3RNormaliseChainGroups() 一样，只逐段把第 144 轮「整链推平」停放的分组还给该段（并清空备份），
  * 再把每段内部统一到该段自己的分组 —— **绝不**把整链推平到控制段。
  *
- * 挂接分组仍是第 159 轮 / q-2=肆 的并集（OR）广播口径，未变。
+ * 挂接分组（第 433 轮 / KI-627）：口径已改为「分组属于段」—— 耦合/解挂/车库拖动/读档
+ * 都**不再**改写任何一段的挂接分组（第 159 轮 / q-2=肆 的全链并集广播已废除）。
  *
  * 与提交点版本的差别只有两点：
  *  - 面向整张地图遍历（读档时所有车辆刚建好），而不是单条链；
@@ -927,32 +928,22 @@ void R3RNormaliseChainGroupsAfterLoad()
 			s = (next != nullptr) ? Train::From(next) : nullptr;
 		}
 
-		/* 挂接分组（第 159 轮 / q-2=肆）：与 train_cmd.cpp 的 R3RNormaliseChainGroups() 同口径 ——
-		 * 取全链段头掩码的**并集（OR）**再广播回每一个段头，不再照抄控制段那一段（覆盖）。 */
-		CoupleGroupMask target = COUPLE_GROUP_MASK_NONE;
+		/* 挂接分组（第 433 轮 / KI-627，玩家口径：分组属于段）：与 train_cmd.cpp 的
+		 * R3RNormaliseChainGroups() 同口径 —— 这里**不再**做全链并集广播，每段保留自己那份。
+		 * 只留一个只读汇总，读档后可在日志里核对每段的掩码是否与存档逐字一致。 */
+		CoupleGroupMask union_mask = COUPLE_GROUP_MASK_NONE;
+		uint nseg = 0;
 		for (Train *s = t; s != nullptr; ) {
 			if (s->Previous() == nullptr || s->IsSegmentFront()) {
-				target |= R3RGetCoupleGroupsOfSegment(s);
+				union_mask |= R3RGetCoupleGroupsOfSegment(s);
+				nseg++;
 			}
 			Vehicle *next = s->Next();
 			s = (next != nullptr) ? Train::From(next) : nullptr;
 		}
-		for (Train *s = t; s != nullptr; ) {
-			if (s->Previous() == nullptr || s->IsSegmentFront()) {
-				if (R3RGetCoupleGroupsOfSegment(s) != target) {
-					R3RClearCoupleGroupsOfSegment(s);
-					for (uint i = 0; i < R3R_COUPLE_GROUP_MASK_BITS; i++) {
-						if ((target & (CoupleGroupMask(1) << i)) != 0) {
-							R3RAddCoupleGroupToSegment(s, CoupleGroupID(static_cast<uint16_t>(i)));
-						}
-					}
-					mask_fixes++;
-					R3RDbgWrite("CGRP-NORM-LOAD seg=%d mask=%llu\n", (int)s->index.base(),
-							(unsigned long long)target);
-				}
-			}
-			Vehicle *next = s->Next();
-			s = (next != nullptr) ? Train::From(next) : nullptr;
+		if (nseg > 1) {
+			R3RDbgWrite("CGRP-NORM-KEEP-LOAD head=%d nseg=%u union=%llu\n",
+					(int)t->index.base(), nseg, (unsigned long long)union_mask);
 		}
 	}
 

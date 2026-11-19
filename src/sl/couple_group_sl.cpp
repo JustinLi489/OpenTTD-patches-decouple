@@ -333,6 +333,22 @@ static void Load_R3SG()
 	if (dbg != nullptr) fclose(dbg);
 }
 
+/**
+ * R3R (第 454 轮 / KI-647): is \a ol still a live member of the OrderList pool?
+ *
+ * Pointer identity only -- the pointer handed in may already be dangling (a parked
+ * list which was destroyed while only a segment row still pointed at it, see
+ * R3RFindOrderListReferrer() in order_cmd.cpp which only looks at vehicles), so it
+ * must never be dereferenced here.
+ */
+static bool R3ROrderListIsLive(const OrderList *ol)
+{
+	for (const OrderList *live : OrderList::Iterate()) {
+		if (live == ol) return true;
+	}
+	return false;
+}
+
 static void Save_R3SG()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_segment_desc);
@@ -345,6 +361,20 @@ static void Save_R3SG()
 	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
 		R3RSegmentRecord *rec = R3RSegmentGet(static_cast<uint16_t>(id));
 		if (rec == nullptr) continue;
+		/* R3R (第 454 轮 / KI-647): the row's parked order list may already be dead --
+		 * R3RFindOrderListReferrer() only scans vehicles, so a list referenced by a
+		 * segment row alone is destroyed without anybody telling the row. Writing such
+		 * a stale pointer stores an index which no longer exists in the OrderList pool,
+		 * and the next load aborts with "Referencing invalid OrderList". Drop it here;
+		 * the parked schedule of that row is unrecoverable either way. */
+		if (rec->orders != nullptr && !R3ROrderListIsLive(rec->orders)) {
+			if (dbg != nullptr) {
+				fprintf(dbg, "SEGSAVE-DROP-ORDERS id=%u use=%d u=%u borrowed=%d reason=dangling\n",
+						(unsigned)id, rec->in_use ? 1 : 0, (unsigned)rec->unitnumber,
+						rec->orders_borrowed ? 1 : 0);
+			}
+			rec->orders = nullptr;
+		}
 		if (dbg != nullptr) {
 			fprintf(dbg, "SEGSAVE-ROW id=%u use=%d u=%u n=\"%s\" g=%d borrowed=%d orders=%d\n",
 					(unsigned)id, rec->in_use ? 1 : 0,
@@ -364,11 +394,31 @@ static void Ptrs_R3SG()
 {
 	SaveLoadTableData slt = SlPrepareNamedSaveLoadTableForPtrOrNull(_r3r_segment_desc);
 
+	/* R3R (第 454 轮 / KI-647): savegames written before this round can carry an order
+	 * list index which does not exist any more -- a parked list which was destroyed
+	 * while only a segment row still pointed at it. IntToReference() would then abort
+	 * the whole load with "Referencing invalid OrderList", i.e. the savegame becomes
+	 * unreadable forever. Clear such a value *before* the pointer pass so the file
+	 * stays loadable; every other field of that row is kept.
+	 *
+	 * The value still holds the raw "index + 1" here (see ReferenceToInt()), so the
+	 * pool ID to validate is raw - 1. */
+	FILE *dbg = R3RDbgOn() ? fopen("R3R_debug.log", "a") : nullptr;
+
 	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
 		R3RSegmentRecord *rec = R3RSegmentGet(static_cast<uint16_t>(id));
 		if (rec == nullptr) continue;
+		const size_t raw = (size_t)rec->orders;
+		if (raw != 0 && !OrderList::IsValidID(raw - 1)) {
+			if (dbg != nullptr) {
+				fprintf(dbg, "R3SG-PTR-DROP id=%u raw=%u use=%d u=%u reason=invalid-orderlist\n",
+						(unsigned)id, (unsigned)raw, rec->in_use ? 1 : 0, (unsigned)rec->unitnumber);
+			}
+			rec->orders = nullptr;
+		}
 		SlObjectPtrOrNullFiltered(rec, slt);
 	}
+	if (dbg != nullptr) fclose(dbg);
 }
 
 extern const ChunkHandler couple_group_chunk_handlers[] = {

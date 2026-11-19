@@ -570,7 +570,23 @@ protected: // These functions should not be called outside acceleration code.
 	{
 		/* R3R: de-articulated-group baked override takes precedence. 0 is a legitimate
 		 * baked value (the split consist may be unpowered), so INVALID = UINT16_MAX. */
-		if (this->power_override != UINT16_MAX) return this->power_override;
+		if (this->power_override != UINT16_MAX) {
+			/* R3R (KI-630): the "consist front reports at least 1 hp" floor at the end
+			 * of this function must also cover a baked override. A wagon-only
+			 * articulated group carries 0 total power, so promoting it to a segment
+			 * *after* de-articulating it (CmdMakeSegment -> DearticulateChainWithSnapshot)
+			 * bakes power_override = 0, and the early return used to bypass the floor:
+			 * the segment then reported 0 hp, showed STR_VEHICLE_STATUS_TRAIN_NO_POWER
+			 * and CmdStartStopVehicle refused with STR_ERROR_TRAIN_START_NO_POWER, while
+			 * the very same segment built without de-articulation reports 1 hp.
+			 * Only the 0 -> 1 floor is applied here; any real baked derating (a value
+			 * above 0) still wins. */
+			uint16_t power = this->power_override;
+			if (power == 0 && this->IsEngine() && RailVehInfo(this->engine_type)->railveh_type == RailVehicleType::Wagon) {
+				power = 1;
+			}
+			return power;
+		}
 
 		/* Power is not added for articulated parts */
 		if (!this->IsArticulatedPart() && (this->IsVirtual() || HasPowerOnRail(this->railtypes, GetRailTypeByTrackBit(this->tile, this->track)))) {

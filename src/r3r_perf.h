@@ -377,6 +377,10 @@ inline bool R3RDbgTagAllowed(const char *fmt)
 	if (n >= 7 && std::strncmp(fmt, "RESERVE", 7) == 0) return true; ///< RESERVECONSIST (per-consist reservation state)
 	if (n >= 8 && std::strncmp(fmt, "DECOUPLE", 8) == 0) return true; ///< DECOUPLE-INTERLOCK/-SEG-SKIP-REAL-ARTIC
 	if (n >= 3 && std::strncmp(fmt, "SPD", 3) == 0) return true;      ///< SPD-DROP (KI-348: who zeroed the speed)
+	/* R3R (第 455 轮, KI-653): the "buying a train pops a native NewGRF refit
+	 * warning" probe. Event-scale (only when the purchase list and the built
+	 * consist already disagree), so it cannot flood. */
+	if (n >= 3 && std::strncmp(fmt, "BUY", 3) == 0) return true;      ///< BUY-REFIT (purchase-vs-built refit mask diff)
 	/* R3R (第 371 轮, 2026-10-29, KI-534): the round-369/370 waypoint-wait probes
 	 * (WP-LOCO-WAIT / WP-EXIT / WP-WAITHOLD / WP-HANDLE / WP-WAIT-KEEP) were all
 	 * written through R3RDbgWrite and therefore swallowed right here: the 第 370 轮

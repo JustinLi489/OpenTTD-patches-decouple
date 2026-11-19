@@ -4343,7 +4343,16 @@ void StartStopVehicle(const Vehicle *v, bool texteffect)
 	/* R3R: car-only consists (free-wagon chains, no engine) cannot be started/stopped by themselves. */
 	if (v->type == VehicleType::Train && Train::From(v)->IsFreeWagon()) return;
 
-	assert(v->IsPrimaryVehicle());
+	/* R3R: callers can hold a stale reference to a vehicle which is no longer the
+	 * head of its chain — a depot list entry captured before a chain edit, or a
+	 * vehicle window whose window_number is the old chain head after a
+	 * reverse-group / couple / decouple re-order (R3R edits the chain without
+	 * rebuilding those lists, and Vehicle::PreDestructor only closes such windows
+	 * while the vehicle is still primary). Starting or stopping a mid-chain car is
+	 * not a meaningful operation, so drop the request instead of asserting:
+	 * upstream's assert(v->IsPrimaryVehicle()) here crashed the game on a stale
+	 * reference rather than on a genuine command-layer violation. */
+	if (!v->IsPrimaryVehicle()) return;
 	Command<Commands::StartStopVehicle>::Post(_vehicle_msg_translation_table[VCT_CMD_START_STOP][v->type], (texteffect && !IsHeadless()) ? CommandCallback::StartStopVehicle : CommandCallback::None, v->tile, v->index, false);
 }
 

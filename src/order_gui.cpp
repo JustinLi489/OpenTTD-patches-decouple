@@ -858,6 +858,20 @@ static std::string CoupleTempGroupLabel(const Order *order)
 }
 
 /**
+ * R3R (第 455 轮, KI-649): does this order name a temporary couple group which still exists?
+ *
+ * Only used to decide whether the order line carries the group suffix: an order whose group
+ * was deleted since is displayed exactly like one which joins none, because that is also how
+ * the game treats it (see R3RGetTempCoupleGroup()).
+ * @param order The order being displayed (may be nullptr).
+ */
+static bool R3RHasTemporaryCoupleGroup(const Order *order)
+{
+	if (order == nullptr || (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE))) return false;
+	return order->HasCoupleTempGroup() && R3RGetCoupleGroupName(order->GetCoupleTempGroup()) != nullptr;
+}
+
+/**
  * R3R (KI-170): build the couple-group drop down for a GOTO_COUPLE order.
  * R3R (KI-225): also used for a WAIT_COUPLE order, where the waiting consist
  * declares the group it offers itself to.
@@ -1140,12 +1154,15 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 					AppendStringInPlace(line, STR_ORDER_RV_DIR_NE + to_underlying(order->GetRoadVehTravelDirection()));
 				}
 			}
-			/* 第 420 轮: 两个互斥标记改在命令文本后用括号表达（与前往车库的「等待调节班次」同风格），
-			 * 订单窗口与时刻表窗口都要显示。两者互斥，故用 else if。 */
+			/* 第 420 轮: 互斥标记改在命令文本后用括号表达（与前往车库的「等待调节班次」同风格），
+			 * 订单窗口与时刻表窗口都要显示。第 455 轮加入第三个标记「到达后停止」，
+			 * 三者共用同一个下拉框、彼此互斥，故用 else if 链。 */
 			if (order->HasR3RStationSeparation()) {
 				AppendStringInPlace(line, STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX);
 			} else if (order->HasR3RWaitDispatch()) {
 				AppendStringInPlace(line, STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX);
+			} else if (order->HasR3RStopAtStation()) {
+				AppendStringInPlace(line, STR_ORDER_R3R_STOP_AT_STATION_SUFFIX);
 			}
 			break;
 		}
@@ -1517,11 +1534,19 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 			} else if (load_str != STR_ORDER_COUPLE_ANY) {
 				AppendStringInPlace(line, load_str);
 			}
+			/* R3R (第 455 轮, KI-649): name the temporary couple group on the line itself. */
+			if (R3RHasTemporaryCoupleGroup(order)) {
+				AppendStringInPlace(line, STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX, CoupleTempGroupLabel(order));
+			}
 			break;
 		}
 
 		case OT_WAIT_COUPLE:
 			AppendStringInPlace(line, STR_ORDER_WAIT_COUPLE);
+			/* R3R (第 455 轮, KI-649): a waiting order offers itself to a group too (KI-225). */
+			if (R3RHasTemporaryCoupleGroup(order)) {
+				AppendStringInPlace(line, STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX, CoupleTempGroupLabel(order));
+			}
 			break;
 
 		case OT_COUPLE_END:
@@ -3989,17 +4014,19 @@ public:
 				break;
 			}
 
-			case WID_O_R3R_SEPARATION: { // R3R (第 416 轮 / 第 420 轮): order markers of a station order
+			case WID_O_R3R_SEPARATION: { // R3R (第 416 轮 / 第 420 轮 / 第 455 轮): order markers of a station order
 				/* 第 420 轮: 主区与箭头都只展开下拉，不再在主区直接切换。
-				 * 两个标记互斥（勾一个会清另一个），再勾同一项即取消。
+				 * 第 455 轮: 加入第三个标记「到达后停止」，三者互斥（勾一个会清另外两个），
+				 * 再勾同一项即取消。
 				 * 本 fork 的 DropdownWindow 用「选中值」而不是位掩码，所以勾选态
 				 * 必须用 DropDownListCheckedItem 表达（值与 OnDropdownSelect 的
-				 * index 一一对应：0 = 调节班次，1 = 等待分配调度）。 */
+				 * index 一一对应：0 = 调节班次，1 = 等待分配调度，2 = 到达后停止）。 */
 				const Order *sep_order = this->GetOrder(this->OrderGetSel());
 				if (sep_order == nullptr || !sep_order->IsType(OT_GOTO_STATION)) break;
 				DropDownList list;
 				list.push_back(MakeDropDownListCheckedItem(sep_order->HasR3RStationSeparation(), STR_ORDER_R3R_SEPARATION, 0, false));
 				list.push_back(MakeDropDownListCheckedItem(sep_order->HasR3RWaitDispatch(), STR_ORDER_R3R_WAIT_DISPATCH, 1, false));
+				list.push_back(MakeDropDownListCheckedItem(sep_order->HasR3RStopAtStation(), STR_ORDER_R3R_STOP_AT_STATION, 2, false));
 				ShowDropDownList(this, std::move(list), -1, WID_O_R3R_SEPARATION, 0, {}, DDSF_SHARED);
 				break;
 			}
@@ -4581,19 +4608,27 @@ public:
 				}
 				break;
 
-			case WID_O_R3R_SEPARATION: { // R3R (第 416 轮 / 第 420 轮): the two markers are mutually exclusive
+			case WID_O_R3R_SEPARATION: { // R3R (第 416 轮 / 第 420 轮 / 第 455 轮): the three markers are mutually exclusive
 				const Order *o = this->GetOrder(this->OrderGetSel());
 				if (o == nullptr || !o->IsType(OT_GOTO_STATION)) break;
 				const bool has_sep = o->HasR3RStationSeparation();
 				const bool has_disp = o->HasR3RWaitDispatch();
+				const bool has_stop = o->HasR3RStopAtStation();
 				if (index == 0) {
 					const bool want = !has_sep;
 					this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STATION_SEPARATION, want ? 1 : 0);
 					if (want && has_disp) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_WAIT_DISPATCH, 0);
+					if (want && has_stop) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STOP_AT_STATION, 0);
 				} else if (index == 1) {
 					const bool want = !has_disp;
 					this->ModifyOrder(this->OrderGetSel(), MOF_R3R_WAIT_DISPATCH, want ? 1 : 0);
 					if (want && has_sep) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STATION_SEPARATION, 0);
+					if (want && has_stop) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STOP_AT_STATION, 0);
+				} else if (index == 2) {
+					const bool want = !has_stop;
+					this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STOP_AT_STATION, want ? 1 : 0);
+					if (want && has_sep) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_STATION_SEPARATION, 0);
+					if (want && has_disp) this->ModifyOrder(this->OrderGetSel(), MOF_R3R_WAIT_DISPATCH, 0);
 				}
 				break;
 			}
@@ -5729,9 +5764,9 @@ private:
 					this->SetWidgetLoweredState(WID_O_FULL_LOAD, IsFullLoadOrderLoadType(order->GetLoadType()));
 					this->SetWidgetLoweredState(WID_O_UNLOAD, order->GetUnloadType() == OrderUnloadType::Unload);
 					this->SetWidgetLoweredState(WID_O_NON_STOP, non_stop);
-					/* One menu holds both markers, so it reads as active when either is set. */
+					/* One menu holds all three markers, so it reads as active when any is set. */
 					this->SetWidgetLoweredState(WID_O_R3R_SEPARATION,
-							order->HasR3RStationSeparation() || order->HasR3RWaitDispatch());
+							order->HasR3RStationSeparation() || order->HasR3RWaitDispatch() || order->HasR3RStopAtStation());
 					break;
 				}
 
@@ -5964,6 +5999,15 @@ public:
 	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
 	{
 		if (widget == WID_O_CAPTION) return GetString(STR_R3R_SCHEDULE_EDITOR_CAPTION);
+		/* R3R (第 455 轮, KI-650): the reused widget tree only carries the orders window's static
+		 * widget strings, so a schedule without a vehicle (no owner, no current order) showed the
+		 * "none" caption in the temporary couple group dropdown whatever the selected order
+		 * joins. Fill the caption from the selected order here, exactly like the orders window. */
+		if (widget == WID_O_COUPLE_TEMP_GROUP) {
+			const Order *order = this->GetSelectedOrder();
+			if (order == nullptr || (!order->IsType(OT_GOTO_COUPLE) && !order->IsType(OT_WAIT_COUPLE))) return {};
+			return GetString(STR_ORDER_COUPLE_TEMP_GROUP_SEL, CoupleTempGroupLabel(order));
+		}
 		return this->Window::GetWidgetString(widget, stringid);
 	}
 
@@ -6152,6 +6196,7 @@ public:
 				DropDownList list;
 				list.push_back(MakeDropDownListCheckedItem(order->HasR3RStationSeparation(), STR_ORDER_R3R_SEPARATION, 0, false));
 				list.push_back(MakeDropDownListCheckedItem(order->HasR3RWaitDispatch(), STR_ORDER_R3R_WAIT_DISPATCH, 1, false));
+				list.push_back(MakeDropDownListCheckedItem(order->HasR3RStopAtStation(), STR_ORDER_R3R_STOP_AT_STATION, 2, false));
 				ShowDropDownList(this, std::move(list), -1, WID_O_R3R_SEPARATION, 0, {}, DDSF_SHARED);
 				break;
 			}
@@ -6448,9 +6493,10 @@ public:
 				const Order *order = this->GetSelectedOrder();
 				if (order == nullptr || !order->IsType(OT_GOTO_STATION)) break;
 
-				/* The separation marker and the wait-dispatch marker are mutually exclusive: set the
-				 * requested one first, then clear the other one. The second change only happens when
-				 * the first one really took effect, so a refused command cannot drop the other marker. */
+				/* The three markers (separation / wait-dispatch / stop-on-arrival) are mutually
+				 * exclusive: set the requested one first, then clear the others. The follow-up
+				 * changes only happen when the first one really took effect, so a refused command
+				 * cannot drop any marker. */
 				if (index == 0) {
 					if (order->HasR3RStationSeparation()) {
 						this->ModifySelectedOrder(MOF_R3R_STATION_SEPARATION, 0);
@@ -6459,6 +6505,10 @@ public:
 						const Order *after = this->GetSelectedOrder();
 						if (after != nullptr && after->HasR3RStationSeparation() && after->HasR3RWaitDispatch()) {
 							this->ModifySelectedOrder(MOF_R3R_WAIT_DISPATCH, 0);
+						}
+						after = this->GetSelectedOrder();
+						if (after != nullptr && after->HasR3RStationSeparation() && after->HasR3RStopAtStation()) {
+							this->ModifySelectedOrder(MOF_R3R_STOP_AT_STATION, 0);
 						}
 					}
 				} else if (index == 1) {
@@ -6469,6 +6519,24 @@ public:
 						const Order *after = this->GetSelectedOrder();
 						if (after != nullptr && after->HasR3RWaitDispatch() && after->HasR3RStationSeparation()) {
 							this->ModifySelectedOrder(MOF_R3R_STATION_SEPARATION, 0);
+						}
+						after = this->GetSelectedOrder();
+						if (after != nullptr && after->HasR3RWaitDispatch() && after->HasR3RStopAtStation()) {
+							this->ModifySelectedOrder(MOF_R3R_STOP_AT_STATION, 0);
+						}
+					}
+				} else if (index == 2) {
+					if (order->HasR3RStopAtStation()) {
+						this->ModifySelectedOrder(MOF_R3R_STOP_AT_STATION, 0);
+					} else {
+						this->ModifySelectedOrder(MOF_R3R_STOP_AT_STATION, 1);
+						const Order *after = this->GetSelectedOrder();
+						if (after != nullptr && after->HasR3RStopAtStation() && after->HasR3RStationSeparation()) {
+							this->ModifySelectedOrder(MOF_R3R_STATION_SEPARATION, 0);
+						}
+						after = this->GetSelectedOrder();
+						if (after != nullptr && after->HasR3RStopAtStation() && after->HasR3RWaitDispatch()) {
+							this->ModifySelectedOrder(MOF_R3R_WAIT_DISPATCH, 0);
 						}
 					}
 				}

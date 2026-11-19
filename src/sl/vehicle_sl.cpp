@@ -607,6 +607,31 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 		}
 	}
 
+	/* R3R（第 433 轮 / KI-628）：老存档补车厢寿命。
+	 * 本轮之前建出来的车厢（含真铰接部件、双头后节、以及由车厢升格而来的 R3R 假引擎）的
+	 * max_age 一律是 0 —— 因为上游 CmdBuildRailWagon() / AddArticulatedParts() 从不赋值，
+	 * AddRearEngineToMultiheadedTrain() 又漏复制 max_age。现在这三条建造路径都已修好，这里把
+	 * 旧车里仍为 0 的补成它自己引擎的寿命：只填 0、绝不覆盖已有值（幂等），存盘后即固化。
+	 * 引擎数据里本来就有 lifelength（默认车厢 20 年），所以补的是真实年限而不是常量。 */
+	if (part_of_load) {
+		uint migrated = 0;
+		for (Train *t : Train::IterateFrontOnly()) {
+			si_v = t;
+			for (Train *u = t; u != nullptr; u = u->Next()) {
+				if (u->max_age.base() != 0) continue;
+				if (!Engine::IsValidID(u->engine_type)) continue;
+				const CalTime::DateDelta life = Engine::Get(u->engine_type)->GetLifeLengthInDays();
+				if (life.base() == 0) continue;
+				u->max_age = life;
+				migrated++;
+			}
+		}
+		/* 标签前缀必须是 R3R-：R3RDbgTagAllowed() 的白名单只放行 RESV/UNRES/EXTEND/LOOP/
+		 * R3R-RES/SPD/WP/DUALHEAD/TTB/DEPOT/SEGID/SEGROW/LEGACY/CGRP/GRP/R3R- 诸族，
+		 * 裸 "STATS-" 会被静默丢弃（第 274/296/370 轮已三次踩坑）。 */
+		if (migrated != 0) R3RDbgWrite("R3R-STATS-MIGRATE-LOAD units=%u\n", migrated);
+	}
+
 	if (part_of_load && SlXvIsFeaturePresent(XSLFI_TEMPLATE_REPLACEMENT) && (_network_server || !_networking)) {
 		for (Train *t : Train::IterateFrontOnly()) {
 			si_v = t;
@@ -741,6 +766,7 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 				const Vehicle *tl = w->Last();
 				fprintf(dbg, "R3RDUMP idx=%d et=%u sub=%02X dir=%d tile=%d,%d xy=%d,%d tb=%02X ow=%d un=%d"
 						" FE=%d FW=%d FWG=%d ENG=%d VIRT=%d ARTH=%d ARTM=%d SEGF=%d DB=%d spd=%u"
+						" ov_w=%u ov_p=%u ov_s=%u cw=%u te=%u"
 						" | prev=%d next=%d head=%d tail=%d ord=%d co=%d\n",
 						(int)w->index.base(), (unsigned int)w->engine_type.base(), (unsigned int)w->subtype,
 						(int)w->direction, TileX(w->tile), TileY(w->tile), w->x_pos, w->y_pos, (unsigned int)wt->track,
@@ -749,6 +775,9 @@ void AfterLoadVehiclesPhase2(bool part_of_load)
 						(int)wt->IsEngine(), (int)wt->IsVirtual(), (int)wt->IsArticGroupHead(),
 						(int)wt->IsArticGroupMember(), (int)wt->IsSegmentFront(),
 						(int)wt->IsDrivingBackwards(), (unsigned int)wt->cur_speed,
+						(unsigned int)wt->weight_override, (unsigned int)wt->power_override,
+						(unsigned int)wt->max_speed_override, (unsigned int)wt->gcache.cached_weight,
+						(unsigned int)wt->gcache.cached_max_te,
 						(int)(w->Previous() != nullptr ? w->Previous()->index.base() : -1),
 						(int)(w->Next() != nullptr ? w->Next()->index.base() : -1),
 						(int)(hd != nullptr ? hd->index.base() : -1),

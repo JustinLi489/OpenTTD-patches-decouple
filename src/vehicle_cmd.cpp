@@ -860,6 +860,16 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 		 * so both ends of the segment can lead after an end swap. */
 		SetSegmentTailFakeEngine(t);
 		t->ConsistChanged(CCF_ARRANGE);
+		/* R3R (KI-630): cached_power is what the vehicle window prints and what
+		 * CmdStartStopVehicle() gates on ("no power" refusal), so log it to make
+		 * the de-articulated path checkable without reading the UI. A car-only
+		 * segment must read at least 1 hp, exactly like one upgraded without a
+		 * ctrl-click de-articulation. */
+		if (R3RDbgOn()) {
+			R3RDbgWrite("SEG-POWER head=%d caronly=%d ovr=%u power=%u\n",
+					(int)t->index.base(), R3RIsCarOnlyFormation(t) ? 1 : 0,
+					(unsigned)t->power_override, (unsigned)t->gcache.cached_power);
+		}
 		R3RDumpUpgradeDbg(t, "UPGRADE-AFTER-SPLIT");
 		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 	}

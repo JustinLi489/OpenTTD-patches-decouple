@@ -621,7 +621,31 @@ private:
 			 * （于是 130/131/132 这些**没被车底压住**的格能被订到，机车才能开进去
 			 * 贴住车底）；别人的位仍然失败，不越权。
 			 * trigger_stations=false：随机化仍在末尾统一触发一次，与改动前一致。 */
-			if (!TryReserveRailTrack(tile, TrackdirToTrack(td), false)) return false;
+			/* R3R (第 432 轮, KI-626): 上面那笔改动把"整格位预留"换成了逐格
+			 * TryReserveRailTrack()，于是这个循环**第一次真的逐格检查"这格有没有
+			 * 这条轨"**——而 `td` 只是**进入站台那一格**的 trackdir，整段平台每格
+			 * 都在复用它。IsCompatibleTrainStationTile() 只保证同站/同轴/轨型兼容，
+			 * 并不保证每格都真有入口那条轨（站台两端接不同 track 的弯道时就会不同），
+			 * 走到那种格必然触发 pbs.cpp:545 的断言（现场 tile 107,127）。
+			 *
+			 * 关键：TryReserveRailTrack() 的 Station 分支写的是**整格位**
+			 * (SetRailStationReservation)，`track` 参数在那一支一次都没被读——
+			 * 只被 545 行的断言检查。所以这里改用**该格真实存在的轨道**喂进去，
+			 * 对预留语义零影响，只是让断言拿到一个必然成立的值。 */
+			const TrackBits plat_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, ::TransportType::TRANSPORT_RAIL, 0));
+			if (plat_tracks == TRACK_BIT_NONE) return false;
+			const Track plat_track = FindFirstTrack(plat_tracks);
+			if (plat_track != TrackdirToTrack(td)) {
+				/* 只读探针：入口 track 与本站台格实际 track 不同（第 432 轮取数用，
+				 * 也为将来判断要不要改成逐格独立 track 语义留数据）。 */
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "RESV-PLAT-TRACK tile=%d,%d entry_track=%u actual_track=%u\n",
+							(int)TileX(tile), (int)TileY(tile), (unsigned)TrackdirToTrack(td), (unsigned)plat_track);
+					fclose(dbg);
+				}
+			}
+			if (!TryReserveRailTrack(tile, plat_track, false)) return false;
 			MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 			tile = TileAdd(tile, diff);
 		} while (IsCompatibleTrainStationTile(tile, start) && tile != this->origin_tile);
@@ -1161,8 +1185,22 @@ public:
 		 * 签名去重，零行为改动。 */
 		{
 			static std::map<uint32_t, uint64_t> r3r_cplres_seen;
-			const uint32_t r3r_vid = Yapf().GetVehicle()->index.base();
+			const Vehicle *const r3r_v = Yapf().GetVehicle();
+			const uint32_t r3r_vid = r3r_v->index.base();
 			const TileIndex r3r_node_tile = this->res_dest_node->GetLastTile();
+			/* R3R (第 459 轮, REG-456-E): 原来只打 origin 的坐标，看不出这个 origin
+			 * 到底是「车脚下」「目的地」还是第三处（上一段预留终点 / 站台回扫 / 站台
+			 * 末端）。玩家报的现象是车在 211,116、订单去 221,129，而订路的入口却在
+			 * 218,122 —— 只有把 origin 归到类里才能判它是哪一种。纯读。 */
+			const int r3r_vtx = (int)TileX(r3r_v->tile);
+			const int r3r_vty = (int)TileY(r3r_v->tile);
+			const int r3r_odx = (int)TileX(this->origin_tile);
+			const int r3r_ody = (int)TileY(this->origin_tile);
+			const int r3r_adx = (r3r_odx > r3r_vtx) ? (r3r_odx - r3r_vtx) : (r3r_vtx - r3r_odx);
+			const int r3r_ady = (r3r_ody > r3r_vty) ? (r3r_ody - r3r_vty) : (r3r_vty - r3r_ody);
+			const int r3r_ogap = (r3r_adx > r3r_ady) ? r3r_adx : r3r_ady;
+			const char *const r3r_osrc = (this->origin_tile == r3r_v->tile) ? "car"
+					: ((this->origin_tile == r3r_v->dest_tile) ? "dest" : "other");
 			const uint64_t r3r_cplres_sig = ((uint64_t)(uint32_t)r3r_node_tile.base() << 40)
 					^ ((uint64_t)(uint32_t)this->origin_tile.base() << 16)
 					^ ((uint64_t)(uint32_t)r3r_ntry << 8)
@@ -1173,13 +1211,16 @@ public:
 				r3r_cplres_prev = r3r_cplres_sig;
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPLRES veh=%d tick=%u origin=%d,%d destTile=%d,%d destTd=%d node=%d,%d root=%d unsafe=%d nTry=%d nOK=%d empty=%d\n",
+					fprintf(dbg, "CPLRES veh=%d tick=%u origin=%d,%d destTile=%d,%d destTd=%d node=%d,%d root=%d unsafe=%d nTry=%d nOK=%d empty=%d vTile=%d,%d vDest=%d,%d gap=%d oSrc=%s\n",
 							(int)r3r_vid, (uint)_tick_counter,
 							(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
 							(int)TileX(this->res_dest_tile), (int)TileY(this->res_dest_tile), (int)this->res_dest_td,
 							(int)TileX(r3r_node_tile), (int)TileY(r3r_node_tile),
 							(this->res_dest_node->parent == nullptr) ? 1 : 0,
-							(int)unsafe_pos, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0);
+							(int)unsafe_pos, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0,
+							r3r_vtx, r3r_vty,
+							(int)TileX(r3r_v->dest_tile), (int)TileY(r3r_v->dest_tile),
+							r3r_ogap, r3r_osrc);
 					fclose(dbg);
 				}
 			}

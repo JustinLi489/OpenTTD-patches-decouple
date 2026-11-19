@@ -901,6 +901,23 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 					 * mirrored twice, i.e. it is back to the plain chain order.
 					 * (Before this bit existed only the segment case could be set.) */
 					if (t->HasDearticulatedGroupRole() && (t->IsSegmentFlipped() != t->IsArticGroupFlipped())) {
+						/* R3R (第 435 轮, KI-631): a de-articulated section carries no
+						 * articulated-part subtype bit, so the loop above counted
+						 * `artic_after` as 0 for *every* section of the group. Swapping
+						 * (rank, 0) then collapsed the whole group onto rank 0 -- each
+						 * section asked the NewGRF for the first face, which is why
+						 * ctrl-clicking an articulated train in a depot looked like it
+						 * did nothing at all (and why the "swap the two bytes" mirror
+						 * never produced a real n-1-rank). Recount the sections that
+						 * follow v inside the same group (v itself included) so that the
+						 * byte swap below really yields the mirrored rank. */
+						uint8_t sections_from_here = 0;
+						for (const Vehicle *u = v; u != nullptr; u = u->Next()) {
+							if (u != v && !u->IsArticGroupMember()) break;
+							sections_from_here++;
+						}
+						artic_after = (sections_from_here > 0) ? sections_from_here - 1 : 0;
+
 						const uint8_t tmp = artic_before;
 						artic_before = artic_after;
 						artic_after = tmp;

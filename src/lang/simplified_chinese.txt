@@ -4009,9 +4009,14 @@ STR_ORDER_R3R_SEPARATION_TOOLTIP                                :{BLACK}让运�
 STR_ORDER_R3R_WAIT_DISPATCH                                     :等待分配
 STR_ORDER_R3R_WAIT_DISPATCH_TOOLTIP                             :{BLACK}到站后从该站场调度池领取一份班次排程, 从它的第一条命令开始执行一遍, 跑完再接着执行本排程在这条命令之后的命令
 
+# R3R:车站订单的到达后停止标记(订单窗口)
+STR_ORDER_R3R_STOP_AT_STATION                                   :到达后停止
+STR_ORDER_R3R_STOP_AT_STATION_TOOLTIP                           :{BLACK}列车进站停稳后不装卸货物 (因此不参与客货流), 不会自动继续执行下一条命令, 并被置为「已停止」, 需要你手动启动才继续. 点击后选择本标记、「等待分配调度」或「调节班次」, 三者互斥, 再次选择当前项即取消
+
 # R3R:前往车站命令后追加的括号说明(与车库订单的"等待调节班次"同风格)
 STR_ORDER_R3R_WAIT_SEPARATION_SUFFIX                            :（等待调节班次）
 STR_ORDER_R3R_WAIT_DISPATCH_SUFFIX                              :（等待分配调度）
+STR_ORDER_R3R_STOP_AT_STATION_SUFFIX                            :（到达后停止）
 
 # R3R:调度池(车站窗口)
 STR_R3R_DISPATCH_POOL_CAPTION                                   :{BLACK}调度池
@@ -4026,6 +4031,77 @@ STR_R3R_DISPATCH_POOL_DELETE_TOOLTIP                            :{BLACK}把选�
 STR_R3R_DISPATCH_POOL_SLOTS_UP                                  :{BLACK}+
 STR_R3R_DISPATCH_POOL_SLOTS_DOWN                                :{BLACK}-
 STR_R3R_DISPATCH_POOL_SLOTS_TOOLTIP                             :{BLACK}这份班次最多可同时分配给几列车
+STR_R3R_DISPATCH_RULE_SEL                                       :{BLACK}规则: {STRING}
+STR_R3R_DISPATCH_RULE_VAR_NONE                                  :{BLACK}无限制
+STR_R3R_DISPATCH_RULE_VAR_SPEED                                 :{BLACK}最高速度
+STR_R3R_DISPATCH_RULE_VAR_POWER                                 :{BLACK}功率
+STR_R3R_DISPATCH_RULE_VAR_TE                                    :{BLACK}最大牵引力
+STR_R3R_DISPATCH_RULE_VAR_RELIABILITY                           :{BLACK}可靠性
+STR_R3R_DISPATCH_RULE_TEXT_SPEED                                :{STRING} {VELOCITY}
+STR_R3R_DISPATCH_RULE_TEXT_POWER                                :{STRING} {POWER}
+STR_R3R_DISPATCH_RULE_TEXT_TE                                   :{STRING} {FORCE}
+STR_R3R_DISPATCH_RULE_TEXT_RELIABILITY                          :{STRING} {COMMA}%
+STR_R3R_DISPATCH_RULE_OP_GE                                     :{BLACK}>=
+STR_R3R_DISPATCH_RULE_OP_LE                                     :{BLACK}<=
+STR_R3R_DISPATCH_RULE_TOOLTIP                                   :{BLACK}决定哪些列车能领到这份班次：到站列车只按自身性能满足规则的才发牌，不满足就继续看下一条
+STR_R3R_DISPATCH_RULE_OP_TOOLTIP                                :{BLACK}在「不低于」与「不高于」之间切换
+STR_R3R_DISPATCH_RULE_STEP_TOOLTIP                              :{BLACK}调整阈值
+
+# R3R（第 451 轮续）：分配规则改为「每个站场一份程序」，在独立窗口中编辑。
+STR_R3R_DISPATCH_RULE_BTN                                       :{BLACK}规则...
+STR_R3R_DISPATCH_RULE_BTN_TOOLTIP                               :{BLACK}编辑本场站的分配规则程序（如果 / 否则 / 或者 / 允许 / 拒绝）
+STR_R3R_DP_CAPTION                                              :{BLACK}分配规则: {STATION} {RAW_STRING}
+STR_R3R_DP_YARD_WHOLE                                           :{BLACK}整站
+STR_R3R_DP_YARD_INDEX                                           :{BLACK}场 {NUM}
+STR_R3R_DP_INSERT_BTN                                           :{BLACK}插入
+STR_R3R_DP_INSERT_TOOLTIP                                       :{BLACK}在选中行之后插入一条新指令
+STR_R3R_DP_DELETE_BTN                                           :{BLACK}删除
+STR_R3R_DP_DELETE_TOOLTIP                                       :{BLACK}删除选中的指令
+STR_R3R_DP_CLEAR_BTN                                            :{BLACK}清空
+STR_R3R_DP_CLEAR_TOOLTIP                                        :{BLACK}清空全部指令（恢复为任何列车都能领到任意调度）
+STR_R3R_DP_INS_IF                                               :{BLACK}如果
+STR_R3R_DP_INS_OR                                               :{BLACK}或者
+STR_R3R_DP_INS_ELSE                                             :{BLACK}否则
+STR_R3R_DP_INS_ENDIF                                            :{BLACK}结束如果
+STR_R3R_DP_INS_ALLOW                                            :{BLACK}允许分配调度
+STR_R3R_DP_INS_DENY                                             :{BLACK}拒绝分配调度
+STR_R3R_DP_VAR_NONE                                             :{BLACK}总是
+STR_R3R_DP_VAR_SPEED                                            :{BLACK}最高速度
+STR_R3R_DP_VAR_POWER                                            :{BLACK}功率
+STR_R3R_DP_VAR_TE                                               :{BLACK}最大牵引力
+STR_R3R_DP_VAR_RELIABILITY                                      :{BLACK}可靠性
+STR_R3R_DP_VAR_POOL_ISSUED                                      :{BLACK}本场已发份数
+STR_R3R_DP_VAR_POOL_REMAINING                                   :{BLACK}本场剩余坑位
+STR_R3R_DP_VAR_NUM_GREEN                                        :{BLACK}前方绿灯数
+STR_R3R_DP_VAR_NUM_RED                                          :{BLACK}前方红灯数
+STR_R3R_DP_VAR_SIGNAL_STATE                                     :{BLACK}另一信号状态
+STR_R3R_DP_VAR_COUNTER                                          :{BLACK}计数器
+STR_R3R_DP_VAR_ENGINE_CLASS                                     :{BLACK}机车类型
+STR_R3R_DP_CLASS_STEAM                                          :{BLACK}蒸汽
+STR_R3R_DP_CLASS_DIESEL                                         :{BLACK}内燃
+STR_R3R_DP_CLASS_ELECTRIC                                       :{BLACK}电力
+STR_R3R_DP_CLASS_MONORAIL                                       :{BLACK}单轨
+STR_R3R_DP_CLASS_MAGLEV                                         :{BLACK}磁浮
+STR_R3R_DP_OP_AT_LEAST                                          :{BLACK}至少
+STR_R3R_DP_OP_AT_MOST                                           :{BLACK}至多
+STR_R3R_DP_OP_IS                                                :{BLACK}是
+STR_R3R_DP_OP_IS_NOT                                            :{BLACK}不是
+STR_R3R_DP_OP_EQUAL                                             :{BLACK}等于
+STR_R3R_DP_OP_NOT_EQUAL                                         :{BLACK}不等于
+STR_R3R_DP_OP_GREATER                                           :{BLACK}大于
+STR_R3R_DP_OP_LESS                                              :{BLACK}小于
+STR_R3R_DP_VALUE                                                :{BLACK}{NUM}
+STR_R3R_DP_COUNTER_SUFFIX                                       :{BLACK}#{NUM}
+STR_R3R_DP_EMPTY                                                :{BLACK}（没有指令 —— 任何列车都能领到本场的任意调度）
+STR_R3R_DP_NO_SCHEDULE                                          :{BLACK}（无调度）
+STR_R3R_DP_SCHEDULE_TOOLTIP                                     :{BLACK}该指令指向哪一份调度
+STR_R3R_DP_RESULT_ALLOW_BTN                                     :{BLACK}允许
+STR_R3R_DP_RESULT_DENY_BTN                                      :{BLACK}拒绝
+STR_R3R_DP_VAR_TOOLTIP                                          :{BLACK}条件变量
+STR_R3R_DP_OP_TOOLTIP                                           :{BLACK}在「至少」与「至多」之间切换
+STR_R3R_DP_STEP_TOOLTIP                                         :{BLACK}调整数值
+STR_R3R_DP_LIST_TOOLTIP                                         :{BLACK}程序自上而下求值；第一条命中的结果决定来领表的列车可以领取哪一份调度
+STR_R3R_DP_RESULT_KIND_TOOLTIP                                  :{BLACK}在「允许」与「拒绝」之间切换
 STR_R3R_DISPATCH_POOL_BUTTON                                    :{BLACK}调度池
 STR_R3R_DISPATCH_POOL_BUTTON_TOOLTIP                            :{BLACK}管理本站各站场的调度池: 把某列车的排程登记成可分配给到站列车的班次
 STR_R3R_DISPATCH_POOL_YARD_SEL                                  :{BLACK}场: {RAW_STRING}
@@ -4039,6 +4115,7 @@ STR_ERROR_R3R_DISPATCH_POOL_FULL                                :{WHITE}本站�
 STR_ERROR_R3R_DISPATCH_POOL_INVALID_TRAIN                       :{WHITE}该排程已不存在
 STR_ERROR_R3R_DISPATCH_POOL_NOT_SHARED                          :{WHITE}该排程属于其它公司, 且未公开
 STR_ERROR_R3R_DISPATCH_POOL_NO_SUCH_ENTRY                       :{WHITE}该班次已不在调度池中
+STR_ERROR_R3R_DISPATCH_NO_SCHEDULE                              :{WHITE}{VEHICLE} 所在的站场没有调度命令可分配
 
 # R3R: 排程池(所有排程的池)
 STR_R3R_SCHEDULE_CAPTION                                        :{BLACK}排程池
@@ -4852,6 +4929,7 @@ STR_ORDER_COUPLE_SIDE_TOOLTIP                                   :{BLACK}本车�
 STR_ORDER_COUPLE_TEMP_GROUP_SEL                                 :{BLACK}临时挂接分组: {RAW_STRING}
 STR_ORDER_COUPLE_TEMP_GROUP_NONE                                :无
 STR_ORDER_COUPLE_TEMP_GROUP_NAMED                               :分组 {NUM}
+STR_ORDER_COUPLE_TEMP_GROUP_SUFFIX                              :（挂接分组：{RAW_STRING}）
 STR_ORDER_COUPLE_TEMP_GROUP_TOOLTIP                             :{BLACK}执行这条命令期间临时加入的挂接分组：除了本段本来就有的分组，再额外拥有该分组，因此可以挂上属于它的车底；挂接成功后这个临时身份立即消失
 
 # Order bottom buttons

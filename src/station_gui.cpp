@@ -45,6 +45,7 @@
 #include "cheat_func.h"
 #include "newgrf_callbacks.h"
 #include "newgrf_cargo.h"
+#include "r3r_dispatch_program_gui.h"
 #include "core/format.hpp"
 #include "3rdparty/robin_hood/robin_hood.h"
 
@@ -3631,6 +3632,72 @@ static std::string R3RDispatchPickerLabel(const OrderList *ol)
 	return schedule + " (" + vehicle + ")";
 }
 
+/** R3R (第 451 轮, KI-642): 规则变量的名字（下拉与行内标签共用）。 */
+static StringID R3RDispatchRuleVarName(R3RDispatchRuleVariable var)
+{
+	switch (var) {
+		case R3RDispatchRuleVariable::MaxSpeed: return STR_R3R_DISPATCH_RULE_VAR_SPEED;
+		case R3RDispatchRuleVariable::Power: return STR_R3R_DISPATCH_RULE_VAR_POWER;
+		case R3RDispatchRuleVariable::MaxTractiveEffort: return STR_R3R_DISPATCH_RULE_VAR_TE;
+		case R3RDispatchRuleVariable::Reliability: return STR_R3R_DISPATCH_RULE_VAR_RELIABILITY;
+		case R3RDispatchRuleVariable::None:
+		default: return STR_R3R_DISPATCH_RULE_VAR_NONE;
+	}
+}
+
+/** R3R (KI-642): 换变量时给的默认阈值（各量级一个能让玩家少按几次的起点）。 */
+static int32_t R3RDispatchRuleDefault(R3RDispatchRuleVariable var)
+{
+	switch (var) {
+		case R3RDispatchRuleVariable::MaxSpeed: return 100;
+		case R3RDispatchRuleVariable::Power: return 1500;
+		case R3RDispatchRuleVariable::MaxTractiveEffort: return 200;
+		case R3RDispatchRuleVariable::Reliability: return 80;
+		case R3RDispatchRuleVariable::None:
+		default: return 0;
+	}
+}
+
+/** R3R (KI-642): 点一次 +/- 的步长（速度 5、功率 100、牵引力 10、可靠性 1）。 */
+static int32_t R3RDispatchRuleStep(R3RDispatchRuleVariable var)
+{
+	switch (var) {
+		case R3RDispatchRuleVariable::MaxSpeed: return 5;
+		case R3RDispatchRuleVariable::Power: return 100;
+		case R3RDispatchRuleVariable::MaxTractiveEffort: return 10;
+		case R3RDispatchRuleVariable::Reliability: return 1;
+		case R3RDispatchRuleVariable::None:
+		default: return 0;
+	}
+}
+
+/**
+ * R3R (第 451 轮, KI-642): 规则的可读文案，例如「最高速度 >= 160 km/h」。
+ *
+ * 数值单位交给游戏自己的格式符（{VELOCITY}/{POWER}/{FORCE}），因此与车库面板、
+ * 车辆详情窗同源：玩家在面板上看到的数字就是这里该填的数字。
+ */
+static std::string R3RDispatchRuleText(const Station::R3RStationYard::R3RDispatchPoolEntry &e)
+{
+	if (e.rule_var == R3RDispatchRuleVariable::None) return GetString(STR_R3R_DISPATCH_RULE_VAR_NONE);
+	const std::string op = GetString(e.rule_op == R3RDispatchRuleOp::AtMost ? STR_R3R_DISPATCH_RULE_OP_LE : STR_R3R_DISPATCH_RULE_OP_GE);
+	const uint32_t value = static_cast<uint32_t>(std::max<int32_t>(0, e.rule_value));
+	switch (e.rule_var) {
+		case R3RDispatchRuleVariable::MaxSpeed:
+			return GetString(STR_R3R_DISPATCH_RULE_TEXT_SPEED, op, PackVelocity(value, VehicleType::Train));
+		case R3RDispatchRuleVariable::Power:
+			return GetString(STR_R3R_DISPATCH_RULE_TEXT_POWER, op, value);
+		case R3RDispatchRuleVariable::MaxTractiveEffort:
+			/* 阈值按 kN 存（见 R3RDispatchClaimStats），{FORCE} 的入参是牛顿。 */
+			return GetString(STR_R3R_DISPATCH_RULE_TEXT_TE, op, static_cast<int64_t>(value) * 1000);
+		case R3RDispatchRuleVariable::Reliability:
+			return GetString(STR_R3R_DISPATCH_RULE_TEXT_RELIABILITY, op, value);
+		case R3RDispatchRuleVariable::None:
+		default:
+			return GetString(STR_R3R_DISPATCH_RULE_VAR_NONE);
+	}
+}
+
 /** R3R (第 416 轮): layout of the dispatch pool (调度池) management window. */
 static constexpr NWidgetPart _nested_station_dispatch_widgets[] = {
 	NWidget(NWID_HORIZONTAL),
@@ -3646,6 +3713,11 @@ static constexpr NWidgetPart _nested_station_dispatch_widgets[] = {
 		NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_SD_SCROLLBAR),
 	EndContainer(),
 
+	/* R3R (第 451 轮续): 规则不再逐条池条目编辑，改为一个按钮弹出独立的「分配规则程序」窗口。 */
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_RULE), SetMinimalSize(120, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_DISPATCH_RULE_BTN, STR_R3R_DISPATCH_RULE_TOOLTIP),
+	EndContainer(),
+
 	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_SD_YARD_SEL), SetMinimalSize(110, 12), SetResize(1, 0), SetFill(1, 0), SetStringTip(STR_R3R_DISPATCH_POOL_YARD_NONE, STR_R3R_YARD_SEL_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SD_ADD), SetMinimalSize(50, 12), SetStringTip(STR_R3R_DISPATCH_POOL_ADD, STR_R3R_DISPATCH_POOL_ADD_TOOLTIP),
@@ -3657,7 +3729,7 @@ static constexpr NWidgetPart _nested_station_dispatch_widgets[] = {
 };
 
 static WindowDesc _station_dispatch_desc(__FILE__, __LINE__,
-	WindowPosition::Automatic, "r3r_station_dispatch", 340, 200,
+	WindowPosition::Automatic, "r3r_station_dispatch", 340, 214,
 	WindowClass::StationDispatch, WindowClass::None,
 	{}, _nested_station_dispatch_widgets
 );
@@ -3754,6 +3826,14 @@ private:
 		this->SetDirty();
 	}
 
+	/** R3R (第 451 轮续): 打开本场（yard == 0 即整站）的「分配规则程序」编辑窗口。
+	 *  规则现在是「一个站场一份程序」，与选中的池条目无关。 */
+	void OpenRuleProgram()
+	{
+		if (!this->CanEdit()) return;
+		ShowDispatchProgramWindow(this->station_id, this->yard);
+	}
+
 	/** Confirmation callback for removing the selected entry. */
 	static void DeleteEntryCallback(Window *w, bool confirmed);
 
@@ -3813,7 +3893,10 @@ public:
 			const OrderList *const entry_orders = R3RDispatchEntryScheduleGui(e);
 			const int num_orders = (entry_orders != nullptr) ? static_cast<int>(entry_orders->GetNumOrders()) : 0;
 			const std::string schedule_name = R3RDispatchScheduleLabel(entry_orders);
-			DrawString(ir.left, ir.right, y, GetString(STR_R3R_DISPATCH_POOL_ENTRY, schedule_name, num_orders, e.issued, e.limit));
+			/* 第 451 轮续: 分配规则改为「一个场一份程序」，条目行不再跟规则文本
+			 * （程序是整场的，挂在条目行上会误导玩家以为是逐条生效的）。 */
+			const std::string line = GetString(STR_R3R_DISPATCH_POOL_ENTRY, schedule_name, num_orders, e.issued, e.limit);
+			DrawString(ir.left, ir.right, y, line);
 		}
 	}
 
@@ -3840,6 +3923,8 @@ public:
 		this->SetWidgetDisabledState(WID_SD_DELETE, !can_edit || !has_entry);
 		this->SetWidgetDisabledState(WID_SD_SLOTS_DOWN, !can_edit || !has_entry);
 		this->SetWidgetDisabledState(WID_SD_SLOTS_UP, !can_edit || !has_entry);
+		/* 第 451 轮续: 「规则」按钮打开整场（或整站）的规则程序，与有没有选中条目无关。 */
+		this->SetWidgetDisabledState(WID_SD_RULE, !can_edit);
 		this->DrawWidgets();
 	}
 
@@ -3929,6 +4014,10 @@ public:
 
 			case WID_SD_SLOTS_UP:
 				this->ChangeSlots(+1);
+				break;
+
+			case WID_SD_RULE:
+				this->OpenRuleProgram();
 				break;
 
 			default:

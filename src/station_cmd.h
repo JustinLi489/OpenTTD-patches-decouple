@@ -38,5 +38,7 @@ DEF_CMD_TUPLE_NT(Commands::RemoveR3RStationYard,           CmdR3RRemoveStationYa
 DEF_CMD_TUPLE_NT(Commands::AddR3RDispatchPoolEntry,        CmdR3RAddDispatchPoolEntry,               {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint32_t, uint16_t>)
 DEF_CMD_TUPLE_NT(Commands::RemoveR3RDispatchPoolEntry,     CmdR3RRemoveDispatchPoolEntry,            {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint16_t>)
 DEF_CMD_TUPLE_NT(Commands::SetR3RDispatchPoolLimit,        CmdR3RSetDispatchPoolLimit,               {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint16_t, uint16_t>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RDispatchPoolRule,         CmdR3RSetDispatchPoolRule,                {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, uint16_t, uint8_t, uint8_t, int32_t>)
+DEF_CMD_TUPLE_NT(Commands::SetR3RDispatchProgram,          CmdR3RSetDispatchProgram,                 {}, CommandType::OtherManagement,       CmdDataT<StationID, uint16_t, std::string>)
 
 #endif /* STATION_CMD_H */

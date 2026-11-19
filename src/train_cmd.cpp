@@ -366,6 +366,89 @@ static bool R3RLeadingEndHasDrivingCab(const Train *last)
 }
 
 /**
+ * R3R (C-2, depot reversal): which vehicle represents the consist?
+ *
+ * A real articulated vehicle is a single NewGRF object: its parent section is the
+ * first one, `Train::ConsistChanged()` derives the chain wide statics from the
+ * chain head's `engine_type`, and every following section records the parent in
+ * `gcache.first_engine` (wagon override, 2CC livery, powered-part power).
+ *
+ * A depot reversal physically reverses the group: it is de-articulated first (the
+ * roles become explicit ArticGroupHead/ArticGroupMember bits), sections keep their
+ * own `engine_type` -- a hidden articulated part prototype, which has *no name*
+ * (`info.string_id == STR_UNDEFINED`) -- and the former tail section becomes the
+ * chain head. Anchoring the consist level statics on such a head would feed the
+ * NewGRF a part where it expects the engine: the details window shows
+ * "(undefined string)", the capacity tab shows "none", and wagon override / 2CC /
+ * powered-part lookups are keyed on a prototype that has no override table.
+ *
+ * The representative is therefore the one section that is a real, named engine --
+ * for a reversed group that is the original parent, which now sits at the tail.
+ *
+ * @param head Chain head (must be the front engine / free wagon / front wagon).
+ * @return The representative engine; equals \a head whenever it is a named engine.
+ */
+static bool R3REngineHasDisplayName(EngineID engine);
+
+static Train *R3RConsistReferenceEngine(Train *head)
+{
+	/* Ordinary chains, and de-articulated groups in their natural order: the head
+	 * is a real engine with a name, so nothing changes. */
+	if (R3REngineHasDisplayName(head->engine_type)) return head;
+
+	/* C-2 reversal: look for a named engine among the group sections. Prefer an
+	 * engine prototype, fall back to any named section (a de-articulated wagon
+	 * group), and keep the head if the whole group is nameless. */
+	Train *named_section = nullptr;
+	for (Train *u = head->Next(); u != nullptr; u = u->Next()) {
+		/* R3R (KI-640, C-2): inspect this car BEFORE testing the group boundary.
+		 * The C-2 commit sets ArticGroupMember on group[0 .. n_cars-2] only
+		 * (train_cmd.cpp, SetArticGroupHead block), so the tail car of a reversed
+		 * group -- the original parent engine, i.e. exactly the car we are looking
+		 * for -- may not carry the member role at all. Breaking first silently
+		 * skipped it and handed the unnamed head back as the representative. */
+		const bool in_group = u->IsArticGroupMember();
+		if (R3REngineHasDisplayName(u->engine_type)) {
+			if (RailVehInfo(u->engine_type)->railveh_type != RailVehicleType::Wagon) return u;
+			if (named_section == nullptr) named_section = u;
+		}
+		if (!in_group) break;
+	}
+	return named_section != nullptr ? named_section : head;
+}
+
+/**
+ * R3R (KI-640, 第 447 轮): can {ENGINE} be rendered for this prototype at all?
+ *
+ * Mirrors the three fallbacks of SCC_ENGINE_NAME (src/strings.cpp): the cached
+ * custom name, the CBID_VEHICLE_NAME callback, and info.string_id. Testing
+ * info.string_id alone classified every vehicle of a GRF that names its engines
+ * through the name callback as "nameless", which turned the representative-engine
+ * lookup into a no-op -- the details window stayed "(undefined string)" although
+ * the parent engine was right there on the chain.
+ *
+ * @param engine Prototype to test.
+ * @return True if {ENGINE} can produce a real name for it.
+ */
+static bool R3REngineHasDisplayName(EngineID engine)
+{
+	const Engine *e = Engine::Get(engine);
+	/* Fallback 1: a cached (custom) name, only used while the engine is enabled. */
+	if (!e->name.empty() && e->IsEnabled()) return true;
+
+	/* Fallbacks 2+3, 4th attempt (2026-11-15): run {ENGINE} for real instead of
+	 * guessing from callback_mask. A hidden NewGRF articulated-part prototype may
+	 * register CBID_VEHICLE_NAME and still return no usable name; SCC_ENGINE_NAME
+	 * then falls through to info.string_id == STR_UNDEFINED and the window renders
+	 * "(undefined string)". Testing the callback bit alone therefore reported
+	 * "named" for exactly the prototypes that cannot render a name, which made
+	 * both the gcache reference engine and the details-window lookup early-return
+	 * as no-ops -- the three earlier "fixes" could never change anything. */
+	const std::string rendered = GetString(STR_ENGINE_NAME, PackEngineNameDParam(engine, EngineNameContext::VehicleDetails));
+	return !rendered.empty() && rendered != GetString(STR_UNDEFINED);
+}
+
+/**
  * Recalculates the cached stuff of a train. Should be called each time a vehicle is added
  * to/removed from the chain, and when the game is loaded.
  * Note: this needs to be called too for 'wagon chains' (in the depot, without an engine)
@@ -377,8 +460,13 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 
 	dbg_assert(this->IsFrontEngine() || this->IsFreeWagon() || this->IsFrontWagon());
 
-	const RailVehicleInfo *rvi_v = RailVehInfo(this->engine_type);
-	EngineID first_engine = this->IsFrontEngine() ? this->engine_type : EngineID::Invalid();
+	/* R3R (C-2): keep the chain level statics on the representative engine (the
+	 * articulated parent role) instead of blindly on the chain head, which may be
+	 * a section after a depot reversal. Identical to the old anchor for ordinary
+	 * chains, and for de-articulated groups in their natural order. */
+	const Train *const r3r_ref_engine = R3RConsistReferenceEngine(this);
+	const RailVehicleInfo *rvi_v = RailVehInfo(r3r_ref_engine->engine_type);
+	EngineID first_engine = this->IsFrontEngine() ? r3r_ref_engine->engine_type : EngineID::Invalid();
 	this->gcache.cached_total_length = 0;
 	this->compatible_railtypes = {};
 	this->tcache.cached_num_engines = 0;
@@ -420,7 +508,18 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 		u->gcache.first_engine = this == u ? EngineID::Invalid() : first_engine;
 		u->railtypes = rvi_u->railtypes;
 
-		if (u->IsEngine()) first_engine = u->engine_type;
+		/* R3R (C-2): a de-articulated section is an engine by *role* only; its
+		 * prototype is a hidden articulated part, which must never become the
+		 * "first engine" for the vehicles behind it (wagon override, 2CC livery and
+		 * powered-part power all use gcache.first_engine). Keep the representative
+		 * engine, i.e. restore the value the sections saw before the group was
+		 * reversed. Only reachable when the head itself is such a hidden part, so
+		 * every ordinary chain keeps its values byte for byte. */
+		if (u->IsEngine()) {
+			first_engine = (r3r_ref_engine != this && u->engine_type != r3r_ref_engine->engine_type &&
+					!R3REngineHasDisplayName(u->engine_type))
+					? r3r_ref_engine->engine_type : u->engine_type;
+		}
 
 		/* Set user defined data to its default value */
 		u->tcache.user_def_data = rvi_u->user_def_data;
@@ -513,6 +612,89 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 			}
 		}
 		uint16_t new_cap = e_u->DetermineCapacity(u);
+		/* R3R (第 468 轮, KI-661): read-only probe for the "0 capacity loco" defect.
+		 * The player's verdict is that this train must carry NOTHING (capacity 0),
+		 * while the chain reads 2 before the de-articulation and 1 after it. To pick
+		 * the right place for the clamp we need the *source* of each figure, so this
+		 * dumps, per vehicle of the consist: the callback result ("cb", what
+		 * DetermineCapacity() just returned), the value currently stored ("old"), the
+		 * refit capacity, the raw GRF property ("prop"), plus the identity bits that
+		 * decide which branch of the KI-641/KI-656 adjudication runs. Pure logging:
+		 * nothing below reads these values, and the whole block is behind R3RDbgOn()
+		 * so a release build with probes off pays nothing. Capped at 400 lines.
+		 *
+		 * The tag is "R3R-CAPCB", not "CAP-CB": R3RDbgWrite() runs every format
+		 * string through R3RDbgTagAllowed() (src\r3r_perf.h:322-405), a first-token
+		 * prefix whitelist whose only catch-all is the "R3R-" prefix. The first
+		 * version of this probe used "CAP-CB" and was therefore swallowed in
+		 * silence -- the 2026-11-19 re-run produced a log with the probe compiled
+		 * in (the literal is in the exe) and not a single line out. That is the
+		 * fifth time this trap fires, so: check a new tag against that predicate
+		 * before trusting a zero count. The same rename is applied to the round-458
+		 * "CAP-MEMBER-ZERO" line below, which was never visible for this reason
+		 * either -- "no CAP-MEMBER-ZERO in the log" up to now proved nothing. */
+		if (R3RDbgOn() && (u->IsArticGroupMember() || u->IsArticulatedPart())) {
+			static unsigned r3r_capcb_lines = 0;
+			if (r3r_capcb_lines < 400) {
+				r3r_capcb_lines++;
+				R3RDbgWrite("R3R-CAPCB head=%d veh=%d cb=%u old=%u rcap=%u prop=%u ct=%u eng=%d rvt=%d art=%d ah=%d am=%d\n",
+						(int)this->index.base(), (int)u->index.base(), (unsigned)new_cap,
+						(unsigned)u->cargo_cap, (unsigned)u->refit_cap,
+						(unsigned)RailVehInfo(u->engine_type)->capacity, (unsigned)u->cargo_type,
+						u->IsEngine() ? 1 : 0, (int)RailVehInfo(u->engine_type)->railveh_type,
+						u->IsArticulatedPart() ? 1 : 0, u->IsArticGroupHead() ? 1 : 0,
+						u->IsArticGroupMember() ? 1 : 0);
+			}
+		}
+		/* R3R (KI-641): a de-articulated group member keeps the capacity it had while
+		 * it was still the articulated parent. The NewGRF capacity callback sees the
+		 * role change and returns 0 for the former parent, which made the capacity
+		 * tab show "none" after a C-2 reversal while the same train showed its real
+		 * capacity before it. Only a destructive 0 is blocked: a legal new value
+		 * (refit) is still written as before. */
+		if (u->IsArticGroupMember() && !u->IsArticGroupHead()) {
+			/* R3R (KI-656, round 458): inside a de-articulated group only the group
+			 * head carries capacity. The members are the former articulated parts and
+			 * the head's figure already includes what they used to contribute, so
+			 * letting each member keep a figure of its own made the consist total
+			 * (train_gui sums every vehicle of the chain) bigger than it was before
+			 * the split. That surplus is a real loading limit -- cargo_cap is what the
+			 * loader checks -- so it is a defect, not a display artefact.
+			 * Chain order guarantees the head is written before its members, so a
+			 * non-zero head means the group is already covered. If the head itself
+			 * fell back to 0, the members stay at 0 as well (2026-11-19, KI-661: the
+			 * KI-641 rescue used to resurrect their old figures here, which is exactly
+			 * the surplus this defect was about). */
+			const Train *ghead = u->Previous();
+			while (ghead != nullptr && ghead->IsArticGroupMember() && !ghead->IsArticGroupHead()) ghead = ghead->Previous();
+			if (ghead != nullptr && ghead->IsArticGroupHead() && ghead->cargo_cap > 0) {
+				if (new_cap != 0 && u->cargo_cap > 0) {
+					R3RDbgWrite("R3R-CAPMEMBERZERO veh=%d head=%d cap=%u->0 cb=%u\n",
+							(int)u->index.base(), (int)ghead->index.base(),
+							(unsigned)u->cargo_cap, (unsigned)new_cap);
+				}
+				new_cap = 0;
+			} else if (new_cap == 0 && u->cargo_cap > 0) {
+				/* R3R (2026-11-19, KI-661): the KI-641 rescue that used to run here
+				 * (`new_cap = u->cargo_cap`) has been removed. The 2026-11-19 probe run
+				 * proved that DetermineCapacity() returns 0 for every member in this
+				 * state, so the non-zero figures on the capacity tab were nothing but
+				 * stale values the rescue kept recycling (2 before the de-articulation,
+				 * 1 after it) -- and the player's verdict is that this train carries
+				 * nothing at all. Keeping a figure the engine itself refuses to compute
+				 * also meant R3R disagreed with vanilla JGRPP, which shows 0 here.
+				 * If a NewGRF genuinely wants a member to carry cargo it must say so via
+				 * its capacity callback (a non-zero `new_cap`), which is written below
+				 * unchanged. Probe only: new_cap stays 0 either way. */
+				static unsigned r3r_capdrop_lines = 0;
+				if (R3RDbgOn() && r3r_capdrop_lines < 200) {
+					r3r_capdrop_lines++;
+					R3RDbgWrite("R3R-CAPDROP veh=%d head=%d cap=%u->0 cb=%u\n",
+							(int)u->index.base(), (int)this->index.base(),
+							(unsigned)u->cargo_cap, (unsigned)new_cap);
+				}
+			}
+		}
 		if (allowed_changes.Test(ConsistChangeFlag::Capacity)) {
 			/* Update vehicle capacity. */
 			if (u->cargo_cap > new_cap) u->cargo.Truncate(new_cap);
@@ -552,6 +734,28 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	}
 	SetBit(last_vis_effect->vcache.cached_veh_flags, VCF_LAST_VISUAL_EFFECT);
 
+	if (r3r_ref_engine != this) {
+		/* Only reversed groups take a reference engine other than the chain head;
+		 * log once per (head, parent) pair so this cannot spam the debug log. */
+		static std::unordered_map<uint32_t, bool> _r3r_c2_ref_logged;
+		const uint32_t c2_key = (uint32_t)this->index.base() * 65536u + (uint32_t)r3r_ref_engine->index.base();
+		if (!_r3r_c2_ref_logged[c2_key]) {
+			_r3r_c2_ref_logged[c2_key] = true;
+			/* Tag renamed from "C2-REF" to "R3R-C2REF": R3RDbgTagAllowed() in
+			 * r3r_perf.h only lets a line through when its first token is a known
+			 * prefix or starts with "R3R-", so the old tag was silently swallowed
+			 * and "no C2-REF lines" proved nothing. */
+			R3RDbgWrite("R3R-C2REF head=%d ref=%d refEng=%d refType=%d powWag=%u n=%u db=%d headNm=%d refNm=%d\n",
+					(int)this->index.base(), (int)r3r_ref_engine->index.base(),
+					(int)r3r_ref_engine->engine_type.base(),
+					(int)RailVehInfo(r3r_ref_engine->engine_type)->railveh_type,
+					(unsigned)RailVehInfo(r3r_ref_engine->engine_type)->pow_wag_power,
+					(unsigned)this->gcache.cached_power, (int)driving_backwards,
+					R3REngineHasDisplayName(this->engine_type) ? 1 : 0,
+					R3REngineHasDisplayName(r3r_ref_engine->engine_type) ? 1 : 0);
+		}
+	}
+
 	/* store consist weight/max speed in cache */
 	this->vcache.cached_max_speed = max_speed;
 	this->tcache.cached_tflags |= (train_can_tilt ? TCF_TILT : TCF_NONE) | (speed_varies_by_railtype ? TCF_SPD_RAILTYPE : TCF_NONE);
@@ -586,6 +790,32 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 
 	/* recalculate cached weights and power too (we do this *after* the rest, so it is known which wagons are powered and need extra weight added) */
 	this->CargoChanged();
+
+	/* R3R (KI-641): a de-articulated group must result in the same tractive effort
+	 * as the real articulated group it came from. CalculatePower() adds
+	 * weight * GetTractiveEffort() per powered unit, but only the parent prototype
+	 * carries a tractive effort; after a C-2 reversal the sections are independent
+	 * engines and the parent is merely a group member, so only the parent's own
+	 * share was counted (the field reading went 25 -> 7). The real group counted
+	 * the whole group weight against the parent coefficient, so restore exactly
+	 * that. Healthy chains have no group roles and are left untouched. */
+	{
+		bool has_group_role = false;
+		for (const Train *u = this; u != nullptr; u = u->Next()) {
+			if (u->IsArticGroupHead() || u->IsArticGroupMember()) {
+				has_group_role = true;
+				break;
+			}
+		}
+		if (has_group_role) {
+			const Train *const r3r_ref = R3RConsistReferenceEngine(this);
+			const uint32_t r3r_te = r3r_ref->GetTractiveEffort();
+			if (r3r_te > 0) {
+				const uint64_t r3r_max_te = static_cast<uint64_t>(this->gcache.cached_weight) * r3r_te * GROUND_ACCELERATION / 256;
+				this->gcache.cached_max_te = static_cast<uint32_t>(std::min<uint64_t>(r3r_max_te, UINT32_MAX));
+			}
+		}
+	}
 
 	this->UpdateAcceleration();
 	if (this->IsFrontEngine()) {
@@ -2152,6 +2382,11 @@ static CommandCost CmdBuildRailWagon(TileIndex tile, DoCommandFlags flags, const
 		v->date_of_last_service = EconTime::CurDate();
 		v->date_of_last_service_newgrf = CalTime::CurDate();
 		v->build_year = CalTime::CurYear();
+		/* R3R（第 433 轮 / KI-628）：车厢也有使用寿命 —— 上游建造车厢时漏了这个赋值（机车在
+		 * CmdBuildRailVehicle 里有 v->max_age = e->GetLifeLengthInDays()），于是车厢与纯车底段的
+		 * max_age 恒为 0、界面显示"寿命 0 年"。引擎数据里本来就带 lifelength（默认车厢 20 年，
+		 * 会被 NewGRF 与"车辆延寿"设置修正），所以这里照机车的口径补上。 */
+		v->max_age = e->GetLifeLengthInDays();
 		v->sprite_seq.Set(SPR_IMG_QUERY);
 		v->random_bits = Random();
 
@@ -2422,6 +2657,32 @@ bool R3RIsCarOnlyFormation(const Train *v)
 }
 
 /**
+ * R3R (KI-630): does this chain hold any genuine traction of its own?
+ *
+ * A chain whose head is a car-only formation may still contain a real locomotive
+ * or a powered wagon further down (the formation was dragged in front of it by a
+ * depot edit, or the couple path put it there). Such a chain must keep driving,
+ * so the car-only "park it" gate in TrainLocoHandler may only engage when this
+ * returns false.
+ *
+ * This replaces the old `gcache.cached_power == 0` test: since KI-630 a car-only
+ * front reports a 1 hp floor even when its baked power_override is 0, so cached
+ * power is no longer a proxy for "no real locomotive anywhere in this chain".
+ * @param consist Chain head (nullptr allowed).
+ * @return True when a real engine or a powered wagon is present.
+ */
+static bool R3RChainHasRealTraction(const Train *consist)
+{
+	for (const Train *u = consist; u != nullptr; u = u->Next()) {
+		/* A real locomotive / railcar: an engine whose rail vehicle type is not Wagon. */
+		if (u->IsEngine() && RailVehInfo(u->engine_type)->railveh_type != RailVehicleType::Wagon) return true;
+		/* A powered wagon (pow_wag_power != 0, flagged by ConsistChanged). */
+		if (u->flags.Test(VehicleRailFlag::PoweredWagon)) return true;
+	}
+	return false;
+}
+
+/**
  * R3R (2026-09-30, R170-A): does this chain hold at least one *genuine*
  * articulated part?
  *
@@ -2653,6 +2914,172 @@ static void R3RDearticulateLegacyArticSegment(Train *head)
 	head->ConsistChanged(CCF_SAVELOAD);
 	R3RDbgWrite("LEGACY-ARTIC-DEARTIC head=%d n=%u (load migration, round 180 option C)\n",
 			(int)head->index.base(), n);
+}
+
+/**
+ * R3R (第 463 轮): override-free ("record") statistics of one vehicle of a
+ * de-articulated group.
+ *
+ * These three helpers re-derive exactly what R3RDearticulateOneGroup() would have
+ * baked, but from the vehicle record instead of from the live, already-baked
+ * fields -- i.e. they mirror the non-override branch of Train::GetWeightWithoutCargo()
+ * and Train::GetPower().
+ *
+ * Why a de-articulated group must be re-baked from the *head* record: while the
+ * group is still genuine, GroundVehicle::CargoChanged() spreads only the head's
+ * record weight over GetEnginePartsCount() vehicles, and Train::GetPower() returns
+ * 0 for every articulated part, so the whole group's statistics are exactly
+ * "the head's record values". After the split those fields are carried per vehicle
+ * by weight_override / power_override / max_speed_override.
+ *
+ * @param v Vehicle of the group.
+ * @return Record weight (without cargo) that this vehicle would contribute.
+ */
+static uint16_t R3RArticBaseWeight(const Train *v)
+{
+	uint16_t weight = 0;
+	if (!v->IsArticulatedPart()) {
+		weight = GetVehicleProperty(v, PROP_TRAIN_WEIGHT, RailVehInfo(v->engine_type)->weight);
+	}
+	if (v->flags.Test(VehicleRailFlag::PoweredWagon)) {
+		weight += RailVehInfo(v->gcache.first_engine)->pow_wag_weight;
+	}
+	return weight;
+}
+
+/** R3R (第 463 轮): see R3RArticBaseWeight(). */
+static uint16_t R3RArticBasePower(const Train *v)
+{
+	if (v->IsArticulatedPart()) return 0;
+
+	uint16_t power = GetVehicleProperty(v, PROP_TRAIN_POWER, RailVehInfo(v->engine_type)->power);
+	if (v->IsMultiheaded()) power /= 2;
+	if (v->IsEngine() && RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon) {
+		power = std::max<uint16_t>(power, 1);
+	}
+	return power;
+}
+
+/**
+ * R3R (第 463 轮, KI-660): re-bake de-articulated groups whose baked statistics are
+ * missing from the savegame.
+ *
+ * Symptom this heals: a segment (3-car articulated unit promoted to ★) reports
+ * 3x weight and 3x power after a load, while the very same unit as a loose chain
+ * (散链, still genuine artic) reports the correct values. Root cause: the baked
+ * overrides are the *only* thing that keeps the split group at 1x. Without them
+ * every former part falls back to its own GRF record -- and those records carry the
+ * whole-unit values, because the engine normally ignores them
+ * (GetWeightWithoutCargo() skips articulated parts, GetPower() returns 0 for them).
+ * Three vehicles each contributing the full unit value = 3x.
+ *
+ * The three override fields are saved from SLV_R3R_ARTIC_OVERRIDE onwards, so a
+ * savegame written by an older exe (or a group that never went through
+ * R3RDearticulateOneGroup()) reads back with all of them at UINT16_MAX.
+ *
+ * Only a group whose overrides are *entirely* absent is re-baked: a group that has
+ * them is authoritative and is left untouched, which makes this idempotent across
+ * any number of save/load cycles. Load-time only (the caller is reached solely from
+ * AfterLoadVehiclesPhase2()), so live consist-editing is unaffected.
+ *
+ * @param head Chain head (nullptr allowed).
+ */
+static void R3RNormaliseArticGroupBakes(Train *head)
+{
+	if (head == nullptr) return;
+
+	bool changed = false;
+	Train *v = head;
+	while (v != nullptr) {
+		if (!v->IsArticGroupHead()) {
+			v = v->Next();
+			continue;
+		}
+
+		/* The group is the head plus its contiguous members. */
+		uint n = 1;
+		Train *nxt = v->Next();
+		for (; nxt != nullptr && nxt->IsArticGroupMember(); nxt = nxt->Next()) n++;
+
+		/* R3R (第 467 轮, KI-662): a *genuine* articulated group (parent plus
+		 * GVSF_ARTICULATED_PART members, i.e. never de-articulated) must never be
+		 * baked. Baking it makes CargoChanged() split an already-split head weight
+		 * a second time (185 -> 63 -> 21), so the whole unit ends up at 1/3 weight
+		 * and 1/3 tractive effort -- the "散链 report 1/3" symptom. The ★/⊗ role
+		 * bits which gate this function also sit on such groups since round 463, so
+		 * the role test alone cannot tell the two kinds apart; the subtype bit can
+		 * (R3RDearticulateOneGroup() clears GVSF_ARTICULATED_PART on every member). */
+		bool real_artic = false;
+		for (const Train *q = v; q != nxt; q = q->Next()) {
+			if (q->IsArticulatedPart()) {
+				real_artic = true;
+				break;
+			}
+		}
+		if (real_artic) {
+			/* Heal a group an older exe already baked: drop the three fields so
+			 * GetWeightWithoutCargo()/GetPower()/GetDisplayMaxSpeed() fall back to
+			 * the records and the genuine artic rules apply again. Safe by
+			 * construction: a de-articulated group has no artic part at all, so it
+			 * can never reach this branch with a legitimate bake. */
+			bool had_bake = false;
+			for (Train *q = v; q != nxt; q = q->Next()) {
+				if (q->weight_override != UINT16_MAX || q->power_override != UINT16_MAX || q->max_speed_override != UINT16_MAX) had_bake = true;
+				q->weight_override = UINT16_MAX;
+				q->power_override = UINT16_MAX;
+				q->max_speed_override = UINT16_MAX;
+			}
+			if (had_bake) {
+				R3RDbgWrite("ARTIC-BAKE-HEAL head=%d n=%u (stale bake on a genuine artic group cleared)\n",
+						(int)v->index.base(), n);
+				changed = true;
+			} else {
+				R3RDbgWrite("ARTIC-BAKE-SKIP head=%d n=%u reason=real-artic-parts\n",
+						(int)v->index.base(), n);
+			}
+			v = nxt;
+			continue;
+		}
+
+		/* A baked group always has at least the head's override set (see
+		 * R3RDearticulateOneGroup()). Anything else means the values never made it
+		 * into the savegame, so rebuild them from the records. */
+		bool baked = false;
+		for (const Train *q = v; q != nxt; q = q->Next()) {
+			if (q->weight_override != UINT16_MAX || q->power_override != UINT16_MAX) {
+				baked = true;
+				break;
+			}
+		}
+		if (baked) {
+			v = nxt;
+			continue;
+		}
+
+		const uint16_t total_weight = R3RArticBaseWeight(v);
+		const uint16_t total_power = R3RArticBasePower(v);
+		const uint16_t max_speed = GetVehicleProperty(v, PROP_TRAIN_SPEED, RailVehInfo(v->engine_type)->max_speed);
+		const uint16_t w_q = total_weight / n;
+		const uint16_t w_r = total_weight % n;
+		const uint16_t p_q = total_power / n;
+		const uint16_t p_r = total_power % n;
+
+		v->weight_override = w_q + w_r;
+		v->power_override = p_q + p_r;
+		v->max_speed_override = max_speed;
+		for (Train *q = v->Next(); q != nxt; q = q->Next()) {
+			q->weight_override = w_q;
+			q->power_override = p_q;
+			q->max_speed_override = max_speed;
+		}
+
+		R3RDbgWrite("ARTIC-BAKE-NORMALISE head=%d n=%u w=%u p=%u spd=%u (overrides missing in savegame)\n",
+				(int)v->index.base(), n, total_weight, total_power, max_speed);
+		changed = true;
+		v = nxt;
+	}
+
+	if (changed) head->ConsistChanged(CCF_SAVELOAD);
 }
 
 /**
@@ -3347,6 +3774,10 @@ static void AddRearEngineToMultiheadedTrain(Train *v)
 	u->engine_type = v->engine_type;
 	u->reliability = v->reliability;
 	u->reliability_spd_dec = v->reliability_spd_dec;
+	/* R3R（第 433 轮 / KI-629）：双头后节也是机车，寿命必须与前节一致。上游只复制了可靠性、
+	 * 服役日期与建造年份，漏了 max_age ⇒ 后节 max_age 恒为 0，一旦它成为界面/段头显示的
+	 * 那一节，玩家就会看到"机车寿命从 30 年变成 0 年"。 */
+	u->max_age = v->max_age;
 	u->date_of_last_service = v->date_of_last_service;
 	u->date_of_last_service_newgrf = v->date_of_last_service_newgrf;
 	u->build_year = v->build_year;
@@ -3895,8 +4326,74 @@ static void R3RCheckTtSync(const Vehicle *v, const char *tag)
 	fclose(dbg);
 }
 
+/* --- KI-629 (第 433 轮): statistics invariant guard ------------------------
+ * 现场（第 433 轮）：机车寿命显示 "30 年 -> 0 年"，纯车底段寿命显示 0（= 上限）。
+ * 已确认上游建造路径从不写 max_age（CmdBuildRailWagon 漏、AddArticulatedParts 清零、
+ * AddRearEngineToMultiheadedTrain 漏复制），本轮的修法在那三处 + 读档迁移。
+ * 但是「编排把已有机车的 max_age 改成 0」这条嫌疑还不能靠读代码排除干净，所以在
+ * ArrangeTrains() 这个「车辆在链之间搬家」的唯一入口上加一条硬不变式：
+ * 进函数时快照每节的 age / max_age / reliability / reliability_spd_dec，出函数时
+ * 核对；任何一格变了就打 R3R-STATS-DRIFT 并当场还原。
+ *
+ * 为什么快照而不是「只允许某几种变化」：ArrangeTrains 只搬运链序，从不该碰这四
+ * 个字段；「不变」才是它该有的行为，所以任何漂移都是缺陷。
+ * 标签前缀必须是 R3R-：裸 "STATS-" 不在 R3RDbgTagAllowed() 白名单里，会被静默丢弃
+ * （第 274/296/370 轮已三次踩坑，0 条不等于没触发）。
+ * 只读（除还原外）：只在探针开启时工作，probe-free 版行为与上游一致。 */
+struct R3RStatSnap {
+	int32_t age;
+	int32_t max_age;
+	uint16_t reliability;
+	uint16_t reliability_spd_dec;
+};
+
+static void R3RSnapshotChainStats(const Train *head, std::map<uint32_t, R3RStatSnap> &out)
+{
+	for (const Train *u = head; u != nullptr; ) {
+		out.emplace(u->index.base(), R3RStatSnap{ u->age.base(), u->max_age.base(),
+				u->reliability, u->reliability_spd_dec });
+		const Vehicle *next = u->Next();
+		u = (next != nullptr) ? Train::From(next) : nullptr;
+	}
+}
+
+static void R3RVerifyChainStats(const char *tag, Train *head_a, Train *head_b,
+		const std::map<uint32_t, R3RStatSnap> &before)
+{
+	if (before.empty()) return;
+	for (Train *head : { head_a, head_b }) {
+		for (Train *u = head; u != nullptr; ) {
+			const auto it = before.find(u->index.base());
+			if (it != before.end()) {
+				const R3RStatSnap &s = it->second;
+				if (u->age.base() != s.age || u->max_age.base() != s.max_age ||
+						u->reliability != s.reliability ||
+						u->reliability_spd_dec != s.reliability_spd_dec) {
+					R3RDbgWrite("R3R-STATS-DRIFT %s veh=%d age=%d->%d maxage=%d->%d rel=%u->%u dec=%u->%u eng=%u\n",
+							tag, (int)u->index.base(), (int)s.age, (int)u->age.base(),
+							(int)s.max_age, (int)u->max_age.base(),
+							(uint)s.reliability, (uint)u->reliability,
+							(uint)s.reliability_spd_dec, (uint)u->reliability_spd_dec,
+							(uint)u->engine_type.base());
+					u->age = CalTime::DateDelta(s.age);
+					u->max_age = CalTime::DateDelta(s.max_age);
+					u->reliability = s.reliability;
+					u->reliability_spd_dec = s.reliability_spd_dec;
+				}
+			}
+			Vehicle *next = u->Next();
+			u = (next != nullptr) ? Train::From(next) : nullptr;
+		}
+	}
+}
+
 static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train *src, bool move_chain)
 {
+	std::map<uint32_t, R3RStatSnap> stat_before;
+	if (R3RDbgOn()) {
+		R3RSnapshotChainStats(*src_head, stat_before);
+		R3RSnapshotChainStats(*dst_head, stat_before);
+	}
 	{
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
@@ -3955,6 +4452,8 @@ static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train 
 		if (dbg != nullptr) { fprintf(dbg, "ARRANGE-NDH-DONE\n"); fclose(dbg); }
 	}
 
+	/* KI-629: 链序搬运不该碰任何一节车的统计量；变了就报告并还原。 */
+	if (!stat_before.empty()) R3RVerifyChainStats("arrange", *src_head, *dst_head, stat_before);
 }
 
 /**
@@ -5701,6 +6200,11 @@ static void ReverseTrainDirection(Train *consist)
  * @param reverse_single_veh if true, reverse a unit in a train (needs to be in a depot)
  * @return the cost of this operation or an error
  */
+/* R3R (第 436 轮, KI-632): defined further down; the depot "flip single unit"
+ * command needs both of them when a genuine articulated group is reversed. */
+static void R3RMoveSegmentOwner(Train *from, Train *to);
+static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by_flip, bool name_follows_chain = false);
+
 CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, bool reverse_single_veh)
 {
 	Train *v = Train::GetIfValid(veh_id);
@@ -5712,12 +6216,14 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 	if (reverse_single_veh) {
 		/* turn a single unit around */
 
-		/* R3R (第 391 轮, KI-558): an articulated group is flipped as a *unit*
-		 * instead of being refused. Upstream refuses the whole vehicle when the
-		 * engine has the ArticEngine callback, because a single Flipped bit on
-		 * the parent cannot flip the sections that follow it. We split the group
-		 * into real vehicles (each with its own Flipped bit) and flip all of
-		 * them; the group marker keeps NewGRF var 0x4D on the pre-flip face.
+		/* R3R (第 391 轮, KI-558; 第 436 轮, KI-632 改为方案 A): an articulated
+		 * group is flipped as a *unit* instead of being refused. Upstream refuses
+		 * the whole vehicle when the engine has the ArticEngine callback, because
+		 * a single Flipped bit on the parent cannot flip the sections that follow
+		 * it. We split the group into real vehicles and then reverse the group's
+		 * chain order plus each section's direction, so that the engine order,
+		 * the cached lengths, NewGRF var 0x4D and the sprites all change together
+		 * (a GRF that derives lengths from static engine properties follows too).
 		 * A multiheaded engine is still refused: its two halves are a different
 		 * kind of unit (see VehicleRailFlag::FakeDualHead / IsDualHeadRear). */
 		if (v->IsMultiheaded()) {
@@ -5731,6 +6237,10 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 		}
 
 		if (flags.Test(DoCommandFlag::Execute)) {
+			/* R3R (第 443 轮 / KI-638/639): 只有链头真的换人时才需要重建 GUI 列表
+			 * —— 普通单节翻 Flipped、组夹在链中间(链头没动)都不必让整个列表重扫。 */
+			bool head_changed = false;
+
 			/* Walk back to the head (parent) of the articulated group. Works for
 			 * both forms: a genuine part derives the member role from its subtype
 			 * bit, a de-articulated one carries the explicit role flag. */
@@ -5748,42 +6258,242 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 
 			/* An articulated group is more than one section. */
 			const bool is_group = group_head->Next() != nullptr && group_head->Next()->IsArticGroupMember();
-			/* Only a genuine (subtype-bit) group has to be de-articulated first. */
-			const bool real_artic = group_head->Next() != nullptr && group_head->Next()->IsArticulatedPart();
-
 			if (!is_group) {
 				/* Plain single unit: exactly the upstream behaviour. */
 				v->flags.Flip(VehicleRailFlag::Flipped);
 			} else {
-				if (real_artic) {
-					/* Split *only this* group. DearticulateChainWithSnapshot() would
-					 * rewrite every other articulated group of the chain as well,
-					 * which a purely cosmetic flip must not do. */
-					R3RDearticulateOneGroup(group_head);
-				}
-
-				/* Flip every section of the group (and mirror its in-group rank).
-				 * The chain order itself is untouched: the mirror is what keeps
-				 * the NewGRF faces in their pre-flip order. */
-				uint n_flipped = 0;
+				/* R3R (第 441 轮, KI-636): 玩家拍板 **C-2 库内物理反序**。
+				 *
+				 * 需求原话："车库内的列车摆放，总是固定一端朝前，另一端固定朝后。
+				 * 表现为总是有：前-铰接1-铰接2-铰接3-后。但实际上我需要能够有
+				 * 前-铰接3-铰接2-铰接1-后。这里的反转不仅是物理上的，也是逻辑上的。
+				 * 只不过，我们的 primary_vehicle 永远是最朝前的车厢"。
+				 *
+				 * 前几轮为什么"点了没反应"（备忘 §19.10 的三条硬证据）：
+				 *  - depot 行由 DrawTrainImage() 按**链序**逐节累加 px 绘制，全程
+				 *    不读 x_pos/y_pos/bounds ⇒ 只交换位置（第 439/440 轮）视觉恒为零；
+				 *  - 库内车 VehState::Hidden，世界视口不画，位置改了也看不到；
+				 *  - 库内 ConsistChanged(CCF_ARRANGE) 用 DepotDirection 把每节
+				 *    direction 抹平，唯一还活着的视觉通道只有 Flipped（sprite 镜像）。
+				 * ⇒ 可见通道只有两条：①链序 ②sprite。C-2 就是两条一起打：
+				 *  ① 真 artic 组先打散（父车必须排在部件之前，反序会破坏不变式）；
+				 *  ② 位置沿轨道轴镜像（depot 不读，但开出库/进世界视口要自洽）；
+				 *  ③ 链序逆序重接（depot 行里唯一能看见"顺序变了"的通道）；
+				 *  ④ 逐节翻 Flipped + SegmentFlipped（每节自己也转过来）；
+				 *  ⑤ 列车身份跟着"最朝前"的那节迁移（primary_vehicle 的要求）；
+				 *  ⑥ 段边界 ★/⊗ 随组边界镜像；⑦ 包围盒 / 视口刷新。
+				 *
+				 * 打散是单向的：这组从此变成"打散组"（ArticGroupHead/Member +
+				 * 烘焙的重量/功率/速度），与克隆路径同款，真 artic 的 GRF 父子
+				 * 回调（0x4D）不再成立 —— KI-632 同源代价。
+				 * 逆序是自逆操作，连点两次必然回到原样。 */
+				/* 组成员：真 artic 部件与已打散组的成员都要收。真 artic 部件
+				 * *不带* ArticGroupMember 角色位，只判角色位时真 artic 组的
+				 * group 永远只有 1 节 —— 这也是前几轮"点了没反应"的一半原因。 */
+				std::vector<Train *> group;
 				for (Train *w = group_head; w != nullptr; w = w->Next()) {
-					if (w != group_head && !w->IsArticGroupMember()) break;
-					w->flags.Flip(VehicleRailFlag::Flipped);
-					w->FlipArticGroupFlipped();
-					n_flipped++;
+					if (w != group_head && !w->IsArticGroupMember() && !w->IsArticulatedPart()) break;
+					group.push_back(w);
+				}
+				const size_t n_cars = group.size();
+				uint n_flipped = 0;
+
+				/* ① 真 artic 组先打散：父车必须先于部件这条不变式使"反序"无法
+				 * 直接做。打散只改 subtype / 角色位与统计烘焙，不删车也不改链序，
+				 * 故 group 里的指针全部继续有效。 */
+				const bool had_real_artic = group_head->GetNextArticulatedPart() != nullptr;
+				if (had_real_artic) R3RDearticulateOneGroup(group_head);
+
+				Train *const old_head = group_head;
+				Train *const new_head = group[n_cars - 1];
+				Train *const before = old_head->Previous();
+				Train *const after = new_head->Next();
+
+				/* Chain position of the group, counted from the chain head. */
+				int start = 0;
+				for (const Train *w = front; w != old_head; w = w->Next()) start++;
+				const int end = start + (int)n_cars - 1;
+
+				/* ② 位置沿轨道轴镜像：新序第 i 位取旧序第 n-1-i 位的位置。
+				 * depot 行不读位置（备忘 §19.10），这一步纯粹为物理自洽。 */
+				for (size_t i = 0; i < n_cars / 2; i++) {
+					Train *wa = group[i];
+					Train *wb = group[n_cars - 1 - i];
+					std::swap(wa->x_pos, wb->x_pos);
+					std::swap(wa->y_pos, wb->y_pos);
+					std::swap(wa->tile, wb->tile);
+					std::swap(wa->track, wb->track);
+					std::swap(wa->z_pos, wb->z_pos);
 				}
 
-				R3RDbgWrite("ARTIC-FLIP head=%d n=%u real_artic=%d flipped=%d seg=%d\n",
-						(int)group_head->index.base(), n_flipped, real_artic ? 1 : 0,
-						group_head->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
-						group_head->IsSegmentFlipped() ? 1 : 0);
+				/* ③ 链序逆序重接。Vehicle::previous 是 private，且新链头还要
+				 * 同步 OTTD_UPPER_TAGGED_PTR 的"非链头"位标记，所以清 previous
+				 * 只能借原前驱的 SetNext(nullptr)（与 R3RFlipChainBySegments
+				 * 第 3 步同一手法）。 */
+				Train *prev = before;
+				for (size_t k = n_cars; k-- > 0;) {
+					Train *w = group[k];
+					if (prev != nullptr) {
+						prev->SetNext(w);
+					} else if (w->Previous() != nullptr) {
+						w->Previous()->SetNext(nullptr);
+					}
+					prev = w;
+				}
+				prev->SetNext(after);
+
+				/* SetNext() 里的 first/last 维护取的是**调用方**的 first，倒序
+				 * 重接时新链头的 first 还指着旧链头，会沿着每一步传播成错值，
+				 * 于是整链 first/last 显式重刷一遍（否则 First()/Last() 全错）。 */
+				Train *const chain_first = (before != nullptr) ? before->First() : new_head;
+				Train *chain_last = chain_first;
+				while (chain_last->Next() != nullptr) chain_last = chain_last->Next();
+				for (Train *w = chain_first; w != nullptr; w = w->Next()) {
+					w->SetFirst(chain_first);
+					w->SetLast(chain_last);
+				}
+
+				/* ④ 逐节翻 Flipped：链序反了之后每节自己也要转过来，
+				 * "链序反转 + sprite 镜像"合起来才是整组沿轨道中轴的镜像（=真
+				 * 掉头）。只做一半就是第 440 轮首版的双重/半重镜像症状（KI-635）。
+				 * SegmentFlipped 是同一个镜像量的 GRF 侧副本：链序反转必然改变
+				 * 段内/组内名次，翻它一次让 0x40/0x41/0x4D 继续按翻转前的名次取图
+				 * （newgrf_engine.cpp 侧按 SegmentFlipped 与 ArticGroupFlipped
+				 * 的 XOR 判镜像，故这里只翻前者，翻两个等于没翻）。 */
+				for (Train *w : group) {
+					w->flags.Flip(VehicleRailFlag::Flipped);
+					w->FlipSegmentFlipped();
+				}
+
+				/* ⑤ 列车身份跟着"最朝前的车厢"走 —— 玩家口径：primary_vehicle
+				 * 永远是最朝前的那节。只有组首就是链头（before == nullptr）时
+				 * 链头才会换人；组夹在链中间时链头没变，identity 一律不动。 */
+				/* R3R (第 443 轮 / KI-638): vehstatus 的 Stopped 位只有链头在维护,
+				 * 链内车厢是 0。链头换人后新链头带着 0 位 ⇒ depot 列表把它画成
+				 * "运行中"(玩家报的"停着的列车变成了启动的")。随身份把停止状态一起
+				 * 搬过去;不用无条件 Set,免得将来出现非库内调用点时把真运行标成停。 */
+				const bool old_was_stopped = old_head->vehstatus.Test(VehState::Stopped);
+				if (before == nullptr) {
+					if (old_head->IsFrontEngine()) {
+						const bool old_was_car_only = R3RIsCarOnlyFormation(old_head);
+						/* 新链头得先具备引擎身份：R3RRelocateFrontIdentity 内部
+						 * 的 NormaliseSubtypes() 有 assert(chain->IsEngine())。
+						 * 这里刻意不调 R3RCreateCarOnlyFormation()：它内部会再跑
+						 * 一次 ConsistChanged()，而此刻新旧两个链头都还带着 front
+						 * 位，没必要在一个编辑中间插入一次整链重算。 */
+						if (!new_head->IsEngine()) {
+							new_head->SetEngine();
+							new_head->ClearWagon();
+							new_head->ClearFreeWagon();
+							new_head->SetFrontEngine();
+						}
+						/* 第三参 owner_moved_by_flip=false：这里不是"翻转把车主
+						 * 搬到新链头"，而是链序整体反序导致最朝前的车厢换人，
+						 * 身份照搬（含 orders 与索引），与折叠修正的翻转头同款。
+						 * 第四参 name_follows_chain=true：名字不属于"身份数据已在
+						 * 别处搬过"的那一半，必须跟着身份留在新链头上，否则
+						 * 玩家看到的就是默认名（KI-639）。 */
+						R3RRelocateFrontIdentity(old_head, new_head, false, true);
+						if (old_was_car_only) {
+							/* 旧假引擎头降为链内普通车厢。刻意不调
+							 * R3RDestroyCarOnlyFormation()：它会 SetFreeWagon 并
+							 * 清段右边界，那是"整条链退回自由车厢"的语义，用在
+							 * 链内车上会破坏 NormaliseSubtypes 的不变式。 */
+							old_head->ClearFrontEngine();
+							old_head->ClearEngine();
+							old_head->SetWagon();
+						}
+					} else {
+						/* 纯自由车厢链（FreeWagon 头）：链头换人，只需把链头
+						 * 身份位挪到新头，没有列车级身份要迁移。 */
+						NormaliseSubtypes(new_head);
+					}
+					front = new_head;
+					head_changed = true;
+					if (old_was_stopped) {
+						new_head->vehstatus.Set(VehState::Stopped);
+					} else {
+						new_head->vehstatus.Reset(VehState::Stopped);
+					}
+					/* 旧链头降为链内车,停止位不再由它维护 —— 留在身上会让它将来
+					 * 重新成为链头时带着一个陈旧的"已停"状态(与链内车恒为 0 的
+					 * 约定不符)。 */
+					old_head->vehstatus.Reset(VehState::Stopped);
+				}
+
+				/* ⑥ 段边界标记 ★/⊗ 随组边界镜像：反序后组首变组尾、组尾变组首，
+				 * 两个边界位必须跟着换车，否则段划分会整体平移一格。 */
+				{
+					const bool seg_front = old_head->IsSegmentFront();
+					const bool seg_back = new_head->IsSegmentBack();
+					if (seg_front) {
+						old_head->ClearSegmentFront();
+						new_head->SetSegmentFront();
+					}
+					if (seg_back) {
+						new_head->ClearSegmentBack();
+						old_head->SetSegmentBack();
+					}
+				}
+
+				/* 组角色位按新链序重设：新组首 = 原组尾。打散组靠这两个位识别
+				 * 父子（GRF 0x4D 名次也按它走），反序后不重设会指到错误的车。 */
+				for (Train *w : group) {
+					w->ClearArticGroupHead();
+					w->ClearArticGroupMember();
+				}
+				new_head->SetArticGroupHead();
+				for (size_t i = 0; i + 1 < n_cars; i++) group[i]->SetArticGroupMember();
+
+				for (Train *w : group) {
+					/* 位置变了，包围盒的 offset 必须逐车重算并标脏，否则贴图与
+					 * 点击框会停在旧位（同 KI-214 的 UpdateDeltaXY 自洽修）。 */
+					w->UpdateDeltaXY();
+					if (w->IsDrawn()) w->Vehicle::UpdateViewport(true);
+					if (w->flags.Test(VehicleRailFlag::Flipped)) n_flipped++;
+					/* 只读探针：让玩家/我们一眼看出"位置真的换了、包围盒跟着换了"。
+					 * bO=origin bE=extent bOf=offset（均为像素，相对 tile 原点）。 */
+					R3RDbgWrite("ARTIC-FLIP-CAR idx=%d x=%d y=%d len=%u flip=%d db=%d bO=(%d,%d) bE=(%d,%d) bOf=(%d,%d)\n",
+							(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
+							(uint)w->gcache.cached_veh_length,
+							w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
+							w->IsDrivingBackwards() ? 1 : 0,
+							(int)w->bounds.origin.x, (int)w->bounds.origin.y,
+							(int)w->bounds.extent.x, (int)w->bounds.extent.y,
+							(int)w->bounds.offset.x, (int)w->bounds.offset.y);
+				}
+
+				/* 名次/镜像/链序全变了，NewGRF 侧按名次缓存的图象必须整体作废。 */
+				new_head->InvalidateNewGRFCacheOfChain();
+
+				R3RDbgWrite("ARTIC-FLIP head=%d n=%u span=%d..%d primary=%d flipped=%u real=%d old=%d new=%d move=%d\n",
+						(int)front->index.base(), (uint)group.size(), start, end,
+						(int)front->IsPrimaryVehicle(), n_flipped,
+						had_real_artic ? 1 : 0,
+						(int)old_head->index.base(), (int)new_head->index.base(),
+						before == nullptr ? 1 : 0);
 			}
 
 			front->ConsistChanged(CCF_ARRANGE);
-			SetWindowDirty(WindowClass::VehicleDepot, front->tile.base());
+			/* R3R (第 443 轮 / KI-638/639): 只重绘不够 —— depot 列表的
+			 * vehicle_list/wagon_list 与车辆列表的 vehgroups 都是构建那一刻的
+			 * VehicleID 快照。C-2 把链头从 old_head 换到 new_head 之后,快照项
+			 * 仍指向已降级为链内车的旧链头:depot 行按旧车画预览/车号,点击被
+			 * ShowVehicle 的 First()!=自身 挡掉,而车辆列表点开详情得到的是
+			 * 链内车(gcache 不是链头口径、运行费用只从该节往后算、名字为空)
+			 * ⇒ 玩家报的"各项显示异常"。必须走 InvalidateData 让
+			 * OnInvalidateData 重建列表(DepotWindow 无条件 generate_list=true;
+			 * BaseVehicleListWindow 在 data==0 时 ForceRebuild)。
+			 * 车辆列表侧用 InvalidateVehicleListWindows(与库内其它编辑路径同款),
+			 * 除车辆/车队/分组列表外还顺带失效 TraceRestrictSlots 与 DepartureBoard
+			 * —— 链头换了车,这些窗口里挂着的 VehicleID 也会一起变陈旧。
+			 * 只在链头真换人时做:组夹在链中间时列表项仍指向合法的链头。 */
+			if (head_changed) {
+				InvalidateWindowData(WindowClass::VehicleDepot, front->tile.base());
+				InvalidateVehicleListWindows(VehicleType::Train);
+			}
 			SetWindowDirty(WindowClass::VehicleDetails, front->index);
 			SetWindowDirty(WindowClass::VehicleView, front->index);
-			DirtyVehicleListWindowForVehicle(front);
 		}
 	} else {
 		/* turn the whole train around */
@@ -7426,6 +8136,16 @@ void R3RRebuildCouplePriorities(Train *chain)
 	 * no-op for every consist which does not carry that illegal combination. */
 	R3RDearticulateLegacyArticSegment(chain);
 
+	/* R3R (第 463 轮, KI-660): the baked per-vehicle statistics of a de-articulated
+	 * group are not derived from anything -- they are the only thing keeping the
+	 * split group at 1x. A savegame written before SLV_R3R_ARTIC_OVERRIDE (or a group
+	 * that never went through R3RDearticulateOneGroup()) reads back with all of them
+	 * at UINT16_MAX, and then every former part falls back to its own GRF record,
+	 * which carries the whole-unit value => weight and power show 3x. Rebuild the
+	 * missing values from the head record here, at the same single load-time entry as
+	 * the legacy ★/⊗ migration above. */
+	R3RNormaliseArticGroupBakes(chain);
+
 	/* R3R (第 191 轮 probe, read-only): 读档重建的**入口**快照 —— 此时段 ID / 段行
 	 * 都还是存档里读回来的原样（本函数随后才 R3RSettleChainSegments 重收），与
 	 * tag="load" 的那一条配对使用即可看出"读档过程本身有没有改坏号/名"：
@@ -7612,6 +8332,38 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		chain->r3r_follow_owner = (pool_host != nullptr) ? pool_host->index : VehicleID::Invalid();
 		chain->r3r_follow_pool = true;
 		chain->r3r_orders_borrowed = true;
+		/* R3R (第 457 轮 / KI-658 已修): 上面"活索引一个字都不动"的前提是错的，
+		 * 与 own 分支 KI-472 记的是同一条教训 —— 借用期被推进的恰恰是活字段
+		 * （ProcessOrders / IncrementImplicitOrderIndex 直接写 v->cur_*_index），
+		 * 它此刻是**耦合方那张表**的坐标，可能远超池表条数。
+		 *
+		 * 崩溃现场（build\R3R_debug.log，2026-11-18 21:35）：
+		 *   :10930 ORD-RETURN-TO-POOL veh=3 pool=1 real=5 impl=5
+		 *   :11052 ORD-IDX-WATCH ... n=12->5 ord=...A347F0->...A32500 impl=4->5
+		 *   :11066 ORDIDX-OOB site=process-orders-bad ... impl=5 num=5
+		 * 即：耦合期在 12 条表里跑到 5，切回 5 条的池表后索引原样留着 ⇒
+		 * `5 < 5` 为假 ⇒ order_cmd.cpp 的 ProcessOrders 断言。
+		 *
+		 * 坐标取自书签（orders_backup_*）：耦合借用一律 refresh=false，且被
+		 * R3RRefreshOrderBookmark() 的守卫挡住，所以它仍是"上池表时跑到哪"。
+		 * 书签缺失或已越界（池表被删短/重建）则落 0 —— 宁可从头跑，不能留越界值。 */
+		{
+			const uint num = pool->GetNumOrders();
+			const VehicleOrderID real_old = chain->cur_real_order_index;
+			const VehicleOrderID impl_old = chain->cur_implicit_order_index;
+			VehicleOrderID real = chain->orders_backup_real_index;
+			VehicleOrderID impl = chain->orders_backup_implicit_index;
+			if (num == 0 || real == INVALID_VEH_ORDER_ID || real >= num) real = 0;
+			if (num == 0 || impl == INVALID_VEH_ORDER_ID || impl >= num) impl = 0;
+			chain->cur_real_order_index = real;
+			chain->cur_implicit_order_index = impl;
+			chain->cur_timetable_order_index = real;
+			R3RDbgWrite("ORD-RETURN-TO-POOL-CLAMP veh=%d num=%u real=%d->%d impl=%d->%d bk=%d/%d\n",
+					(int)chain->index.base(), (unsigned)num,
+					(int)real_old, (int)real, (int)impl_old, (int)impl,
+					(int)chain->orders_backup_real_index, (int)chain->orders_backup_implicit_index);
+			chain->DeleteUnreachedImplicitOrders();
+		}
 		/* 驱动表换了（耦合方表 → 池表），订单窗口/车辆列表得跟着刷新 ——
 		 * 与下面常规归还路径同一口径（本函数末尾的 InvalidateVehicleOrder）。 */
 		InvalidateVehicleOrder(chain, 0);
@@ -7703,17 +8455,34 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		keep_bk_real = own_real;
 		keep_bk_impl = own_impl;
 	} else if (chain->orders_backup != nullptr) {
-		/* R3R (第 297 轮 / KI-472 探针, 只读): 从备份还原索引——全流程里唯一
-		 * "直接赋值、不做任何界校验"的隐式索引写入点。备份时的订单表与此刻
-		 * 的表可能条数不同（备份后表被删过、被重建过、被段重建换过），一旦
-		 * backup_implicit_index >= 当前条数，这里就把越界值写进活字段。
-		 * 紧随其后的 DeleteUnreachedImplicitOrders 自带环绕保护，但那是
-		 * 入口之后的事，救不了已经写进去的值。 */
+		/* R3R (第 297 轮 / KI-472 探针；第 456 轮 / KI-654 已修): 从备份还原索引
+		 * ——全流程里唯一"直接赋值、不做任何界校验"的隐式索引写入点。备份时的
+		 * 订单表与此刻的表可能条数不同（备份后表被删短/被重建/被段重建换过），
+		 * 一旦 backup_implicit_index >= 当前条数，旧代码就把越界值写进活字段。
+		 * 紧随其后的 DeleteUnreachedImplicitOrders 救不了：它入口处
+		 * GetOrder(cur_implicit_order_index) 返回 nullptr 就整段跳过，不做纠正，
+		 * 于是越界值一路带到 ProcessOrders 的
+		 * "cur_implicit_order_index < GetNumOrders()" 断言（崩溃现场 veh=3）。
+		 * 修法与上面 own 分支同构：按恢复出来那张表的实际条数归一化。 */
 		R3RWatchOrderIndex(chain, "backup-restore-in");
 		chain->orders = chain->orders_backup;
-		chain->cur_real_order_index = chain->orders_backup_real_index;
-		chain->cur_implicit_order_index = chain->orders_backup_implicit_index;
-		chain->cur_timetable_order_index = chain->cur_real_order_index;
+		{
+			const uint num = chain->orders->GetNumOrders();
+			VehicleOrderID real = chain->orders_backup_real_index;
+			VehicleOrderID impl = chain->orders_backup_implicit_index;
+			const VehicleOrderID real_old = real;
+			const VehicleOrderID impl_old = impl;
+			if (num == 0 || real == INVALID_VEH_ORDER_ID || real >= num) real = 0;
+			if (num == 0 || impl == INVALID_VEH_ORDER_ID || impl >= num) impl = 0;
+			if (real != real_old || impl != impl_old) {
+				R3RDbgWrite("ORD-RETURN-BK-CLAMP veh=%d num=%u real=%d->%d impl=%d->%d\n",
+						(int)chain->index.base(), (unsigned)num,
+						(int)real_old, (int)real, (int)impl_old, (int)impl);
+			}
+			chain->cur_real_order_index = real;
+			chain->cur_implicit_order_index = impl;
+			chain->cur_timetable_order_index = real;
+		}
 		chain->DeleteUnreachedImplicitOrders();
 		R3RWatchOrderIndex(chain, "backup-restore-out");
 	} else if (orphan) {
@@ -7739,6 +8508,10 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 
 /** R3R: 只是探针节流：同一条列车"没坑位"只喊一次。 */
 static std::set<uint32_t> _r3r_dispatch_no_slot;
+
+/** R3R (第 455 轮, KI-651): 「池空」提示的节流。玩家拍板 B-455-4 —— 每列车只弹
+ * 一次，之后无论它在同一站场等多久都不再刷屏（补日程后照常领到即可，无需回滚）。 */
+static std::set<uint32_t> _r3r_dispatch_empty_notified;
 
 /** R3R: 列车此刻是否真的停在给定车站的站台/站场格上。 */
 static bool R3RTrainParkedAtStation(const Train *v, StationID st)
@@ -7797,17 +8570,55 @@ static void TrainDispatchHandler(Train *v)
 
 	const OrderList *const own_orders = v->GetEffectiveOrders();
 	const uint32_t except_schedule = (own_orders != nullptr) ? own_orders->index.base() : Station::R3R_DISPATCH_NO_SCHEDULE;
+
+	/* R3R (第 451 轮, KI-642): 池条目的分配规则用**这列来车自己的性能**求值
+	 * （第 412 轮 C-8 口径）。取整链缓存值：速度/功率/牵引力/可靠性都是
+	 * ConsistChanged() 写在本链链头（也就是 v）上的整列口径，和车库面板显示
+	 * 的数字是同一份，不会出现「面板上够、领不到」的错位。
+	 * 单位口径（与规则阈值的存储单位一致）：
+	 *   速度 = kmh-ish（GetDisplayMaxSpeed，列车上就是面板数字）、功率 = hp（cached_power）、
+	 *   牵引力 = kN（cached_max_te 是牛顿，除 1000）、可靠性 = %。 */
+	R3RDispatchClaimStats claim_stats;
+	claim_stats.max_speed = static_cast<uint32_t>(std::max<int>(0, v->GetDisplayMaxSpeed()));
+	claim_stats.power = v->gcache.cached_power;
+	claim_stats.max_te = v->gcache.cached_max_te / 1000;
+	claim_stats.reliability = v->reliability;
+	/* R3R (第 455 轮, KI-652): 机车类型。和 ConsistChanged 取「代表引擎」同一口径 ——
+	 * 链头可能是段首车厢（假引擎），此时真正代表这列车的原型在链内别处。 */
+	claim_stats.engine_class = static_cast<uint8_t>(RailVehInfo(R3RConsistReferenceEngine(v)->engine_type)->engclass);
+	claim_stats.valid = true;
+
 	uint32_t schedule = Station::R3R_DISPATCH_NO_SCHEDULE;
-	if (st->R3RDispatchPoolPick(yard, except_schedule, schedule) < 0) {
-		/* 没坑位：原地等。节流到每列车一次，避免每 tick 刷屏。 */
+	const int picked = st->R3RDispatchPoolPick(yard, except_schedule, schedule, &claim_stats);
+	if (picked < 0) {
+		/* 没得领：坑位已满，或本车性能不满足所有条目的分配规则（第 451 轮）。
+		 * 两种都按「原地等」处理。节流到每列车一次，避免每 tick 刷屏。 */
 		if (_r3r_dispatch_no_slot.insert(v->index.base()).second) {
 			R3RDbgWrite("DISP-POOL-WAIT veh=%d st=%d yard=%u count=%u\n",
 					(int)v->index.base(), (int)st_id.base(), (unsigned)yard,
 					(unsigned)st->R3RDispatchPoolCount(yard));
 		}
+		/* R3R (第 455 轮, KI-651): 池里一条调度命令都没有时，玩家看到的只是列车
+		 * 静默地原地反复尝试领取，毫无提示。这里给一次明确的弹框。
+		 * 玩家拍板 B-455-4：每列车只弹一次（同一列车之后不再刷屏）；
+		 * 排程一步都不推进 —— 下面照旧 return，列车留在原地等玩家补日程。
+		 * 只有"池里真的一条都没有"才弹：坑位满 / 规则不满足是正常等待，不打扰。 */
+		if (st->R3RDispatchPoolCount(yard) == 0 &&
+				_r3r_dispatch_empty_notified.insert(v->index.base()).second) {
+			ShowErrorMessage(GetEncodedString(STR_ERROR_R3R_DISPATCH_NO_SCHEDULE, v->index),
+					{}, WarningLevel::Warning);
+			R3RDbgWrite("DISP-POOL-EMPTY-NOTIFY veh=%d st=%d yard=%u\n",
+					(int)v->index.base(), (int)st_id.base(), (unsigned)yard);
+		}
 		return;
 	}
 	_r3r_dispatch_no_slot.erase(v->index.base());
+	/* 第 451 轮探针：领到哪一条、以及规则求值用的这四个实测值，
+	 * 便于复测时核对「为什么这列车领到了/没领到这张表」。 */
+	R3RDbgWrite("DISP-POOL-PICK veh=%d st=%d yard=%u idx=%d sched=%u spd=%u pow=%u te=%u rel=%u\n",
+			(int)v->index.base(), (int)st_id.base(), (unsigned)yard, picked, (unsigned)schedule,
+			(unsigned)claim_stats.max_speed, (unsigned)claim_stats.power,
+			(unsigned)claim_stats.max_te, (unsigned)claim_stats.reliability);
 
 	/* 表此刻必须真的可用（Pick 已校验，这里取指针）。 */
 	OrderList *const pool_orders = OrderList::GetIfValid(OrderListID(schedule));
@@ -8006,6 +8817,24 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	/* Parked without a recorded position: adopting it would corrupt the chain's
 	 * indices, so keep driving what it has and let the owner hand over later. */
 	if (owner_real == INVALID_VEH_ORDER_ID) inherit_progress = false;
+	/* R3R (第 457 轮 / KI-658 已修): owner 不会被 tick —— 只有链头跑 ProcessOrders。
+	 * 所以 owner 自己的索引可能停在"表被删短之前"的旧坐标上而不被任何人发现，
+	 * 一旦被下面两个分支采纳（samelist 的 inherit / 切表后的无条件赋值），越界值
+	 * 就落到链头上，链头在 ProcessOrders 撞断言。这里按 owner 表的真实条数归一，
+	 * 与 R3RReturnBorrowedOrders() 的两处 clamp 同构。 */
+	{
+		const uint owner_num = owner_orders->GetNumOrders();
+		const VehicleOrderID owner_real_old = owner_real;
+		const VehicleOrderID owner_impl_old = owner_implicit;
+		if (owner_num == 0 || owner_real == INVALID_VEH_ORDER_ID || owner_real >= owner_num) owner_real = 0;
+		if (owner_num == 0 || owner_implicit == INVALID_VEH_ORDER_ID || owner_implicit >= owner_num) owner_implicit = 0;
+		if (owner_real != owner_real_old || owner_implicit != owner_impl_old) {
+			R3RDbgWrite("ORD-SYNC-CLAMP veh=%d owner=%d num=%u real=%d->%d impl=%d->%d inherit=%d\n",
+					(int)chain->index.base(), (int)owner->index.base(), (unsigned)owner_num,
+					(int)owner_real_old, (int)owner_real, (int)owner_impl_old, (int)owner_implicit,
+					inherit_progress ? 1 : 0);
+		}
+	}
 
 	if (chain->GetEffectiveOrders() == owner_orders) {
 		/* Already driving the right list; only adopt the progress if asked. */
@@ -8487,36 +9316,23 @@ static void R3RNormaliseChainGroups(Train *head)
 		R3RDbgWrite("GRP-NORM head=%d nseg=%u\n", (int)front->index.base(), changed_segs);
 	}
 
-	/* 挂接分组（第 159 轮 / q-2=肆）：先取**全链段头掩码的并集（OR）**，再广播回每一个段头。
-	 * 旧口径只照抄控制段（覆盖），会把被并入那一侧的挂接分组整片抹掉。 */
-	CoupleGroupMask target = COUPLE_GROUP_MASK_NONE;
+	/* 挂接分组（第 433 轮 / KI-627，玩家口径：**分组属于段**）：这里**不再**做全链并集广播。
+	 * 第 159 轮 / q-2=肆 曾是「取全链段头掩码的并集（OR）再广播回每个段头」，于是段 A(1+2) 与
+	 * 段 B(1+3) 一耦合就双双变成 1+2+3，段级信息被抹平。挂接分组本来就是逐段存储、逐段读取的
+	 * （段头 carrier + R3RGetCoupleGroupsOfSegment），耦合/解挂/车库拖动/读档都不应改写
+	 * 任何一段的分组，故这里只留一个只读汇总探针，方便复测核对每段各持什么。 */
+	CoupleGroupMask union_mask = COUPLE_GROUP_MASK_NONE;
 	uint nseg = 0;
 	for (Train *t = front; t != nullptr; ) {
 		if (t->Previous() == nullptr || t->IsSegmentFront()) {
-			target |= R3RGetCoupleGroupsOfSegment(t);
+			union_mask |= R3RGetCoupleGroupsOfSegment(t);
 			nseg++;
 		}
 		Vehicle *next = t->Next();
 		t = (next != nullptr) ? Train::From(next) : nullptr;
 	}
-	R3RDbgWrite("CGRP-NORM-UNION head=%d nseg=%u mask=%llu\n", (int)front->index.base(), nseg,
-			(unsigned long long)target);
-	for (Train *t = front; t != nullptr; ) {
-		if (t->Previous() == nullptr || t->IsSegmentFront()) {
-			if (R3RGetCoupleGroupsOfSegment(t) != target) {
-				R3RClearCoupleGroupsOfSegment(t);
-				for (uint i = 0; i < R3R_COUPLE_GROUP_MASK_BITS; i++) {
-					if ((target & (CoupleGroupMask(1) << i)) != 0) {
-						R3RAddCoupleGroupToSegment(t, CoupleGroupID(static_cast<uint16_t>(i)));
-					}
-				}
-				R3RDbgWrite("CGRP-NORM seg=%d mask=%llu\n", (int)t->index.base(),
-						(unsigned long long)target);
-			}
-		}
-		Vehicle *next = t->Next();
-		t = (next != nullptr) ? Train::From(next) : nullptr;
-	}
+	R3RDbgWrite("CGRP-NORM-KEEP head=%d nseg=%u union=%llu\n", (int)front->index.base(), nseg,
+			(unsigned long long)union_mask);
 }
 
 /* --- KI-14 (1): edge-triggered debug output -------------------------------
@@ -11657,8 +12473,13 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
  *              批数据 —— 再搬一次等于把排程搬回已降为链内普通车的 from,正好复现
  *              KI-187;此时只补齐"前端列车身份"(车号 / current_order / 利润 /
  *              服役间隔 / 窗口 / 列车名)。
+ * @param name_follows_chain R3R (第 443 轮 / KI-639): 列车名是否随链头身份迁往 to,
+ *              与 owner_moved_by_flip 解耦。折叠修正路径由 owner_moved_by_flip 隐含
+ *              "名字随身份"(第 199 轮口径);库内反序换链头(C-2)不是翻转搬的身份,
+ *              但名字同样属于链头身份,故那条路径显式传 true。为 false 时保持旧行为
+ *              —— 还原 to 自己的名字快照,from 的名由 R3RParkTrainName() 停进备份。
  */
-static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by_flip = false)
+static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by_flip, bool name_follows_chain)
 {
 	assert(from->IsFrontEngine());
 	assert(to != nullptr && to->First() == to);
@@ -11721,7 +12542,13 @@ static void R3RRelocateFrontIdentity(Train *from, Train *to, bool owner_moved_by
 	 * 而 from 有名时,名字留在 to 上;同时不再把同一件名字停进 from 的备份(否则同一件名字
 	 * 会同时活在链头与链内车上,from 将来重新成为链头时会冒出一个陈旧副本;借用态同理,
 	 * 借来的名随链头身份继续被 to 穿着)。 */
-	const bool name_follows_identity = owner_moved_by_flip && kept_to_name.empty() && !from->name.empty();
+	/* R3R (第 443 轮 / KI-639): 名字跟随身份与"身份数据是否已被搬走"是两件事。
+	 * 第 199 轮把两者绑在 owner_moved_by_flip 上,于是 C-2(库内反序换链头)这种
+	 * "身份要搬、但不是 flip 搬的"路径只能传 false → 名字被还原成 to 的空快照、
+	 * from 的名又被停进已降级为链内车的备份 ⇒ 新链头永久无名(界面显示默认名)。
+	 * 第 4 参 name_follows_chain 把名字这一半单独解耦:C-2 传 false,true,
+	 * 排程/索引照旧搬(否则丢 orders),名字同时留在新链头上。 */
+	const bool name_follows_identity = (owner_moved_by_flip || name_follows_chain) && kept_to_name.empty() && !from->name.empty();
 
 	/* R3R (第 185 轮 / KI-280): from 此刻身上的名字是不是借来的，必须在这里（下面借用
 	 * 标志被 swap 到 to 身上之前）采样 —— 末尾对 from 的 R3RParkTrainName() 不能把借名
@@ -18956,6 +19783,26 @@ static bool R3ROtherChainAheadOfMovingFront(const Train *consist, const Train *o
 	return false;
 }
 
+/**
+ * R3R（第 453 轮，KI-646 / P-453-1）：@a head 这条链是否有任何一节停在 @a tile 上。
+ *
+ * 只用于"解挂缝的两半是否贴身"：解挂是纯链切分、不改坐标，切开的瞬间两半必然共用若干
+ * 格，但**两半的链头不一定在同一格**（多节列车本来就跨格；机车带 DB 倒车到站后直接解挂
+ * 时，解出方的 moving front 在链尾、与它自己的 first 更是不同格）。旧判据只比
+ * consist->tile 与 other_train->tile 这两个链头格，这种现场就被整条漏掉。
+ *
+ * 上限 128 节只为防止异常链，不做任何位置/状态改写。
+ */
+static bool R3RChainTouchesTile(const Train *head, TileIndex tile)
+{
+	if (head == nullptr) return false;
+	uint n = 0;
+	for (const Train *w = head->First(); w != nullptr && n++ < 128; w = w->Next()) {
+		if (w->tile == tile) return true;
+	}
+	return false;
+}
+
 TryPathReserveResultFlags TryPathReserveWithResultFlags(Train *consist, bool mark_as_stuck, bool first_tile_okay)
 {
 	/* R3R (第 357 轮, KI-533 / R48-1~R48-3): 预留尝试的**入口**台账。
@@ -19534,7 +20381,23 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		const Train *const tpr_pair = R3RGetCouplePairPartner(consist);
 		const bool tpr_pair_hit = (tpr_pair != nullptr && tpr_other_first != nullptr &&
 				tpr_other_first->index == tpr_pair->index);
-		const bool tpr_same_tile = (other_train->tile == consist->tile);
+		/* R3R（第 453 轮，KI-646 / P-453-1）：同格判据必须按"两半是否贴身"判，不能只比**链头格**。
+		 *
+		 * KI-330 的现场证据是 otherTile == moving_front->tile，而这里一直比的是
+		 * other_train->tile 与 consist->tile 这两个链头格。解挂是多节列车的中段切分：
+		 * 两半的链头完全可能不在同一格 —— 2026-11-16 玩家的现场正是机车（链头）带 DB
+		 * 倒车到站后直接解挂，解出方的 moving front 与 first 根本不在同一格 ⇒ 旧判据命中
+		 * 不了 ⇒ 机车把自己刚解下的车底判成"前路被占"，MarkTrainAsStuck 之后永久不动
+		 * （车底侧又被解挂互锁按住等前车走远 ⇒ 两侧互等，于是"无法拉开距离"）。
+		 * 现判"贴身"：另一链的链头格落在我这条链覆盖的格上，或我的链头格落在另一链覆盖的
+		 * 格上。真阻塞（另一列车停在我预留前路的尽头格）两侧都不贴身，照旧命中。
+		 * 仍不做任何位置/状态改写，只是不让"自己的车底"被算成挡路者。 */
+		const Train *const tpr_other = Train::From(other_train);
+		const bool tpr_same_tile = (other_train->tile == consist->tile) ||
+				R3RChainTouchesTile(consist, other_train->tile) ||
+				R3RChainTouchesTile(tpr_other, consist->tile);
+		/* 只用于日志判读：1 = 链头格其实不同，靠"贴身"判据才认出这是解挂缝。 */
+		const bool tpr_touch_only = tpr_same_tile && (other_train->tile != consist->tile);
 		/* R3R（第 350 轮，KI-523）：同格豁免必须再问一句"另一半在哪一侧"。解挂后的两半
 		 * 各自朝背离方向走才是正常脱离；若另一半正压在我行走方向的前方（像素级判断，
 		 * 见 R3ROtherChainAheadOfMovingFront），那不是我该走的路 —— 这时不能给豁免，
@@ -19562,11 +20425,15 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 				const Train *ex_first = Train::From(other_train)->First();
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "TPR-SEAM-EXEMPT veh=%u tile=%u,%u spd=%d other=%u origin=%u,%u okay=%d td=%d otherOrder=%d caronly=%d\n",
+					const Train *const ex_mf = consist->GetMovingFront();
+					fprintf(dbg, "TPR-SEAM-EXEMPT veh=%u tile=%u,%u spd=%d other=%u origin=%u,%u okay=%d td=%d otherOrder=%d caronly=%d touch=%d otherTile=%u,%u mf=%u,%u\n",
 							consist->index.base(), (uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
 							other_train->index.base(), (uint)TileX(origin.tile), (uint)TileY(origin.tile),
 							origin.okay ? 1 : 0, (int)origin.trackdir, (int)other_train->current_order.GetType(),
-							(ex_first != nullptr && R3RIsCarOnlyFormation(ex_first)) ? 1 : 0);
+							(ex_first != nullptr && R3RIsCarOnlyFormation(ex_first)) ? 1 : 0,
+							tpr_touch_only ? 1 : 0,
+							(uint)TileX(other_train->tile), (uint)TileY(other_train->tile),
+							(ex_mf != nullptr) ? (uint)TileX(ex_mf->tile) : 0u, (ex_mf != nullptr) ? (uint)TileY(ex_mf->tile) : 0u);
 					fclose(dbg);
 				}
 			}
@@ -20021,6 +20888,37 @@ static void TrainEnterStation(Train *consist, StationID station)
 	 * assert(cargo_payment == nullptr)（economy.cpp:1650）。健康到站时恒为空，
 	 * 因此这一步在正常路径上是零动作。 */
 	R3RSettleStaleCargoPayment(consist, "enter-station");
+
+	/* R3R (第 455 轮, KI-648): 「到达车站后停止」命令属性。
+	 *
+	 * 玩家拍板 B-455-3：进站停稳即停，不等装卸 —— 所以这里绝不进 BeginLoading()：
+	 * 车上的货不卸、站台的货不装，也就不产生 CargoPayment、不改站台库存，即
+	 * 不参与客货流（link graph 只跟货走，与车辆本身无关）。
+	 * B-455-2：玩家点车辆窗口的「启动/停止」即继续下一条 —— 停住只靠
+	 * VehState::Stopped，订单索引在这里就地推进。不推进的话列车一起步就会在
+	 * 同一站台重新触发到站流程（自身永远开不出站）。
+	 *
+	 * 与「等待分配」在 UI 上是三选一互斥，故无需再判 wait_dispatch。 */
+	if (consist->current_order.IsType(OT_GOTO_STATION) && consist->current_order.HasR3RStopAtStation()) {
+		R3RSpdCtx(consist, "stn-stop-at-station", consist->cur_speed, 0);
+		consist->cur_speed = 0;
+		consist->UpdateTrainSpeedAdaptationLimit(0);
+		consist->force_proceed = TFP_NONE;
+		consist->DeleteUnreachedImplicitOrders();
+		UpdateVehicleTimetable(consist, true);
+		consist->current_order.Free();
+		consist->SetDestTile(INVALID_TILE);
+		if (consist->GetNumOrders() > 0) consist->IncrementRealOrderIndex();
+		consist->vehstatus.Set(VehState::Stopped);
+		InvalidateWindowData(WindowClass::VehicleView, consist->index);
+		const TileIndex stop_tile = consist->GetStationLoadingVehicle()->tile;
+		TriggerStationRandomisation(st, stop_tile, StationRandomTrigger::VehicleArrives);
+		TriggerStationAnimation(st, stop_tile, StationAnimationTrigger::VehicleArrives);
+		R3RDbgWrite("STOP-AT-STATION veh=%d st=%d real=%d tile=%d,%d stopped=1\n",
+				(int)consist->index.base(), (int)station.base(),
+				(int)consist->cur_real_order_index, (int)TileX(consist->tile), (int)TileY(consist->tile));
+		return;
+	}
 
 	consist->BeginLoading();
 
@@ -22545,15 +23443,22 @@ static bool R3RChainAllWagonsSegmented(const Train *t)
 {
 	if (t == nullptr) return false;
 	bool in_segment = false;
-	for (const Train *v = t; v != nullptr; v = Train::From(v->Next())) {
-		if (v->IsArticulatedPart()) continue;
-		if (v->IsSegmentFront()) in_segment = true;
-		if (!in_segment) {
-			if (RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon) return false;
-			if (!v->IsEngine() && !v->IsDualHeadRear()) return false;
-			continue;
+	/* KI-625: never hand a null pointer to Train::From() -- its type assert
+	 * dereferences the vehicle, so `v = Train::From(v->Next())` read [0+0x3C]
+	 * and crashed whenever the walk reached the chain tail. Advance through an
+	 * explicit null check instead. */
+	for (const Train *v = t; v != nullptr; ) {
+		const Vehicle *const n = v->Next();
+		if (!v->IsArticulatedPart()) {
+			if (v->IsSegmentFront()) in_segment = true;
+			if (!in_segment) {
+				if (RailVehInfo(v->engine_type)->railveh_type == RailVehicleType::Wagon) return false;
+				if (!v->IsEngine() && !v->IsDualHeadRear()) return false;
+			} else if (v->IsSegmentBack()) {
+				in_segment = false;
+			}
 		}
-		if (v->IsSegmentBack()) in_segment = false;
+		v = (n != nullptr) ? Train::From(n) : nullptr;
 	}
 	return true;
 }
@@ -23656,10 +24561,13 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * locomotive, so this test stops matching) or pulls it out of the depot by
 	 * re-linking the chain (NormalizeTrainVehInDepot).
 	 *
-	 * `cached_power == 0` pins the condition to "no real locomotive anywhere in
-	 * this chain": a chain whose head happens to be a wagon but which does carry
-	 * real traction must still be able to drive. */
-	if (R3RIsCarOnlyFormation(consist) && consist->gcache.cached_power == 0) {
+	 * "no real locomotive anywhere in this chain" is what pins the condition:
+	 * a chain whose head happens to be a wagon but which does carry real traction
+	 * must still be able to drive. R3R (KI-630): this used to be tested through
+	 * `cached_power == 0`, which stopped being a proxy for it once a car-only
+	 * front -- including one built by ctrl-click de-articulation -- reports the
+	 * 1 hp floor in Train::GetPower(); use the explicit test instead. */
+	if (R3RIsCarOnlyFormation(consist) && !R3RChainHasRealTraction(consist)) {
 		/* Only worth a log line when the formation was really rolling -- i.e. the
 		 * "it drove itself" symptom in the field; a parked formation would
 		 * otherwise write once per tick. */
@@ -24235,18 +25143,36 @@ Money Train::GetRunningCost() const
 	Money cost = 0;
 	const Train *v = this;
 
+	/* R3R (KI-641): GetNextVehicle() treats a de-articulated group as a single unit
+	 * and skips its members, so when the chain head became a group head the former
+	 * parent was skipped entirely and the yearly cost collapsed to the head's own
+	 * (empty) entry. Walk the physical chain and let one representative engine (the
+	 * parent prototype) stand for the whole group, exactly like a real articulated
+	 * group. Healthy chains have no group roles and take the old path unchanged. */
+	const Train *r3r_ref = nullptr;
+	if (this == this->First()) {
+		for (const Train *u = this; u != nullptr; u = u->Next()) {
+			if (u->IsArticGroupHead() || u->IsArticGroupMember()) {
+				r3r_ref = R3RConsistReferenceEngine(const_cast<Train *>(this));
+				break;
+			}
+		}
+	}
+
 	do {
-		const Engine *e = v->GetEngine();
+		if (r3r_ref != nullptr && v != r3r_ref && (v->IsArticGroupHead() || v->IsArticGroupMember())) continue;
+		const Train *const cost_unit = (r3r_ref != nullptr && v == r3r_ref) ? r3r_ref : v;
+		const Engine *e = cost_unit->GetEngine();
 		if (e->VehInfo<RailVehicleInfo>().running_cost_class == Price::Invalid) continue;
 
-		uint cost_factor = GetVehicleProperty(v, PROP_TRAIN_RUNNING_COST_FACTOR, e->VehInfo<RailVehicleInfo>().running_cost);
+		uint cost_factor = GetVehicleProperty(cost_unit, PROP_TRAIN_RUNNING_COST_FACTOR, e->VehInfo<RailVehicleInfo>().running_cost);
 		if (cost_factor == 0) continue;
 
 		/* Halve running cost for multiheaded parts */
-		if (v->IsMultiheaded()) cost_factor /= 2;
+		if (cost_unit->IsMultiheaded()) cost_factor /= 2;
 
 		cost += GetPrice(e->VehInfo<RailVehicleInfo>().running_cost_class, cost_factor, e->GetGRF());
-	} while ((v = v->GetNextVehicle()) != nullptr);
+	} while ((v = (r3r_ref != nullptr) ? v->Next() : v->GetNextVehicle()) != nullptr);
 
 	if (this->cur_speed == 0) {
 		if (this->IsInDepot()) {
