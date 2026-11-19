@@ -25,6 +25,8 @@ enum class SpriteComponent : uint8_t {
 	Palette = 2, ///< Sprite has palette data.
 	End, ///< End marker.
 };
+
+/** Bitset of \c SpriteComponent elements. */
 using SpriteComponents = EnumBitSet<SpriteComponent, uint8_t, SpriteComponent::End>;
 
 struct SpriteLoaderResult {
@@ -47,8 +49,8 @@ template <class T>
 class SpriteCollMap {
 	EnumIndexArray<T, ZoomLevel, ZoomLevel::SpriteEnd> data{};
 public:
-	inline constexpr T &operator[](const ZoomLevel &zoom) { return this->data[zoom]; }
-	inline constexpr const T &operator[](const ZoomLevel &zoom) const { return this->data[zoom]; }
+	constexpr T &operator[](const ZoomLevel &zoom) { return this->data[zoom]; }
+	constexpr const T &operator[](const ZoomLevel &zoom) const { return this->data[zoom]; }
 
 	T &Root() { return this->data[ZoomLevel::Min]; }
 	const T &Root() const { return this->data[ZoomLevel::Min]; }

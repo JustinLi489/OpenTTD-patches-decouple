@@ -19,6 +19,7 @@
 #include "company_func.h"
 #include "newgrf.h"
 #include "newgrf_extension.h"
+#include "settings_type.h"
 #include "r3r_perf.h"
 #include <vector>
 
@@ -476,6 +477,7 @@ void AddArticulatedParts(Vehicle *first)
 				t->subtype = 0;
 				t->track = front->track;
 				t->railtypes = front->railtypes;
+				t->flags.Set(VehicleRailFlag::AllowedOnNormalRail, _settings_game.vehicle.disable_elrails && RailVehInfo(front->engine_type)->intended_railtypes.Test(RAILTYPE_ELECTRIC));
 
 				t->spritenum = e_artic->VehInfo<RailVehicleInfo>().image_index;
 				if (e_artic->CanCarryCargo()) {

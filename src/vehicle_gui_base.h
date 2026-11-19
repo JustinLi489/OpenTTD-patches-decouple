@@ -146,6 +146,7 @@ public:
 		ADI_CREATE_GROUP,
 		ADI_TRACERESTRICT_SLOT_MGMT,
 		ADI_TRACERESTRICT_COUNTER_MGMT,
+		ADI_EXPORT_ORDERS,
 		ADI_COUPLE_GROUP_MGMT,             ///< R3R: open the couple group window (Q4).
 		ADI_R3R_SCHEDULE_MGMT,             ///< R3R (第 417 轮): open the schedule pool window.
 	};
@@ -179,9 +180,9 @@ public:
 	void FilterVehicleList();
 	StringID GetCargoFilterLabel(CargoType cargo_type) const;
 	DropDownList BuildCargoDropDownList(bool full) const;
-	Dimension GetActionDropdownSize(bool show_autoreplace, bool show_group, bool show_template_replace, StringID change_order_str = 0);
+	Dimension GetActionDropdownSize(bool show_autoreplace, bool show_group, bool show_template_replace, StringID change_order_str = STR_NULL);
 	DropDownList BuildActionDropdownList(bool show_autoreplace, bool show_group, bool show_template_replace,
-			StringID change_order_str = 0, bool show_create_group = false, bool consider_top_level = false);
+			StringID change_order_str = STR_NULL, bool show_create_group = false, bool consider_top_level = false);
 	bool ShouldShowActionDropdownList() const;
 
 	std::span<const StringID> GetVehicleSorterNames() const;

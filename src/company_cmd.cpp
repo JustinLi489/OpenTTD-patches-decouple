@@ -42,11 +42,13 @@
 #include "tbtr_template_vehicle_func.h"
 #include "core/backup_type.hpp"
 #include "debug_desync.h"
+#include "script/api/script_event_types.hpp"
 #include "timer/timer.h"
 #include "timer/timer_game_tick.h"
 #include "tilehighlight_func.h"
 #include "plans_func.h"
 
+#include "widgets/company_widget.h"
 #include "widgets/statusbar_widget.h"
 
 #include "table/strings.h"
@@ -453,6 +455,44 @@ CommandCost CheckTileOwnership(TileIndex tile)
 }
 
 /**
+ * Set a company name based on type and seed, if the name is unique and shorter than the max length.
+ * @param other_names List of names that cannot be used.
+ * @param c The company of the name to set.
+ * @param t The nearby town, for news message.
+ * @param str The type of name.
+ * @param strp The random seed.
+ * @return True iff the name was set.
+ */
+static bool SetCompanyName(std::span<const std::string> other_names, Company *c, const Town *t, StringID str, uint32_t strp)
+{
+	assert(c != nullptr);
+	assert(t != nullptr);
+
+	/* Name must not be too long. */
+	std::string name = GetString(str, strp);
+	if (Utf8StringLength(name) >= MAX_LENGTH_COMPANY_NAME_CHARS) return false;
+
+	/* No companies must have this name already. */
+	if (std::ranges::find(other_names, name) != other_names.end()) return false;
+
+	c->name_1 = str;
+	c->name_2 = strp;
+
+	MarkWholeScreenDirty();
+	AI::BroadcastNewEvent(new ScriptEventCompanyRenamed(c->index, name));
+	Game::NewEvent(new ScriptEventCompanyRenamed(c->index, name));
+
+	if (!c->is_ai) return true;
+
+	auto cni = std::make_unique<CompanyNewsInformation>(STR_NEWS_COMPANY_LAUNCH_TITLE, c);
+	EncodedString headline = GetEncodedString(STR_NEWS_COMPANY_LAUNCH_DESCRIPTION, cni->company_name, t->index);
+	AddNewsItem(std::move(headline),
+		NewsType::CompanyInfo, NewsStyle::Company, {}, c->last_build_coordinate, {}, std::move(cni));
+
+	return true;
+}
+
+/**
  * Generate the name of a company from the last build coordinate.
  * @param c Company to give a name.
  */
@@ -461,51 +501,24 @@ static void GenerateCompanyName(Company *c)
 	if (c->name_1 != STR_SV_UNNAMED) return;
 	if (c->last_build_coordinate == 0) return;
 
-	Town *t = ClosestTownFromTile(c->last_build_coordinate, UINT_MAX);
-
-	StringID str;
-	uint32_t strp;
-	std::string name;
-	if (t->name.empty() && IsInsideMM(t->townnametype, SPECSTR_TOWNNAME_START, SPECSTR_TOWNNAME_END)) {
-		str = t->townnametype - SPECSTR_TOWNNAME_START + SPECSTR_COMPANY_NAME_START;
-		strp = t->townnameparts;
-
-verify_name:;
-		/* No companies must have this name already */
-		for (const Company *cc : Company::Iterate()) {
-			if (cc->name_1 == str && cc->name_2 == strp) goto bad_town_name;
-		}
-
-		name = GetString(str, strp);
-		if (Utf8StringLength(name) >= MAX_LENGTH_COMPANY_NAME_CHARS) goto bad_town_name;
-
-set_name:;
-		c->name_1 = str;
-		c->name_2 = strp;
-
-		MarkWholeScreenDirty();
-		AI::BroadcastNewEvent(new ScriptEventCompanyRenamed(c->index, name));
-		Game::NewEvent(new ScriptEventCompanyRenamed(c->index, name));
-
-		if (c->is_ai) {
-			auto cni = std::make_unique<CompanyNewsInformation>(STR_NEWS_COMPANY_LAUNCH_TITLE, c);
-			EncodedString headline = GetEncodedString(STR_NEWS_COMPANY_LAUNCH_DESCRIPTION, cni->company_name, t->index);
-			AddNewsItem(std::move(headline),
-				NewsType::CompanyInfo, NewsStyle::Company, {}, c->last_build_coordinate, {}, std::move(cni));
-		}
-		return;
+	/* Collect existing company names. */
+	std::vector<std::string> other_names;
+	for (const Company *cc : Company::Iterate()) {
+		if (cc != c) other_names.emplace_back(GetString(STR_COMPANY_NAME, cc->index));
 	}
-bad_town_name:;
+
+	const Town *t = ClosestTownFromTile(c->last_build_coordinate, UINT_MAX);
+
+	if (t->name.empty() && IsInsideMM(t->townnametype, SPECSTR_TOWNNAME_START, SPECSTR_TOWNNAME_END)) {
+		if (SetCompanyName(other_names, c, t, SPECSTR_COMPANY_NAME_START + (t->townnametype - SPECSTR_TOWNNAME_START), t->townnameparts)) return;
+	}
 
 	if (c->president_name_1 == SPECSTR_PRESIDENT_NAME) {
-		str = SPECSTR_ANDCO_NAME;
-		strp = c->president_name_2;
-		name = GetString(str, strp);
-		goto set_name;
-	} else {
-		str = SPECSTR_ANDCO_NAME;
-		strp = Random();
-		goto verify_name;
+		if (SetCompanyName(other_names, c, t, SPECSTR_ANDCO_NAME, c->president_name_2)) return;
+	}
+
+	for (;;) {
+		if (SetCompanyName(other_names, c, t, SPECSTR_ANDCO_NAME, Random())) return;
 	}
 }
 
@@ -548,7 +561,9 @@ static Colours GenerateCompanyColour()
 	}
 
 	/* Sort it according to the values in _colour_sort. */
-	std::ranges::stable_sort(colours, std::greater_equal{}, [](auto &i) { return _colour_sort[i]; });
+	std::stable_sort(colours.begin(), colours.end(), [](Colours a, Colours b) {
+		return _colour_sort[a] > _colour_sort[b];
+	});
 
 	/* Move the colours that look similar to each company's colour to the side */
 	for (const Company *c : Company::Iterate()) {
@@ -566,28 +581,43 @@ static Colours GenerateCompanyColour()
 }
 
 /**
+ * Set a company's president name based on seed, if the name is unique and shorter than the max length.
+ * @param other_names List of names that cannot be used.
+ * @param c The company of the president name to set.
+ * @param seed The random seed.
+ * @return True iff the name was set.
+ */
+static bool SetPresidentName(std::span<const std::string> other_names, Company *c, uint32_t seed)
+{
+	assert(c != nullptr);
+
+	c->president_name_1 = SPECSTR_PRESIDENT_NAME;
+	c->president_name_2 = seed;
+
+	/* President name must not be too long. */
+	std::string name = GetString(STR_PRESIDENT_NAME, c->index);
+	if (Utf8StringLength(name) >= MAX_LENGTH_PRESIDENT_NAME_CHARS) return false;
+
+	/* No presidents must have this name already. */
+	if (std::ranges::find(other_names, name) != other_names.end()) return false;
+
+	return true;
+}
+
+/**
  * Generate a random president name of a company.
  * @param c Company that needs a new president name.
  */
 static void GeneratePresidentName(Company *c)
 {
+	/* Collect existing president names. */
+	std::vector<std::string> other_names;
+	for (const Company *cc : Company::Iterate()) {
+		if (cc != c) other_names.emplace_back(GetString(STR_PRESIDENT_NAME, cc->index));
+	}
+
 	for (;;) {
-restart:;
-		c->president_name_2 = Random();
-		c->president_name_1 = SPECSTR_PRESIDENT_NAME;
-
-		/* Reserve space for extra unicode character. We need to do this to be able
-		 * to detect too long president name. */
-		std::string name = GetString(STR_PRESIDENT_NAME, c->index);
-		if (Utf8StringLength(name) >= MAX_LENGTH_PRESIDENT_NAME_CHARS) continue;
-
-		for (const Company *cc : Company::Iterate()) {
-			if (c != cc) {
-				std::string other_name = GetString(STR_PRESIDENT_NAME, cc->index);
-				if (name == other_name) goto restart;
-			}
-		}
-		return;
+		if (SetPresidentName(other_names, c, Random())) return;
 	}
 }
 
@@ -598,7 +628,7 @@ restart:;
  */
 void ResetCompanyLivery(Company *c)
 {
-	for (LiveryScheme scheme = LiveryScheme::Begin; scheme < LiveryScheme::End; scheme++) {
+	for (LiveryScheme scheme : EnumRange(LiveryScheme::End)) {
 		c->livery[scheme].in_use.Reset();
 		c->livery[scheme].colour1 = c->colour;
 		c->livery[scheme].colour2 = c->colour;
@@ -701,7 +731,7 @@ TimeoutTimer<TimerGameTick> _new_competitor_timeout({ TimerGameTick::Priority::C
 
 	/* Send a command to all clients to start up a new AI.
 	 * Works fine for Multiplayer and Singleplayer */
-	Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, CompanyID::Invalid(), CompanyRemoveReason::None, INVALID_CLIENT_ID, {});
+	Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, CompanyID::Invalid(), CompanyRemoveReason::None, ClientID::Invalid, {});
 });
 
 /** Start of a new game. */
@@ -863,7 +893,7 @@ void OnTick_Companies(bool main_tick)
 			for (auto i = 0; i < _settings_game.difficulty.max_no_competitors; i++) {
 				if (_networking && num_companies++ >= _settings_client.network.max_companies) break;
 				if (num_ais++ >= _settings_game.difficulty.max_no_competitors) break;
-				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, CompanyID::Invalid(), CompanyRemoveReason::None, INVALID_CLIENT_ID, {});
+				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, CompanyID::Invalid(), CompanyRemoveReason::None, ClientID::Invalid, {});
 			}
 			timeout = 10 * 60 * TICKS_PER_SECOND;
 		}
@@ -939,7 +969,7 @@ void CompanyAdminUpdate(const Company *company)
  */
 void CompanyAdminRemove(CompanyID company_id, CompanyRemoveReason reason)
 {
-	if (_network_server) NetworkAdminCompanyRemove(company_id, (AdminCompanyRemoveReason)reason);
+	if (_network_server) NetworkAdminCompanyRemove(company_id, static_cast<AdminCompanyRemoveReason>(reason));
 }
 
 /**
@@ -1219,7 +1249,7 @@ CommandCost CmdSetCompanyManagerFace(DoCommandFlags flags, uint style, uint32_t 
  */
 void UpdateCompanyLiveries(Company *c)
 {
-	for (LiveryScheme i = LiveryScheme::Steam; i < LiveryScheme::End; i++) {
+	for (LiveryScheme i : EnumRange(LiveryScheme::Steam, LiveryScheme::End)) {
 		if (!c->livery[i].in_use.Test(Livery::Flag::Primary)) c->livery[i].colour1 = c->livery[LiveryScheme::Default].colour1;
 		if (!c->livery[i].in_use.Test(Livery::Flag::Secondary)) c->livery[i].colour2 = c->livery[LiveryScheme::Default].colour2;
 	}
@@ -1281,8 +1311,8 @@ CommandCost CmdSetCompanyColour(DoCommandFlags flags, LiveryScheme scheme, bool 
 			/* Else loop through all schemes to see if any are left enabled.
 			 * If not, disable the default scheme too. */
 			c->livery[LiveryScheme::Default].in_use.Reset({Livery::Flag::Primary, Livery::Flag::Secondary});
-			for (scheme = LiveryScheme::Default; scheme < LiveryScheme::End; scheme++) {
-				if (c->livery[scheme].in_use.Any({Livery::Flag::Primary, Livery::Flag::Secondary})) {
+			for (LiveryScheme other_scheme : EnumRange(LiveryScheme::End)) {
+				if (c->livery[other_scheme].in_use.Any({Livery::Flag::Primary, Livery::Flag::Secondary})) {
 					c->livery[LiveryScheme::Default].in_use.Set(Livery::Flag::Primary);
 					break;
 				}
@@ -1472,13 +1502,13 @@ uint32_t CompanyInfrastructure::GetRoadTramTotal(RoadTramType rtt) const
 void CompanyInfrastructure::Dump(format_target &buffer) const
 {
 	uint rail_total = 0;
-	for (RailType rt = RAILTYPE_BEGIN; rt != RAILTYPE_END; rt++) {
+	for (RailType rt : EnumRange(RAILTYPE_END)) {
 		if (rail[rt]) buffer.format("Rail: {}: {}\n", GetStringFmtParam(GetRailTypeInfo(rt)->strings.name), rail[rt]);
 		rail_total += rail[rt];
 	}
 	buffer.format("Total Rail: {}\n", rail_total);
 	buffer.format("Signal: {}\n", signal);
-	for (RoadType rt = ROADTYPE_BEGIN; rt != ROADTYPE_END; rt++) {
+	for (RoadType rt : EnumRange(ROADTYPE_END)) {
 		if (road[rt]) buffer.format("{}: {}: {}\n", RoadTypeIsTram(rt) ? "Tram" : "Road", GetStringFmtParam(GetRoadTypeInfo(rt)->strings.name), road[rt]);
 	}
 	buffer.format("Total Road: {}\n", this->GetRoadTotal());

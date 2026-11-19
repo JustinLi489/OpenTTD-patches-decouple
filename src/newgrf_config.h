@@ -32,6 +32,8 @@ enum class GRFConfigFlag : uint8_t {
 	Reserved, ///< GRF file passed GrfLoadingStage::Reserve stage
 	Invalid, ///< GRF is unusable with this version of OpenTTD
 };
+
+/** Bitset of \c GRFConfigFlag elements. */
 using GRFConfigFlags = EnumBitSet<GRFConfigFlag, uint8_t>;
 
 /** Status of GRF */
@@ -51,6 +53,8 @@ enum class GRFBug : uint8_t {
 	UnknownCbResult = 3, ///< A callback returned an unknown/invalid result
 	VehCapacity     = 4, ///< Capacity of vehicle changes when not refitting or arranging
 };
+
+/** Bitset of \c GRFBug elements. */
 using GRFBugs = EnumBitSet<GRFBug, uint8_t>;
 
 /** Status of post-gameload GRF compatibility check */
@@ -86,15 +90,8 @@ enum GRFPalette : uint8_t {
 
 /** Basic data to distinguish a GRF. Used in the server list window */
 struct GRFIdentifier {
-	uint32_t grfid;   ///< GRF ID (defined by Action 0x08)
-	MD5Hash md5sum;   ///< MD5 checksum of file to distinguish files with the same GRF ID (eg. newer version of GRF)
-
-	GRFIdentifier() = default;
-	GRFIdentifier(const GRFIdentifier &other) = default;
-	GRFIdentifier(GRFIdentifier &&other) = default;
-	GRFIdentifier(uint32_t grfid, const MD5Hash &md5sum) : grfid(grfid), md5sum(md5sum) {}
-
-	GRFIdentifier& operator =(const GRFIdentifier &other) = default;
+	GrfID grfid; ///< GRF ID (defined by Action 0x08)
+	MD5Hash md5sum; ///< MD5 checksum of file to distinguish files with the same GRF ID (eg. newer version of GRF)
 
 	/**
 	 * Does the identification match the provided values?
@@ -102,7 +99,7 @@ struct GRFIdentifier {
 	 * @param md5sum Expected md5sum, may be \c nullptr (in which case, do not check it).
 	 * @return the object has the provided grfid and md5sum.
 	 */
-	inline bool HasGrfIdentifier(uint32_t grfid, const MD5Hash *md5sum) const
+	inline bool HasGrfIdentifier(GrfID grfid, const MD5Hash *md5sum) const
 	{
 		if (this->grfid != grfid) return false;
 		if (md5sum == nullptr) return true;
@@ -241,8 +238,8 @@ struct NewGRFScanCallback {
 size_t GRFGetSizeOfDataSection(FileHandle &f);
 
 void ScanNewGRFFiles(NewGRFScanCallback *callback);
-const GRFConfig *FindGRFConfig(uint32_t grfid, FindGRFConfigMode mode, const MD5Hash *md5sum = nullptr, uint32_t desired_version = 0);
-GRFConfig *GetGRFConfig(uint32_t grfid, uint32_t mask = 0xFFFFFFFF);
+const GRFConfig *FindGRFConfig(GrfID grfid, FindGRFConfigMode mode, const MD5Hash *md5sum = nullptr, uint32_t desired_version = 0);
+GRFConfig *GetGRFConfig(GrfID grfid, uint32_t mask = 0xFFFFFFFF);
 void CopyGRFConfigList(GRFConfigList &dst, const GRFConfigList &src, bool init_only);
 void AppendStaticGRFConfigs(GRFConfigList &dst);
 void AppendToGRFConfigList(GRFConfigList &dst, std::unique_ptr<GRFConfig> &&el);

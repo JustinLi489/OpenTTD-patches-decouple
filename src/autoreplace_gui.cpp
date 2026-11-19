@@ -437,7 +437,7 @@ public:
 	{
 		switch (widget) {
 			case WID_RV_SORT_ASCENDING_DESCENDING:
-				this->DrawSortButtonState(WID_RV_SORT_ASCENDING_DESCENDING, this->descending_sort_order ? SBS_DOWN : SBS_UP);
+				this->DrawSortButton(WID_RV_SORT_ASCENDING_DESCENDING, this->descending_sort_order);
 				break;
 
 			case WID_RV_INFO_TAB: {
@@ -455,7 +455,7 @@ public:
 					str = GetString(STR_REPLACE_NOT_REPLACING_VEHICLE_SELECTED);
 				}
 
-				DrawString(r.Shrink(WidgetDimensions::scaled.frametext, WidgetDimensions::scaled.framerect), std::move(str), TextColour::Black, SA_HOR_CENTER);
+				DrawString(r.Shrink(WidgetDimensions::scaled.frametext, WidgetDimensions::scaled.framerect), std::move(str), TextColour::Black, AlignmentH::Centre);
 				break;
 			}
 

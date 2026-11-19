@@ -113,7 +113,7 @@ int DrawStationCoverageAreaText(const Rect &r, StationCoverageType sct, int rad,
 		}
 
 		/* Convert cargo counts to a set of cargo bits, and draw the result. */
-		for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+		for (CargoType cargo : EnumRange(NUM_CARGO)) {
 			switch (sct) {
 				case SCT_PASSENGERS_ONLY: if (!IsCargoInClass(cargo, CargoClass::Passengers)) continue; break;
 				case SCT_NON_PASSENGERS_ONLY: if (IsCargoInClass(cargo, CargoClass::Passengers)) continue; break;
@@ -272,7 +272,7 @@ static void StationsWndShowStationRating(int left, int right, int y, CargoType c
 		}
 	}
 
-	DrawString(left + padding, right, y, cs->abbrev, tc, SA_CENTER, false, FontSize::Small);
+	DrawString(left + padding, right, y, cs->abbrev, tc, {AlignmentH::Centre, AlignmentV::Middle}, false, FontSize::Small);
 
 	/* Draw green/red ratings bar (fits under the waiting bar) */
 	y += height + padding + 1;
@@ -352,10 +352,10 @@ protected:
 
 					bool has_rating = false;
 					/* Add to the station/cargo counts. */
-					for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+					for (CargoType cargo : EnumRange(NUM_CARGO)) {
 						if (st->goods[cargo].HasRating()) this->stations_per_cargo_type[cargo]++;
 					}
-					for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+					for (CargoType cargo : EnumRange(NUM_CARGO)) {
 						if (st->goods[cargo].HasRating()) {
 							has_rating = true;
 							if (this->filter.cargoes.Test(cargo)) {
@@ -600,7 +600,7 @@ public:
 		switch (widget) {
 			case WID_STL_SORTBY:
 				/* draw arrow pointing up/down for ascending/descending sorting */
-				this->DrawSortButtonState(WID_STL_SORTBY, this->stations.IsDescSortOrder() ? SBS_DOWN : SBS_UP);
+				this->DrawSortButton(WID_STL_SORTBY, this->stations.IsDescSortOrder());
 				break;
 
 			case WID_STL_LIST: {
@@ -1489,10 +1489,10 @@ struct StationViewWindow : public Window {
 	void Close([[maybe_unused]] int data = 0) override
 	{
 		ZoningStationWindowOpenClose(Station::Get(window_number));
-		CloseWindowById(WindowClass::TrainList,       VehicleListIdentifier(VL_STATION_LIST, VehicleType::Train,    this->owner, this->window_number).ToWindowNumber(), false);
-		CloseWindowById(WindowClass::RoadVehicleList, VehicleListIdentifier(VL_STATION_LIST, VehicleType::Road,     this->owner, this->window_number).ToWindowNumber(), false);
-		CloseWindowById(WindowClass::ShipList,        VehicleListIdentifier(VL_STATION_LIST, VehicleType::Ship,     this->owner, this->window_number).ToWindowNumber(), false);
-		CloseWindowById(WindowClass::AircraftList,    VehicleListIdentifier(VL_STATION_LIST, VehicleType::Aircraft, this->owner, this->window_number).ToWindowNumber(), false);
+		CloseWindowById(WindowClass::TrainList,       VehicleListIdentifier(VehicleListType::Station, VehicleType::Train,    this->owner, this->window_number).ToWindowNumber(), false);
+		CloseWindowById(WindowClass::RoadVehicleList, VehicleListIdentifier(VehicleListType::Station, VehicleType::Road,     this->owner, this->window_number).ToWindowNumber(), false);
+		CloseWindowById(WindowClass::ShipList,        VehicleListIdentifier(VehicleListType::Station, VehicleType::Ship,     this->owner, this->window_number).ToWindowNumber(), false);
+		CloseWindowById(WindowClass::AircraftList,    VehicleListIdentifier(VehicleListType::Station, VehicleType::Aircraft, this->owner, this->window_number).ToWindowNumber(), false);
 
 		SetViewportCatchmentStation(Station::Get(this->window_number), false);
 		this->Window::Close();
@@ -1650,7 +1650,7 @@ struct StationViewWindow : public Window {
 			}
 
 			/* Draw arrow pointing up/down for ascending/descending sorting */
-			this->DrawSortButtonState(WID_SV_SORT_ORDER, sort_orders[1] == SO_ASCENDING ? SBS_UP : SBS_DOWN);
+			this->DrawSortButton(WID_SV_SORT_ORDER, sort_orders[1] != SO_ASCENDING);
 
 			int pos = this->vscroll->GetPosition();
 
@@ -1844,7 +1844,7 @@ struct StationViewWindow : public Window {
 	 */
 	void BuildCargoList(CargoDataEntry *entry, const Station *st)
 	{
-		for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+		for (CargoType cargo : EnumRange(NUM_CARGO)) {
 			if (this->cached_destinations.Retrieve(cargo) == nullptr) {
 				this->RecalcDestinations(cargo);
 			}
@@ -2327,20 +2327,20 @@ struct StationViewWindow : public Window {
 	void SelectSortBy(int index)
 	{
 		_settings_client.gui.station_gui_sort_by = index;
-		switch (StationViewWindow::sort_names[index]) {
-			case STR_STATION_VIEW_WAITING_STATION:
+		switch (StationViewWindow::sort_names[index].base()) {
+			case STR_STATION_VIEW_WAITING_STATION.base():
 				this->current_mode = MODE_WAITING;
 				this->sortings[1] = this->sortings[2] = this->sortings[3] = CargoSortType::AsGrouping;
 				break;
-			case STR_STATION_VIEW_WAITING_AMOUNT:
+			case STR_STATION_VIEW_WAITING_AMOUNT.base():
 				this->current_mode = MODE_WAITING;
 				this->sortings[1] = this->sortings[2] = this->sortings[3] = CargoSortType::Count;
 				break;
-			case STR_STATION_VIEW_PLANNED_STATION:
+			case STR_STATION_VIEW_PLANNED_STATION.base():
 				this->current_mode = MODE_PLANNED;
 				this->sortings[1] = this->sortings[2] = this->sortings[3] = CargoSortType::AsGrouping;
 				break;
-			case STR_STATION_VIEW_PLANNED_AMOUNT:
+			case STR_STATION_VIEW_PLANNED_AMOUNT.base():
 				this->current_mode = MODE_PLANNED;
 				this->sortings[1] = this->sortings[2] = this->sortings[3] = CargoSortType::Count;
 				break;
@@ -2361,33 +2361,33 @@ struct StationViewWindow : public Window {
 		this->grouping_index = index;
 		_settings_client.gui.station_gui_group_order = index;
 		this->GetWidget<NWidgetCore>(WID_SV_GROUP_BY)->SetString(StationViewWindow::group_names[index]);
-		switch (StationViewWindow::group_names[index]) {
-			case STR_STATION_VIEW_GROUP_S_V_D:
+		switch (StationViewWindow::group_names[index].base()) {
+			case STR_STATION_VIEW_GROUP_S_V_D.base():
 				this->groupings[1] = GR_SOURCE;
 				this->groupings[2] = GR_NEXT;
 				this->groupings[3] = GR_DESTINATION;
 				break;
-			case STR_STATION_VIEW_GROUP_S_D_V:
+			case STR_STATION_VIEW_GROUP_S_D_V.base():
 				this->groupings[1] = GR_SOURCE;
 				this->groupings[2] = GR_DESTINATION;
 				this->groupings[3] = GR_NEXT;
 				break;
-			case STR_STATION_VIEW_GROUP_V_S_D:
+			case STR_STATION_VIEW_GROUP_V_S_D.base():
 				this->groupings[1] = GR_NEXT;
 				this->groupings[2] = GR_SOURCE;
 				this->groupings[3] = GR_DESTINATION;
 				break;
-			case STR_STATION_VIEW_GROUP_V_D_S:
+			case STR_STATION_VIEW_GROUP_V_D_S.base():
 				this->groupings[1] = GR_NEXT;
 				this->groupings[2] = GR_DESTINATION;
 				this->groupings[3] = GR_SOURCE;
 				break;
-			case STR_STATION_VIEW_GROUP_D_S_V:
+			case STR_STATION_VIEW_GROUP_D_S_V.base():
 				this->groupings[1] = GR_DESTINATION;
 				this->groupings[2] = GR_SOURCE;
 				this->groupings[3] = GR_NEXT;
 				break;
-			case STR_STATION_VIEW_GROUP_D_V_S:
+			case STR_STATION_VIEW_GROUP_D_V_S.base():
 				this->groupings[1] = GR_DESTINATION;
 				this->groupings[2] = GR_NEXT;
 				this->groupings[3] = GR_SOURCE;
@@ -3084,7 +3084,7 @@ public:
 		const int left0 = r.left + WidgetDimensions::scaled.framerect.left + 1;
 		const int right0 = r.right - WidgetDimensions::scaled.framerect.right - 1;
 
-		DrawString(left0, right0, y, this->data[0], TextColour::LightBlue, SA_CENTER);
+		DrawString(left0, right0, y, this->data[0], TextColour::LightBlue, {AlignmentH::Centre, AlignmentV::Middle});
 
 		y += GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal;
 

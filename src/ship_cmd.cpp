@@ -38,6 +38,7 @@
 #include "core/checksum_func.hpp"
 #include "articulated_vehicles.h"
 #include "tile_cmd.h"
+#include "script/api/script_event_types.hpp"
 #include "3rdparty/cpp-ring-buffer/ring_buffer.hpp"
 #include "3rdparty/robin_hood/robin_hood.h"
 
@@ -67,7 +68,7 @@ WaterClass GetEffectiveWaterClass(TileIndex tile)
 {
 	if (HasTileWaterClass(tile)) return GetWaterClass(tile);
 	if (IsTileType(tile, TileType::TunnelBridge)) {
-		dbg_assert_tile(GetTunnelBridgeTransportType(tile) == TRANSPORT_WATER, tile);
+		dbg_assert_tile(GetTunnelBridgeTransportType(tile) == TransportType::Water, tile);
 		return WaterClass::Canal;
 	}
 	if (IsTileType(tile, TileType::Railway)) {
@@ -88,7 +89,7 @@ bool IsValidImageIndex<VehicleType::Ship>(uint8_t image_index)
 
 static inline TrackBits GetTileShipTrackStatus(TileIndex tile)
 {
-	return TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TRANSPORT_WATER, 0));
+	return TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TransportType::Water, 0));
 }
 
 static void GetShipIcon(EngineID engine, EngineImageType image_type, VehicleSpriteSeq *result)
@@ -146,7 +147,11 @@ void Ship::GetImage(Direction direction, EngineImageType image_type, VehicleSpri
 {
 	uint8_t spritenum = this->spritenum;
 
-	if (image_type == EIT_ON_MAP) direction = this->rotation;
+	if (image_type == EngineImageType::OnMap) direction = this->rotation;
+
+	/* Reverse the ship's visual direction if the ship is double-ended and the second end is used as the bow.
+	 * The ship's sprites might not be symmetrical, this avoids them flipping around visually. */
+	if (this->flags.Test(VehicleShipFlag::SecondEndFacingForward)) direction = ReverseDir(direction);
 
 	if (IsCustomVehicleSpriteNum(spritenum)) {
 		GetCustomVehicleSprite(this, direction, image_type, result);
@@ -452,9 +457,13 @@ static bool CheckShipStayInDepot(Ship *v)
 		return true;
 	}
 
-	assert(v->GetVehicleTrackdir() == TRACKDIR_X_NE || v->GetVehicleTrackdir() == TRACKDIR_Y_NW);
-	v->direction = DiagDirToDir(TrackdirToExitdir(v->GetVehicleTrackdir()));
+	const Trackdir trackdir = v->GetVehicleTrackdir();
+	assert_msg(IsDiagonalTrackdir(trackdir), "{}", trackdir);
+	v->direction = DiagDirToDir(TrackdirToExitdir(trackdir));
 	if (CheckReverseShip(v)) v->direction = ReverseDir(v->direction);
+
+	/* Double-ended always exit a depot with the first end facing forward, consistent with train reversal behaviour. */
+	v->flags.Reset(VehicleShipFlag::SecondEndFacingForward);
 
 	v->state = AxisToTrackBits(GetShipDepotAxis(v->tile));
 	v->rotation = v->direction;
@@ -800,7 +809,7 @@ bool IsShipDestinationTile(TileIndex tile, StationID station)
 {
 	dbg_assert(IsDockingTile(tile));
 	/* Check each tile adjacent to docking tile. */
-	for (DiagDirection d = DiagDirection::Begin; d != DiagDirection::End; d++) {
+	for (DiagDirection d : EnumRange(DiagDirection::End)) {
 		TileIndex t = tile + TileOffsByDiagDir(d);
 		if (!IsValidTile(t)) continue;
 		if (IsDockTile(t) && GetStationIndex(t) == station && IsDockWaterPart(t)) return true;
@@ -824,6 +833,12 @@ static void ReverseShipIntoTrackdir(Ship *v, Trackdir trackdir)
 	dbg_assert(v->direction != Direction::Invalid);
 	v->state = TrackdirBitsToTrackBits(TrackdirToTrackdirBits(trackdir));
 
+	/* Double-ended ships can instantly "turn" 180 degrees by switching which end is forward-facing. */
+	if (v->GetEngine()->info.extra_flags.Test(ExtraEngineFlag::IsDoubleEnded)) {
+		v->rotation = ReverseDir(v->rotation);
+		v->flags.Flip(VehicleShipFlag::SecondEndFacingForward);
+	}
+
 	/* Remember our current location to avoid movement glitch */
 	v->rotation_x_pos = v->x_pos;
 	v->rotation_y_pos = v->y_pos;
@@ -837,6 +852,12 @@ static void ReverseShipIntoTrackdir(Ship *v, Trackdir trackdir)
 static void ReverseShip(Ship *v)
 {
 	v->direction = ReverseDir(v->direction);
+
+	/* Double-ended ships can instantly "turn" 180 degrees by switching which end is forward-facing. */
+	if (v->GetEngine()->info.extra_flags.Test(ExtraEngineFlag::IsDoubleEnded)) {
+		v->rotation = ReverseDir(v->rotation);
+		v->flags.Flip(VehicleShipFlag::SecondEndFacingForward);
+	}
 
 	/* Remember our current location to avoid movement glitch */
 	v->rotation_x_pos = v->x_pos;
@@ -923,7 +944,7 @@ static void ShipController(Ship *v)
 						/* Test if continuing forward would lead to a dead-end, moving into the dock. */
 						const DiagDirection exitdir = VehicleExitDir(v->direction, v->state);
 						const TileIndex tile = TileAddByDiagDir(v->tile, exitdir);
-						if (TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TRANSPORT_WATER, 0, exitdir)) == TRACK_BIT_NONE) return ReverseShip(v);
+						if (TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TransportType::Water, 0, exitdir)) == TRACK_BIT_NONE) return ReverseShip(v);
 					} else if (v->dest_tile != INVALID_TILE) {
 						/* We have a target, let's see if we reached it... */
 						if (v->current_order.IsType(OT_GOTO_WAYPOINT) &&

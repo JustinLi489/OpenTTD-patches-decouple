@@ -20,7 +20,7 @@
 #include "date_func.h"
 #include "session_stats.h"
 
-#include "currency.h"
+#include "currency_func.h"
 #include "fontcache.h"
 #include "language.h"
 
@@ -164,12 +164,6 @@ void SurveyCompiler(nlohmann::json &survey)
 #elif defined(__clang__)
 	survey["name"] = "clang";
 	survey["version"] = __clang_version__;
-#elif defined(__ICC) && defined(__GNUC__)
-	survey["name"] = "ICC";
-	survey["version"] = __ICC;
-#	if defined(__GNUC__)
-		survey["extra"] = fmt::format("GCC {}.{}.{} mode", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
-#	endif
 #elif defined(__GNUC__)
 	survey["name"] = "GCC";
 	survey["version"] = fmt::format("{}.{}.{}", __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
@@ -304,7 +298,7 @@ void SurveyCompanies(nlohmann::json &survey)
 			company["script"] = fmt::format("{}.{}", c->ai_info->GetName(), c->ai_info->GetVersion());
 		}
 
-		for (VehicleType type = VehicleType::Begin; type < VehicleType::CompanyEnd; type++) {
+		for (VehicleType type : EnumRange(VehicleType::CompanyEnd)) {
 			uint amount = c->group_all[type].num_vehicle;
 			company["vehicles"][_vehicle_type_to_string[type]] = amount;
 		}
@@ -340,8 +334,7 @@ void SurveyTimers(nlohmann::json &survey)
 void SurveyGrfs(nlohmann::json &survey)
 {
 	for (const auto &c : _grfconfig) {
-		auto grfid = fmt::format("{:08x}", std::byteswap(c->ident.grfid));
-		auto &grf = survey[std::move(grfid)];
+		auto &grf = survey[c->ident.grfid.AsString()];
 
 		grf["md5sum"] = FormatArrayAsHex(c->ident.md5sum, true);
 		grf["status"] = c->status;

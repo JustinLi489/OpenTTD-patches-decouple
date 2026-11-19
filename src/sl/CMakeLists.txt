@@ -1,4 +1,5 @@
 add_files(
+    afterload.cpp
     ai_sl.cpp
     airport_sl.cpp
     animated_tile_sl.cpp
@@ -34,11 +35,15 @@ add_files(
     oldloader_sl.cpp
     order_sl.cpp
     plans_sl.cpp
+    randomizer_sl.cpp
     saveload.cpp
     saveload.h
     saveload_buffer.h
     saveload_common.h
+    saveload_common_error.h
+    saveload_common_type.h
     saveload_filter.h
+    saveload_func.h
     saveload_internal.h
     saveload_types.h
     signal_sl.cpp

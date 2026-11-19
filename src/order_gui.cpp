@@ -45,6 +45,7 @@
 #include "core/backup_type.hpp"
 #include "core/string_consumer.hpp"
 #include "fios.h"
+#include "time_type.h"
 
 #include "widgets/order_widget.h"
 
@@ -1097,7 +1098,7 @@ void DrawOrderString(const Vehicle *v, const Order *order, int order_index, int 
 		}
 	}
 
-	DrawString(left, rtl ? right - 2 * sprite_size.width - 3 : middle, y, GetString(STR_ORDER_INDEX, order_index + 1), colour, SA_RIGHT | SA_FORCE);
+	DrawString(left, rtl ? right - 2 * sprite_size.width - 3 : middle, y, GetString(STR_ORDER_INDEX, order_index + 1), colour, AlignmentH::ForceRight);
 
 	bool timetable_wait_time_valid = false;
 	format_buffer line;
@@ -2098,6 +2099,9 @@ private:
 	std::array<int, 4> current_aux_planes{};
 	int current_value_plane = 0;
 	int current_mgmt_plane = 0;
+	bool drag_selected = false;    ///< Order being dragged was the selected order.
+	Point drag_start_pt{};         ///< Start point for order drags.
+	uint64_t drag_start_time_us{}; ///< Start time for order drags, from MicrosecondsRealtimeTicks().
 
 	/**
 	 * Return the memorised selected order.
@@ -2852,7 +2856,7 @@ public:
 	virtual EventState OnCTRLStateChange() override
 	{
 		this->UpdateButtonState();
-		return ES_NOT_HANDLED;
+		return EventState::NotHandled;
 	}
 
 	void UpdateButtonState()
@@ -3474,7 +3478,7 @@ public:
 			}
 		}
 		int offset = std::max(0, ((int)(r.bottom - r.top + 1) - (int)d.height) / 2); // Offset for rendering the text vertically centered
-		DrawString(left, right, r.top + offset + clicked, STR_ORDERS_TIMETABLE_VIEW, TextColour::FromString, SA_HOR_CENTER);
+		DrawString(left, right, r.top + offset + clicked, STR_ORDERS_TIMETABLE_VIEW, TextColour::FromString, AlignmentH::Centre);
 	}
 
 	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
@@ -3722,7 +3726,7 @@ public:
 		}
 	}
 
-	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
+	void OnClick(Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
 	{
 		switch (widget) {
 			case WID_O_ORDER_LIST: {
@@ -3759,9 +3763,13 @@ public:
 				this->CloseChildWindows();
 				HideDropDownMenu(this);
 
+				const bool was_selected = (sel == this->selected_order);
+
 				if (sel == INVALID_VEH_ORDER_ID || this->vehicle->owner != _local_company) {
 					/* Deselect clicked order */
 					this->selected_order = -1;
+					this->UpdateButtonState();
+					return;
 				} else if (sel == this->selected_order) {
 					if (sel >= this->GetNumOrdersOfHost()) {
 						this->UpdateButtonState();
@@ -3774,7 +3782,7 @@ public:
 						return;
 					}
 
-					if (order->IsType(OT_LABEL) && order->GetLabelSubType() == OLST_TEXT) {
+					if (order->IsType(OT_LABEL) && order->GetLabelSubType() == OLST_TEXT && click_count > 1) {
 						if (this->IsWidgetActiveInLayout(WID_O_TEXT_LABEL)) this->OnClick({}, WID_O_TEXT_LABEL, click_count);
 						return;
 					}
@@ -3785,7 +3793,7 @@ public:
 					 * message and, when the row really was an OT_WAIT_COUPLE (see
 					 * the decouple wait point), the click appeared to "turn" the
 					 * order into "wait for coupling". Only station orders cycle. */
-					if (this->vehicle->type == VehicleType::Train && order->IsType(OT_GOTO_STATION)) {
+					if (this->vehicle->type == VehicleType::Train && order->IsType(OT_GOTO_STATION) && click_count > 1) {
 						OrderStopLocation osl = static_cast<OrderStopLocation>((to_underlying(order->GetStopLocation()) + 1) % to_underlying(OrderStopLocation::End));
 						if (osl == OrderStopLocation::Through && !_settings_client.gui.show_adv_load_mode_features) {
 							osl = OrderStopLocation::NearEnd;
@@ -3800,26 +3808,31 @@ public:
 							}
 						}
 						this->ModifyOrder(sel, MOF_STOP_LOCATION, to_underlying(osl));
+						return;
 					}
-					if (this->vehicle->type == VehicleType::Road) {
+					if (this->vehicle->type == VehicleType::Road && (order->IsType(OT_GOTO_STATION) || order->IsType(OT_GOTO_WAYPOINT)) && click_count > 1) {
 						DiagDirection current = order->GetRoadVehTravelDirection();
 						if (_settings_client.gui.show_adv_load_mode_features || current != DiagDirection::Invalid) {
 							uint dir = (to_underlying(current) + 1) & 0xFF;
 							if (dir >= to_underlying(DiagDirection::End)) dir = to_underlying(DiagDirection::Invalid);
 							this->ModifyOrder(sel, MOF_RV_TRAVEL_DIR, dir);
+							return;
 						}
 					}
 				} else {
 					/* Select clicked order */
 					this->selected_order = sel;
-
-					if (this->vehicle->owner == _local_company) {
-						/* Activate drag and drop */
-						SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
-					}
+					this->UpdateButtonState();
 				}
 
-				this->UpdateButtonState();
+				if (this->vehicle->owner == _local_company) {
+					/* Activate drag and drop */
+					this->drag_selected = was_selected;
+					this->drag_start_pt = pt;
+					this->drag_start_time_us = MicrosecondsRealtimeTicks();
+					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
+				}
+
 				break;
 			}
 
@@ -4157,7 +4170,7 @@ public:
 
 				int selected = (order->GetConditionValue() & GetBitMaskSC<uint16_t>(ODFLCB_TAG_START, ODFLCB_TAG_COUNT));
 				SB(selected, ODCB_MODE_START, ODCB_MODE_COUNT, OCDM_TAG);
-				ShowDropDownList(this, std::move(list), selected, WID_O_COND_SCHED_VALUE, 0, DropDownOptions{}, DDSF_SHARED);
+				if (!list.empty()) ShowDropDownList(this, std::move(list), selected, WID_O_COND_SCHED_VALUE, 0, DropDownOptions{}, DDSF_SHARED);
 				break;
 			}
 
@@ -4478,7 +4491,7 @@ public:
 		}
 
 		if (this->query_text_widget == WID_O_ADD_VEH_GROUP) {
-			Command<Commands::CreateGroupFromList>::Post(STR_ERROR_GROUP_CAN_T_CREATE, VehicleListIdentifier(VL_SINGLE_VEH, this->vehicle->type, this->vehicle->owner, this->vehicle->index), CargoFilterCriteria::CF_ANY, str.has_value() ? *str : std::string{});
+			Command<Commands::CreateGroupFromList>::Post(STR_ERROR_GROUP_CAN_T_CREATE, VehicleListIdentifier(VehicleListType::SingleVehicle, this->vehicle->type, this->vehicle->owner, this->vehicle->index), CargoFilterCriteria::CF_ANY, str.has_value() ? *str : std::string{});
 		}
 
 		if (this->query_text_widget == WID_O_TEXT_LABEL && str.has_value()) {
@@ -4873,6 +4886,13 @@ public:
 					this->selected_order = -1;
 					this->UpdateButtonState();
 				}
+				if (this->drag_selected && from_order == to_order && from_order < this->vehicle->GetNumOrders() &&
+						EuclideanDistanceSquared(pt, this->drag_start_pt) <= 40 && (MicrosecondsRealtimeTicks() - this->drag_start_time_us) < 250000) {
+					const Order *order = this->vehicle->GetOrder(from_order);
+					if (order != nullptr && order->IsType(OT_LABEL) && order->GetLabelSubType() == OLST_TEXT) {
+						if (this->IsWidgetActiveInLayout(WID_O_TEXT_LABEL)) this->OnClick({}, WID_O_TEXT_LABEL, 1);
+					}
+				}
 				break;
 			}
 
@@ -4896,7 +4916,7 @@ public:
 
 	EventState OnHotkey(int hotkey) override
 	{
-		if (this->vehicle->owner != _local_company) return ES_NOT_HANDLED;
+		if (this->vehicle->owner != _local_company) return EventState::NotHandled;
 
 		switch (hotkey) {
 			case OHK_SKIP:           this->OrderClick_Skip(); break;
@@ -4915,9 +4935,9 @@ public:
 			case OHK_DUPLICATE:      this->OrderClick_DuplicateHotkey(); break;
 			case OHK_RETARGET_JUMP:  this->OrderClick_RetargetJumpHotkey(); break;
 			case OHK_CLOSE:          this->Close(); break;
-			default: return ES_NOT_HANDLED;
+			default: return EventState::NotHandled;
 		}
-		return ES_HANDLED;
+		return EventState::Handled;
 	}
 
 	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
@@ -5357,7 +5377,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_train_widgets
 		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 			NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_MGMT),
 				NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_MGMT_BTN), SetMinimalSize(100, 12), SetFill(1, 0),
-														SetStringTip(STR_ORDERS_MANAGE_ORDER, STR_ORDERS_MANAGE_ORDER_TOOLTIP), SetResize(1, 0), SetAlignment(SA_TOP | SA_LEFT),
+														SetStringTip(STR_ORDERS_MANAGE_ORDER, STR_ORDERS_MANAGE_ORDER_TOOLTIP), SetResize(1, 0), SetAlignment({AlignmentH::Start, AlignmentV::Top}),
 				NWidget(WWT_DROPDOWN, Colours::Grey, WID_O_MGMT_LIST_BTN), SetMinimalSize(100, 12), SetFill(1, 0),
 														SetStringTip(STR_ORDERS_MANAGE_LIST, STR_ORDERS_MANAGE_LIST_TOOLTIP), SetResize(1, 0),
 			EndContainer(),
@@ -5521,7 +5541,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_orders_widgets = {
 	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_SELECTION, Colours::Invalid, WID_O_SEL_MGMT),
 			NWidget(NWID_BUTTON_DROPDOWN, Colours::Grey, WID_O_MGMT_BTN), SetMinimalSize(100, 12), SetFill(1, 0),
-													SetStringTip(STR_ORDERS_MANAGE_ORDER, STR_ORDERS_MANAGE_ORDER_TOOLTIP), SetResize(1, 0), SetAlignment(SA_TOP | SA_LEFT),
+													SetStringTip(STR_ORDERS_MANAGE_ORDER, STR_ORDERS_MANAGE_ORDER_TOOLTIP), SetResize(1, 0), SetAlignment({AlignmentH::Start, AlignmentV::Top}),
 			NWidget(WWT_DROPDOWN, Colours::Grey, WID_O_MGMT_LIST_BTN), SetMinimalSize(100, 12), SetFill(1, 0),
 													SetStringTip(STR_ORDERS_MANAGE_LIST, STR_ORDERS_MANAGE_LIST_TOOLTIP), SetResize(1, 0),
 		EndContainer(),

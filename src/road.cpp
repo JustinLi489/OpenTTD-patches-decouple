@@ -66,7 +66,7 @@ static bool IsPossibleCrossing(const TileIndex tile, Axis ax)
 RoadBits CleanUpRoadBits(const TileIndex tile, RoadBits org_rb)
 {
 	if (!IsValidTile(tile)) return {};
-	for (DiagDirection dir = DiagDirection::Begin; dir < DiagDirection::End; dir++) {
+	for (DiagDirection dir : EnumRange(DiagDirection::End)) {
 		TileIndex neighbour_tile = TileAddByDiagDir(tile, dir);
 
 		/* Get the Roadbit pointing to the neighbour_tile */
@@ -137,7 +137,7 @@ bool HasRoadTypeAvail(const CompanyID company, RoadType roadtype)
 {
 	if (company == OWNER_DEITY || company == OWNER_TOWN || _game_mode == GameMode::Editor || _generating_world) {
 		const RoadTypeInfo *rti = GetRoadTypeInfo(roadtype);
-		if (rti->label == 0) return false;
+		if (rti->label.Empty()) return false;
 
 		/* Not yet introduced at this date. */
 		if (IsInsideMM(rti->introduction_date, 0, CalTime::MAX_DATE.base()) && rti->introduction_date > CalTime::CurDate()) return false;
@@ -195,10 +195,10 @@ RoadTypes AddDateIntroducedRoadTypes(RoadTypes current, CalTime::Date date)
 {
 	RoadTypes rts = current;
 
-	for (RoadType rt = ROADTYPE_BEGIN; rt != ROADTYPE_END; rt++) {
+	for (RoadType rt : EnumRange(ROADTYPE_END)) {
 		const RoadTypeInfo *rti = GetRoadTypeInfo(rt);
 		/* Unused road type. */
-		if (rti->label == 0) continue;
+		if (rti->label.Empty()) continue;
 
 		/* Not date introduced. */
 		if (!IsInsideMM(rti->introduction_date, 0, CalTime::MAX_DATE.base())) continue;
@@ -282,7 +282,7 @@ RoadTypes GetRoadTypes(bool introduces)
 RoadType GetRoadTypeByLabel(RoadTypeLabel label, bool allow_alternate_labels)
 {
 	extern RoadTypeInfo _roadtypes[ROADTYPE_END];
-	if (label == 0) return INVALID_ROADTYPE;
+	if (label.Empty()) return INVALID_ROADTYPE;
 
 	auto it = std::ranges::find(_roadtypes, label, &RoadTypeInfo::label);
 	if (it == std::end(_roadtypes) && allow_alternate_labels) {
@@ -374,7 +374,7 @@ static TileIndex BuildTunnel(PathNode *current, TileIndex end_tile = INVALID_TIL
 	Backup cur_company(_current_company, OWNER_DEITY, FILE_LINE);
 	DoCommandFlags flags{DoCommandFlag::Auto};
 	if (build_tunnel) flags.Set(DoCommandFlag::Execute);
-	const CommandCost build_tunnel_cmd = CmdBuildTunnel(flags, start_tile, TRANSPORT_ROAD, _public_road_type);
+	const CommandCost build_tunnel_cmd = CmdBuildTunnel(flags, start_tile, TransportType::Road, _public_road_type);
 	cur_company.Restore();
 
 	assert(!build_tunnel || build_tunnel_cmd.Succeeded());
@@ -406,7 +406,7 @@ static TileIndex BuildBridge(const TileIndex start_tile, const TileIndex end_til
 	Backup cur_company(_current_company, OWNER_DEITY, FILE_LINE);
 	DoCommandFlags flags{DoCommandFlag::Auto};
 	if (build_bridge) flags.Set(DoCommandFlag::Execute);
-	const CommandCost  build_bridge_cmd = CmdBuildBridge(flags, end_tile, start_tile, TRANSPORT_ROAD, bridge_type, _public_road_type, BuildBridgeFlags::None);
+	const CommandCost  build_bridge_cmd = CmdBuildBridge(flags, end_tile, start_tile, TransportType::Road, bridge_type, _public_road_type, BuildBridgeFlags::None);
 	cur_company.Restore();
 
 	assert(!build_bridge || build_bridge_cmd.Succeeded());
@@ -503,7 +503,7 @@ static TileIndex BuildRiverBridge(PathNode *current, const DiagDirection road_di
 	Backup cur_company(_current_company, OWNER_DEITY, FILE_LINE);
 	DoCommandFlags flags{DoCommandFlag::Auto};
 	if (build_bridge) flags.Set(DoCommandFlag::Execute);
-	const CommandCost  build_bridge_cmd = CmdBuildBridge(flags, end_tile, start_tile, TRANSPORT_ROAD, bridge_type, _public_road_type, BuildBridgeFlags::None);
+	const CommandCost  build_bridge_cmd = CmdBuildBridge(flags, end_tile, start_tile, TransportType::Road, bridge_type, _public_road_type, BuildBridgeFlags::None);
 	cur_company.Restore();
 
 	assert(!build_bridge || build_bridge_cmd.Succeeded());
@@ -566,20 +566,20 @@ static bool IsValidNeighbourOfPreviousTile(const TileIndex tile, const TileIndex
 	if (is_non_trivial_foundation(sd) || is_non_trivial_foundation(previous_sd)) {
 		static const Corner test_corners[16] = {
 			// DiagDirection::NE
-			CORNER_N, CORNER_W,
-			CORNER_E, CORNER_S,
+			Corner::N, Corner::W,
+			Corner::E, Corner::S,
 
 			// DiagDirection::SE
-			CORNER_S, CORNER_W,
-			CORNER_E, CORNER_N,
+			Corner::S, Corner::W,
+			Corner::E, Corner::N,
 
 			// DiagDirection::SW
-			CORNER_S, CORNER_E,
-			CORNER_W, CORNER_N,
+			Corner::S, Corner::E,
+			Corner::W, Corner::N,
 
 			// DiagDirection::NW
-			CORNER_N, CORNER_E,
-			CORNER_W, CORNER_S
+			Corner::N, Corner::E,
+			Corner::W, Corner::S
 		};
 		const Corner *corners = test_corners + (to_underlying(forward_direction) * 4);
 		return ((previous_sd.z + GetSlopeZInCorner(previous_sd.slope, corners[0])) == (sd.z + GetSlopeZInCorner(sd.slope, corners[1]))) &&

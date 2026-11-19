@@ -77,7 +77,7 @@ static uint32_t saveSTC(const SlxiSubChunkInfo &info, bool dry_run);
 const std::initializer_list<SlxiSubChunkInfo> _sl_xv_sub_chunk_infos = {
 	{ XSLFI_VERSION_LABEL,                    XSCF_IGNORABLE_ALL,       1,   1, "version_label",                    saveVL,  loadVL,  nullptr          },
 	{ XSLFI_UPSTREAM_VERSION,                 XSCF_NULL,                2,   2, "upstream_version",                 saveUV,  loadUV,  nullptr          },
-	{ XSLFI_TRACE_RESTRICT,                   XSCF_NULL,               23,  23, "tracerestrict",                    nullptr, nullptr, "TRRM,TRRP,TRRS,TRRG,TRRB" },
+	{ XSLFI_TRACE_RESTRICT,                   XSCF_NULL,               24,  24, "tracerestrict",                    nullptr, nullptr, "TRRM,TRRP,TRRS,TRRG,TRRB" },
 	{ XSLFI_TRACE_RESTRICT_OWNER,             XSCF_NULL,                1,   1, "tracerestrict_owner",              nullptr, nullptr, nullptr          },
 	{ XSLFI_TRACE_RESTRICT_ORDRCND,           XSCF_NULL,                4,   4, "tracerestrict_order_cond",         nullptr, nullptr, nullptr          },
 	{ XSLFI_TRACE_RESTRICT_STATUSCND,         XSCF_NULL,                2,   2, "tracerestrict_status_cond",        nullptr, nullptr, nullptr          },
@@ -228,6 +228,8 @@ const std::initializer_list<SlxiSubChunkInfo> _sl_xv_sub_chunk_infos = {
 	{ XSLFI_ENGINE_MULTI_RAILTYPE,            XSCF_NULL,                1,   1, "slv_engine_multi_railtype",        nullptr, nullptr, nullptr          },
 	{ XSLFI_TOWN_SUPPLY_HISTORY,              XSCF_NULL,                1,   1, "slv_town_supply_history",          nullptr, nullptr, nullptr          },
 	{ XSLFI_DRIVE_BACKWARDS,                  XSCF_NULL,                1,   1, "slv_drive_backwards",              nullptr, nullptr, nullptr          },
+	{ XSLFI_DOUBLE_ENDED_SHIPS,               XSCF_NULL,                1,   1, "slv_double_ended_ships",           nullptr, nullptr, nullptr          },
+	{ XSLFI_SCRIPT_RANDOMIZER,                XSCF_IGNORABLE_ALL,       1,   1, "slv_script_randomizer",            nullptr, nullptr, "SRND"           },
 
 	{ XSLFI_PR_13745_APPLIED,                 XSCF_IGNORABLE_ALL,       1,   1, "pr_13745",                         nullptr, nullptr, nullptr          },
 	{ XSLFI_SIGNAL_STATE_FIX,                 XSCF_IGNORABLE_ALL,       1,   1, "signal_state_fix",                 nullptr, nullptr, nullptr          },
@@ -818,6 +820,6 @@ static uint32_t saveSTC(const SlxiSubChunkInfo &info, bool dry_run)
 }
 
 extern const ChunkHandler version_ext_chunk_handlers[] = {
-	{ 'SLXI', Save_SLXI, Load_SLXI, nullptr, Load_SLXI, CH_RIFF },
+	{ 'SLXI', Save_SLXI, Load_SLXI, nullptr, Load_SLXI, ChunkType::Riff },
 };
 extern const ChunkHandlerTable _version_ext_chunk_handlers(version_ext_chunk_handlers);

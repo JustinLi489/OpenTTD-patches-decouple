@@ -44,7 +44,7 @@
 
 #include "safeguards.h"
 
-ClientID _cmd_client_id = INVALID_CLIENT_ID;
+ClientID _cmd_client_id = ClientID::Invalid;
 
 /**
  * List of flags for a command log entry
@@ -441,7 +441,7 @@ bool DoCommandPImplementation(Commands cmd, TileIndex tile, const CommandPayload
 	if (!(intl_flags & DCIF_NETWORK_COMMAND) && GetCommandFlags(cmd).Test(CommandFlag::ClientID)) {
 		modified_payload = orig_payload.Clone();
 		assert(IsCorrectCommandPayloadType(cmd, *modified_payload));
-		SetPreCheckedCommandPayloadClientID(cmd, *modified_payload, CLIENT_ID_SERVER);
+		SetPreCheckedCommandPayloadClientID(cmd, *modified_payload, ClientID::Server);
 		use_payload = modified_payload.get();
 	}
 
@@ -822,7 +822,7 @@ void CommandCost::AllocAuxData()
 			NOT_REACHED();
 
 		case CommandCostInlineType::ExtraMsg:
-			aux_data->extra_message = this->inl.extra_message;
+			aux_data->extra_message = StringID{this->inl.extra_message};
 			break;
 
 		case CommandCostInlineType::Tile:
@@ -908,7 +908,7 @@ void SerialisePayload(BufferSerialisationRef buffer, const T &payload)
 void SerialisedBaseCommandContainer::Serialise(BufferSerialisationRef buffer) const
 {
 	buffer.Send_uint16(to_underlying(this->cmd));
-	buffer.Send_uint16(this->error_msg);
+	buffer.Send_uint16(this->error_msg.base());
 	buffer.Send_uint32(this->tile.base());
 	SerialisePayload(buffer, this->payload);
 }
@@ -916,7 +916,7 @@ void SerialisedBaseCommandContainer::Serialise(BufferSerialisationRef buffer) co
 void DynBaseCommandContainer::Serialise(BufferSerialisationRef buffer) const
 {
 	buffer.Send_uint16(to_underlying(this->cmd));
-	buffer.Send_uint16(this->error_msg);
+	buffer.Send_uint16(this->error_msg.base());
 	buffer.Send_uint32(this->tile.base());
 	SerialisePayload(buffer, *this->payload);
 }
@@ -927,7 +927,7 @@ const char *DynBaseCommandContainer::Deserialise(DeserialisationBuffer &buffer)
 	if (!IsValidCommand(this->cmd)) return "invalid command";
 	if (GetCommandFlags(this->cmd).Test(CommandFlag::Offline)) return "single-player only command";
 
-	this->error_msg = buffer.Recv_uint16();
+	this->error_msg = static_cast<StringID>(buffer.Recv_uint16());
 	this->tile = TileIndex(buffer.Recv_uint32());
 
 	StringValidationSettings default_settings = (!_network_server && GetCommandFlags(this->cmd).Test(CommandFlag::StrCtrl)) ? StringValidationSettings{StringValidationSetting::AllowControlCode, StringValidationSetting::ReplaceWithQuestionMark} : StringValidationSetting::ReplaceWithQuestionMark;

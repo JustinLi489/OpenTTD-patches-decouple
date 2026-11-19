@@ -94,13 +94,13 @@ struct StationResolverObject : public SpecializedResolverObject<StationRandomTri
 
 	TownScopeResolver *GetTown();
 
-	ScopeResolver *GetScope(VarSpriteGroupScope scope = VSG_SCOPE_SELF, VarSpriteGroupScopeOffset relative = 0) override
+	ScopeResolver *GetScope(VarSpriteGroupScope scope = VarSpriteGroupScope::Self, VarSpriteGroupScopeOffset relative = 0) override
 	{
 		switch (scope) {
-			case VSG_SCOPE_SELF:
+			case VarSpriteGroupScope::Self:
 				return &this->station_scope;
 
-			case VSG_SCOPE_PARENT: {
+			case VarSpriteGroupScope::Parent: {
 				TownScopeResolver *tsr = this->GetTown();
 				if (tsr != nullptr) return tsr;
 				[[fallthrough]];
@@ -117,9 +117,6 @@ struct StationResolverObject : public SpecializedResolverObject<StationRandomTri
 	uint32_t GetDebugID() const override;
 };
 
-static const uint32_t STATION_CLASS_LABEL_DEFAULT = 'DFLT';
-static const uint32_t STATION_CLASS_LABEL_WAYPOINT = 'WAYP';
-
 static constexpr StationClassID STAT_CLASS_DFLT{0}; ///< Default station class.
 static constexpr StationClassID STAT_CLASS_WAYP{1}; ///< Waypoint class.
 
@@ -132,6 +129,8 @@ enum class StationSpecFlag : uint8_t {
 	ExtendedFoundations = 4, ///< Extended foundation block instead of simple.
 	DivByStationArea = 5, ///< Divide cargo amount by station area.
 };
+
+/** Bitset of \c StationSpecFlag elements. */
 using StationSpecFlags = EnumBitSet<StationSpecFlag, uint8_t>;
 
 enum class StationSpecIntlFlag : uint8_t {
@@ -196,7 +195,10 @@ struct StationSpec : NewGRFSpecBase<StationClassID> {
 		NoWires = 1, ///< Tile should NOT contain catenary wires.
 		Blocked = 2, ///< Tile is blocked to vehicles.
 	};
+
+	/** Bitset of \c TileFlag elements. */
 	using TileFlags = EnumBitSet<TileFlag, uint8_t>;
+
 	std::vector<TileFlags> tileflags; ///< List of tile flags.
 
 	AnimationInfo<StationAnimationTriggers> animation;
@@ -218,6 +220,9 @@ struct StationSpec : NewGRFSpecBase<StationClassID> {
 /** Class containing information relating to station classes. */
 using StationClass = NewGRFClass<StationSpec, StationClassID>;
 
+static const StationClass::GlobalID STATION_CLASS_LABEL_DEFAULT{"DFLT"}; ///< Class label for default rail station.
+static const StationClass::GlobalID STATION_CLASS_LABEL_WAYPOINT{"WAYP"}; ///< Class label for default rail waypoints.
+
 const StationSpec *GetStationSpec(TileIndex t);
 
 /**
@@ -238,7 +243,7 @@ inline uint16_t GetStationLayoutKey(uint8_t platforms, uint8_t length)
  */
 inline bool IsWaypointClass(const StationClass &cls)
 {
-	return cls.global_id == STATION_CLASS_LABEL_WAYPOINT || GB(cls.global_id, 24, 8) == UINT8_MAX;
+	return cls.global_id == STATION_CLASS_LABEL_WAYPOINT || cls.global_id[0] == UINT8_MAX;
 }
 
 /* Evaluate a tile's position within a station, and return the result a bitstuffed format. */

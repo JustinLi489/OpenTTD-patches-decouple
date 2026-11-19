@@ -80,12 +80,12 @@ public:
 
 		Rect ir = r.Shrink(WidgetDimensions::scaled.frametext);
 		for (size_t i = 0; i < this->landinfo_data.size(); i++) {
-			DrawString(ir, this->landinfo_data[i], i == 0 ? TextColour::LightBlue : TextColour::FromString, SA_HOR_CENTER);
+			DrawString(ir, this->landinfo_data[i], i == 0 ? TextColour::LightBlue : TextColour::FromString, AlignmentH::Centre);
 			ir.top += GetCharacterHeight(FontSize::Normal) + (i == 0 ? WidgetDimensions::scaled.vsep_wide : WidgetDimensions::scaled.vsep_normal);
 		}
 
 		if (!this->cargo_acceptance.empty()) {
-			DrawStringMultiLine(ir, GetString(STR_JUST_RAW_STRING, this->cargo_acceptance), TextColour::FromString, SA_CENTER);
+			DrawStringMultiLine(ir, GetString(STR_JUST_RAW_STRING, this->cargo_acceptance), TextColour::FromString, {AlignmentH::Centre, AlignmentV::Middle});
 		}
 	}
 
@@ -507,7 +507,7 @@ struct AboutWindow : public Window {
 		/* Show all scrolling _credits */
 		for (const auto &str : _credits) {
 			if (y >= r.top + 7 && y < r.bottom - this->line_height) {
-				DrawString(r.left, r.right, y, str, TextColour::Black, SA_LEFT | SA_FORCE);
+				DrawString(r.left, r.right, y, str, TextColour::Black, AlignmentH::ForceLeft);
 			}
 			y += this->line_height;
 		}
@@ -568,7 +568,7 @@ void ShowCostOrIncomeAnimation(int x, int y, int z, Money cost)
 		cost = -cost;
 		msg = STR_INCOME_FLOAT_INCOME;
 	}
-	AddTextEffect(msg, pt.x, pt.y, DAY_TICKS, TE_RISING, cost);
+	AddTextEffect(msg, pt.x, pt.y, DAY_TICKS, TextEffectMode::Rising, cost);
 }
 
 /**
@@ -586,14 +586,14 @@ void ShowFeederIncomeAnimation(int x, int y, int z, Money transfer, Money income
 	Point pt = RemapCoords(x, y, z);
 
 	if (income == 0) {
-		AddTextEffect(STR_FEEDER, pt.x, pt.y, DAY_TICKS, TE_RISING, transfer);
+		AddTextEffect(STR_FEEDER, pt.x, pt.y, DAY_TICKS, TextEffectMode::Rising, transfer);
 	} else {
 		StringID msg = STR_FEEDER_COST;
 		if (income < 0) {
 			income = -income;
 			msg = STR_FEEDER_INCOME;
 		}
-		AddTextEffect(msg, pt.x, pt.y, DAY_TICKS, TE_RISING, transfer, income);
+		AddTextEffect(msg, pt.x, pt.y, DAY_TICKS, TextEffectMode::Rising, transfer, income);
 	}
 }
 
@@ -612,7 +612,7 @@ TextEffectID ShowFillingPercent(int x, int y, int z, uint8_t percent, StringID s
 
 	assert(string != STR_NULL);
 
-	return AddTextEffect(string, pt.x, pt.y, 0, TE_STATIC, percent);
+	return AddTextEffect(string, pt.x, pt.y, 0, TextEffectMode::Static, percent);
 }
 
 /**
@@ -666,7 +666,7 @@ struct TooltipsWindow : public Window
 		this->parent = parent;
 		this->close_cond = close_tooltip;
 		this->delete_next_mouse_loop = false;
-		if (close_tooltip == TCC_HOVER_VIEWPORT) {
+		if (close_tooltip == TooltipCloseCondition::HoverViewport) {
 			this->viewport_virtual_left = parent->viewport->virtual_left;
 			this->viewport_virtual_top = parent->viewport->virtual_top;
 		}
@@ -714,7 +714,7 @@ struct TooltipsWindow : public Window
 		GfxFillRect(r, PC_BLACK);
 		GfxFillRect(r.Shrink(WidgetDimensions::scaled.bevel), PC_LIGHT_YELLOW);
 
-		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect).Shrink(WidgetDimensions::scaled.fullbevel), this->text.GetDecodedString(), TextColour::Black, SA_CENTER);
+		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect).Shrink(WidgetDimensions::scaled.fullbevel), this->text.GetDecodedString(), TextColour::Black, {AlignmentH::Centre, AlignmentV::Middle});
 	}
 
 	void OnMouseLoop() override
@@ -728,12 +728,11 @@ struct TooltipsWindow : public Window
 		/* We can show tooltips while dragging tools. These are shown as long as
 		 * we are dragging the tool. Normal tooltips work with hover or rmb. */
 		switch (this->close_cond) {
-			case TCC_RIGHT_CLICK: if (!_right_button_down) this->Close();; break;
-			case TCC_HOVER: if (!_mouse_hovering) this->Close();; break;
-			case TCC_NONE: break;
-			case TCC_NEXT_LOOP: this->delete_next_mouse_loop = true; break;
+			case TooltipCloseCondition::RightClick: if (!_right_button_down) this->Close();; break;
+			case TooltipCloseCondition::Hover: if (!_mouse_hovering) this->Close();; break;
+			case TooltipCloseCondition::None: break;
 
-			case TCC_HOVER_VIEWPORT:
+			case TooltipCloseCondition::HoverViewport:
 				if (_settings_client.gui.hover_delay_ms == 0) {
 					if (!_right_button_down) this->delete_next_mouse_loop = true;
 				} else if (!_mouse_hovering) {
@@ -746,7 +745,7 @@ struct TooltipsWindow : public Window
 				}
 				break;
 
-			case TCC_EXIT_VIEWPORT: {
+			case TooltipCloseCondition::ExitViewport: {
 				Window *w = FindWindowFromPt(_cursor.pos.x, _cursor.pos.y);
 				if (w == nullptr || IsPtInWindowViewport(w, _cursor.pos.x, _cursor.pos.y) == nullptr) this->Close();
 				break;
@@ -819,7 +818,7 @@ void QueryString::DrawEditBox(const Window *w, WidgetID wid) const
 	Rect fr = r.Indent(clearbtn_width, !rtl);
 
 	DrawFrameRect(cr, wi->colour, wi->IsLowered() ? FrameFlag::Lowered : FrameFlags{});
-	DrawSpriteIgnorePadding(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT, PAL_NONE, cr, SA_CENTER);
+	DrawSpriteIgnorePadding(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT, PAL_NONE, cr, {AlignmentH::Centre, AlignmentV::Middle});
 	if (this->text.GetText().empty()) GfxFillRect(cr.Shrink(WidgetDimensions::scaled.bevel), GetColourGradient(wi->colour, Shade::Darker), FillRectMode::Checker);
 
 	DrawFrameRect(fr, wi->colour, {FrameFlag::Lowered, FrameFlag::Darkened});
@@ -1110,7 +1109,7 @@ public:
 	EventState OnKeyPress(char32_t key, uint16_t keycode) override
 	{
 		if constexpr (N == 1) {
-			return ES_NOT_HANDLED;
+			return EventState::NotHandled;
 		} else if (keycode == WKC_TAB) {
 			static_assert(N == 2);
 			if (this->GetFocusedTextbuf() == &this->editboxes[1].text) {
@@ -1118,9 +1117,9 @@ public:
 			} else {
 				this->SetFocusedWidget(WID_QS_TEXT2);
 			}
-			return ES_HANDLED;
+			return EventState::Handled;
 		} else {
-			return ES_NOT_HANDLED;
+			return EventState::NotHandled;
 		}
 	}
 
@@ -1130,7 +1129,7 @@ public:
 
 		if (this->flags.Test(QueryStringFlag::Password)) {
 			DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect).Shrink(WidgetDimensions::scaled.frametext),
-				STR_WARNING_PASSWORD_SECURITY, TextColour::FromString, SA_CENTER);
+				STR_WARNING_PASSWORD_SECURITY, TextColour::FromString, {AlignmentH::Centre, AlignmentV::Middle});
 		}
 	}
 
@@ -1389,7 +1388,7 @@ struct QueryWindow : public Window {
 	{
 		if (widget != WID_Q_TEXT) return;
 
-		DrawStringMultiLine(r, this->message.GetDecodedString(), TextColour::FromString, SA_CENTER);
+		DrawStringMultiLine(r, this->message.GetDecodedString(), TextColour::FromString, {AlignmentH::Centre, AlignmentV::Middle});
 	}
 
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
@@ -1429,9 +1428,9 @@ struct QueryWindow : public Window {
 
 			case WKC_ESC:
 				this->Close();
-				return ES_HANDLED;
+				return EventState::Handled;
 		}
-		return ES_NOT_HANDLED;
+		return EventState::NotHandled;
 	}
 };
 

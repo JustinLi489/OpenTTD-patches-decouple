@@ -1824,8 +1824,8 @@ struct CheckDeterministicSpriteGroupOutputVarBitsProcedureHandler {
 		std::bitset<256> output_bits;
 		bool done = false;
 	};
-	inline static robin_hood::unordered_node_map<const DeterministicSpriteGroup *, ProcedureRecord> record_map;
-	inline static std::vector<std::pair<const DeterministicSpriteGroup *, ProcedureRecord *>> record_queue;
+	static inline robin_hood::unordered_node_map<const DeterministicSpriteGroup *, ProcedureRecord> record_map;
+	static inline std::vector<std::pair<const DeterministicSpriteGroup *, ProcedureRecord *>> record_queue;
 
 	CheckDeterministicSpriteGroupOutputVarBitsProcedureHandler(const std::bitset<256> &bits)
 			: needed_output_bits(nullptr), output_bits(bits) {}
@@ -2721,7 +2721,7 @@ static bool IsVariableInlinable(uint16_t variable, GrfSpecFeature feature)
 static void OptimiseVarAction2CheckInliningCandidate(DeterministicSpriteGroup *group, std::vector<DeterministicSpriteGroupAdjust> &saved_adjusts)
 {
 	if (HasGrfOptimiserFlag(NGOF_NO_OPT_VARACT2_PROC_INLINE)) return;
-	if (group->adjusts.size() > MAX_PROC_INLINE_ADJUST_COUNT || !group->IsCalculatedResult() || group->var_scope != VSG_SCOPE_SELF) return;
+	if (group->adjusts.size() > MAX_PROC_INLINE_ADJUST_COUNT || !group->IsCalculatedResult() || group->var_scope != VarSpriteGroupScope::Self) return;
 
 	for (const DeterministicSpriteGroupAdjust &adjust : group->adjusts) {
 		uint variable = adjust.variable;

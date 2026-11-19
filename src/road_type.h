@@ -11,13 +11,14 @@
 #define ROAD_TYPE_H
 
 #include "core/enum_type.hpp"
+#include "core/label_type.hpp"
 
 extern uint32_t _road_layout_change_counter;
 
-typedef uint32_t RoadTypeLabel;
+using RoadTypeLabel = Label<struct RoadTypeLabelTag>;
 
-static const RoadTypeLabel ROADTYPE_LABEL_ROAD = 'ROAD';
-static const RoadTypeLabel ROADTYPE_LABEL_TRAM = 'ELRL';
+static const RoadTypeLabel ROADTYPE_LABEL_ROAD{"ROAD"};
+static const RoadTypeLabel ROADTYPE_LABEL_TRAM{"ELRL"};
 
 /**
  * The different roadtypes we support
@@ -29,8 +30,8 @@ enum RoadType : uint8_t {
 	ROADTYPE_END     = 63,   ///< Used for iterations
 	INVALID_ROADTYPE = 63,   ///< flag for invalid roadtype
 };
-DECLARE_INCREMENT_DECREMENT_OPERATORS(RoadType)
 
+/** Bitset of \c RoadType elements. */
 using RoadTypes = EnumBitSet<RoadType, uint64_t>;
 
 /**

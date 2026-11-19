@@ -915,6 +915,7 @@ STR_TRACE_RESTRICT_VARIABLE_UNDEFINED                           :undefined
 STR_TRACE_RESTRICT_VARIABLE_UNDEFINED_RED                       :{PUSH_COLOUR}{RED}undefined{POP_COLOUR}
 STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_INTEGER                  :{STRING} {STRING} {STRING} {COMMA} then
 STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_SPEED                    :{STRING} {STRING} {STRING} {VELOCITY} then
+STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_TICK_COUNT               :{STRING} {STRING} {STRING} {TT_TICKS} then
 STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_WEIGHT                   :{STRING} {STRING} {STRING} {WEIGHT_SHORT} then
 STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_POWER                    :{STRING} {STRING} {STRING} {POWER} then
 STR_TRACE_RESTRICT_CONDITIONAL_COMPARE_FORCE                    :{STRING} {STRING} {STRING} {FORCE} then
@@ -1076,6 +1077,8 @@ STR_TRACE_RESTRICT_TIME_DAY_ITEM_SHORT                          :day
 STR_TRACE_RESTRICT_TIME_MONTH_ITEM_SHORT                        :month
 STR_TRACE_RESTRICT_TIMETABLE_LATENESS                           :lateness
 STR_TRACE_RESTRICT_TIMETABLE_EARLINESS                          :earliness
+STR_TRACE_RESTRICT_TIMETABLE_LATENESS_LONG                      :timetable lateness
+STR_TRACE_RESTRICT_TIMETABLE_EARLINESS_LONG                     :timetable earliness
 STR_TRACE_RESTRICT_OTHER_COMPANY_GROUP                          :{GROUP} {COMPANY_NUM}
 STR_TRACE_RESTRICT_GUI_LABEL                                    :Text label
 STR_TRACE_RESTRICT_GUI_LABEL_ITEM                               :{PUSH_COLOUR}{YELLOW}Label:{POP_COLOUR} {RAW_STRING}
@@ -1511,6 +1514,8 @@ STR_CONFIG_DEPARTURE_VEHICLE_TYPE                               :Show vehicle ty
 STR_CONFIG_DEPARTURE_VEHICLE_TYPE_HELPTEXT                      :Whether to show a vehicle's type as an icon in its departure board entries
 STR_CONFIG_DEPARTURE_VEHICLE_COLOR                              :Show vehicle type icon in silver: {STRING2}
 STR_CONFIG_DEPARTURE_VEHICLE_COLOR_HELPTEXT                     :Whether to show vehicle type icons in silver
+STR_CONFIG_DEPARTURE_SCHEDULE_ROUTE_ID                          :Show vehicle route ID in entries: {STRING2}
+STR_CONFIG_DEPARTURE_SCHEDULE_ROUTE_ID_HELPTEXT                 :Whether to show schedule the dispatch route ID associated a departure board entry
 STR_CONFIG_DEPARTURE_LARGER_FONT                                :Use larger font for stations called at on departure boards: {STRING2}
 STR_CONFIG_DEPARTURE_LARGER_FONT_HELPTEXT                       :Whether to use a larger font for lists of stations called at
 STR_CONFIG_DEPARTURE_DESTINATION_TYPE                           :Show icons for destinations that are docks or airports: {STRING2}
@@ -1844,6 +1849,7 @@ STR_ORDER_APPEND_REVERSED_ORDER_LIST                            :Append reversed
 STR_ORDER_DUPLICATE_ORDER                                       :Duplicate order
 STR_ORDER_CHANGE_JUMP_TARGET                                    :Change jump target
 STR_ORDER_EXPORT_ORDER_LIST                                     :Export order list
+STR_ORDER_EXPORT_ORDER_LISTS                                    :Export order lists
 STR_ORDER_IMPORT_ORDER_LIST_REPLACE                             :Import order list (replace)
 STR_ORDER_IMPORT_ORDER_LIST_APPEND                              :Import order list (append)
 STR_ORDER_IMPORT_ORDER_LIST_INSERT                              :Import order list (insert)
@@ -2000,6 +2006,9 @@ STR_TIMETABLE_DEPARTURE_ABBREVIATION                            :D:{SPACE}{SPACE
 
 STR_DATE_MINUTES_MINUTE_TOOLTIP                                 :{BLACK}Select minute
 STR_DATE_MINUTES_HOUR_TOOLTIP                                   :{BLACK}Select hour
+STR_DATE_HHMM_TOOLTIP                                           :{BLACK}Time (hhmm)
+STR_DATE_DAY_OFFSET                                             :{BLACK}Day offset:
+STR_DATE_DAY_OFFSET_TOOLTIP                                     :{BLACK}Set day offset from the current timetable day
 
 STR_TIME_CAPTION                                                :{WHITE}Set time
 
@@ -2310,8 +2319,10 @@ STR_SCHDISPATCH_ADJUST_CAPTION_DAY                              :{BLACK}Adjustme
 STR_SCHDISPATCH_ADJUST_CAPTION_TICKS                            :{BLACK}Adjustment to add (ticks)
 STR_SCHDISPATCH_ADJUST_CAPTION_SLOT_PREFIXED                    :{BLACK}{TT_TIME}: {STRING}
 STR_SCHDISPATCH_ADJUST_CAPTION_MULTI_SLOT_PREFIXED              :{BLACK}{NUM} slots from {TT_TIME}: {STRING}
-STR_SCHDISPATCH_RESET_LAST_DISPATCH                             :{BLACK}Reset Last Dispatched
+STR_SCHDISPATCH_RESET_LAST_DISPATCH                             :{BLACK}Clear Last Dispatched
 STR_SCHDISPATCH_RESET_LAST_DISPATCH_TOOLTIP                     :{BLACK}Reset when a vehicle was last dispatched from the schedule.
+STR_SCHDISPATCH_SET_LAST_DISPATCH                               :{BLACK}Set Last Dispatched
+STR_SCHDISPATCH_SET_LAST_DISPATCH_TOOLTIP                       :{BLACK}Manually set when a vehicle was last dispatched from the schedule.
 STR_SCHDISPATCH_CLEAR                                           :{BLACK}Clear Departure Slots
 STR_SCHDISPATCH_CLEAR_TOOLTIP                                   :{BLACK}Clear all departure slots from the schedule.
 STR_SCHDISPATCH_MANAGE                                          :{BLACK}Manage Schedule

@@ -8,7 +8,7 @@
 /** @file strings.cpp Handling of translated strings. */
 
 #include "stdafx.h"
-#include "currency.h"
+#include "currency_func.h"
 #include "station_base.h"
 #include "town.h"
 #include "waypoint_base.h"
@@ -219,7 +219,7 @@ EncodedString EncodedString::ReplaceParam(size_t param, StringParameter &&data) 
 
 	StringID str;
 	if (auto r = consumer.TryReadIntegerBase<uint32_t>(16); r.has_value()) {
-		str = *r;
+		str = static_cast<StringID>(*r);
 	} else {
 		return {};
 	}
@@ -446,7 +446,7 @@ void GetStringWithArgs(StringBuilder builder, StringID string, StringParameters 
 	switch (tab) {
 		case TEXT_TAB_TOWN:
 			if (IsInsideMM(string, SPECSTR_TOWNNAME_START, SPECSTR_TOWNNAME_END) && !game_script) {
-				GenerateTownNameString(builder, string - SPECSTR_TOWNNAME_START, args.GetNextParameter<uint32_t>());
+				GenerateTownNameString(builder, (string - SPECSTR_TOWNNAME_START).base(), args.GetNextParameter<uint32_t>());
 				return;
 			}
 			break;
@@ -735,10 +735,8 @@ static void FormatGenericCurrency(StringBuilder builder, const CurrencySpec *spe
 		number = -number;
 	}
 
-	/* Add prefix part, following symbol_pos specification.
-	 * Here, it can can be either 0 (prefix) or 2 (both prefix and suffix).
-	 * The only remaining value is 1 (suffix), so everything that is not 1 */
-	if (spec->symbol_pos != 1) builder += spec->prefix;
+	/* Add prefix part, following symbol_pos specification. */
+	if (spec->symbol_pos.Test(CurrencySymbolPosition::Prefix)) builder += spec->prefix;
 
 	StringID number_str = STR_NULL;
 
@@ -769,10 +767,8 @@ static void FormatGenericCurrency(StringBuilder builder, const CurrencySpec *spe
 		FormatStringDirect(builder, GetStringPtr(number_str), {});
 	}
 
-	/* Add suffix part, following symbol_pos specification.
-	 * Here, it can can be either 1 (suffix) or 2 (both prefix and suffix).
-	 * The only remaining value is 1 (prefix), so everything that is not 0 */
-	if (spec->symbol_pos != 0) builder += spec->suffix;
+	/* Add suffix part, following symbol_pos specification. */
+	if (spec->symbol_pos.Test(CurrencySymbolPosition::Suffix)) builder += spec->suffix;
 
 	if (negative) {
 		builder.Utf8Encode(SCC_POP_COLOUR);
@@ -1342,11 +1338,11 @@ uint ConvertDisplayToForceWeightRatio(double in)
 
 uint ConvertCargoQuantityToDisplayQuantity(CargoType cargo, uint quantity)
 {
-	switch (CargoSpec::Get(cargo)->units_volume) {
-		case STR_TONS:
+	switch (CargoSpec::Get(cargo)->units_volume.base()) {
+		case STR_TONS.base():
 			return _units_weight[_settings_game.locale.units_weight].c.ToDisplay(quantity);
 
-		case STR_LITERS:
+		case STR_LITERS.base():
 			return _units_volume[_settings_game.locale.units_volume].c.ToDisplay(quantity);
 
 		default:
@@ -1357,11 +1353,11 @@ uint ConvertCargoQuantityToDisplayQuantity(CargoType cargo, uint quantity)
 
 uint ConvertDisplayQuantityToCargoQuantity(CargoType cargo, uint quantity)
 {
-	switch (CargoSpec::Get(cargo)->units_volume) {
-		case STR_TONS:
+	switch (CargoSpec::Get(cargo)->units_volume.base()) {
+		case STR_TONS.base():
 			return _units_weight[_settings_game.locale.units_weight].c.FromDisplay(quantity);
 
-		case STR_LITERS:
+		case STR_LITERS.base():
 			return _units_volume[_settings_game.locale.units_volume].c.FromDisplay(quantity);
 
 		default:
@@ -1412,7 +1408,7 @@ static void DecodeEncodedString(StringConsumer &consumer, bool game_script, Stri
 					return;
 				}
 				assert(!record.AnyBytesLeft());
-				param = MakeStringID(TEXT_TAB_GAMESCRIPT_START, StringIndexInTab(param));
+				param = MakeStringID(TEXT_TAB_GAMESCRIPT_START, StringIndexInTab(param)).base();
 				sub_args.emplace_back(param);
 				break;
 			}
@@ -1606,7 +1602,7 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 					break;
 
 				case SCC_NEWGRF_STRINL: {
-					StringID substr = consumer.ReadUtf8(STR_NULL);
+					StringID substr{consumer.ReadUtf8(STR_NULL.base())};
 					std::string_view ptr = GetStringPtr(substr);
 					str_stack.emplace(ptr, args.GetOffset(), next_substr_case_index); // this may invalidate "consumer"
 					next_substr_case_index = 0;
@@ -1812,12 +1808,12 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 						break;
 					}
 
-					switch (CargoSpec::Get(cargo)->units_volume) {
-						case STR_TONS:
+					switch (CargoSpec::Get(cargo)->units_volume.base()) {
+						case STR_TONS.base():
 							amount = _units_weight[_settings_game.locale.units_weight].c.ToDisplay(amount);
 							break;
 
-						case STR_LITERS:
+						case STR_LITERS.base():
 							amount = _units_volume[_settings_game.locale.units_volume].c.ToDisplay(amount);
 							break;
 
@@ -1842,8 +1838,8 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 					}
 
 					StringID cargo_str = CargoSpec::Get(cargo)->units_volume;
-					switch (cargo_str) {
-						case STR_TONS: {
+					switch (cargo_str.base()) {
+						case STR_TONS.base(): {
 							assert(_settings_game.locale.units_weight < lengthof(_units_weight));
 							const auto &x = _units_weight[_settings_game.locale.units_weight];
 							auto tmp_params = MakeParameters(x.c.ToDisplay(amount), x.decimal_places);
@@ -1851,7 +1847,7 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 							break;
 						}
 
-						case STR_LITERS: {
+						case STR_LITERS.base(): {
 							assert(_settings_game.locale.units_volume < lengthof(_units_volume));
 							const auto &x = _units_volume[_settings_game.locale.units_volume];
 							auto tmp_params = MakeParameters(x.c.ToDisplay(amount), x.decimal_places);
@@ -2323,7 +2319,7 @@ static void FormatString(StringBuilder builder, std::string_view str_arg, String
 
 					bool tiny = (b == SCC_VIEWPORT_TOWN_LABEL2);
 					StringID string_id = STR_VIEWPORT_TOWN_COLOUR;
-					if (!tiny) string_id += GB(data, 40, 2);
+					if (!tiny) string_id = string_id + GB(data, 40, 2);
 					auto tmp_params = MakeParameters(t, GB(data, 32, 8), GB(data, 0, 32));
 					GetStringWithArgs(builder, string_id, tmp_params);
 					break;
@@ -2575,23 +2571,23 @@ static void GenPresidentName(StringBuilder builder, uint32_t seed)
 
 static bool GetSpecialNameString(StringBuilder builder, StringID string, StringParameters &args)
 {
-	switch (string) {
-		case SPECSTR_SILLY_NAME: // Not used in new companies, but retained for old-loader savegames
+	switch (string.base()) {
+		case SPECSTR_SILLY_NAME.base(): // Not used in new companies, but retained for old-loader savegames
 			builder += _silly_company_names[std::min<size_t>(args.GetNextParameter<uint16_t>(), std::size(_silly_company_names) - 1)];
 			return true;
 
-		case SPECSTR_ANDCO_NAME: // used for Foobar & Co company names
+		case SPECSTR_ANDCO_NAME.base(): // used for Foobar & Co company names
 			GenAndCoName(builder, args.GetNextParameter<uint32_t>());
 			return true;
 
-		case SPECSTR_PRESIDENT_NAME: // President name
+		case SPECSTR_PRESIDENT_NAME.base(): // President name
 			GenPresidentName(builder, args.GetNextParameter<uint32_t>());
 			return true;
 	}
 
 	/* TownName Transport company names, with the appropriate town name. */
 	if (IsInsideMM(string, SPECSTR_COMPANY_NAME_START, SPECSTR_COMPANY_NAME_END)) {
-		GenerateTownNameString(builder, string - SPECSTR_COMPANY_NAME_START, args.GetNextParameter<uint32_t>());
+		GenerateTownNameString(builder, (string - SPECSTR_COMPANY_NAME_START).base(), args.GetNextParameter<uint32_t>());
 		builder += " Transport";
 		return true;
 	}
@@ -2609,7 +2605,7 @@ bool LanguagePackHeader::IsValid() const
 	       this->version      == TO_LE32(LANGUAGE_PACK_VERSION) &&
 	       this->plural_form  <  LANGUAGE_MAX_PLURAL &&
 	       this->text_dir     <= 1 &&
-	       this->newgrflangid < MAX_LANG &&
+	       this->newgrflangid < GRFLanguage::End &&
 	       this->num_genders  < MAX_NUM_GENDERS &&
 	       this->num_cases    < MAX_NUM_CASES &&
 	       StrValid(this->name) &&
@@ -2655,7 +2651,7 @@ bool ReadLanguagePack(const LanguageMetadata *lang)
 	std::array<uint, TEXT_TAB_END> tab_start, tab_num;
 
 	uint count = 0;
-	for (uint i = 0; i < TEXT_TAB_END; i++) {
+	for (StringTab i : EnumRange(TEXT_TAB_END)) {
 		uint16_t num = FROM_LE16(lang_pack->offsets[i]);
 		if (num > TAB_SIZE) return false;
 
@@ -2773,7 +2769,7 @@ const char *GetCurrentLocale(const char *param);
  * @param newgrflangid NewGRF languages ID to check.
  * @return The language's metadata, or nullptr if it is not known.
  */
-const LanguageMetadata *GetLanguage(uint8_t newgrflangid)
+const LanguageMetadata *GetLanguage(GRFLanguage newgrflangid)
 {
 	for (const LanguageMetadata &lang : _languages) {
 		if (newgrflangid == lang.newgrflangid) return &lang;
@@ -2900,7 +2896,9 @@ void BaseStringMissingGlyphSearcher::DetermineRequiredGlyphs(FontSizes fontsizes
 {
 	this->missing_fontsizes.Reset();
 	this->missing_glyphs.clear();
+	this->required_glyphs.clear();
 	robin_hood::unordered_flat_set<char32_t> missing_glyphs_map;
+	robin_hood::unordered_flat_set<char32_t> required_glyphs_map;
 
 	this->Reset();
 	for (auto text = this->NextString(); text.has_value(); text = this->NextString()) {
@@ -2915,7 +2913,11 @@ void BaseStringMissingGlyphSearcher::DetermineRequiredGlyphs(FontSizes fontsizes
 
 			if (!fontsizes.Test(fs)) continue;
 			if (!IsPrintable(c) || IsTextDirectionChar(c)) continue;
+			if (c != ' ' && (IsWhitespace(c) || IsNonbreakingWhitespace(c))) continue;
 			if (IsInsideMM(c, SCC_SPRITE_START, SCC_SPRITE_END)) continue;
+
+			required_glyphs_map.insert(c);
+
 			if (fc->MapCharToGlyph(c, false) != 0) continue;
 
 			this->missing_fontsizes.Set(fs);
@@ -2927,16 +2929,14 @@ void BaseStringMissingGlyphSearcher::DetermineRequiredGlyphs(FontSizes fontsizes
 	for (char32_t c : missing_glyphs_map) {
 		this->missing_glyphs.push_back(c);
 	}
+	this->required_glyphs.reserve(required_glyphs_map.size());
+	for (char32_t c : required_glyphs_map) {
+		this->required_glyphs.push_back(c);
+	}
 }
 
 /** Helper for searching through the language pack. */
 class LanguagePackGlyphSearcher : public BaseStringMissingGlyphSearcher {
-public:
-	/**
-	 * Create this language pack glyph searcher.
-	 */
-	LanguagePackGlyphSearcher() : BaseStringMissingGlyphSearcher(FONTSIZES_REQUIRED) {}
-
 private:
 	uint i; ///< Iterator for the primary language tables.
 	uint j; ///< Iterator for the secondary language tables.
@@ -2977,17 +2977,18 @@ private:
  * mean it might use characters that are not in the
  * font, which is the whole reason this check has
  * been added.
+ * @param fontsizes Font sizes to consider.
  * @param searcher  The methods to use to search for strings to check.
  *                  If nullptr the loaded language pack searcher is used.
  */
-void CheckForMissingGlyphs(MissingGlyphSearcher *searcher)
+void CheckForMissingGlyphs(FontSizes fontsizes, MissingGlyphSearcher *searcher)
 {
 	static LanguagePackGlyphSearcher pack_searcher;
 	if (searcher == nullptr) searcher = &pack_searcher;
 
-	FontCache::LoadFontCaches(searcher->fontsizes);
+	FontCache::LoadFontCaches(fontsizes);
 
-	searcher->DetermineRequiredGlyphs(searcher->fontsizes);
+	searcher->DetermineRequiredGlyphs(fontsizes);
 	bool bad_font = searcher->missing_fontsizes.Any();
 
 #if defined(WITH_FREETYPE) || defined(_WIN32) || defined(WITH_COCOA)
@@ -2997,7 +2998,11 @@ void CheckForMissingGlyphs(MissingGlyphSearcher *searcher)
 		bool any_font_configured = !_fcsettings.medium.font.empty();
 		FontCacheSettings backup = _fcsettings;
 
-		bad_font = !FontProviderManager::FindFallbackFont(_langpack.langpack->isocode, searcher);
+		/* All systems expect a hyphen not an underscore in the isocode. */
+		std::string isocode = _langpack.langpack->isocode;
+		std::ranges::replace(isocode, '_', '-');
+
+		bad_font = !FontProviderManager::FindFallbackFont(isocode, searcher);
 		if (!bad_font) {
 			FontCache::LoadFontCaches(searcher->missing_fontsizes);
 		}
@@ -3017,7 +3022,7 @@ void CheckForMissingGlyphs(MissingGlyphSearcher *searcher)
 #endif
 
 	/* Update the font width cache */
-	LoadStringWidthTable(searcher->fontsizes);
+	LoadStringWidthTable(fontsizes);
 	ReInitAllWindows(false);
 
 	if (bad_font) {
@@ -3049,4 +3054,13 @@ void CheckForMissingGlyphs(MissingGlyphSearcher *searcher)
 		ShowErrorMessage(GetEncodedRawString(err_str), {}, WarningLevel::Error);
 	}
 #endif /* !(WITH_ICU_I18N && WITH_HARFBUZZ) && !WITH_UNISCRIBE && !WITH_COCOA */
+}
+
+void AppendWidestTinyOrIsoCalendarDate(format_target &result, bool iso, FontSize size)
+{
+	static_assert(CalTime::MAX_YEAR.base() == 5000000); // 7 digits
+	uint8_t widest = GetBroadestDigit(size).second; // 0-padded, so only the second return value is needed
+	/* Day and month are zero-padded with ZEROFILL_NUM, hence the two 2s. */
+	auto tmp_params = MakeParameters(widest * 11, 2, widest * 11, 2, GetParamMaxDigits(7, size));
+	FormatStringDirect(StringBuilder(result), GetStringPtr(iso ? STR_FORMAT_DATE_ISO : STR_FORMAT_DATE_TINY), tmp_params, 0);
 }

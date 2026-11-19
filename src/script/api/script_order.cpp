@@ -247,7 +247,9 @@ static ScriptOrder::OrderPosition RealOrderPositionToScriptOrderPosition(Vehicle
 
 /* static */ SQInteger ScriptOrder::GetOrderCount(VehicleID vehicle_id)
 {
-	return ScriptVehicle::IsPrimaryVehicle(vehicle_id) ? ::Vehicle::Get(vehicle_id)->GetNumManualOrders() : -1;
+	if (!ScriptVehicle::IsPrimaryVehicle(vehicle_id)) return -1;
+
+	return ::Vehicle::Get(vehicle_id)->GetNumManualOrders();
 }
 
 /* static */ TileIndex ScriptOrder::GetOrderDestination(VehicleID vehicle_id, OrderPosition order_position)
@@ -272,11 +274,11 @@ static ScriptOrder::OrderPosition RealOrderPositionToScriptOrderPosition(Vehicle
 
 		case OT_GOTO_STATION: {
 			const Station *st = ::Station::Get(order->GetDestination().ToStationID());
-			if (st->train_station.tile != INVALID_TILE) {
+			if (!st->train_station.IsEmpty()) {
 				for (TileIndex t : st->train_station) {
 					if (st->TileBelongsToRailStation(t)) return t;
 				}
-			} else if (st->ship_station.tile != INVALID_TILE) {
+			} else if (!st->ship_station.IsEmpty()) {
 				for (TileIndex t : st->ship_station) {
 					if (IsTileType(t, TileType::Station) && (IsDock(t) || IsOilRig(t)) && GetStationIndex(t) == st->index) return t;
 				}
@@ -284,7 +286,7 @@ static ScriptOrder::OrderPosition RealOrderPositionToScriptOrderPosition(Vehicle
 				return st->bus_stops->xy;
 			} else if (st->truck_stops != nullptr) {
 				return st->truck_stops->xy;
-			} else if (st->airport.tile != INVALID_TILE) {
+			} else if (!st->airport.IsEmpty()) {
 				for (TileIndex tile : st->airport) {
 					if (st->TileBelongsToAirport(tile) && !::IsHangar(tile)) return tile;
 				}
@@ -294,11 +296,11 @@ static ScriptOrder::OrderPosition RealOrderPositionToScriptOrderPosition(Vehicle
 
 		case OT_GOTO_WAYPOINT: {
 			const Waypoint *wp = ::Waypoint::Get(order->GetDestination().ToStationID());
-			if (wp->train_station.tile != INVALID_TILE) {
+			if (!wp->train_station.IsEmpty()) {
 				for (TileIndex t : wp->train_station) {
 					if (wp->TileBelongsToRailStation(t)) return t;
 				}
-			} else if (wp->road_waypoint_area.tile != INVALID_TILE) {
+			} else if (!wp->road_waypoint_area.IsEmpty()) {
 				for (TileIndex t : wp->road_waypoint_area) {
 					if (::IsRoadWaypointTile(t) && ::GetStationIndex(t) == wp->index) return t;
 				}
@@ -710,7 +712,7 @@ static void _DoCommandReturnSetOrderFlags(class ScriptInstance &instance)
 		auto check_tile = [](TileIndex &tile) {
 			if (ScriptTile::IsStationTile(tile)) {
 				const Station *st = ::Station::GetByTile(tile);
-				if (st != nullptr && st->airport.tile != INVALID_TILE) tile = st->airport.tile;
+				if (st != nullptr && !st->airport.IsEmpty()) tile = st->airport.tile;
 			 }
 		};
 		check_tile(origin_tile);

@@ -39,7 +39,7 @@ constexpr bool is_enum_incrementable_v = is_enum_incrementable<enum_type>::value
  * @return Reference to the incremented enum.
  */
 template <typename enum_type, std::enable_if_t<is_enum_incrementable_v<enum_type>, bool> = true>
-inline constexpr enum_type &operator ++(enum_type &e)
+constexpr enum_type &operator ++(enum_type &e)
 {
 	e = static_cast<enum_type>(to_underlying(e) + 1);
 	return e;
@@ -51,7 +51,7 @@ inline constexpr enum_type &operator ++(enum_type &e)
  * @return Copy of the original value.
  */
 template <typename enum_type, std::enable_if_t<is_enum_incrementable_v<enum_type>, bool> = true>
-inline constexpr enum_type operator ++(enum_type &e, int)
+constexpr enum_type operator ++(enum_type &e, int)
 {
 	enum_type e_org = e;
 	++e;
@@ -64,7 +64,7 @@ inline constexpr enum_type operator ++(enum_type &e, int)
  * @return Reference to the decremented enum.
  */
 template <typename enum_type, std::enable_if_t<is_enum_incrementable_v<enum_type>, bool> = true>
-inline constexpr enum_type &operator --(enum_type &e)
+constexpr enum_type &operator --(enum_type &e)
 {
 	e = static_cast<enum_type>(to_underlying(e) - 1);
 	return e;
@@ -76,7 +76,7 @@ inline constexpr enum_type &operator --(enum_type &e)
  * @return Copy of the original value.
  */
 template <typename enum_type, std::enable_if_t<is_enum_incrementable_v<enum_type>, bool> = true>
-inline constexpr enum_type operator --(enum_type &e, int)
+constexpr enum_type operator --(enum_type &e, int)
 {
 	enum_type e_org = e;
 	--e;
@@ -124,13 +124,13 @@ constexpr bool is_enum_sequential_v = is_enum_sequential<enum_type>::value;
  * @return The new enum.
  */
 template <typename enum_type, std::enable_if_t<is_enum_sequential_v<enum_type>, bool> = true>
-inline constexpr enum_type operator+(enum_type e, int offset)
+constexpr enum_type operator+(enum_type e, int offset)
 {
 	return static_cast<enum_type>(to_underlying(e) + offset);
 }
 
 template <typename enum_type, std::enable_if_t<is_enum_sequential_v<enum_type>, bool> = true>
-inline constexpr enum_type &operator+=(enum_type &e, int offset)
+constexpr enum_type &operator+=(enum_type &e, int offset)
 {
 	e = e + offset;
 	return e;
@@ -143,13 +143,13 @@ inline constexpr enum_type &operator+=(enum_type &e, int offset)
  * @return The new enum.
  */
 template <typename enum_type, std::enable_if_t<is_enum_sequential_v<enum_type>, bool> = true>
-inline constexpr enum_type operator-(enum_type e, int offset)
+constexpr enum_type operator-(enum_type e, int offset)
 {
 	return static_cast<enum_type>(to_underlying(e) - offset);
 }
 
 template <typename enum_type, std::enable_if_t<is_enum_sequential_v<enum_type>, bool> = true>
-inline constexpr enum_type &operator-=(enum_type &e, int offset)
+constexpr enum_type &operator-=(enum_type &e, int offset)
 {
 	e = e - offset;
 	return e;
@@ -162,7 +162,7 @@ inline constexpr enum_type &operator-=(enum_type &e, int offset)
  * @return The value of the first enum minus the value of the second enum.
  */
 template <typename enum_type, std::enable_if_t<is_enum_sequential_v<enum_type>, bool> = true>
-inline constexpr auto operator-(enum_type a, enum_type b)
+constexpr auto operator-(enum_type a, enum_type b)
 {
 	return to_underlying(a) - to_underlying(b);
 }
@@ -175,13 +175,13 @@ inline constexpr auto operator-(enum_type a, enum_type b)
 
 /** Operators to allow to work with enum as with type safe bit set in C++ */
 #define DECLARE_ENUM_AS_BIT_SET(enum_type) \
-	inline constexpr enum_type operator | (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) | to_underlying(m2)); } \
-	inline constexpr enum_type operator & (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) & to_underlying(m2)); } \
-	inline constexpr enum_type operator ^ (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) ^ to_underlying(m2)); } \
-	inline constexpr enum_type& operator |= (enum_type& m1, enum_type m2) { m1 = m1 | m2; return m1; } \
-	inline constexpr enum_type& operator &= (enum_type& m1, enum_type m2) { m1 = m1 & m2; return m1; } \
-	inline constexpr enum_type& operator ^= (enum_type& m1, enum_type m2) { m1 = m1 ^ m2; return m1; } \
-	inline constexpr enum_type operator ~(enum_type m) { return static_cast<enum_type>(~to_underlying(m)); }
+	constexpr enum_type operator | (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) | to_underlying(m2)); } \
+	constexpr enum_type operator & (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) & to_underlying(m2)); } \
+	constexpr enum_type operator ^ (enum_type m1, enum_type m2) { return static_cast<enum_type>(to_underlying(m1) ^ to_underlying(m2)); } \
+	constexpr enum_type& operator |= (enum_type& m1, enum_type m2) { m1 = m1 | m2; return m1; } \
+	constexpr enum_type& operator &= (enum_type& m1, enum_type m2) { m1 = m1 & m2; return m1; } \
+	constexpr enum_type& operator ^= (enum_type& m1, enum_type m2) { m1 = m1 ^ m2; return m1; } \
+	constexpr enum_type operator ~(enum_type m) { return static_cast<enum_type>(~to_underlying(m)); }
 
 /** Operator that allows this enumeration to be added to any other enumeration. */
 #define DECLARE_ENUM_AS_ADDABLE(EnumType) \
@@ -201,7 +201,7 @@ inline constexpr auto operator-(enum_type a, enum_type b)
  * @return True iff the flag is set.
  */
 template <typename T, class = typename std::enable_if_t<std::is_enum_v<T>>>
-[[debug_inline]] inline constexpr bool HasFlag(const T x, const T y)
+[[debug_inline]] constexpr bool HasFlag(const T x, const T y)
 {
 	return (x & y) == y;
 }
@@ -212,7 +212,7 @@ template <typename T, class = typename std::enable_if_t<std::is_enum_v<T>>>
  * @param y The flag to toggle.
  */
 template <typename T, class = typename std::enable_if_t<std::is_enum_v<T>>>
-[[debug_inline]] inline constexpr void ToggleFlag(T &x, const T y)
+[[debug_inline]] constexpr void ToggleFlag(T &x, const T y)
 {
 	x ^= y;
 }
@@ -232,6 +232,88 @@ template <typename T, class = typename std::enable_if_t<std::is_enum_v<T>>>
 		x &= ~y;
 	}
 }
+
+/**
+ * Iterate a range of enum values.
+ * @tparam Tenum The enum type.
+ */
+template <typename Tenum>
+class EnumRange {
+private:
+	Tenum first; ///< The first (inclusive) value of the range.
+	Tenum last; ///< The last (exclusive) value of the range.
+public:
+	/**
+	 * Construct an EnumRange from first to last.
+	 * @param first The first value.
+	 * @param last The last value.
+	 */
+	constexpr EnumRange(Tenum first, Tenum last) : first(first), last(last) {}
+
+	/**
+	 * Construct an EnumRange from default to last.
+	 * @param last The last value.
+	 */
+	constexpr EnumRange(Tenum last) : EnumRange({}, last) {}
+
+	/**
+	 * Forward iterator
+	 */
+	class Iterator {
+	public:
+		using value_type = Tenum; ///< C++ specification trait 'value_type' of this Iterator.
+		using difference_type = value_type &; ///< C++ specification trait 'difference_type' of this Iterator.
+		using iterator_category = std::forward_iterator_tag; ///< C++ specification trait 'iterator_category' of this Iterator.
+		using pointer = void; ///< C++ specification trait 'pointer' of this Iterator.
+		using reference = void; ///< C++ specification trait 'reference' of this Iterator.
+
+		/**
+		 * Construct this iterator.
+		 * @param v The initial value.
+		 */
+		explicit Iterator(Tenum v) : value(v) {}
+
+		/**
+		 * Deference operator.
+		 * @return The current value.
+		 */
+		constexpr Tenum operator*() const
+		{
+			return static_cast<Tenum>(value);
+		}
+
+		/**
+		 * Increment to the next value.
+		 * @return The iterator.
+		 */
+		constexpr Iterator &operator++()
+		{
+			value = static_cast<Tenum>(to_underlying(value) + 1);
+			return *this;
+		}
+
+		/**
+		 * Compare with another instance of this iterator.
+		 * @return The std::strong_ordering of the comparison.
+		 */
+		constexpr auto operator<=>(const Iterator &) const = default;
+
+	private:
+		Tenum value; ///< Current value.
+	};
+
+	/**
+	 * Get the begin iterator for this range.
+	 * @return Begin iterator.
+	 */
+	constexpr Iterator begin() const { return Iterator(first); }
+
+	/**
+	 * Get the end iterator for this range.
+	 * @return End iterator.
+	 */
+	constexpr Iterator end() const { return Iterator(last); }
+};
 
 /** Helper template structure to get the mask for an EnumBitSet from the end enum value. */
 template <typename Tstorage, typename Tenum, Tenum Tend_value>
@@ -254,7 +336,19 @@ public:
 	using EnumType = typename BaseClass::ValueType;
 
 	constexpr EnumBitSet() : BaseClass() {}
-	constexpr EnumBitSet(Tenum value) : BaseClass() { this->Set(value); }
+
+	/**
+	 * Construct an EnumBitSet from an enum value.
+	 * @param value The single enum value to be set.
+	 */
+	constexpr EnumBitSet(Tenum value) : BaseClass()
+	{
+		/* MSVC 19.44 and older does not consider cast of dynamic type (e.g. BaseBitSet) to EnumBitSet as constant,
+		 * when the EnumBitSet is constructed inside an initializer list like we do for many lookup tables.
+		 * By setting the return type to BaseClass the cast becomes redundant and compilation does not fail. */
+		this->template Set<BaseClass>(value);
+	}
+
 	explicit constexpr EnumBitSet(Tstorage data) : BaseClass(data) {}
 
 	/**
@@ -264,7 +358,10 @@ public:
 	constexpr EnumBitSet(std::initializer_list<const Tenum> values) : BaseClass()
 	{
 		for (const Tenum &value : values) {
-			this->Set(value);
+			/* MSVC 19.44 and older does not consider cast of dynamic type (e.g. BaseBitSet) to EnumBitSet as constant,
+			 * when the EnumBitSet is constructed inside an initializer list like we do for many lookup tables.
+			 * By setting the return type to BaseClass the cast becomes redundant and compilation does not fail. */
+			this->template Set<BaseClass>(value);
 		}
 	}
 

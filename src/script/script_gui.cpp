@@ -42,6 +42,9 @@
 #include "../game/game_info.hpp"
 #include "../game/game_instance.hpp"
 
+#include "../widgets/script_widget.h"
+#include "../widgets/misc_widget.h"
+
 #include "table/strings.h"
 
 #include "../safeguards.h"
@@ -915,7 +918,7 @@ struct ScriptDebugWindow : public Window {
 				if (colour == TextColour::Black) colour = TextColour::White; // Make black text readable by inverting it to white.
 			}
 
-			DrawString(fr, line.text, colour, SA_LEFT | SA_FORCE);
+			DrawString(fr, line.text, colour, AlignmentH::ForceLeft);
 			fr.top += this->resize.step_height;
 		}
 	}
@@ -1042,8 +1045,8 @@ struct ScriptDebugWindow : public Window {
 					break;
 				}
 				/* First kill the company of the AI, then start a new one. This should start the current AI again */
-				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::Delete, this->filter.script_debug_company, CompanyRemoveReason::Manual, INVALID_CLIENT_ID, {});
-				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, this->filter.script_debug_company, CompanyRemoveReason::None, INVALID_CLIENT_ID, {});
+				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::Delete, this->filter.script_debug_company, CompanyRemoveReason::Manual, ClientID::Invalid, {});
+				Command<Commands::CompanyControl>::Post(CompanyCtrlAction::NewAI, this->filter.script_debug_company, CompanyRemoveReason::None, ClientID::Invalid, {});
 				break;
 
 			case WID_SCRD_SETTINGS:
@@ -1185,13 +1188,13 @@ struct ScriptDebugWindow : public Window {
 	/**
 	 * Handler for global hotkeys of the ScriptDebugWindow.
 	 * @param hotkey Hotkey
-	 * @return ES_HANDLED if hotkey was accepted.
+	 * @return EventState::Handled if hotkey was accepted.
 	 */
 	static EventState ScriptDebugGlobalHotkeys(int hotkey)
 	{
-		if (_game_mode != GameMode::Normal) return ES_NOT_HANDLED;
+		if (_game_mode != GameMode::Normal) return EventState::NotHandled;
 		Window *w = ShowScriptDebugWindow(CompanyID::Invalid());
-		if (w == nullptr) return ES_NOT_HANDLED;
+		if (w == nullptr) return EventState::NotHandled;
 		return w->OnHotkey(hotkey);
 	}
 

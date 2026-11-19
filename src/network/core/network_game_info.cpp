@@ -12,6 +12,7 @@
 #include "../../company_base.h"
 #include "../../date_func.h"
 #include "../../debug.h"
+#include "../../newgrf.h"
 #include "../../map_func.h"
 #include "../../game/game.hpp"
 #include "../../game/game_info.hpp"
@@ -218,7 +219,7 @@ void SerializeNetworkGameInfo(Packet &p, const NetworkServerGameInfo &info, bool
 	p.Send_uint64(info.ticks_playing);
 
 	/* NETWORK_GAME_INFO_VERSION = 6 */
-	p.Send_uint8(send_newgrf_names ? NST_GRFID_MD5_NAME : NST_GRFID_MD5);
+	p.Send_uint8(to_underlying(send_newgrf_names ? NewGRFSerializationType::GrfIdMd5Name : NewGRFSerializationType::GrfIdMd5));
 
 	/* NETWORK_GAME_INFO_VERSION = 5 */
 	GameInfo *game_info = Game::GetInfo();
@@ -307,7 +308,7 @@ void SerializeNetworkGameInfoExtended(Packet &p, const NetworkServerGameInfo &in
 		p.Send_uint32(game_info == nullptr ? -1 : (uint32_t)game_info->GetVersion());
 		p.Send_string(game_info == nullptr ? "" : game_info->GetName());
 
-		p.Send_uint8(send_newgrf_names ? NST_GRFID_MD5_NAME : NST_GRFID_MD5);
+		p.Send_uint8(to_underlying(send_newgrf_names ? NewGRFSerializationType::GrfIdMd5Name : NewGRFSerializationType::GrfIdMd5));
 	}
 
 	if (version >= 2) {
@@ -346,7 +347,7 @@ void SerializeNetworkGameInfoExtended(Packet &p, const NetworkServerGameInfo &in
 void DeserializeNetworkGameInfo(Packet &p, NetworkGameInfo &info, const GameInfoNewGRFLookupTable *newgrf_lookup_table)
 {
 	uint8_t game_info_version = p.Recv_uint8();
-	NewGRFSerializationType newgrf_serialisation = NST_GRFID_MD5;
+	NewGRFSerializationType newgrf_serialisation = NewGRFSerializationType::GrfIdMd5;
 
 	/*
 	 *              Please observe the order.
@@ -362,8 +363,8 @@ void DeserializeNetworkGameInfo(Packet &p, NetworkGameInfo &info, const GameInfo
 			[[fallthrough]];
 
 		case 6:
-			newgrf_serialisation = (NewGRFSerializationType)p.Recv_uint8();
-			if (newgrf_serialisation >= NST_END) return;
+			newgrf_serialisation = static_cast<NewGRFSerializationType>(p.Recv_uint8());
+			if (newgrf_serialisation >= NewGRFSerializationType::End) return;
 			[[fallthrough]];
 
 		case 5: {
@@ -383,15 +384,15 @@ void DeserializeNetworkGameInfo(Packet &p, NetworkGameInfo &info, const GameInfo
 			for (uint i = 0; i < num_grfs; i++) {
 				NamedGRFIdentifier grf;
 				switch (newgrf_serialisation) {
-					case NST_GRFID_MD5:
+					case NewGRFSerializationType::GrfIdMd5:
 						DeserializeGRFIdentifier(p, grf.ident);
 						break;
 
-					case NST_GRFID_MD5_NAME:
+					case NewGRFSerializationType::GrfIdMd5Name:
 						DeserializeGRFIdentifierWithName(p, grf);
 						break;
 
-					case NST_LOOKUP_ID: {
+					case NewGRFSerializationType::LookupId: {
 						if (newgrf_lookup_table == nullptr) return;
 						auto it = newgrf_lookup_table->find(p.Recv_uint32());
 						if (it == newgrf_lookup_table->end()) return;
@@ -465,7 +466,7 @@ void DeserializeNetworkGameInfoExtended(Packet &p, NetworkGameInfo &info)
 	const uint8_t version = p.Recv_uint8();
 	if (version > SERVER_GAME_INFO_EXTENDED_MAX_VERSION) return; // Unknown version
 
-	NewGRFSerializationType newgrf_serialisation = NST_GRFID_MD5;
+	NewGRFSerializationType newgrf_serialisation = NewGRFSerializationType::GrfIdMd5;
 
 	info.calendar_date  = CalTime::DeserialiseDateClamped(p.Recv_uint32());
 	info.calendar_start = CalTime::DeserialiseDateClamped(p.Recv_uint32());
@@ -490,8 +491,8 @@ void DeserializeNetworkGameInfoExtended(Packet &p, NetworkGameInfo &info)
 		info.gamescript_version = (int)p.Recv_uint32();
 		info.gamescript_name = p.Recv_string(NETWORK_NAME_LENGTH);
 
-		newgrf_serialisation = (NewGRFSerializationType)p.Recv_uint8();
-		if (newgrf_serialisation >= NST_END) return;
+		newgrf_serialisation = static_cast<NewGRFSerializationType>(p.Recv_uint8());
+		if (newgrf_serialisation >= NewGRFSerializationType::End) return;
 	}
 
 	if (version >= 2) {
@@ -508,15 +509,15 @@ void DeserializeNetworkGameInfoExtended(Packet &p, NetworkGameInfo &info)
 		for (uint i = 0; i < num_grfs; i++) {
 			NamedGRFIdentifier grf;
 			switch (newgrf_serialisation) {
-				case NST_GRFID_MD5:
+				case NewGRFSerializationType::GrfIdMd5:
 					DeserializeGRFIdentifier(p, grf.ident);
 					break;
 
-				case NST_GRFID_MD5_NAME:
+				case NewGRFSerializationType::GrfIdMd5Name:
 					DeserializeGRFIdentifierWithName(p, grf);
 					break;
 
-				case NST_LOOKUP_ID: {
+				case NewGRFSerializationType::LookupId: {
 					Debug(net, 0, "Unexpected NST_LOOKUP_ID in DeserializeNetworkGameInfoExtended");
 					return;
 				}
@@ -542,7 +543,7 @@ void DeserializeNetworkGameInfoExtended(Packet &p, NetworkGameInfo &info)
  */
 void SerializeGRFIdentifier(Packet &p, const GRFIdentifier &grf)
 {
-	p.Send_uint32(grf.grfid);
+	p.Send_uint32(std::byteswap(FlattenNewGRFLabel(grf.grfid)));
 	p.Send_bytes(grf.md5sum);
 }
 
@@ -553,7 +554,7 @@ void SerializeGRFIdentifier(Packet &p, const GRFIdentifier &grf)
  */
 void DeserializeGRFIdentifier(Packet &p, GRFIdentifier &grf)
 {
-	grf.grfid = p.Recv_uint32();
+	grf.grfid = UnflattenNewGRFLabel<GrfID>(std::byteswap(p.Recv_uint32()));
 	p.Recv_bytes(grf.md5sum);
 }
 

@@ -47,45 +47,33 @@ static InspectTargetId GetTownInspectTargetId(const Town *town)
 	return InspectTargetId(GrfSpecFeature::FakeTowns, town->index.base());
 }
 
-struct label_dumper : public NewGRFLabelDumper {
-	inline const char *RailTypeLabel(RailType rt)
-	{
-		return this->Label(GetRailTypeInfo(rt)->label);
-	}
-
-	inline const char *RoadTypeLabel(RoadType rt)
-	{
-		return this->Label(GetRoadTypeInfo(rt)->label);
-	}
-};
-
 static void DumpRailTypeList(NIExtraInfoOutput &output, const char *prefix, RailTypes rail_types, RailTypes mark = {})
 {
-	for (RailType rt = RAILTYPE_BEGIN; rt < RAILTYPE_END; rt++) {
+	for (RailType rt : EnumRange(RAILTYPE_END)) {
 		if (!rail_types.Test(rt)) continue;
 		const RailTypeInfo *rti = GetRailTypeInfo(rt);
-		if (rti->label == 0) continue;
+		if (rti->label.Empty()) continue;
 
 		output.Print("{}{:02} {}{}",
 				prefix,
 				(uint)rt,
-				label_dumper().Label(rti->label),
+				rti->label,
 				mark.Test(rt) ? " !!!" : "");
 	}
 }
 
 static void DumpRoadTypeList(NIExtraInfoOutput &output, const char *prefix, RoadTypes road_types)
 {
-	for (RoadType rt = ROADTYPE_BEGIN; rt < ROADTYPE_END; rt++) {
+	for (RoadType rt : EnumRange(ROADTYPE_END)) {
 		if (!road_types.Test(rt)) continue;
 		const RoadTypeInfo *rti = GetRoadTypeInfo(rt);
-		if (rti->label == 0) continue;
+		if (rti->label.Empty()) continue;
 
 		output.Print("{}{:02} {} {}",
 				prefix,
 				(uint)rt,
 				RoadTypeIsTram(rt) ? "Tram" : "Road",
-				label_dumper().Label(rti->label));
+				rti->label);
 	}
 }
 
@@ -140,14 +128,14 @@ class NIHVehicle : public NIHelper {
 	const void *GetInstance(uint index) const override   { return Vehicle::Get(index); }
 	const void *GetSpec(uint index) const override       { return Vehicle::Get(index)->GetEngine(); }
 	std::string GetName(uint index) const override       { return GetString(STR_VEHICLE_NAME, Vehicle::Get(index)->First()->index.base()); }
-	uint32_t GetGRFID(uint index) const override         { return Vehicle::Get(index)->GetGRFID(); }
+	GrfID GetGRFID(uint index) const override            { return Vehicle::Get(index)->GetGRFID(); }
 	std::span<const BadgeID> GetBadges(uint index) const override { return Vehicle::Get(index)->GetEngine()->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		Vehicle *v = Vehicle::Get(index);
 		VehicleResolverObject ro(v->engine_type, v, VehicleResolverObject::WagonOverride::Cached);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	/* virtual */ void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -262,7 +250,7 @@ class NIHVehicle : public NIHelper {
 			const uint rt_count = CountBits(t->railtypes);
 			if (rt_count == 1) {
 				const RailType rt = *t->railtypes.begin();
-				output.buffer.format("{:02}, {}", rt, label_dumper().RailTypeLabel(rt));
+				output.buffer.format("{:02}, {}", rt, GetRailTypeInfo(rt)->label);
 			} else {
 				output.buffer.format("count: {}", rt_count);
 			}
@@ -367,7 +355,7 @@ class NIHVehicle : public NIHelper {
 							break;
 						case TRLIT_CURVE_SPEED:
 							output.buffer.format("curve speed: {}", item.data_id);
-							if (_settings_game.vehicle.train_acceleration_model != AM_ORIGINAL) print_braking_speed(item.start, item.data_id, item.z_pos);
+							if (_settings_game.vehicle.train_acceleration_model != AccelerationModel::Original) print_braking_speed(item.start, item.data_id, item.z_pos);
 
 							break;
 						case TRLIT_SPEED_ADAPTATION: {
@@ -419,7 +407,7 @@ class NIHVehicle : public NIHelper {
 
 			output.register_next_line_click_flag_toggle(8 << flag_shift);
 			output.Print("  [{}] Roadtype: {} ({}), Compatible: 0x{:X}",
-					(output.flags & (8 << flag_shift)) ? '-' : '+', rv->roadtype, label_dumper().RoadTypeLabel(rv->roadtype), rv->compatible_roadtypes);
+					(output.flags & (8 << flag_shift)) ? '-' : '+', rv->roadtype, GetRoadTypeInfo(rv->roadtype)->label, rv->compatible_roadtypes);
 			if (output.flags & (8 << flag_shift)) {
 				DumpRoadTypeList(output, "    ", rv->compatible_roadtypes);
 			}
@@ -445,6 +433,19 @@ class NIHVehicle : public NIHelper {
 				if (output.buffer.size() > 0) output.FinishPrint();
 			} else {
 				output.buffer.append("none");
+				output.FinishPrint();
+			}
+			{
+				output.buffer.append("  Ship flags: ");
+				bool first = true;
+				auto add_cb_flag = [&](VehicleShipFlag flag, const char *name) {
+					if (!s->flags.Test(flag)) return;
+					if (!first) output.buffer.append(", ");
+					output.buffer.append(name);
+					first = false;
+				};
+				add_cb_flag(VehicleShipFlag::SecondEndFacingForward, "SecondEndFacingForward");
+				if (first) output.buffer.append("[NONE]");
 				output.FinishPrint();
 			}
 		}
@@ -661,7 +662,7 @@ class NIHVehicle : public NIHelper {
 					const uint rt_count = CountBits(rts);
 					if (rt_count == 1) {
 						const RailType rt = *rts.begin();
-						output.buffer.format("{}, {}", rt, label_dumper().RailTypeLabel(rt));
+						output.buffer.format("{}, {}", rt, GetRailTypeInfo(rt)->label);
 					} else {
 						output.buffer.format("count: {}", rt_count);
 					}
@@ -679,7 +680,7 @@ class NIHVehicle : public NIHelper {
 					const RoadVehicleInfo &rvi = e->VehInfo<RoadVehicleInfo>();
 					const RoadTypeInfo *rti = GetRoadTypeInfo(rvi.roadtype);
 					output.Print("    [{}] Roadtype: {} ({}), Powered: 0x{:X}",
-							(output.flags & (16 << flag_shift)) ? '-' : '+', rvi.roadtype, label_dumper().RoadTypeLabel(rvi.roadtype), rti->powered_roadtypes);
+							(output.flags & (16 << flag_shift)) ? '-' : '+', rvi.roadtype, GetRoadTypeInfo(rvi.roadtype)->label, rti->powered_roadtypes);
 					if (output.flags & (16 << flag_shift)) {
 						DumpRoadTypeList(output, "      ", rti->powered_roadtypes);
 					}
@@ -704,12 +705,16 @@ class NIHVehicle : public NIHelper {
 					print_bit(ExtraEngineFlag::NoPreview,       "NoPreview");
 					print_bit(ExtraEngineFlag::JoinPreview,     "JoinPreview");
 					print_bit(ExtraEngineFlag::SyncReliability, "SyncReliability");
+					print_bit(ExtraEngineFlag::HasCab,          "HasCab");
+					print_bit(ExtraEngineFlag::IsDoubleEnded,   "IsDoubleEnded");
 				} else {
-					output.Print("    [+] Extra Engine Flags: {}{}{}{}",
+					output.Print("    [+] Extra Engine Flags: {}{}{}{}{}{}",
 							e->info.extra_flags.Test(ExtraEngineFlag::NoNews)          ? 'n' : '-',
 							e->info.extra_flags.Test(ExtraEngineFlag::NoPreview)       ? 'p' : '-',
 							e->info.extra_flags.Test(ExtraEngineFlag::JoinPreview)     ? 'j' : '-',
-							e->info.extra_flags.Test(ExtraEngineFlag::SyncReliability) ? 's' : '-');
+							e->info.extra_flags.Test(ExtraEngineFlag::SyncReliability) ? 's' : '-',
+							e->info.extra_flags.Test(ExtraEngineFlag::HasCab)          ? 'c' : '-',
+							e->info.extra_flags.Test(ExtraEngineFlag::IsDoubleEnded)   ? 'd' : '-');
 				}
 			}
 		}
@@ -777,14 +782,14 @@ class NIHStation : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return GetStationSpec(TileIndex{index}); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_STATION_NAME, GetStationIndex(TileIndex{index}), TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? GetStationSpec(TileIndex{index})->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (this->IsInspectable(index)) ? GetStationSpec(TileIndex{index})->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return this->IsInspectable(index) ? GetStationSpec(TileIndex{index})->badges : std::span<const BadgeID>{}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TileIndex tile{index};
 		StationResolverObject ro(GetStationSpec(tile), BaseStation::GetByTile(tile), tile, INVALID_RAILTYPE);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	/* virtual */ void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -798,7 +803,7 @@ class NIHStation : public NIHelper {
 		}
 
 		const StationClass *cls = StationClass::Get(statspec->class_index);
-		output.Print("Class ID: {}", label_dumper().Label(cls->global_id));
+		output.Print("Class ID: {}", cls->global_id);
 
 		for (size_t i = 0; i < statspec->renderdata.size(); i++) {
 			output.Print("Tile Layout {}:", i);
@@ -937,14 +942,14 @@ class NIHHouse : public NIHelper {
 	const void *GetInstance(uint)const override          { return nullptr; }
 	const void *GetSpec(uint index) const override       { return HouseSpec::Get(GetHouseType(TileIndex{index})); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_TOWN_NAME, GetTownIndex(TileIndex{index}), TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? HouseSpec::Get(GetHouseType(TileIndex{index}))->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (this->IsInspectable(index)) ? HouseSpec::Get(GetHouseType(TileIndex{index}))->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return HouseSpec::Get(GetHouseType(TileIndex{index}))->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TileIndex tile{index};
 		HouseResolverObject ro(GetHouseType(tile), tile, Town::GetByTile(tile));
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1035,14 +1040,14 @@ class NIHIndustryTile : public NIHelper {
 	const void *GetInstance(uint)const override          { return nullptr; }
 	const void *GetSpec(uint index) const override       { return GetIndustryTileSpec(GetIndustryGfx(TileIndex{index})); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_INDUSTRY_NAME, GetIndustryIndex(TileIndex{index}), TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? GetIndustryTileSpec(GetIndustryGfx(TileIndex{index}))->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (this->IsInspectable(index)) ? GetIndustryTileSpec(GetIndustryGfx(TileIndex{index}))->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return GetIndustryTileSpec(GetIndustryGfx(TileIndex{index}))->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TileIndex tile{index};
 		IndustryTileResolverObject ro(GetIndustryGfx(tile), tile, Industry::GetByTile(tile));
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1054,7 +1059,7 @@ class NIHIndustryTile : public NIHelper {
 		if (indts != nullptr) {
 			output.Print("  anim_production: {}, anim_next: {}, anim_state: {}, ", indts->anim_production, indts->anim_next, indts->anim_state);
 			output.Print("  animation: frames: {}, status: {}, speed: {}, triggers: 0x{:X}", indts->animation.frames, indts->animation.status, indts->animation.speed, indts->animation.triggers);
-			output.Print("  special_flags: 0x{:X}, enabled: {}", indts->special_flags, indts->enabled);
+			output.Print("  special_flags: 0x{:X}", indts->special_flags);
 		}
 	}
 
@@ -1083,38 +1088,38 @@ template <typename BASE> uint NipAcceptedCargoReader(const void *b, uint8_t slot
 #define NIP_ACCEPTED_CARGO(prop, base, slot, type, name) { name, NIValueReader(NipAcceptedCargoReader<base>, slot), prop, type }
 
 static const NIProperty _nip_industries[] = {
-	NIP_PRODUCED_CARGO(0x25, Industry,  0, NIT_CARGO, "produced cargo 0"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  1, NIT_CARGO, "produced cargo 1"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  2, NIT_CARGO, "produced cargo 2"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  3, NIT_CARGO, "produced cargo 3"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  4, NIT_CARGO, "produced cargo 4"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  5, NIT_CARGO, "produced cargo 5"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  6, NIT_CARGO, "produced cargo 6"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  7, NIT_CARGO, "produced cargo 7"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  8, NIT_CARGO, "produced cargo 8"),
-	NIP_PRODUCED_CARGO(0x25, Industry,  9, NIT_CARGO, "produced cargo 9"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 10, NIT_CARGO, "produced cargo 10"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 11, NIT_CARGO, "produced cargo 11"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 12, NIT_CARGO, "produced cargo 12"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 13, NIT_CARGO, "produced cargo 13"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 14, NIT_CARGO, "produced cargo 14"),
-	NIP_PRODUCED_CARGO(0x25, Industry, 15, NIT_CARGO, "produced cargo 15"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  0, NIT_CARGO, "accepted cargo 0"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  1, NIT_CARGO, "accepted cargo 1"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  2, NIT_CARGO, "accepted cargo 2"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  3, NIT_CARGO, "accepted cargo 3"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  4, NIT_CARGO, "accepted cargo 4"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  5, NIT_CARGO, "accepted cargo 5"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  6, NIT_CARGO, "accepted cargo 6"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  7, NIT_CARGO, "accepted cargo 7"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  8, NIT_CARGO, "accepted cargo 8"),
-	NIP_ACCEPTED_CARGO(0x26, Industry,  9, NIT_CARGO, "accepted cargo 9"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 10, NIT_CARGO, "accepted cargo 10"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 11, NIT_CARGO, "accepted cargo 11"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 12, NIT_CARGO, "accepted cargo 12"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 13, NIT_CARGO, "accepted cargo 13"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 14, NIT_CARGO, "accepted cargo 14"),
-	NIP_ACCEPTED_CARGO(0x26, Industry, 15, NIT_CARGO, "accepted cargo 15"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  0, NIType::Cargo, "produced cargo 0"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  1, NIType::Cargo, "produced cargo 1"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  2, NIType::Cargo, "produced cargo 2"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  3, NIType::Cargo, "produced cargo 3"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  4, NIType::Cargo, "produced cargo 4"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  5, NIType::Cargo, "produced cargo 5"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  6, NIType::Cargo, "produced cargo 6"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  7, NIType::Cargo, "produced cargo 7"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  8, NIType::Cargo, "produced cargo 8"),
+	NIP_PRODUCED_CARGO(0x25, Industry,  9, NIType::Cargo, "produced cargo 9"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 10, NIType::Cargo, "produced cargo 10"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 11, NIType::Cargo, "produced cargo 11"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 12, NIType::Cargo, "produced cargo 12"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 13, NIType::Cargo, "produced cargo 13"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 14, NIType::Cargo, "produced cargo 14"),
+	NIP_PRODUCED_CARGO(0x25, Industry, 15, NIType::Cargo, "produced cargo 15"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  0, NIType::Cargo, "accepted cargo 0"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  1, NIType::Cargo, "accepted cargo 1"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  2, NIType::Cargo, "accepted cargo 2"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  3, NIType::Cargo, "accepted cargo 3"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  4, NIType::Cargo, "accepted cargo 4"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  5, NIType::Cargo, "accepted cargo 5"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  6, NIType::Cargo, "accepted cargo 6"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  7, NIType::Cargo, "accepted cargo 7"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  8, NIType::Cargo, "accepted cargo 8"),
+	NIP_ACCEPTED_CARGO(0x26, Industry,  9, NIType::Cargo, "accepted cargo 9"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 10, NIType::Cargo, "accepted cargo 10"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 11, NIType::Cargo, "accepted cargo 11"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 12, NIType::Cargo, "accepted cargo 12"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 13, NIType::Cargo, "accepted cargo 13"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 14, NIType::Cargo, "accepted cargo 14"),
+	NIP_ACCEPTED_CARGO(0x26, Industry, 15, NIType::Cargo, "accepted cargo 15"),
 };
 
 #define NICI(cb_id, bit) NIC(cb_id, IndustrySpec, callback_mask, bit)
@@ -1167,7 +1172,7 @@ class NIHIndustry : public NIHelper {
 	bool ShowSpriteDumpButton(uint index) const override { return true; }
 	InspectTargetId GetParent(uint index) const override { return HasBit(index, 26) ? InspectTargetId::Invalid() : GetTownInspectTargetId(Industry::Get(index)->town); }
 	const void *GetInstance(uint index)const override    { return HasBit(index, 26) ? nullptr : Industry::Get(index); }
-	uint32_t GetGRFID(uint index) const override         { return (!this->ShowExtraInfoOnly(index)) ? ((const IndustrySpec *)this->GetSpec(index))->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (!this->ShowExtraInfoOnly(index)) ? ((const IndustrySpec *)this->GetSpec(index))->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return GetIndustrySpec(Industry::Get(index)->type)->badges; }
 
 	bool ShowExtraInfoOnly(uint index) const override
@@ -1204,19 +1209,19 @@ class NIHIndustry : public NIHelper {
 	{
 		Industry *i = Industry::Get(index);
 		IndustriesResolverObject ro(i->location.tile, i, i->type);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
-	const std::span<int32_t> GetPSA(uint index, uint32_t) const override
+	const std::span<int32_t> GetPSA(uint index, GrfID) const override
 	{
 		const Industry *i = (const Industry *)this->GetInstance(index);
 		if (i->psa == nullptr) return {};
 		return i->psa->storage;
 	}
 
-	std::vector<uint32_t> GetPSAGRFIDs(uint index) const override
+	std::vector<GrfID> GetPSAGRFIDs(uint index) const override
 	{
-		return { 0 };
+		return { GrfID{} };
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1337,7 +1342,7 @@ class NIHCargo : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return CargoSpec::Get(index); }
 	std::string GetName(uint index) const override       { return GetString(CargoSpec::Get(index)->name); }
-	uint32_t GetGRFID(uint index) const override         { return (!this->ShowExtraInfoOnly(index)) ? CargoSpec::Get(index)->grffile->grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (!this->ShowExtraInfoOnly(index)) ? CargoSpec::Get(index)->grffile->grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint) const override { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
@@ -1353,7 +1358,7 @@ class NIHCargo : public NIHelper {
 		const CargoSpec *spec = CargoSpec::Get(index);
 		output.Print("  Bit: {:2}, Label: {}, Callback mask: 0x{:02X}",
 				spec->bitnum,
-				label_dumper().Label(spec->label.base()),
+				spec->label,
 				spec->callback_mask);
 
 		{
@@ -1466,7 +1471,7 @@ class NIHSignals : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return nullptr; }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT_SIGNALS, INVALID_STRING_ID, TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 	std::span<const BadgeID> GetBadges(uint) const override { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
@@ -1496,8 +1501,8 @@ class NIHSignals : public NIHelper {
 				}
 			} while (bits != TRACK_BIT_NONE);
 		}
-		NewSignalsResolverObject ro(nullptr, tile, TCX_NORMAL, 0, 0, ctx, style, GetFirstTraceRestrictProgramOnTile(tile), z);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		NewSignalsResolverObject ro(nullptr, tile, TileContext::Normal, 0, 0, ctx, style, GetFirstTraceRestrictProgramOnTile(tile), z);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1601,14 +1606,14 @@ class NIHObject : public NIHelper {
 	const void *GetInstance(uint index)const override    { return Object::GetByTile(TileIndex{index}); }
 	const void *GetSpec(uint index) const override       { return ObjectSpec::GetByTile(TileIndex{index}); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT_OBJECT, INVALID_STRING_ID, TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (!this->ShowExtraInfoOnly(index)) ? ObjectSpec::GetByTile(TileIndex{index})->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (!this->ShowExtraInfoOnly(index)) ? ObjectSpec::GetByTile(TileIndex{index})->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return ObjectSpec::GetByTile(TileIndex{index})->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TileIndex tile{index};
 		ObjectResolverObject ro(ObjectSpec::GetByTile(tile), Object::GetByTile(tile), tile);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1624,8 +1629,8 @@ class NIHObject : public NIHelper {
 				output.buffer.format("  (local ID: {})", spec->grf_prop.local_id);
 			}
 			if (spec->class_index != ObjectClassID::Invalid()) {
-				uint class_id = ObjectClass::Get(spec->class_index)->global_id;
-				output.buffer.format(", class ID: {}", label_dumper().Label(class_id));
+				ObjectClass::GlobalID class_id = ObjectClass::Get(spec->class_index)->global_id;
+				output.buffer.format(", class ID: {}", class_id);
 			}
 			output.FinishPrint();
 
@@ -1709,14 +1714,13 @@ static const NIVariable _niv_railtypes[] = {
 	NIV(A2VRI_RAILTYPE_ADJACENT_CROSSING, "adjacent crossing"),
 };
 
-static void PrintTypeLabels(NIExtraInfoOutput &output, const char *prefix, uint32_t label, const uint32_t *alternate_labels, size_t alternate_labels_count)
+static void PrintAlternateLabels(NIExtraInfoOutput &output, const char *prefix, const BaseLabel *alternate_labels, size_t alternate_labels_count)
 {
 	if (alternate_labels_count > 0) {
 		output.buffer.format("{}Alternate labels: ", prefix);
 		for (size_t i = 0; i < alternate_labels_count; i++) {
 			if (i != 0) output.buffer.append(", ");
-			uint32_t l = alternate_labels[i];
-			output.buffer.append(label_dumper().Label(l));
+			alternate_labels[i].fmt_format_value(output.buffer);
 		}
 		output.FinishPrint();
 	}
@@ -1729,15 +1733,15 @@ class NIHRailType : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return nullptr; }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT_RAIL_TYPE, INVALID_STRING_ID, TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return GetRailTypeInfo(GetRailType(TileIndex{index}))->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		/* There is no unique GRFFile for the tile. Multiple GRFs can define different parts of the railtype.
 		 * However, currently the NewGRF Debug GUI does not display variables depending on the GRF (like 0x7F) anyway. */
-		RailTypeResolverObject ro(nullptr, TileIndex{index}, TCX_NORMAL, RailSpriteType::End);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		RailTypeResolverObject ro(nullptr, TileIndex{index}, TileContext::Normal, RailSpriteType::End);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1748,7 +1752,7 @@ class NIHRailType : public NIHelper {
 
 		auto writeRailType = [&](RailType type) {
 			const RailTypeInfo *info = GetRailTypeInfo(type);
-			output.Print("  Type: {} ({})", type, label_dumper().RailTypeLabel(type));
+			output.Print("  Type: {} ({})", type, info->label);
 			output.Print("  Flags: {}{}{}{}{}{}",
 					info->flags.Test(RailTypeFlag::Catenary)        ? 'c' : '-',
 					info->flags.Test(RailTypeFlag::NoLevelCrossing) ? 'l' : '-',
@@ -1777,7 +1781,7 @@ class NIHRailType : public NIHelper {
 			dump_railtypes("Compatible", info->compatible_railtypes, {});
 			dump_railtypes("Indirect compatible", info->indirect_compatible_railtypes, RailTypes(~info->compatible_railtypes.base()));
 
-			PrintTypeLabels(output, "  ", info->label, (const uint32_t*) info->alternate_labels.data(), info->alternate_labels.size());
+			PrintAlternateLabels(output, "  ", (const BaseLabel *)info->alternate_labels.data(), info->alternate_labels.size());
 			output.Print("  Cost multiplier: {}/8, Maintenance multiplier: {}/8", info->cost_multiplier, info->maintenance_multiplier);
 
 			CalTime::YearMonthDay ymd = CalTime::ConvertDateToYMD(info->introduction_date);
@@ -1869,14 +1873,14 @@ class NIHAirportTile : public NIHelper {
 	const void *GetInstance(uint)const override          { return nullptr; }
 	const void *GetSpec(uint index) const override       { return AirportTileSpec::Get(GetAirportGfx(TileIndex{index})); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_STATION_NAME, GetStationIndex(TileIndex{index}), TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? AirportTileSpec::Get(GetAirportGfx(TileIndex{index}))->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (this->IsInspectable(index)) ? AirportTileSpec::Get(GetAirportGfx(TileIndex{index}))->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return AirportTileSpec::Get(GetAirportGfx(TileIndex{index}))->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TileIndex tile{index};
 		AirportTileResolverObject ro(AirportTileSpec::GetByTile(tile), tile, Station::GetByTile(tile));
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -1922,17 +1926,17 @@ class NIHAirport : public NIHelper {
 	const void *GetInstance(uint index)const override    { return Station::Get(index); }
 	const void *GetSpec(uint index) const override       { return AirportSpec::Get(Station::Get(index)->airport.type); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_STATION_NAME, index, Station::Get(index)->airport.tile); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? AirportSpec::Get(Station::Get(index)->airport.type)->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override { return (this->IsInspectable(index)) ? AirportSpec::Get(Station::Get(index)->airport.type)->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return AirportSpec::Get(Station::Get(index)->airport.type)->badges; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		Station *st = Station::Get(index);
 		AirportResolverObject ro(st->airport.tile, st, AirportSpec::Get(st->airport.type), st->airport.layout);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
-	const std::span<int32_t> GetPSA(uint index, uint32_t) const override
+	const std::span<int32_t> GetPSA(uint index, GrfID) const override
 	{
 		const Station *st = (const Station *)this->GetInstance(index);
 		if (st->airport.psa == nullptr) return {};
@@ -1977,17 +1981,17 @@ class NIHTown : public NIHelper {
 	const void *GetInstance(uint index)const override    { return Town::Get(index); }
 	const void *GetSpec(uint) const override             { return nullptr; }
 	std::string GetName(uint index) const override       { return GetString(STR_TOWN_NAME, index); }
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 	bool PSAWithParameter() const override               { return true; }
 	std::span<const BadgeID> GetBadges(uint) const override { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
 		TownResolverObject ro(nullptr, Town::Get(index), true);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
-	const std::span<int32_t> GetPSA(uint index, uint32_t grfid) const override
+	const std::span<int32_t> GetPSA(uint index, GrfID grfid) const override
 	{
 		Town *t = Town::Get(index);
 
@@ -1998,11 +2002,11 @@ class NIHTown : public NIHelper {
 		return {};
 	}
 
-	virtual std::vector<uint32_t> GetPSAGRFIDs(uint index) const override
+	virtual std::vector<GrfID> GetPSAGRFIDs(uint index) const override
 	{
-		Town *t = Town::Get(index);
+		const Town *t = Town::Get(index);
 
-		std::vector<uint32_t> output;
+		std::vector<GrfID> output;
 		for (const auto &iter : t->psa_list) {
 			output.push_back(iter->grfid);
 		}
@@ -2025,7 +2029,7 @@ class NIHTown : public NIHelper {
 		output.Print("  Growth rate: {}, Growth Counter: {}, T to Rebuild: {}, Growing: {}, Custom growth: {}",
 				t->growth_rate, t->grow_counter, t->time_until_rebuild, t->flags.Test(TownFlag::IsGrowing) ? 1 : 0, t->flags.Test(TownFlag::CustomGrowth) ? 1 : 0);
 
-		output.Print("  Road layout: {}", GetStringFmtParam(STR_CONFIG_SETTING_TOWN_LAYOUT_DEFAULT + t->layout));
+		output.Print("  Road layout: {}", GetStringFmtParam(STR_CONFIG_SETTING_TOWN_LAYOUT_DEFAULT + to_underlying(t->layout)));
 
 		if (t->have_ratings.Any()) {
 			output.Print("  Company ratings:");
@@ -2087,7 +2091,7 @@ class NIHStationStruct : public NIHelper {
 		}
 	}
 
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
@@ -2224,7 +2228,7 @@ class NIHTraceRestrict : public NIHelper {
 				GetTraceRestrictRefIdTrack(static_cast<TraceRestrictRefId>(index)));
 	}
 
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
 	{
@@ -2337,7 +2341,7 @@ private:
 	const void *GetInstance(uint index) const override   { return nullptr; }
 	const void *GetSpec(uint index) const override       { return nullptr; }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT_ROAD_TYPE, INVALID_STRING_ID, TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 
 	std::span<const BadgeID> GetBadges(uint index) const override
 	{
@@ -2350,8 +2354,8 @@ private:
 	{
 		/* There is no unique GRFFile for the tile. Multiple GRFs can define different parts of the railtype.
 		 * However, currently the NewGRF Debug GUI does not display variables depending on the GRF (like 0x7F) anyway. */
-		RoadTypeResolverObject ro(nullptr, TileIndex{index}, TCX_NORMAL, RoadSpriteType::End);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		RoadTypeResolverObject ro(nullptr, TileIndex{index}, TileContext::Normal, RoadSpriteType::End);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -2363,7 +2367,7 @@ private:
 			if (type == INVALID_ROADTYPE) return;
 
 			const RoadTypeInfo* rti = GetRoadTypeInfo(type);
-			output.Print("  {} Type: {} ({})", rtt == RoadTramType::Tram ? "Tram" : "Road", type, label_dumper().RoadTypeLabel(type));
+			output.Print("  {} Type: {} ({})", rtt == RoadTramType::Tram ? "Tram" : "Road", type, rti->label);
 			output.Print("    Flags: {}{}{}{}{}",
 					rti->flags.Test(RoadTypeFlag::Catenary)        ? 'c' : '-',
 					rti->flags.Test(RoadTypeFlag::NoLevelCrossing) ? 'l' : '-',
@@ -2383,7 +2387,7 @@ private:
 			if (output.flags & rtt_click_flag) {
 				DumpRoadTypeList(output, "      ", rti->powered_roadtypes);
 			}
-			PrintTypeLabels(output, "    ", rti->label, (const uint32_t*) rti->alternate_labels.data(), rti->alternate_labels.size());
+			PrintAlternateLabels(output, "    ", (const BaseLabel *)rti->alternate_labels.data(), rti->alternate_labels.size());
 			output.Print("    Cost multiplier: {}/8, Maintenance multiplier: {}/8", rti->cost_multiplier, rti->maintenance_multiplier);
 		};
 		writeInfo(RoadTramType::Road);
@@ -2480,7 +2484,7 @@ class NIHRoadStop : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return GetRoadStopSpec(TileIndex{index}); }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_STATION_NAME, GetStationIndex(TileIndex{index}), TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return (this->IsInspectable(index)) ? GetRoadStopSpec(TileIndex{index})->grf_prop.grfid : 0; }
+	GrfID GetGRFID(uint index) const override            { return (this->IsInspectable(index)) ? GetRoadStopSpec(TileIndex{index})->grf_prop.grfid : GrfID{}; }
 	std::span<const BadgeID> GetBadges(uint index) const override { return this->IsInspectable(index) ? GetRoadStopSpec(TileIndex{index})->badges : std::span<const BadgeID>{}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
@@ -2488,7 +2492,7 @@ class NIHRoadStop : public NIHelper {
 		TileIndex tile{index};
 		StationGfx view = GetStationGfx(tile);
 		RoadStopResolverObject ro(GetRoadStopSpec(tile), BaseStation::GetByTile(tile), tile, INVALID_ROADTYPE, GetStationType(tile), view);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
@@ -2497,8 +2501,8 @@ class NIHRoadStop : public NIHelper {
 		output.Print("Debug Info:");
 		const RoadStopSpec *spec = GetRoadStopSpec(tile);
 		if (spec != nullptr) {
-			uint class_id = RoadStopClass::Get(spec->class_index)->global_id;
-			output.buffer.format("  class ID: {}", label_dumper().Label(class_id));
+			RoadStopClass::GlobalID class_id = RoadStopClass::Get(spec->class_index)->global_id;
+			output.buffer.format("  class ID: {}", class_id);
 			if (spec->grf_prop.grffile != nullptr) {
 				output.buffer.format("  (local ID: {})", spec->grf_prop.local_id);
 			}
@@ -2547,7 +2551,7 @@ class NIHNewLandscape : public NIHelper {
 	const void *GetInstance(uint index)const override    { return nullptr; }
 	const void *GetSpec(uint index) const override       { return nullptr; }
 	std::string GetName(uint index) const override       { return GetString(STR_NEWGRF_INSPECT_CAPTION_OBJECT_AT, STR_LAI_CLEAR_DESCRIPTION_ROCKS, INVALID_STRING_ID, TileIndex{index}); }
-	uint32_t GetGRFID(uint index) const override         { return 0; }
+	GrfID GetGRFID(uint index) const override            { return {}; }
 	std::span<const BadgeID> GetBadges(uint) const override { return {}; }
 
 	uint Resolve(uint index, uint var, uint param, GetVariableExtra &extra) const override
@@ -2562,14 +2566,14 @@ class NIHNewLandscape : public NIHelper {
 		ti.tile = tile;
 
 		NewLandscapeResolverObject ro(nullptr, &ti, NEW_LANDSCAPE_ROCKS);
-		return ro.GetScope(VSG_SCOPE_SELF)->GetVariable(var, param, extra);
+		return ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(var, param, extra);
 	}
 
 	void ExtraInfo(uint index, NIExtraInfoOutput &output) const override
 	{
 		output.Print("New Landscape GRFs:");
 		for (const GRFFile *grf : _new_landscape_rocks_grfs) {
-			output.Print("  GRF: {:08X}", std::byteswap(grf->grfid));
+			output.Print("  GRF: {}", grf->grfid);
 			output.Print("    Enable rocks recolour: {}, Enable drawing snowy rocks: {}",
 					HasBit(grf->new_landscape_ctrl_flags, NLCF_ROCKS_RECOLOUR_ENABLED), HasBit(grf->new_landscape_ctrl_flags, NLCF_ROCKS_DRAW_SNOWY_ENABLED));
 		}

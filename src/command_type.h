@@ -23,7 +23,7 @@
 #include <type_traits>
 
 struct GRFFile;
-enum ClientID : uint32_t;
+enum class ClientID : uint32_t;
 
 enum CommandCostIntlFlags : uint8_t {
 	CCIF_NONE                     = 0,
@@ -135,7 +135,7 @@ class CommandCost {
 
 	union {
 		CommandResultData result{};
-		StringID extra_message;                 ///< Additional warning message for when success is unset
+		StringID::BaseType extra_message;               ///< Additional warning message for when success is unset
 		uint32_t tile;
 		int64_t additional_cash_required;
 		CommandCostAuxiliaryData *aux_data;
@@ -223,7 +223,7 @@ public:
 	{
 		CommandCost cc(msg);
 		cc.SetInlineType(CommandCostInlineType::ExtraMsg);
-		cc.inl.extra_message = extra_msg;
+		cc.inl.extra_message = extra_msg.base();
 		return cc;
 	}
 
@@ -334,7 +334,7 @@ public:
 	{
 		if (this->Succeeded()) return INVALID_STRING_ID;
 		if (this->GetInlineType() == CommandCostInlineType::ExtraMsg) {
-			return this->inl.extra_message;
+			return StringID{this->inl.extra_message};
 		} else if (this->GetInlineType() == CommandCostInlineType::AuxiliaryData) {
 			return this->inl.aux_data->extra_message;
 		} else {
@@ -364,7 +364,7 @@ public:
 	 * @param cmd_msg optional failure string as passed to DoCommand
 	 * @return a string summarising the command result
 	 */
-	std::string SummaryMessage(StringID cmd_msg = 0) const;
+	std::string SummaryMessage(StringID cmd_msg = STR_NULL) const;
 
 	bool IsSuccessWithMessage() const
 	{
@@ -749,6 +749,7 @@ enum class Commands : uint16_t {
 	SchDispatchSetDelay,                    ///< scheduled dispatch set maximum allow delay
 	SchDispatchSetReuseSlots,               ///< scheduled dispatch set whether to re-use dispatch slots
 	SchDispatchResetLastDispatch,           ///< scheduled dispatch reset last dispatch date
+	SchDispatchSetLastDispatch,             ///< scheduled dispatch set last dispatch date
 	SchDispatchClear,                       ///< scheduled dispatch clear schedule
 	SchDispatchAddNewSchedule,              ///< scheduled dispatch add new schedule
 	SchDispatchRemoveSchedule,              ///< scheduled dispatch remove schedule
@@ -928,6 +929,8 @@ enum class DoCommandFlag : uint8_t {
 	AllowRemoveWater,     ///< always allow removing water
 	Town,                 ///< town operation
 };
+
+/** Bitset of \c DoCommandFlag elements. */
 using DoCommandFlags = EnumBitSet<DoCommandFlag, uint16_t>;
 
 enum DoCommandIntlFlag : uint8_t {
@@ -970,6 +973,8 @@ enum class CommandFlag : uint8_t {
 	ServerNS,  ///< the command can only be initiated by the server (this is not executed in spectator mode).
 	LogAux,    ///< the command should be logged in the auxiliary log instead of the main log.
 };
+
+/** Bitset of \c CommandFlag elements. */
 using CommandFlags = EnumBitSet<CommandFlag, uint16_t>;
 
 static constexpr CommandFlags CMD_SERVER{CommandFlag::Server};

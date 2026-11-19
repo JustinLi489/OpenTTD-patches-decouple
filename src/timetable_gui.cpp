@@ -494,23 +494,24 @@ struct TimetableWindow : GeneralVehicleWindow {
 	{
 		switch (widget) {
 			case WID_VT_ARRIVAL_DEPARTURE_PANEL: {
-				int64_t param;
-				if (_settings_time.time_in_minutes) {
-					param = _settings_time.FromTickMinutes(_settings_time.NowInTickMinutes().ToSameDayClockTime(GetBroadestHourDigitsValue(), (int)GetParamMaxDigits(2))).base();
-				} else if (EconTime::UsingWallclockUnits()) {
-					param = _state_ticks.base() + (TICKS_PER_SECOND * 9999);
-				} else {
-					param = EconTime::MAX_YEAR.base() * DAYS_IN_YEAR;
-				}
-
 				format_buffer buf;
-				auto get_width = [&](StringID str) {
+				auto get_width = [&](StringID str, int64_t param) {
 					buf.clear();
 					AppendStringInPlace(buf, str, param);
 					return GetStringBoundingBox(buf).width;
 				};
-				this->deparr_time_width = get_width(STR_JUST_TT_TIME);
-				this->deparr_abbr_width = std::max(get_width(STR_TIMETABLE_ARRIVAL_ABBREVIATION), get_width(STR_TIMETABLE_DEPARTURE_ABBREVIATION));
+
+				if (_settings_time.time_in_minutes) {
+					this->deparr_time_width = get_width(STR_JUST_TIME_HHMM, (GetBroadestHourDigitsValue() * 100) + GetParamMaxDigits(2));
+				} else if (EconTime::UsingWallclockUnits()) {
+					this->deparr_time_width = get_width(STR_JUST_TT_TIME, _state_ticks.base() + (TICKS_PER_SECOND * 9999));
+				} else {
+					format_buffer_sized<64> date_buf;
+					AppendWidestTinyOrIsoCalendarDate(date_buf, false);
+					this->deparr_time_width = GetStringBoundingBox(date_buf).width;
+				}
+
+				this->deparr_abbr_width = std::max(get_width(STR_TIMETABLE_ARRIVAL_ABBREVIATION, 0), get_width(STR_TIMETABLE_DEPARTURE_ABBREVIATION, 0));
 				size.width = this->deparr_abbr_width + this->deparr_time_width + padding.width;
 				[[fallthrough]];
 			}
@@ -614,7 +615,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 	{
 		this->UpdateSelectionStates();
 		this->SetDirty();
-		return ES_NOT_HANDLED;
+		return EventState::NotHandled;
 	}
 
 	void SetButtonDisabledStates()
@@ -1071,7 +1072,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 					ShowQueryString({}, STR_TIMETABLE_START_SECONDS_QUERY, 6, this, CS_NUMERAL, QueryStringFlag::AcceptUnchanged);
 				} else if (_settings_time.time_in_minutes && _settings_client.gui.timetable_start_text_entry) {
 					this->set_start_date_all = set_all;
-					ShowQueryString(GetString(STR_JUST_INT, _settings_time.NowInTickMinutes().ClockHHMM()), STR_TIMETABLE_START, 31, this, CS_NUMERAL, QueryStringFlag::AcceptUnchanged);
+					ShowQueryString(fmt::format("{:04}", _settings_time.NowInTickMinutes().ClockHHMM()), STR_TIMETABLE_START, 31, this, CS_NUMERAL, QueryStringFlag::AcceptUnchanged);
 				} else {
 					ShowSetDateWindow(this, v->index.base(), _state_ticks, EconTime::CurYear(), EconTime::CurYear() + 15,
 							ChangeTimetableStartCallback, reinterpret_cast<void *>(static_cast<uintptr_t>(set_all ? 1 : 0)));
@@ -1295,7 +1296,7 @@ struct TimetableWindow : GeneralVehicleWindow {
 			}
 
 			case WID_VT_ADD_VEH_GROUP: {
-				Command<Commands::CreateGroupFromList>::Post(STR_ERROR_GROUP_CAN_T_CREATE, VehicleListIdentifier(VL_SINGLE_VEH, v->type, v->owner, v->index), CargoFilterCriteria::CF_ANY, *str);
+				Command<Commands::CreateGroupFromList>::Post(STR_ERROR_GROUP_CAN_T_CREATE, VehicleListIdentifier(VehicleListType::SingleVehicle, v->type, v->owner, v->index), CargoFilterCriteria::CF_ANY, *str);
 				break;
 			}
 		}

@@ -80,13 +80,13 @@
 #include "../pathfinder/water_regions.h"
 #include "../tile_cmd.h"
 
+#include "saveload_internal.h"
+#include "saveload_func.h"
 
-#include "../sl/saveload_internal.h"
+#include "../table/strings.h"
 
 #include <signal.h>
 #include <algorithm>
-
-#include "table/strings.h"
 
 #include "../safeguards.h"
 
@@ -128,7 +128,7 @@ void SetWaterClassDependingOnSurroundings(TileIndex t, bool include_invalid_wate
 	bool has_canal = false;
 	bool has_river = false;
 
-	for (DiagDirection dir = DiagDirection::Begin; dir < DiagDirection::End; dir++) {
+	for (DiagDirection dir : EnumRange(DiagDirection::End)) {
 		TileIndex neighbour = TileAddByDiagDir(t, dir);
 		switch (GetTileType(neighbour)) {
 			case TileType::Water:
@@ -200,18 +200,18 @@ static void UpdateExclusiveRights()
 	}
 }
 
-static const uint8_t convert_currency[] = {
-	 0,  1, 12,  8,  3,
-	10, 14, 19,  4,  5,
-	 9, 11, 13,  6, 17,
-	16, 22, 21,  7, 15,
-	18,  2, 20,
-};
-
 /** Since savegame version 4.2 the currencies are arranged differently. */
 static void UpdateCurrencies()
 {
-	_settings_game.locale.currency = convert_currency[_settings_game.locale.currency];
+	constexpr Currency convert_currency[] = {
+		Currency::GBP, Currency::USD, Currency::FRF, Currency::DEM, Currency::JPY,
+		Currency::ESP, Currency::HUF, Currency::PLN, Currency::ATS, Currency::BEF,
+		Currency::DKK, Currency::FIM, Currency::GRD, Currency::CHF, Currency::NLG,
+		Currency::ITL, Currency::SIT, Currency::RUR, Currency::CZK, Currency::ISK,
+		Currency::NOK, Currency::EUR, Currency::RON,
+	};
+
+	_settings_game.locale.currency = convert_currency[to_underlying(_settings_game.locale.currency)];
 }
 
 /**
@@ -390,27 +390,17 @@ static void ResetSignalHandlers()
 static const GRFIdentifier &GetOverriddenIdentifier(const GRFConfig &c)
 {
 	const LoggedAction &la = _gamelog_actions.back();
-	if (la.at != GLAT_LOAD) return c.ident;
+	if (la.at != GamelogActionType::Load) return c.ident;
 
 	for (const LoggedChange &lc : la.changes) {
-		if (lc.ct == GLCT_GRFCOMPAT && lc.grfcompat.grfid == c.ident.grfid) return lc.grfcompat;
+		if (lc.ct == GamelogChangeType::GRFCompat && lc.grfcompat.grfid == c.ident.grfid) return lc.grfcompat;
 	}
 
 	return c.ident;
 }
 
 /** Was the saveload crash because of missing NewGRFs? */
-static bool _saveload_crash_with_missing_newgrfs = false;
-
-/**
- * Did loading the savegame cause a crash? If so,
- * were NewGRFs missing?
- * @return when the saveload crashed due to missing NewGRFs.
- */
-bool SaveloadCrashWithMissingNewGRFs()
-{
-	return _saveload_crash_with_missing_newgrfs;
-}
+bool _saveload_crash_with_missing_newgrfs = false;
 
 /**
  * Signal handler used to give a user a more useful report for crashes during
@@ -448,11 +438,11 @@ static void CDECL HandleSavegameLoadCrash(int signum)
 		for (const auto &c : _grfconfig) {
 			if (c->flags.Test(GRFConfigFlag::Compatible)) {
 				const GRFIdentifier &replaced = GetOverriddenIdentifier(*c);
-				buffer.format("NewGRF {:08X} (checksum {}) not found.\n  Loaded NewGRF \"{}\" (checksum {}) with same GRF ID instead.\n",
-						std::byteswap(c->ident.grfid), c->original_md5sum, c->filename, replaced.md5sum);
+				buffer.format("NewGRF {} (checksum {}) not found.\n  Loaded NewGRF \"{}\" (checksum {}) with same GRF ID instead.\n",
+						c->ident.grfid, c->original_md5sum, c->filename, replaced.md5sum);
 			}
 			if (c->status == GRFStatus::NotFound) {
-				buffer.format("NewGRF {:08X} ({}) not found; checksum {}.\n", std::byteswap(c->ident.grfid), c->filename, c->ident.md5sum);
+				buffer.format("NewGRF {} ({}) not found; checksum {}.\n", c->ident.grfid, c->filename, c->ident.md5sum);
 			}
 		}
 	} else {
@@ -511,10 +501,10 @@ static void FixOwnerOfRailTrack(TileIndex t)
 	}
 
 	/* try to find any connected rail */
-	for (DiagDirection dd = DiagDirection::Begin; dd < DiagDirection::End; dd++) {
+	for (DiagDirection dd : EnumRange(DiagDirection::End)) {
 		TileIndex tt = t + TileOffsByDiagDir(dd);
-		if (GetTileTrackdirBits(t, TRANSPORT_RAIL, 0, dd) != TRACKDIR_BIT_NONE &&
-				GetTileTrackdirBits(tt, TRANSPORT_RAIL, 0, ReverseDiagDir(dd)) != TRACKDIR_BIT_NONE &&
+		if (GetTileTrackdirBits(t, TransportType::Rail, 0, dd) != TRACKDIR_BIT_NONE &&
+				GetTileTrackdirBits(tt, TransportType::Rail, 0, ReverseDiagDir(dd)) != TRACKDIR_BIT_NONE &&
 				Company::IsValidID(GetTileOwner(tt))) {
 			SetTileOwner(t, GetTileOwner(tt));
 			return;
@@ -549,7 +539,7 @@ static void FixOwnerOfRailTrack(TileIndex t)
  * @param dir vehicle's direction, or # Direction::Invalid if it can be ignored
  * @return inclination bits to set
  */
-static uint FixVehicleInclination(Vehicle *v, Direction dir)
+static GroundVehicleFlags FixVehicleInclination(Vehicle *v, Direction dir)
 {
 	/* Compute place where this vehicle entered the tile */
 	int entry_x = v->x_pos;
@@ -570,13 +560,13 @@ static uint FixVehicleInclination(Vehicle *v, Direction dir)
 	uint8_t middle_z = GetSlopePixelZ(middle_x, middle_y, true);
 
 	/* middle_z == entry_z, no height change. */
-	if (middle_z == entry_z) return 0;
+	if (middle_z == entry_z) return {};
 
 	/* middle_z < entry_z, we are going downwards. */
-	if (middle_z < entry_z) return 1U << GVF_GOINGDOWN_BIT;
+	if (middle_z < entry_z) return GroundVehicleFlag::GoingDown;
 
 	/* middle_z > entry_z, we are going upwards. */
-	return 1U << GVF_GOINGUP_BIT;
+	return GroundVehicleFlag::GoingUp;
 }
 
 /**
@@ -742,8 +732,8 @@ bool AfterLoadGame()
 			int dx = TileX(t) - TileX(st->train_station.tile);
 			int dy = TileY(t) - TileY(st->train_station.tile);
 			assert(dx >= 0 && dy >= 0);
-			st->train_station.w = std::max<uint>(st->train_station.w, dx + 1);
-			st->train_station.h = std::max<uint>(st->train_station.h, dy + 1);
+			st->train_station.w = std::max<uint16_t>(st->train_station.w, dx + 1);
+			st->train_station.h = std::max<uint16_t>(st->train_station.h, dy + 1);
 		}
 	}
 
@@ -814,7 +804,7 @@ bool AfterLoadGame()
 		}
 
 		for (Town *t : Town::Iterate()) {
-			t->name = CopyFromOldName(t->townnametype);
+			t->name = CopyFromOldName(static_cast<StringID>(t->townnametype));
 			if (!t->name.empty()) t->townnametype = SPECSTR_TOWNNAME_START + _settings_game.game_creation.town_name;
 		}
 	}
@@ -916,7 +906,7 @@ bool AfterLoadGame()
 	 */
 	if (IsSavegameVersionBefore(SLV_4, 2)) _settings_game.station.modified_catchment = false;
 	if (IsSavegameVersionBefore(SLV_6, 1)) _settings_game.pf.forbid_90_deg = false;
-	if (IsSavegameVersionBefore(SLV_21))   _settings_game.vehicle.train_acceleration_model = 0;
+	if (IsSavegameVersionBefore(SLV_21))   _settings_game.vehicle.train_acceleration_model = AccelerationModel::Original;
 	if (IsSavegameVersionBefore(SLV_90))   _settings_game.vehicle.plane_speed = 4;
 	if (IsSavegameVersionBefore(SLV_95))   _settings_game.vehicle.dynamic_engines = false;
 	if (IsSavegameVersionBefore(SLV_96))   _settings_game.economy.station_noise_level = false;
@@ -926,7 +916,7 @@ bool AfterLoadGame()
 	if (IsSavegameVersionBefore(SLV_134))  _settings_game.economy.feeder_payment_share = 75;
 	if (IsSavegameVersionBefore(SLV_138))  _settings_game.vehicle.plane_crashes = 2;
 	if (IsSavegameVersionBefore(SLV_139)) {
-		_settings_game.vehicle.roadveh_acceleration_model = 0;
+		_settings_game.vehicle.roadveh_acceleration_model = AccelerationModel::Original;
 		_settings_game.vehicle.roadveh_slope_steepness = 7;
 	}
 	if (IsSavegameVersionBefore(SLV_143))  _settings_game.economy.allow_town_level_crossings = true;
@@ -998,7 +988,7 @@ bool AfterLoadGame()
 			if (st->airport.tile == INVALID_TILE) continue;
 			StringID err = INVALID_STRING_ID;
 			if (st->airport.type == 9) {
-				if (st->ship_station.tile != INVALID_TILE && IsOilRig(st->ship_station.tile)) {
+				if (!st->ship_station.IsEmpty() && IsOilRig(st->ship_station.tile)) {
 					/* this airport is probably an oil rig, not a huge airport */
 				} else {
 					err = STR_GAME_SAVELOAD_ERROR_HUGE_AIRPORTS_PRESENT;
@@ -1024,7 +1014,7 @@ bool AfterLoadGame()
 		 */
 		for (Aircraft *v : Aircraft::Iterate()) {
 			Station *st = GetTargetAirportIfValid(v);
-			if (st != nullptr && ((st->ship_station.tile != INVALID_TILE && IsOilRig(st->ship_station.tile)) || st->airport.type == AT_OILRIG)) {
+			if (st != nullptr && ((!st->ship_station.IsEmpty() && IsOilRig(st->ship_station.tile)) || st->airport.type == AT_OILRIG)) {
 				/* aircraft is on approach to an oil rig, bail out now */
 				SetSaveLoadError(STR_GAME_SAVELOAD_ERROR_HELI_OILRIG_BUG);
 				/* Restore the signals */
@@ -1353,7 +1343,7 @@ bool AfterLoadGame()
 				case TileType::TunnelBridge:
 					/* Middle part of "old" bridges */
 					if (old_bridge && IsBridge(t) && HasBit(_m[t].m5, 6)) break;
-					if (((old_bridge && IsBridge(t)) ? (TransportType)GB(_m[t].m5, 1, 2) : GetTunnelBridgeTransportType(t)) == TRANSPORT_ROAD) {
+					if (((old_bridge && IsBridge(t)) ? (TransportType)GB(_m[t].m5, 1, 2) : GetTunnelBridgeTransportType(t)) == TransportType::Road) {
 						SB(_me[t].m7, 6, 2, 1); // Set pre-NRT road type bits for conversion later.
 					}
 					break;
@@ -1411,7 +1401,7 @@ bool AfterLoadGame()
 
 				case TileType::TunnelBridge:
 					if (old_bridge && IsBridge(t) && HasBit(_m[t].m5, 6)) break;
-					if (((old_bridge && IsBridge(t)) ? (TransportType)GB(_m[t].m5, 1, 2) : GetTunnelBridgeTransportType(t)) == TRANSPORT_ROAD) {
+					if (((old_bridge && IsBridge(t)) ? (TransportType)GB(_m[t].m5, 1, 2) : GetTunnelBridgeTransportType(t)) == TransportType::Road) {
 						if (fix_roadtypes) SB(_me[t].m7, 6, 2, GB(_m[t].m3, 0, 3));
 
 						Owner o = GetTileOwner(t);
@@ -1457,7 +1447,7 @@ bool AfterLoadGame()
 					break;
 
 				case TileType::TunnelBridge:
-					if (GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL) {
+					if (GetTunnelBridgeTransportType(t) == TransportType::Rail) {
 						update_railtype(t);
 					}
 					break;
@@ -1476,7 +1466,7 @@ bool AfterLoadGame()
 					Axis axis = static_cast<Axis>(GB(_m[t].m5, 0, 1));
 
 					if (HasBit(_m[t].m5, 5)) { // transport route under bridge?
-						if (GB(_m[t].m5, 3, 2) == TRANSPORT_RAIL) {
+						if (GB(_m[t].m5, 3, 2) == to_underlying(TransportType::Rail)) {
 							MakeRailNormal(
 								t,
 								GetTileOwner(t),
@@ -1517,7 +1507,7 @@ bool AfterLoadGame()
 					DiagDirection dir = ReverseDiagDir(XYNSToDiagDir(axis, north_south));
 					TransportType type = (TransportType)GB(_m[t].m5, 1, 2);
 
-					_m[t].m5 = 1 << 7 | type << 2 | to_underlying(dir);
+					_m[t].m5 = 1 << 7 | to_underlying(type) << 2 | to_underlying(dir);
 				}
 			}
 		}
@@ -1561,7 +1551,7 @@ bool AfterLoadGame()
 					has_road = IsAnyRoadStop(t);
 					break;
 				case TileType::TunnelBridge:
-					has_road = GetTunnelBridgeTransportType(t) == TRANSPORT_ROAD;
+					has_road = GetTunnelBridgeTransportType(t) == TransportType::Road;
 					break;
 				default:
 					break;
@@ -1585,20 +1575,20 @@ bool AfterLoadGame()
 		MemSetT(tram_types, ROADTYPE_TRAM, 31);
 		road_types[31] = INVALID_ROADTYPE;
 		tram_types[31] = INVALID_ROADTYPE;
-		for (RoadType rt = ROADTYPE_BEGIN; rt < ROADTYPE_END; rt++) {
+		for (RoadType rt : EnumRange(ROADTYPE_END)) {
 			const RoadTypeInfo *rti = GetRoadTypeInfo(rt);
 			if (RoadTypeIsRoad(rt)) {
-				if (rti->label == 'ROAD') {
+				if (rti->label == RoadTypeLabel{"ROAD"}) {
 					road_types[0] = rt;
-				} else if (rti->label == 'ELRD') {
+				} else if (rti->label == RoadTypeLabel{"ELRD"}) {
 					road_types[1] = rt;
 				} else if (next_road_type < 31) {
 					road_types[next_road_type++] = rt;
 				}
 			} else {
-				if (rti->label == 'RAIL') {
+				if (rti->label == RoadTypeLabel{"RAIL"}) {
 					tram_types[0] = rt;
-				} else if (rti->label == 'ELRL') {
+				} else if (rti->label == RoadTypeLabel{"ELRL"}) {
 					tram_types[1] = rt;
 				} else if (next_tram_type < 31) {
 					tram_types[next_tram_type++] = rt;
@@ -1615,7 +1605,7 @@ bool AfterLoadGame()
 					has_road = IsAnyRoadStop(t);
 					break;
 				case TileType::TunnelBridge:
-					has_road = GetTunnelBridgeTransportType(t) == TRANSPORT_ROAD;
+					has_road = GetTunnelBridgeTransportType(t) == TransportType::Road;
 					break;
 				default:
 					break;
@@ -1641,7 +1631,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeaturePresent(XSLFI_SIG_TUNNEL_BRIDGE, 1, 6)) {
 		/* m2 signal state bit allocation has shrunk */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsBridge(t) && IsTunnelBridgeSignalSimulationEntrance(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsBridge(t) && IsTunnelBridgeSignalSimulationEntrance(t)) {
 				extern void ShiftBridgeEntranceSimulatedSignalsExtended(TileIndex t, int shift, uint64_t in);
 				const uint shift = 15 - BRIDGE_M2_SIGNAL_STATE_COUNT;
 				ShiftBridgeEntranceSimulatedSignalsExtended(t, shift, GB(_m[t].m2, BRIDGE_M2_SIGNAL_STATE_COUNT, shift));
@@ -1653,7 +1643,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeaturePresent(XSLFI_CHILLPP)) {
 		/* fix signal tunnel/bridge PBS */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeSignalSimulationEntrance(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeSignalSimulationEntrance(t)) {
 				UnreserveAcrossRailTunnelBridge(t);
 			}
 		}
@@ -1662,7 +1652,7 @@ bool AfterLoadGame()
 	if (!SlXvIsFeaturePresent(XSLFI_CUSTOM_BRIDGE_HEADS, 2)) {
 		/* change map bits for rail bridge heads */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL) {
+			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TransportType::Rail) {
 				SetCustomBridgeHeadTrackBits(t, DiagDirToDiagTrackBits(GetTunnelBridgeDirection(t)));
 				SetBridgeReservationTrackBits(t, HasBit(_m[t].m5, 4) ? DiagDirToDiagTrackBits(GetTunnelBridgeDirection(t)) : TRACK_BIT_NONE);
 				ClrBit(_m[t].m5, 4);
@@ -1680,7 +1670,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeaturePresent(XSLFI_CUSTOM_BRIDGE_HEADS, 1, 3)) {
 		/* fix any mismatched road/tram bits */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TRANSPORT_ROAD) {
+			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TransportType::Road) {
 				for (RoadTramType rtt : { RoadTramType::Tram, RoadTramType::Road }) {
 					RoadType rt = GetRoadType(t, rtt);
 					if (rt == INVALID_ROADTYPE) continue;
@@ -1719,18 +1709,23 @@ bool AfterLoadGame()
 		}
 	}
 
-	/* Elrails got added in rev 24 */
+	/* Elrails got added in rev 24 but can be disabled since version 38. */
 	if (IsSavegameVersionBefore(SLV_24)) {
-		RailType min_rail = RAILTYPE_ELECTRIC;
+		RailType min_rail = static_cast<RailType>(1); // Monorail was 1 before elrails were introduced.
 
-		for (Train *v : Train::Iterate()) {
-			RailTypes rts = RailVehInfo(v->engine_type)->railtypes;
+		if (!_settings_game.vehicle.disable_elrails) {
+			for (Train *v : Train::Iterate()) {
+				RailTypes rts = RailVehInfo(v->engine_type)->railtypes;
 
-			v->railtypes = rts;
-			if (rts.Test(RAILTYPE_ELECTRIC)) min_rail = RAILTYPE_RAIL;
+				if (rts.Test(RAILTYPE_ELECTRIC)) {
+					min_rail = RAILTYPE_RAIL;
+					break;
+				}
+			}
 		}
 
-		/* .. so we convert the entire map from normal to elrail (so maintain "fairness") */
+		/* We update the entire map to keep monorail and maglev in place. */
+		/* If min_rail == RAILTYPE_RAIL, this will also upgrade normal rail to electric rail. */
 		for (TileIndex t(0); t < map_size; t++) {
 			switch (GetTileType(t)) {
 				case TileType::Railway:
@@ -1750,7 +1745,7 @@ bool AfterLoadGame()
 					break;
 
 				case TileType::TunnelBridge:
-					if (GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL) {
+					if (GetTunnelBridgeTransportType(t) == TransportType::Rail) {
 						SetRailType(t, UpdateRailType(GetRailType(t), min_rail));
 					}
 					break;
@@ -1762,7 +1757,13 @@ bool AfterLoadGame()
 				SetSecondaryRailType(t, GetRailType(t));
 			}
 		}
+	} else if (IsSavegameVersionBefore(SLV_38)) {
+		/* Since we cannot know the preference of a user, let elrails enabled; it
+		 * can be disabled manually. */
+		_settings_game.vehicle.disable_elrails = false;
 	}
+	/* Do the same as when elrails were enabled/disabled manually just now. */
+	UpdateDisableElrailSettingState(_settings_game.vehicle.disable_elrails, false);
 
 	/* In version 16.1 of the savegame a company can decide if trains, which get
 	 * replaced, shall keep their old length. In all prior versions, just default
@@ -1915,12 +1916,6 @@ bool AfterLoadGame()
 			order->SetRefit(CARGO_NO_REFIT);
 		});
 	}
-
-	/* from version 38 we have optional elrails, since we cannot know the
-	 * preference of a user, let elrails enabled; it can be disabled manually */
-	if (IsSavegameVersionBefore(SLV_38)) _settings_game.vehicle.disable_elrails = false;
-	/* do the same as when elrails were enabled/disabled manually just now */
-	UpdateDisableElrailSettingState(_settings_game.vehicle.disable_elrails, false);
 
 	/* From version 53, the map array was changed for house tiles to allow
 	 * space for newhouses grf features. A new byte, m7, was also added. */
@@ -2508,7 +2503,7 @@ bool AfterLoadGame()
 					break;
 
 				case TileType::TunnelBridge: // Clear PBS reservation on tunnels/bridges
-					if (GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL) UnreserveAcrossRailTunnelBridge(t);
+					if (GetTunnelBridgeTransportType(t) == TransportType::Rail) UnreserveAcrossRailTunnelBridge(t);
 					break;
 
 				default: break;
@@ -2641,18 +2636,19 @@ bool AfterLoadGame()
 
 	if (IsSavegameVersionBefore(SLV_113)) {
 		/* allow_town_roads is added, set it if town_layout wasn't TL_NO_ROADS */
-		if (_settings_game.economy.town_layout == 0) { // was TL_NO_ROADS
+		uint8_t old_town_layout = to_underlying(_settings_game.economy.town_layout);
+		if (old_town_layout == 0) { // was TL_NO_ROADS
 			_settings_game.economy.allow_town_roads = false;
-			_settings_game.economy.town_layout = TL_BETTER_ROADS;
+			_settings_game.economy.town_layout = TownLayout::BetterRoads;
 		} else {
 			_settings_game.economy.allow_town_roads = true;
-			_settings_game.economy.town_layout = static_cast<TownLayout>(_settings_game.economy.town_layout - 1);
+			_settings_game.economy.town_layout = static_cast<TownLayout>(old_town_layout - 1);
 		}
 
 		/* Initialize layout of all towns. Older versions were using different
 		 * generator for random town layout, use it if needed. */
 		for (Town *t : Town::Iterate()) {
-			if (_settings_game.economy.town_layout != TL_RANDOM) {
+			if (_settings_game.economy.town_layout != TownLayout::Random) {
 				t->layout = _settings_game.economy.town_layout;
 				continue;
 			}
@@ -2929,7 +2925,7 @@ bool AfterLoadGame()
 	/* Oilrig was moved from id 15 to 9. */
 	if (IsSavegameVersionBefore(SLV_139)) {
 		for (Station *st : Station::Iterate()) {
-			if (st->airport.tile != INVALID_TILE && st->airport.type == 15) {
+			if (!st->airport.IsEmpty() && st->airport.type == 15) {
 				st->airport.type = AT_OILRIG;
 			}
 		}
@@ -2937,7 +2933,7 @@ bool AfterLoadGame()
 
 	if (IsSavegameVersionBefore(SLV_140)) {
 		for (Station *st : Station::Iterate()) {
-			if (st->airport.tile != INVALID_TILE) {
+			if (!st->airport.IsEmpty()) {
 				st->airport.w = st->airport.GetSpec()->size_x;
 				st->airport.h = st->airport.GetSpec()->size_y;
 			}
@@ -3199,8 +3195,7 @@ bool AfterLoadGame()
 					t->flags.Reset(VehicleRailFlag{2});
 
 					/* Clear both bits first. */
-					ClrBit(t->gv_flags, GVF_GOINGUP_BIT);
-					ClrBit(t->gv_flags, GVF_GOINGDOWN_BIT);
+					t->gv_flags.Reset({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
 
 					/* Crashed vehicles can't be going up/down. */
 					if (t->vehstatus.Test(VehState::Crashed)) break;
@@ -3213,15 +3208,14 @@ bool AfterLoadGame()
 				}
 				case VehicleType::Road: {
 					RoadVehicle *rv = RoadVehicle::From(v);
-					ClrBit(rv->gv_flags, GVF_GOINGUP_BIT);
-					ClrBit(rv->gv_flags, GVF_GOINGDOWN_BIT);
+					rv->gv_flags.Reset({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
 
 					/* Crashed vehicles can't be going up/down. */
 					if (rv->vehstatus.Test(VehState::Crashed)) break;
 
 					if (rv->state == RVSB_IN_DEPOT || rv->state == RVSB_WORMHOLE) break;
 
-					TrackBits trackbits = TrackdirBitsToTrackBits(GetTileTrackdirBits(rv->tile, TRANSPORT_ROAD, GetRoadTramType(rv->roadtype)));
+					TrackBits trackbits = TrackdirBitsToTrackBits(GetTileTrackdirBits(rv->tile, TransportType::Road, GetRoadTramType(rv->roadtype)));
 
 					/* Only X/Y tracks can be sloped. */
 					if (trackbits != TRACK_BIT_X && trackbits != TRACK_BIT_Y) break;
@@ -3392,6 +3386,9 @@ bool AfterLoadGame()
 				u->direction = ReverseDir(u->direction);
 			}
 		}
+		for (Vehicle *v : Vehicle::Iterate()) {
+			v->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
+		}
 
 		/* Update the setting for train flipping. */
 		_settings_game.difficulty.train_flip_reverse_allowed = _settings_game.difficulty.line_reverse_mode ? TrainFlipReversingAllowed::EndOfLineOnly : TrainFlipReversingAllowed::All;
@@ -3445,7 +3442,7 @@ bool AfterLoadGame()
 	}
 	if (!SlXvIsFeaturePresent(XSLFI_IMPROVED_BREAKDOWNS, 3)) {
 		for (Vehicle *v : Vehicle::Iterate()) {
-			switch(v->type) {
+			switch (v->type) {
 				case VehicleType::Train:
 				case VehicleType::Road:
 					v->breakdown_chance_factor = 128;
@@ -3466,16 +3463,9 @@ bool AfterLoadGame()
 		}
 	}
 	if (!SlXvIsFeaturePresent(XSLFI_IMPROVED_BREAKDOWNS, 4)) {
-		for (Vehicle *v : Vehicle::Iterate()) {
-			switch(v->type) {
-				case VehicleType::Aircraft:
-					if (v->breakdown_type == BREAKDOWN_AIRCRAFT_SPEED && v->breakdown_severity == 0) {
-						v->breakdown_severity = std::max(1, std::min(v->vcache.cached_max_speed >> 4, 255));
-					}
-					break;
-
-				default:
-					break;
+		for (Aircraft *v : Aircraft::Iterate()) {
+			if (v->breakdown_type == BREAKDOWN_AIRCRAFT_SPEED && v->breakdown_severity == 0) {
+				v->breakdown_severity = std::max(1, std::min(v->vcache.cached_max_speed >> 4, 255));
 			}
 		}
 	}
@@ -3880,7 +3870,7 @@ bool AfterLoadGame()
 		/* set the semaphore bit to match what it would have been in v1 */
 		/* clear the PBS bit, update the end signal state */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeWithSignalSimulation(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeWithSignalSimulation(t)) {
 				SetTunnelBridgeSemaphore(t, CalTime::CurYear() < _settings_client.gui.semaphore_build_before);
 				SetTunnelBridgePBS(t, false);
 				UpdateSignalsOnSegment(t, DiagDirection::Invalid, GetTileOwner(t));
@@ -3892,7 +3882,7 @@ bool AfterLoadGame()
 		 * to no longer re-use signalled tunnel exit bit
 		 */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeWithSignalSimulation(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeWithSignalSimulation(t)) {
 				if (HasBit(_m[t].m5, 5)) {
 					/* signalled tunnel entrance */
 					SignalState state = HasBit(_m[t].m5, 6) ? SignalState::Red : SignalState::Green;
@@ -3908,7 +3898,7 @@ bool AfterLoadGame()
 		const bool move_signal_num = SlXvIsFeaturePresent(XSLFI_SIG_TUNNEL_BRIDGE, 1, 4);
 		for (Train *t : Train::Iterate()) {
 			TileIndex tile = t->tile;
-			if (IsTileType(tile, TileType::TunnelBridge) && GetTunnelBridgeTransportType(tile) == TRANSPORT_RAIL && IsTunnelBridgeWithSignalSimulation(tile)) {
+			if (IsTileType(tile, TileType::TunnelBridge) && GetTunnelBridgeTransportType(tile) == TransportType::Rail && IsTunnelBridgeWithSignalSimulation(tile)) {
 				if (move_signal_num) {
 					t->tunnel_bridge_signal_num = t->load_unload_ticks;
 					t->load_unload_ticks = 0;
@@ -3925,7 +3915,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeaturePresent(XSLFI_SIG_TUNNEL_BRIDGE, 1, 5)) {
 		/* entrance and exit signal red/green states now have separate bits */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeSignalSimulationExit(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeSignalSimulationExit(t)) {
 				SetTunnelBridgeExitSignalState(t, HasBit(_me[t].m6, 0) ? SignalState::Green : SignalState::Red);
 			}
 		}
@@ -3939,7 +3929,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeaturePresent(XSLFI_SIG_TUNNEL_BRIDGE, 1, 8)) {
 		/* spacing made per tunnel/bridge */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeWithSignalSimulation(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeWithSignalSimulation(t)) {
 				DiagDirection dir = GetTunnelBridgeDirection(t);
 				if (dir == DiagDirection::NE || dir == DiagDirection::SE) {
 					TileIndex other = GetOtherTunnelBridgeEnd(t);
@@ -3964,7 +3954,7 @@ bool AfterLoadGame()
 	if (SlXvIsFeatureMissing(XSLFI_CUSTOM_BRIDGE_HEADS)) {
 		/* ensure that previously unused custom bridge-head bits are cleared */
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TRANSPORT_ROAD) {
+			if (IsBridgeTile(t) && GetTunnelBridgeTransportType(t) == TransportType::Road) {
 				SB(_m[t].m2, 0, 8, 0);
 			}
 		}
@@ -4007,7 +3997,7 @@ bool AfterLoadGame()
 
 	if (IsSavegameVersionBefore(SLV_TOWN_CARGOGEN)) {
 		/* Ensure the original cargo generation mode is used */
-		_settings_game.economy.town_cargogen_mode = TCGM_ORIGINAL;
+		_settings_game.economy.town_cargogen_mode = TownCargoGenMode::Original;
 	}
 
 	if (IsSavegameVersionBefore(SLV_SERVE_NEUTRAL_INDUSTRIES)) {
@@ -4055,7 +4045,7 @@ bool AfterLoadGame()
 		 * SLV_MULTITILE_DOCKS and SLV_ENDING_YEAR. */
 		/* Placing objects on docking tiles was not updating adjacent station's docking tiles. */
 		for (Station *st : Station::Iterate()) {
-			if (st->ship_station.tile != INVALID_TILE) UpdateStationDockingTiles(st);
+			if (!st->ship_station.IsEmpty()) UpdateStationDockingTiles(st);
 		}
 	}
 
@@ -4348,7 +4338,7 @@ bool AfterLoadGame()
 
 	if (SlXvIsFeatureMissing(XSLFI_TRACE_RESTRICT_TUNBRIDGE)) {
 		for (TileIndex t(0); t < map_size; t++) {
-			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TRANSPORT_RAIL && IsTunnelBridgeWithSignalSimulation(t)) {
+			if (IsTileType(t, TileType::TunnelBridge) && GetTunnelBridgeTransportType(t) == TransportType::Rail && IsTunnelBridgeWithSignalSimulation(t)) {
 				SetTunnelBridgeRestrictedSignal(t, false);
 			}
 		}
@@ -4537,13 +4527,13 @@ bool AfterLoadGame()
 		}
 	}
 
-	if (IsSavegameVersionBefore(SLV_MAX_LOAN_FOR_COMPANY)) {
+	if (IsEffectiveUpstreamSavegameVersionBefore(SLV_MAX_LOAN_FOR_COMPANY)) {
 		for (Company *c : Company::Iterate()) {
 			c->max_loan = COMPANY_MAX_LOAN_DEFAULT;
 		}
 	}
 
-	if (IsSavegameVersionBefore(SLV_SCRIPT_RANDOMIZER)) {
+	if (IsSavegameVersionBefore(SLV_SCRIPT_RANDOMIZER) && SlXvIsFeatureMissing(XSLFI_SCRIPT_RANDOMIZER)) {
 		ScriptObject::InitializeRandomizers();
 	}
 
@@ -4739,7 +4729,7 @@ void ReloadNewGRFData()
 	AppendSpecialEventsLogEntry("NewGRF reload");
 
 	RailTypeLabel rail_type_label_map[RAILTYPE_END];
-	for (RailType rt = RAILTYPE_BEGIN; rt != RAILTYPE_END; rt++) {
+	for (RailType rt : EnumRange(RAILTYPE_END)) {
 		rail_type_label_map[rt] = GetRailTypeInfo(rt)->label;
 	}
 
@@ -4775,7 +4765,7 @@ void ReloadNewGRFData()
 	UpdateStationTileCacheFlags(false);
 
 	RailType rail_type_translate_map[RAILTYPE_END];
-	for (RailType old_type = RAILTYPE_BEGIN; old_type != RAILTYPE_END; old_type++) {
+	for (RailType old_type : EnumRange(RAILTYPE_END)) {
 		RailType new_type = GetRailTypeByLabel(rail_type_label_map[old_type]);
 		rail_type_translate_map[old_type] = (new_type == INVALID_RAILTYPE) ? RAILTYPE_RAIL : new_type;
 	}

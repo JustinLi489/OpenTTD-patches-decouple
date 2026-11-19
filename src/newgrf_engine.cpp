@@ -13,6 +13,7 @@
 #include "train.h"
 #include "roadveh.h"
 #include "company_func.h"
+#include "newgrf.h"
 #include "newgrf_badge.h"
 #include "newgrf_cargo.h"
 #include "newgrf_spritegroup.h"
@@ -342,12 +343,12 @@ static uint8_t MapAircraftMovementAction(const Aircraft *v)
 /* virtual */ ScopeResolver *VehicleResolverObject::GetScope(VarSpriteGroupScope scope, VarSpriteGroupScopeOffset relative)
 {
 	switch (scope) {
-		case VSG_SCOPE_SELF:   return &this->self_scope;
-		case VSG_SCOPE_PARENT: return &this->parent_scope;
-		case VSG_SCOPE_RELATIVE: {
+		case VarSpriteGroupScope::Self:   return &this->self_scope;
+		case VarSpriteGroupScope::Parent: return &this->parent_scope;
+		case VarSpriteGroupScope::Relative: {
 			int32_t count = GB(relative, 0, 8);
 			if (this->self_scope.v != nullptr && (relative != this->cached_relative_count || HasBit(relative, 15))) {
-				/* Note: This caching only works as long as the VSG_SCOPE_RELATIVE cannot be used in
+				/* Note: This caching only works as long as the VarSpriteGroupScope::Relative cannot be used in
 				 *       VarAct2 with procedure calls. */
 				/* Therefore procedure calls made from within a relative scope must save and restore the cached relative scope */
 				if (HasBit(relative, 15)) count = GetRegister(0x100);
@@ -673,7 +674,7 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 	/* Calculated vehicle parameters */
 	switch (variable) {
 		case 0x25: // Get engine GRF ID
-			return v->GetGRFID();
+			return FlattenNewGRFLabel(v->GetGRFID());
 
 		case 0x40: // Get length of consist
 			/* R3R (KI-540, round 375): the refit capacity callback must see the
@@ -786,7 +787,7 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 
 				const Station *st = GetTargetAirportIfValid(Aircraft::From(v));
 
-				if (st != nullptr && st->airport.tile != INVALID_TILE) {
+				if (st != nullptr && !st->airport.IsEmpty()) {
 					airporttype = st->airport.GetSpec()->ttd_airport_type;
 				}
 
@@ -1085,10 +1086,14 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 				/* Before trains could drive backwards, many NewGRFs faked this effect by swapping sprites when the Reversed flag was set.
 				 * To maintain their intended behaviour, only pass them the Reversed flag if the vehicle is not driving backwards. */
 				if (t->flags.Test(VehicleRailFlag::Reversed) != t->IsDrivingBackwards()) SetBit(modflags, 8);
+
+				if (v->IsDrivingBackwards()) SetBit(modflags, 11);
 			}
+
+			if (v->type == VehicleType::Ship && Ship::From(v)->flags.Test(VehicleShipFlag::SecondEndFacingForward)) SetBit(modflags, 11);
+
 			if (v->vehicle_flags.Test(VehicleFlag::CargoUnloading)) SetBit(modflags, 1);
 			if (v->vehicle_flags.Test(VehicleFlag::BuiltAsPrototype)) SetBit(modflags, 10);
-			if (v->IsDrivingBackwards()) SetBit(modflags, 11);
 
 			return variable == 0xFE ? modflags : GB(modflags, 8, 8);
 		}
@@ -1500,7 +1505,7 @@ static void GetCustomEngineSprite(EngineID engine, const Vehicle *v, Direction d
 	bool sprite_stack = EngInfo(engine)->misc_flags.Test(EngineMiscFlag::SpriteStack);
 	uint max_stack = sprite_stack ? static_cast<uint>(std::size(result->seq)) : 1;
 	for (uint stack = 0; stack < max_stack; ++stack) {
-		object.callback_param1 = image_type | (stack << 8);
+		object.callback_param1 = to_underlying(image_type) | (stack << 8);
 		const ResultSpriteGroup *group = object.Resolve<ResultSpriteGroup>();
 		uint32_t reg100 = sprite_stack ? GetRegister(0x100) : 0;
 		if (group != nullptr && group->num_sprites != 0) {
@@ -1534,7 +1539,7 @@ static void GetRotorOverrideSprite(EngineID engine, const struct Aircraft *v, En
 	 * TTDPatch copies some variables between the vehicles each time, to somehow synchronize the rotor vehicle with the primary vehicle.
 	 * We use 'rotor_in_gui' to replicate when the variables differ.
 	 * But some other variables like 'rotor state' and 'rotor speed' are not available in OpenTTD, while they are in TTDPatch. */
-	bool rotor_in_gui = image_type != EIT_ON_MAP;
+	bool rotor_in_gui = image_type != EngineImageType::OnMap;
 	VehicleResolverObject object(engine, v, VehicleResolverObject::WagonOverride::Self, rotor_in_gui, CBID_NO_CALLBACK);
 	result->Clear();
 	uint rotor_pos = v == nullptr || rotor_in_gui ? 0 : v->Next()->Next()->state;
@@ -1542,7 +1547,7 @@ static void GetRotorOverrideSprite(EngineID engine, const struct Aircraft *v, En
 	bool sprite_stack = e->info.misc_flags.Test(EngineMiscFlag::SpriteStack);
 	uint max_stack = sprite_stack ? static_cast<uint>(std::size(result->seq)) : 1;
 	for (uint stack = 0; stack < max_stack; ++stack) {
-		object.callback_param1 = image_type | (stack << 8);
+		object.callback_param1 = to_underlying(image_type) | (stack << 8);
 		const ResultSpriteGroup *group = object.Resolve<ResultSpriteGroup>();
 		uint32_t reg100 = sprite_stack ? GetRegister(0x100) : 0;
 		if (group != nullptr && group->num_sprites != 0) {
@@ -1865,7 +1870,7 @@ void FillNewGRFVehicleCache(const Vehicle *v)
 		/* Only resolve when the cache isn't valid. */
 		if (HasBit(v->grf_cache.cache_valid, cache_entry[1])) continue;
 		GetVariableExtra extra;
-		ro.GetScope(VSG_SCOPE_SELF)->GetVariable(cache_entry[0], 0, extra);
+		ro.GetScope(VarSpriteGroupScope::Self)->GetVariable(cache_entry[0], 0, extra);
 	}
 
 	/* Make sure really all bits are set. */

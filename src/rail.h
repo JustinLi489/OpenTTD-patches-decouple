@@ -13,7 +13,7 @@
 #include "engine_type.h"
 #include "rail_type.h"
 #include "track_type.h"
-#include "gfx_type.h"
+#include "sprite_id_type.h"
 #include "core/enum_type.hpp"
 #include "core/flatset_type.hpp"
 #include "slope_type.h"
@@ -34,6 +34,8 @@ enum class RailTypeFlag : uint8_t {
 	Allow90Deg      = 4, ///< Bit number for always allowed 90 degree turns, regardless of setting.
 	Disallow90Deg   = 5, ///< Bit number for never allowed 90 degree turns, regardless of setting.
 };
+
+/** Bitset of \c RailTypeFlag elements. */
 using RailTypeFlags = EnumBitSet<RailTypeFlag, uint8_t>;
 
 /** Railtype control flags. */

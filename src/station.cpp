@@ -64,10 +64,10 @@ BaseStation::~BaseStation()
 {
 	if (CleaningPool()) return;
 
-	CloseWindowById(WindowClass::TrainList,       VehicleListIdentifier(VL_STATION_LIST, VehicleType::Train,    this->owner, this->index).ToWindowNumber());
-	CloseWindowById(WindowClass::RoadVehicleList, VehicleListIdentifier(VL_STATION_LIST, VehicleType::Road,     this->owner, this->index).ToWindowNumber());
-	CloseWindowById(WindowClass::ShipList,        VehicleListIdentifier(VL_STATION_LIST, VehicleType::Ship,     this->owner, this->index).ToWindowNumber());
-	CloseWindowById(WindowClass::AircraftList,    VehicleListIdentifier(VL_STATION_LIST, VehicleType::Aircraft, this->owner, this->index).ToWindowNumber());
+	CloseWindowById(WindowClass::TrainList,       VehicleListIdentifier(VehicleListType::Station, VehicleType::Train,    this->owner, this->index).ToWindowNumber());
+	CloseWindowById(WindowClass::RoadVehicleList, VehicleListIdentifier(VehicleListType::Station, VehicleType::Road,     this->owner, this->index).ToWindowNumber());
+	CloseWindowById(WindowClass::ShipList,        VehicleListIdentifier(VehicleListType::Station, VehicleType::Ship,     this->owner, this->index).ToWindowNumber());
+	CloseWindowById(WindowClass::AircraftList,    VehicleListIdentifier(VehicleListType::Station, VehicleType::Aircraft, this->owner, this->index).ToWindowNumber());
 	CloseWindowById(WindowClass::StationCargoGraph, this->index);
 
 	extern void CloseStationDeparturesWindow(StationID station);
@@ -112,7 +112,7 @@ Station::~Station()
 		if (a->targetairport == this->index) a->targetairport = StationID::Invalid();
 	}
 
-	for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+	for (CargoType cargo : EnumRange(NUM_CARGO)) {
 		LinkGraph *lg = LinkGraph::GetIfValid(this->goods[cargo].link_graph);
 		if (lg == nullptr) continue;
 
@@ -265,7 +265,7 @@ void Station::AddFacility(StationFacility new_facility_bit, TileIndex facil_xy)
  */
 void Station::MarkTilesDirty(bool cargo_change) const
 {
-	if (this->train_station.tile == INVALID_TILE) return;
+	if (this->train_station.IsEmpty()) return;
 
 	/* cargo_change is set if we're refreshing the tiles due to cargo moving
 	 * around. */
@@ -372,13 +372,13 @@ uint Station::GetCatchmentRadius() const
 	uint ret = CA_NONE;
 
 	if (_settings_game.station.modified_catchment) {
-		if (this->bus_stops          != nullptr)      ret = std::max<uint>(ret, CA_BUS);
-		if (this->truck_stops        != nullptr)      ret = std::max<uint>(ret, CA_TRUCK);
-		if (this->train_station.tile != INVALID_TILE) ret = std::max<uint>(ret, CA_TRAIN);
-		if (this->ship_station.tile  != INVALID_TILE) ret = std::max<uint>(ret, CA_DOCK);
-		if (this->airport.tile       != INVALID_TILE) ret = std::max<uint>(ret, this->airport.GetSpec()->catchment);
+		if (this->bus_stops != nullptr) ret = std::max<uint>(ret, CA_BUS);
+		if (this->truck_stops != nullptr) ret = std::max<uint>(ret, CA_TRUCK);
+		if (!this->train_station.IsEmpty()) ret = std::max<uint>(ret, CA_TRAIN);
+		if (!this->ship_station.IsEmpty()) ret = std::max<uint>(ret, CA_DOCK);
+		if (!this->airport.IsEmpty()) ret = std::max<uint>(ret, this->airport.GetSpec()->catchment);
 	} else {
-		if (this->bus_stops != nullptr || this->truck_stops != nullptr || this->train_station.tile != INVALID_TILE || this->ship_station.tile != INVALID_TILE || this->airport.tile != INVALID_TILE) {
+		if (this->bus_stops != nullptr || this->truck_stops != nullptr || !this->train_station.IsEmpty() || !this->ship_station.IsEmpty() || !this->airport.IsEmpty()) {
 			ret = CA_UNMODIFIED;
 		}
 	}

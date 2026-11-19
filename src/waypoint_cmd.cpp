@@ -272,7 +272,7 @@ CommandCost CmdBuildRailWaypoint(DoCommandFlags flags, TileIndex start_tile, Axi
 		if (wp->owner != _current_company) return CommandCost(STR_ERROR_TOO_CLOSE_TO_ANOTHER_WAYPOINT);
 
 		/* Check if we want to expand an already existing waypoint. */
-		if (wp->train_station.tile != INVALID_TILE) {
+		if (!wp->train_station.IsEmpty()) {
 			CommandCost ret = CanExpandRailStation(wp, new_location);
 			if (ret.Failed()) return ret;
 		}
@@ -525,6 +525,10 @@ CommandCost CmdBuildBuoy(DoCommandFlags flags, TileIndex tile)
 	if (wp == nullptr && !Waypoint::CanAllocateItem()) return CommandCost(STR_ERROR_TOO_MANY_STATIONS_LOADING);
 
 	CommandCost cost(ExpensesType::Construction, _price[Price::BuildWaypointBuoy]);
+
+	/* Get the water class of the water tile before it is cleared.*/
+	WaterClass wc = GetWaterClass(tile);
+
 	if (!IsWaterTile(tile)) {
 		CommandCost ret = Command<Commands::LandscapeClear>::Do(flags | DoCommandFlag::Auto, tile);
 		if (ret.Failed()) return ret;
@@ -550,7 +554,7 @@ CommandCost CmdBuildBuoy(DoCommandFlags flags, TileIndex tile)
 
 		if (wp->town == nullptr) MakeDefaultName(wp);
 
-		MakeBuoy(tile, wp->index, GetWaterClass(tile));
+		MakeBuoy(tile, wp->index, wc);
 		InvalidateWaterRegion(tile);
 		CheckForDockingTile(tile);
 		MarkTileDirtyByTile(tile);

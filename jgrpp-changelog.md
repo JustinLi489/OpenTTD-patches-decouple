@@ -2,6 +2,47 @@
 
 * * *
 
+### v0.73.5 (2026-11-01)
+* Fix certain NewGRF station, road stop, object classes being changed to a different type on savegame load.
+* Fix extra movement step after reversing at an end of line, which could cause train crashes or reservation problems.
+* Fix company max loan (as set by game scripts) not being saved/loaded.
+* Fix station catchment increase setting not being applied to the build rail station overlay.
+* Fix click to edit behaviour for label orders.
+* Bump trunk base from commit 12208d12048e747cd5c76bada4c5ddaab573efc4 to commit 141b4e5eecdd8442763b31facfdd3372961bedbf.
+
+### v0.73.4 (2026-10-12)
+* Fix crash which could occur with some extra-zoom and/or 32bpp NewGRFs/basesets.
+* Fix crash editing scheduled dispatch tag conditional orders when no tags were usable.
+* Fix crash which could occur after manually sending ships to a specific depot.
+* Fix reversing at a waypoint or behind a signal being removed if the train was partially in a depot.
+* Fix inconsistent handling of reversing at waypoints when the front of the train had already passed the waypoint.
+* Fix column spacing in departures window when arrival times were enabled.
+* Bulk order list export:
+  * Fix crash exporting from non-group vehicle list windows.
+  * Fix missing or duplicated order lists depending on the number of vehicles in the shared order set.
+* Enable dragging the selected order in order list windows.
+* Bump trunk base from commit af60d6b7cd60c8855febb0847bd66169780dd1ef to commit 12208d12048e747cd5c76bada4c5ddaab573efc4.
+
+### v0.73.3 (2026-09-16)
+* Fix only first 10 items in town action list being clickable.
+* Fix detection of crashed vehicles on signalled tunnels/bridges.
+* Fix width of HH:MM columns in departure board and timetable window with some fonts.
+* Add setting for showing dispatch route ID in departure boards.
+* Add ability to export JSON order lists for all vehicles for each vehicle type.
+* Template-based train replacement: Fix handling of templates longer than the train length limit.
+* Fix save dialog not warning when overwriting order list files.
+* Fix vehicle movement issues after loading some SpringPP savegames.
+* Linux: Fix crash logging version information when SDL IM is present.
+* Bump trunk base from commit 061e5c9cd3373301a9557869144ed767309b3d7a to commit af60d6b7cd60c8855febb0847bd66169780dd1ef.
+
+### v0.73.2 (2026-08-26)
+* Fix crash which could occur when NewGRFs perform an incorrect sprite replacement.
+* Fix crash which could occur with overlapping use of the give money and join buttons in the company window.
+* Scheduled dispatch: Allow schedule last dispatched to be set to a specific time/date instead of just being cleared.
+* Routing restrictions: Add condition for train timetable lateness.
+* Remove scrollbar from town local authority window action pane.
+* Bump trunk base from commit 7e2bcaf792696f68244d657858df263cfe5cb63e to commit 061e5c9cd3373301a9557869144ed767309b3d7a.
+
 ### v0.73.1 (2026-08-08)
 * Fix leftover reserved paths which could occur for trains entering and partially in a depot.
 * Fix driving backwards pathfinder penalty when partially in depot.

@@ -68,7 +68,7 @@ EnumIndexArray<int, FontSize, FontSize::End> font_height_cache;
 
 void UpdateFontHeightCache()
 {
-	for (FontSize fs = FontSize::Begin; fs != FontSize::End; fs++) {
+	for (FontSize fs : EnumRange(FontSize::End)) {
 		font_height_cache[fs] = FontCache::Get(fs)->GetHeight();
 	}
 }
@@ -80,7 +80,7 @@ void UpdateFontHeightCache()
  */
 /* static */ void FontCache::InitializeFontCaches()
 {
-	for (FontSize fs = FontSize::Begin; fs != FontSize::End; fs++) {
+	for (FontSize fs : EnumRange(FontSize::End)) {
 		if (FontCache::Get(fs) != nullptr) continue;
 		FontCache::Register(FontProviderManager::LoadFont(fs, FontType::Sprite, false, {}, {}));
 	}
@@ -114,14 +114,7 @@ void SetFont(FontSize fontsize, const std::string &font, uint size)
 
 	if (fontsize != FontSize::Monospace) {
 		/* Try to reload only the modified font. */
-		FontCacheSettings backup = _fcsettings;
-		for (FontSize fs = FontSize::Begin; fs < FontSize::End; fs++) {
-			if (fs == fontsize) continue;
-			FontCache *fc = FontCache::Get(fs);
-			GetFontCacheSubSetting(fs)->font = fc->HasParent() ? fc->GetFontName() : "";
-		}
-		CheckForMissingGlyphs();
-		_fcsettings = std::move(backup);
+		CheckForMissingGlyphs(fontsize);
 	} else {
 		FontCache::LoadFontCaches(fontsize);
 	}
@@ -151,7 +144,7 @@ static bool IsDefaultFont(const FontCacheSubSetting &setting)
 uint GetFontCacheFontSize(FontSize fs)
 {
 	const FontCacheSubSetting &setting = *GetFontCacheSubSetting(fs);
-	return IsDefaultFont(setting) ? FontCache::GetDefaultFontHeight(fs) : setting.size;
+	return IsDefaultFont(setting) && setting.size == 0 ? FontCache::GetDefaultFontHeight(fs) : setting.size;
 }
 
 #if defined(WITH_FREETYPE) || defined(_WIN32) || defined(WITH_COCOA)

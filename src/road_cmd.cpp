@@ -49,6 +49,7 @@
 #include "maintenance_func.h"
 #include "tile_cmd.h"
 #include "road_layout_func.h"
+#include "debug.h"
 
 #include "table/strings.h"
 #include "table/roadtypes.h"
@@ -128,7 +129,7 @@ void InitRoadTypes()
 		ResolveRoadTypeGUISprites(&rti);
 		_roadtypes_hidden_mask.Set(rt, rti.flags.Test(RoadTypeFlag::Hidden));
 
-		if (rti.label == 0) continue;
+		if (rti.label.Empty()) continue;
 		_sorted_roadtypes.push_back(rt);
 	}
 	std::sort(_sorted_roadtypes.begin(), _sorted_roadtypes.end(), CompareRoadTypes);
@@ -142,7 +143,7 @@ void InitRoadTypesCaches()
 	_collision_mode_roadtypes.fill({});
 	_roadtypes_non_train_colliding = {};
 
-	for (RoadType rt = ROADTYPE_BEGIN; rt != ROADTYPE_END; rt++) {
+	for (RoadType rt : EnumRange(ROADTYPE_END)) {
 		const RoadTypeInfo &rti = _roadtypes[rt];
 		_collision_mode_roadtypes[rti.collision_mode].Set(rt);
 		if (rti.extra_flags.Test(RoadTypeExtraFlag::NoTrainCollision)) _roadtypes_non_train_colliding.Set(rt);
@@ -157,7 +158,7 @@ void InitRoadTypesCaches()
  */
 RoadType AllocateRoadType(RoadTypeLabel label, RoadTramType rtt)
 {
-	auto it = std::ranges::find(_roadtypes, 0, &RoadTypeInfo::label);
+	auto it = std::ranges::find(_roadtypes, RoadTypeLabel{}, &RoadTypeInfo::label);
 	if (it == std::end(_roadtypes)) return INVALID_ROADTYPE;
 
 	RoadTypeInfo &rti = *it;
@@ -487,9 +488,9 @@ Money RoadMaintenanceCost(RoadType roadtype, uint32_t num, uint32_t total_num)
 }
 
 /** Invalid RoadBits on slopes.  */
-extern const RoadBits _invalid_tileh_slopes_road[2][15] = {
+extern const std::array<NonSteepSlopeIndexArray<RoadBits>, 2> _invalid_tileh_slopes_road = {{
 	/* The inverse of the mixable RoadBits on a leveled slope */
-	{
+	{{{
 		{}, // SLOPE_FLAT
 		{RoadBit::NE, RoadBit::SE}, // SLOPE_W
 		{RoadBit::NE, RoadBit::NW}, // SLOPE_S
@@ -509,10 +510,10 @@ extern const RoadBits _invalid_tileh_slopes_road[2][15] = {
 		RoadBit::SW, // SLOPE_NE
 		{}, // SLOPE_SEN
 		{}, // SLOPE_NWS
-	},
+	}}},
 	/* The inverse of the allowed straight roads on a slope
 	 * (with and without a foundation). */
-	{
+	{{{
 		{}, // SLOPE_FLAT
 		{}, // SLOPE_W (Foundation)
 		{}, // SLOPE_S (Foundation)
@@ -532,8 +533,8 @@ extern const RoadBits _invalid_tileh_slopes_road[2][15] = {
 		ROAD_Y, // SLOPE_NE
 		ROAD_ALL, // SLOPE_SEN
 		ROAD_ALL, // SLOPE_NW
-	}
-};
+	}}}
+}};
 
 Foundation GetRoadFoundation(Slope tileh, RoadBits bits);
 
@@ -663,7 +664,7 @@ static CommandCost RemoveRoad(TileIndex tile, DoCommandFlags flags, RoadBits pie
 		}
 
 		case TileType::TunnelBridge: {
-			if (GetTunnelBridgeTransportType(tile) != TRANSPORT_ROAD) return CMD_ERROR;
+			if (GetTunnelBridgeTransportType(tile) != TransportType::Road) return CMD_ERROR;
 			CommandCost ret = TunnelBridgeIsFree(tile, GetOtherTunnelBridgeEnd(tile));
 			if (ret.Failed()) return ret;
 			break;
@@ -1243,7 +1244,7 @@ CommandCost CmdBuildRoad(DoCommandFlags flags, TileIndex tile, RoadBits pieces, 
 		}
 
 		case TileType::TunnelBridge: {
-			if (GetTunnelBridgeTransportType(tile) != TRANSPORT_ROAD) goto do_clear;
+			if (GetTunnelBridgeTransportType(tile) != TransportType::Road) goto do_clear;
 
 			const TileIndex other_end = GetOtherTunnelBridgeEnd(tile);
 
@@ -1751,9 +1752,9 @@ CommandCost CmdRemoveLongRoad(DoCommandFlags flags, TileIndex end_tile, TileInde
 				had_success = true;
 			} else {
 				/* Some errors are more equal than others. */
-				switch (last_error.GetErrorMessage()) {
-					case STR_ERROR_OWNED_BY:
-					case STR_ERROR_LOCAL_AUTHORITY_REFUSES_TO_ALLOW_THIS:
+				switch (last_error.GetErrorMessage().base()) {
+					case STR_ERROR_OWNED_BY.base():
+					case STR_ERROR_LOCAL_AUTHORITY_REFUSES_TO_ALLOW_THIS.base():
 						break;
 					default:
 						last_error = std::move(ret);
@@ -1811,7 +1812,7 @@ CommandCost CmdBuildRoadDepot(DoCommandFlags flags, TileIndex tile, RoadType rt,
 	}
 
 	if (IsBridgeAbove(tile)) {
-		CommandCost ret = IsDepotBridgeAboveOK(tile, TRANSPORT_ROAD, dir, GetBridgeAboveInfo(tile));
+		CommandCost ret = IsDepotBridgeAboveOK(tile, TransportType::Road, dir, GetBridgeAboveInfo(tile));
 		if (ret.Failed()) return ret;
 	}
 
@@ -1958,7 +1959,9 @@ Foundation GetRoadFoundation(Slope tileh, RoadBits bits)
 	return (bits == ROAD_X ? Foundation::InclinedX : Foundation::InclinedY);
 }
 
-const uint8_t _road_sloped_sprites[14] = {
+/** Lookup table to convert tile's slope into corresponding road sprite offset. */
+static constexpr NonSteepSlopeIndexArray<uint8_t> _road_sloped_sprites = {
+	0xFF, // Dummy value to prevent `index - 1` while accesing.
 	0,  0,  2,  0,
 	0,  1,  0,  0,
 	3,  0,  0,  0,
@@ -2027,7 +2030,7 @@ void DrawRoadTypeCatenary(const TileInfo *ti, RoadType rt, RoadBits rb)
 		/* On junctions we check whether neighbouring tiles also have catenary, and possibly
 		 * do not draw catenary towards those neighbours, which do not have catenary. */
 		RoadBits rb_new{};
-		for (DiagDirection dir = DiagDirection::Begin; dir < DiagDirection::End; dir++) {
+		for (DiagDirection dir : EnumRange(DiagDirection::End)) {
 			if (rb.Any(DiagDirToRoadBits(dir))) {
 				TileIndex neighbour = TileAddByDiagDir(ti->tile, dir);
 				if (MayHaveRoad(neighbour)) {
@@ -2052,8 +2055,8 @@ void DrawRoadTypeCatenary(const TileInfo *ti, RoadType rt, RoadBits rb)
 		if (front != 0) front += GetRoadSpriteOffset(ti->tileh, rb);
 		if (back != 0) back += GetRoadSpriteOffset(ti->tileh, rb);
 	} else if (ti->tileh != SLOPE_FLAT) {
-		back  = SPR_TRAMWAY_BACK_WIRES_SLOPED  + _road_sloped_sprites[ti->tileh - 1];
-		front = SPR_TRAMWAY_FRONT_WIRES_SLOPED + _road_sloped_sprites[ti->tileh - 1];
+		back = SPR_TRAMWAY_BACK_WIRES_SLOPED + _road_sloped_sprites[ti->tileh];
+		front = SPR_TRAMWAY_FRONT_WIRES_SLOPED + _road_sloped_sprites[ti->tileh];
 	} else {
 		back  = SPR_TRAMWAY_BASE + _road_backpole_sprites_1[rb.base()];
 		front = SPR_TRAMWAY_BASE + _road_frontwire_sprites_1[rb.base()];
@@ -2072,9 +2075,9 @@ void DrawRoadTypeCatenary(const TileInfo *ti, RoadType rt, RoadBits rb)
 		static const SubSprite west  = { -INF, -INF, -12, INF };
 		static const SubSprite north = {  -12, -INF,  12, INF };
 		static const SubSprite east  = {   12, -INF, INF, INF };
-		int8_t west_z = GetSlopePixelZInCorner(ti->tileh, CORNER_W);
-		int8_t north_z = GetSlopePixelZInCorner(ti->tileh, CORNER_N);
-		int8_t east_z = GetSlopePixelZInCorner(ti->tileh, CORNER_E);
+		int8_t west_z = GetSlopePixelZInCorner(ti->tileh, Corner::W);
+		int8_t north_z = GetSlopePixelZInCorner(ti->tileh, Corner::N);
+		int8_t east_z = GetSlopePixelZInCorner(ti->tileh, Corner::E);
 		AddSortableSpriteToDraw(back, pal, *ti, {{15, 0, west_z}, {1, 1, z_wires}, {-15, 0, static_cast<int8_t>(-west_z)}}, IsTransparencySet(TransparencyOption::Catenary), &west);
 		AddSortableSpriteToDraw(back, pal, *ti, {{0, 0, north_z}, {1, 1, z_wires}, {0, 0, static_cast<int8_t>(-north_z)}}, IsTransparencySet(TransparencyOption::Catenary), &north);
 		AddSortableSpriteToDraw(back, pal, *ti, {{0, 15, east_z}, {1, 1, z_wires}, {0, -15, static_cast<int8_t>(-east_z)}}, IsTransparencySet(TransparencyOption::Catenary), &east);
@@ -2228,7 +2231,7 @@ static SpriteID GetRoadGroundSprite(const TileInfo *ti, Roadside roadside, const
 	/* Draw original road base sprite */
 	SpriteID image = SPR_ROAD_Y + offset;
 	if (DrawRoadAsSnowOrDesert(snow_or_desert, roadside)) {
-		image += 19;
+		image += NUM_SLOPES;
 	} else {
 		switch (roadside) {
 			case Roadside::Barren:
@@ -2240,7 +2243,7 @@ static SpriteID GetRoadGroundSprite(const TileInfo *ti, Roadside roadside, const
 				break;
 
 			default:
-				image -= 19;
+				image -= NUM_SLOPES;
 				break; // Paved
 		}
 	}
@@ -2386,7 +2389,7 @@ static void DrawTile_Road(TileInfo *ti, DrawTileProcParams params)
 
 				Roadside roadside = GetRoadside(ti->tile);
 				if (DrawRoadAsSnowOrDesert(IsOnSnowOrDesert(ti->tile), roadside)) {
-					image += 19;
+					image += NUM_SLOPES;
 				} else {
 					switch (roadside) {
 						case Roadside::Barren:
@@ -2397,7 +2400,7 @@ static void DrawTile_Road(TileInfo *ti, DrawTileProcParams params)
 							break;
 
 						default:
-							image -= 19;
+							image -= NUM_SLOPES;
 							break; // Paved
 					}
 				}
@@ -2812,11 +2815,11 @@ static TrackStatus GetTileTrackStatus_Road(TileIndex tile, TransportType mode, u
 	TrackdirBits trackdirbits = TRACKDIR_BIT_NONE;
 	TrackdirBits red_signals = TRACKDIR_BIT_NONE; // crossing barred
 	switch (mode) {
-		case TRANSPORT_RAIL:
+		case TransportType::Rail:
 			if (IsLevelCrossing(tile)) trackdirbits = TrackBitsToTrackdirBits(GetCrossingRailBits(tile));
 			break;
 
-		case TRANSPORT_ROAD: {
+		case TransportType::Road: {
 			RoadTramType rtt = static_cast<RoadTramType>(GB(sub_mode, 0, 8));
 			if (!HasTileRoadType(tile, rtt)) break;
 			switch (GetRoadTileType(tile)) {
@@ -2853,7 +2856,7 @@ static TrackStatus GetTileTrackStatus_Road(TileIndex tile, TransportType mode, u
 								break;
 
 							default:
-								NOT_REACHED();
+								NOT_REACHED_MSG("{}, {}", tile, rcows);
 						}
 					}
 					break;
@@ -3206,7 +3209,7 @@ CommandCost CmdConvertRoad(DoCommandFlags flags, TileIndex tile, TileIndex area_
 				}
 				break;
 			case TileType::TunnelBridge:
-				if (GetTunnelBridgeTransportType(tile) != TRANSPORT_ROAD) continue;
+				if (GetTunnelBridgeTransportType(tile) != TransportType::Road) continue;
 				if (IsTunnel(tile) && RoadNoTunnels(to_type)) {
 					error.MakeError(STR_ERROR_TUNNEL_DISALLOWED_ROAD);
 					continue;

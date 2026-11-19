@@ -35,6 +35,8 @@
 #include "couple_group.h"
 #include "zoom_func.h"
 #include "vehicle_cmd.h"
+#include "fileio_type.h"
+#include "fios.h"
 
 #include "widgets/group_widget.h"
 
@@ -410,7 +412,7 @@ private:
 
 		/* draw fold / unfold button */
 		if (has_children) {
-			DrawSpriteIgnorePadding(Group::Get(g_id)->IsFolded(GroupFoldBits::GroupView) ? SPR_CIRCLE_FOLDED : SPR_CIRCLE_UNFOLDED, PAL_NONE, r.WithX(this->column_rects[VGC_FOLD]).Translate(indent * level_width, 0), SA_CENTER);
+			DrawSpriteIgnorePadding(Group::Get(g_id)->IsFolded(GroupFoldBits::GroupView) ? SPR_CIRCLE_FOLDED : SPR_CIRCLE_UNFOLDED, PAL_NONE, r.WithX(this->column_rects[VGC_FOLD]).Translate(indent * level_width, 0), {AlignmentH::Centre, AlignmentV::Middle});
 		}
 
 		/* draw group name */
@@ -418,24 +420,24 @@ private:
 
 		/* draw autoreplace protection */
 		if (protection) {
-			DrawSpriteIgnorePadding(SPR_GROUP_REPLACE_PROTECT, PAL_NONE, r.WithX(this->column_rects[VGC_PROTECT]), SA_CENTER);
+			DrawSpriteIgnorePadding(SPR_GROUP_REPLACE_PROTECT, PAL_NONE, r.WithX(this->column_rects[VGC_PROTECT]), {AlignmentH::Centre, AlignmentV::Middle});
 		}
 
 		/* draw autoreplace status */
 		if (stats.autoreplace_defined) {
-			DrawSpriteIgnorePadding(SPR_GROUP_REPLACE_ACTIVE, stats.autoreplace_finished ? PALETTE_CRASH : PAL_NONE, r.WithX(this->column_rects[VGC_AUTOREPLACE]), SA_CENTER);
+			DrawSpriteIgnorePadding(SPR_GROUP_REPLACE_ACTIVE, stats.autoreplace_finished ? PALETTE_CRASH : PAL_NONE, r.WithX(this->column_rects[VGC_AUTOREPLACE]), {AlignmentH::Centre, AlignmentV::Middle});
 		}
 
 		/* draw the profit icon */
-		DrawSpriteIgnorePadding(this->GetGroupProfitSpriteID(g_id), PAL_NONE, r.WithX(this->column_rects[VGC_PROFIT]), SA_CENTER);
+		DrawSpriteIgnorePadding(this->GetGroupProfitSpriteID(g_id), PAL_NONE, r.WithX(this->column_rects[VGC_PROFIT]), {AlignmentH::Centre, AlignmentV::Middle});
 
 		/* draw the number of vehicles of the group */
 		int num_vehicle_with_subgroups = GetGroupNumVehicle(this->vli.company, g_id, this->vli.vtype);
 		int num_vehicle = GroupStatistics::Get(this->vli.company, g_id, this->vli.vtype).num_vehicle;
 		if (IsAllGroupID(g_id) || IsDefaultGroupID(g_id) || num_vehicle_with_subgroups == num_vehicle) {
-			DrawString(r.WithX(this->column_rects[VGC_NUMBER]).CentreToHeight(this->column_size[VGC_NUMBER].height), GetString(STR_JUST_COMMA, num_vehicle), colour, SA_RIGHT | SA_FORCE, false, FontSize::Small);
+			DrawString(r.WithX(this->column_rects[VGC_NUMBER]).CentreToHeight(this->column_size[VGC_NUMBER].height), GetString(STR_JUST_COMMA, num_vehicle), colour, AlignmentH::ForceRight, false, FontSize::Small);
 		} else {
-			DrawString(r.WithX(this->column_rects[VGC_NUMBER]).CentreToHeight(this->column_size[VGC_NUMBER].height), GetString(STR_GROUP_COUNT_WITH_SUBGROUP, num_vehicle, num_vehicle_with_subgroups - num_vehicle), colour, SA_RIGHT | SA_FORCE);
+			DrawString(r.WithX(this->column_rects[VGC_NUMBER]).CentreToHeight(this->column_size[VGC_NUMBER].height), GetString(STR_GROUP_COUNT_WITH_SUBGROUP, num_vehicle, num_vehicle_with_subgroups - num_vehicle), colour, AlignmentH::ForceRight);
 		}
 	}
 
@@ -736,16 +738,16 @@ public:
 
 				int y = r.top + (1 + r.bottom - r.top - (3 * GetCharacterHeight(FontSize::Normal))) / 2;
 				DrawString(left, right, y, STR_GROUP_PROFIT_THIS_YEAR, TextColour::Black);
-				DrawString(left, right, y, GetString(STR_JUST_CURRENCY_LONG, this->money_this_year), TextColour::Black, SA_RIGHT);
+				DrawString(left, right, y, GetString(STR_JUST_CURRENCY_LONG, this->money_this_year), TextColour::Black, AlignmentH::End);
 
 				y += GetCharacterHeight(FontSize::Normal);
 				DrawString(left, right, y, STR_GROUP_PROFIT_LAST_YEAR, TextColour::Black);
-				DrawString(left, right, y, GetString(STR_JUST_CURRENCY_LONG, this->money_last_year), TextColour::Black, SA_RIGHT);
+				DrawString(left, right, y, GetString(STR_JUST_CURRENCY_LONG, this->money_last_year), TextColour::Black, AlignmentH::End);
 
 				y += GetCharacterHeight(FontSize::Normal);
 				DrawString(left, right, y, STR_GROUP_OCCUPANCY, TextColour::Black);
 				if (this->vehicles.size() > 0) {
-					DrawString(left, right, y, GetString(STR_GROUP_OCCUPANCY_VALUE, this->occupancy_ratio), TextColour::Black, SA_RIGHT);
+					DrawString(left, right, y, GetString(STR_GROUP_OCCUPANCY_VALUE, this->occupancy_ratio), TextColour::Black, AlignmentH::End);
 				}
 
 				break;
@@ -769,7 +771,7 @@ public:
 			}
 
 			case WID_GL_SORT_BY_ORDER:
-				this->DrawSortButtonState(WID_GL_SORT_BY_ORDER, this->vehgroups.IsDescSortOrder() ? SBS_DOWN : SBS_UP);
+				this->DrawSortButton(WID_GL_SORT_BY_ORDER, this->vehgroups.IsDescSortOrder());
 				break;
 
 			case WID_GL_LIST_VEHICLE:
@@ -936,7 +938,7 @@ public:
 						}
 
 						SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
-						SetMouseCursorVehicle(v, EIT_IN_LIST);
+						SetMouseCursorVehicle(v, EngineImageType::InList);
 						_cursor.vehchain = true;
 
 						this->SetDirty();
@@ -996,7 +998,7 @@ public:
 
 			case WID_GL_MANAGE_VEHICLES_DROPDOWN: {
 				DropDownList list = this->BuildActionDropdownList(true, Group::IsValidID(this->vli.ToGroupID()), this->vli.vtype == VehicleType::Train,
-						0, false, IsTopLevelGroupID(this->vli.ToGroupID()));
+						STR_NULL, false, IsTopLevelGroupID(this->vli.ToGroupID()));
 				ShowDropDownList(this, std::move(list), -1, WID_GL_MANAGE_VEHICLES_DROPDOWN);
 				break;
 			}
@@ -1127,9 +1129,9 @@ public:
 
 				std::string name = GenerateAutoNameForVehicleGroup(v);
 
-				VehicleListType vli_type = VL_SINGLE_VEH;
+				VehicleListType vli_type = VehicleListType::SingleVehicle;
 				if (_ctrl_pressed) {
-					vli_type = VL_SHARED_ORDERS;
+					vli_type = VehicleListType::VehicleSharedOrders;
 					v = v->FirstShared();
 				}
 				Command<Commands::CreateGroupFromList>::Post(STR_ERROR_GROUP_CAN_T_CREATE, VehicleListIdentifier(vli_type, v->type, v->owner, v->index), CargoFilterCriteria::CF_ANY, name);
@@ -1221,6 +1223,10 @@ public:
 						ShowTraceRestrictCounterWindow(this->owner);
 						break;
 					}
+
+					case ADI_EXPORT_ORDERS:
+						ShowSaveLoadDialog(AbstractFileType::Orderlist, SaveLoadOperation::Save, this->vli);
+						break;
 
 					case ADI_COUPLE_GROUP_MGMT: // R3R: couple group management (Q4)
 						ShowCoupleGroupWindow(this->owner);
@@ -1427,7 +1433,7 @@ static void ShowCompanyGroupInternal(CompanyID company, VehicleType vehicle_type
 	if (!Company::IsValidID(company)) return;
 
 	assert(to_underlying(vehicle_type) < std::size(_vehicle_group_desc));
-	VehicleListIdentifier vli(VL_GROUP_LIST, vehicle_type, company);
+	VehicleListIdentifier vli(VehicleListType::Group, vehicle_type, company);
 	VehicleGroupWindow *w = AllocateWindowDescFront<VehicleGroupWindow, Tneed_existing_window>(_vehicle_group_desc[to_underlying(vehicle_type)], vli.ToWindowNumber(), vli);
 	if (w != nullptr) w->SelectGroup(group);
 }
@@ -1460,7 +1466,7 @@ void ShowCompanyGroupForVehicle(const Vehicle *v)
  */
 static inline VehicleGroupWindow *FindVehicleGroupWindow(VehicleType vt, Owner owner)
 {
-	return dynamic_cast<VehicleGroupWindow *>(FindWindowById(GetWindowClassForVehicleType(vt), VehicleListIdentifier(VL_GROUP_LIST, vt, owner).ToWindowNumber()));
+	return dynamic_cast<VehicleGroupWindow *>(FindWindowById(GetWindowClassForVehicleType(vt), VehicleListIdentifier(VehicleListType::Group, vt, owner).ToWindowNumber()));
 }
 
 /**
@@ -1507,7 +1513,7 @@ void DeleteGroupHighlightOfVehicle(const Vehicle *v)
 	/* If we haven't got any vehicles on the mouse pointer, we haven't got any highlighted in any group windows either
 	 * If that is the case, we can skip looping though the windows and save time
 	 */
-	if (_special_mouse_mode != WSM_DRAGDROP) return;
+	if (_special_mouse_mode != SpecialMouseMode::DragDrop) return;
 
 	VehicleGroupWindow *w = FindVehicleGroupWindow(v->type, v->owner);
 	if (w != nullptr) w->UnselectVehicle(v->index);

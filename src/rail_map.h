@@ -35,7 +35,7 @@ enum class RailTileType : uint8_t {
  * @pre IsTileType(t, TileType::Railway)
  * @return the RailTileType
  */
-[[debug_inline]] inline static RailTileType GetRailTileType(TileIndex t)
+[[debug_inline]] static inline RailTileType GetRailTileType(TileIndex t)
 {
 	dbg_assert_tile(IsTileType(t, TileType::Railway), t);
 	return static_cast<RailTileType>(GB(_m[t].m5, 6, 2));
@@ -48,7 +48,7 @@ enum class RailTileType : uint8_t {
  * @pre IsTileType(t, TileType::Railway)
  * @return true if and only if the tile is normal rail (with or without signals)
  */
-[[debug_inline]] inline static bool IsPlainRail(TileIndex t)
+[[debug_inline]] static inline bool IsPlainRail(TileIndex t)
 {
 	RailTileType rtt = GetRailTileType(t);
 	return rtt == RailTileType::Normal || rtt == RailTileType::Signals;
@@ -59,7 +59,7 @@ enum class RailTileType : uint8_t {
  * @param t the tile to get the information from
  * @return true if and only if the tile is normal rail (with or without signals)
  */
-[[debug_inline]] inline static bool IsPlainRailTile(TileIndex t)
+[[debug_inline]] static inline bool IsPlainRailTile(TileIndex t)
 {
 	return IsTileType(t, TileType::Railway) && IsPlainRail(t);
 }
@@ -94,7 +94,7 @@ inline void SetHasSignals(TileIndex tile, bool signals)
  * @pre IsTileType(t, TileType::Railway)
  * @return true if and only if the tile is a rail depot
  */
-[[debug_inline]] inline static bool IsRailDepot(TileIndex t)
+[[debug_inline]] static inline bool IsRailDepot(TileIndex t)
 {
 	return GetRailTileType(t) == RailTileType::Depot;
 }
@@ -104,7 +104,7 @@ inline void SetHasSignals(TileIndex tile, bool signals)
  * @param t the tile to get the information from
  * @return true if and only if the tile is a rail depot
  */
-[[debug_inline]] inline static bool IsRailDepotTile(TileIndex t)
+[[debug_inline]] static inline bool IsRailDepotTile(TileIndex t)
 {
 	return IsTileType(t, TileType::Railway) && IsRailDepot(t);
 }
@@ -116,7 +116,7 @@ inline void SetHasSignals(TileIndex tile, bool signals)
  */
 inline RailType GetRailType(TileIndex t)
 {
-	return (RailType)GB(_me[t].m8, 0, 6);
+	return static_cast<RailType>(GB(_me[t].m8, 0, 6));
 }
 
 /**
@@ -201,7 +201,7 @@ inline bool HasTrack(TileIndex tile, Track track)
  */
 inline DiagDirection GetRailDepotDirection(TileIndex t)
 {
-	return (DiagDirection)GB(_m[t].m5, 0, 2);
+	return static_cast<DiagDirection>(GB(_m[t].m5, 0, 2));
 }
 
 /**

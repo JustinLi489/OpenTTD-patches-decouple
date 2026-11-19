@@ -30,6 +30,8 @@ enum class IndustryLifeType : uint8_t {
 	Organic = 1, ///< Like forests
 	Processing = 2, ///< Like factories
 };
+
+/** Bitset of \c IndustryLifeType elements. */
 using IndustryLifeTypes = EnumBitSet<IndustryLifeType, uint8_t>;
 
 static constexpr IndustryLifeTypes INDUSTRYLIFE_BLACK_HOLE{}; ///< Like power plants and banks
@@ -86,6 +88,8 @@ enum class IndustryBehaviour : uint8_t {
 	/* Internal use */
 	ExpensiveLocationCallback = 31, ///< Location callback looks expensive
 };
+
+/** Bitset of \c IndustryBehaviour elements. */
 using IndustryBehaviours = EnumBitSet<IndustryBehaviour, uint32_t>;
 
 /** Flags for miscellaneous industry tile specialities */
@@ -93,6 +97,8 @@ enum class IndustryTileSpecialFlag : uint8_t {
 	NextFrameRandomBits = 0, ///< Callback 0x26 needs random bits
 	AcceptsAllCargo = 1, ///< Tile always accepts all cargoes the associated industry accepts
 };
+
+/** Bitset of \c IndustryTileSpecialFlag elements. */
 using IndustryTileSpecialFlags = EnumBitSet<IndustryTileSpecialFlag, uint8_t>;
 
 /** Definition of one tile in an industry tile layout */
@@ -161,8 +167,8 @@ struct IndustryTileSpec {
 	std::array<CargoType, INDUSTRY_NUM_INPUTS> accepts_cargo; ///< Cargo accepted by this tile
 	std::array<int8_t, INDUSTRY_NUM_INPUTS> acceptance;     ///< Level of acceptance per cargo type (signed, may be negative!)
 	Slope slopes_refused;                 ///< slope pattern on which this tile cannot be built
-	uint8_t anim_production;              ///< Animation frame to start when goods are produced
-	uint8_t anim_next;                    ///< Next frame in an animation
+	IndustryGfx anim_production;          ///< Animation frame to start when goods are produced
+	IndustryGfx anim_next;                ///< Next frame in an animation
 	/**
 	 * When true, the tile has to be drawn using the animation
 	 * state instead of the construction stage
@@ -172,7 +178,6 @@ struct IndustryTileSpec {
 	IndustryTileCallbackMasks callback_mask;            ///< Bitmask of industry tile callbacks that have to be called
 	AnimationInfo<IndustryAnimationTriggers> animation; ///< Information about the animation (is it looping, how many loops etc)
 	IndustryTileSpecialFlags special_flags; ///< Bitmask of extra flags used by the tile
-	bool enabled;                           ///< entity still available (by default true).newgrf can disable it, though
 	SubstituteGRFFileProps grf_prop;        ///< properties related to the grf file
 	std::vector<BadgeID> badges;
 
@@ -199,18 +204,14 @@ extern std::array<IndustryType, NUM_INDUSTRYTYPES> _sorted_industry_types;
  */
 inline IndustryGfx GetTranslatedIndustryTileID(IndustryGfx gfx)
 {
-	/* the 0xFF should be GFX_WATERTILE_SPECIALCHECK but for reasons of include mess,
-	 * we'll simplify the writing.
-	 * Basically, the first test is required since the GFX_WATERTILE_SPECIALCHECK value
+	/* Basically, the first test is required since the GFX_WATERTILE_SPECIALCHECK value
 	 * will never be assigned as a tile index and is only required in order to do some
 	 * tests while building the industry (as in WATER REQUIRED */
-	if (gfx != 0xFF) {
-		dbg_assert(gfx < NUM_INDUSTRYTILES);
-		const IndustryTileSpec *it = &_industry_tile_specs[gfx];
-		return it->grf_prop.override_id == INVALID_INDUSTRYTILE ? gfx : it->grf_prop.override_id;
-	} else {
-		return gfx;
-	}
+	if (gfx == GFX_WATERTILE_SPECIALCHECK) return gfx;
+
+	assert(gfx < NUM_INDUSTRYTILES);
+	const IndustryTileSpec *it = &_industry_tile_specs[gfx];
+	return it->grf_prop.override_id == INVALID_INDUSTRYTILE ? gfx : it->grf_prop.override_id;
 }
 
 #endif /* INDUSTRYTYPE_H */

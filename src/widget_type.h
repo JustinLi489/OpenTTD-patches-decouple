@@ -132,6 +132,8 @@ enum class AspectFlag : uint8_t {
 	ResizeX, ///< Resize horizontally to reach desired aspect ratio.
 	ResizeY, ///< Resize vertically to reach desired aspect ratio.
 };
+
+/** Bitset of \c AspectFlag elements. */
 using AspectFlags = EnumBitSet<AspectFlag, uint8_t>;
 
 /* Forward declarations. */
@@ -160,6 +162,17 @@ public:
 	virtual void AdjustPaddingForZoom();
 	virtual void SetupSmallestSize(Window *w) = 0;
 	virtual void AssignSizePosition(SizingType sizing, int x, int y, uint given_width, uint given_height, bool rtl) = 0;
+
+	/**
+	 * Get a widget's preferred size for a given size.
+	 * @param given_width The given width.
+	 * @param given_height The given height.
+	 * @return pair containing preferred width and height.
+	 */
+	virtual std::pair<uint, uint> GetPreferredSizeForSize(uint given_width, uint given_height)
+	{
+		return {given_width, given_height};
+	}
 
 	virtual void FillWidgetLookup(WidgetLookup &widget_lookup);
 
@@ -394,6 +407,8 @@ enum class NWidgetDisplayFlag : uint8_t {
 	/* Generic. */
 	Highlight, ///< Highlight of widget is on.
 };
+
+/** Bitset of \c NWidgetDisplayFlag elements. */
 using NWidgetDisplayFlags = EnumBitSet<NWidgetDisplayFlag, uint16_t>;
 
 /** Container with the data associated to a single widget. */
@@ -423,7 +438,7 @@ public:
 	inline void SetToolTip(StringID tool_tip);
 	inline StringID GetToolTip() const;
 	inline void SetTextStyle(TextColour colour, FontSize size);
-	inline void SetAlignment(StringAlignment align);
+	inline void SetAlignment(Alignment align);
 
 	inline StringID GetString() const;
 	inline SpriteID GetSprite() const;
@@ -454,7 +469,7 @@ protected:
 	TextColour highlight_colour{};             ///< Colour of highlight.
 	TextColour text_colour{};                  ///< Colour of text within widget.
 	FontSize text_size = FontSize::Normal;     ///< Size of text within widget.
-	StringAlignment align = SA_CENTER;         ///< Alignment of text/image within widget.
+	Alignment align = {AlignmentH::Centre, AlignmentV::Middle}; ///< Alignment of text/image within widget.
 
 	/* This function constructs the widgets, so it should be able to write the variables. */
 	friend void ApplyNWidgetPartAttribute(const struct NWidgetPart &nwid, NWidgetBase *dest);
@@ -552,7 +567,7 @@ inline StringID NWidgetCore::GetToolTip() const
  * Set the text/image alignment of the nested widget.
  * @param align Alignment to use.
  */
-inline void NWidgetCore::SetAlignment(StringAlignment align)
+inline void NWidgetCore::SetAlignment(Alignment align)
 {
 	this->align = align;
 }
@@ -723,6 +738,8 @@ enum class NWidContainerFlag : uint8_t {
 	EqualSize, ///< Containers should keep all their (resizing) children equally large.
 	BigFirst, ///< Allocate space to biggest resize first.
 };
+
+/** Bitset of \c NWidContainerFlag elements. */
 using NWidContainerFlags = EnumBitSet<NWidContainerFlag, uint8_t>;
 
 /** Container with pre/inter/post child space. */
@@ -1284,7 +1301,7 @@ struct NWidgetPartTextStyle {
  * @ingroup NestedWidgetParts
  */
 struct NWidgetPartAlignment {
-	StringAlignment align; ///< Alignment of text/image.
+	Alignment align; ///< Alignment of text/image.
 };
 
 struct NWidgetPartAspect {
@@ -1423,7 +1440,7 @@ constexpr NWidgetPart SetTextStyle(TextColour colour, FontSize size = FontSize::
  * @return The created widget part.
  * @ingroup NestedWidgetParts
  */
-constexpr NWidgetPart SetAlignment(StringAlignment align)
+constexpr NWidgetPart SetAlignment(Alignment align)
 {
 	return NWidgetPart{WPT_ALIGNMENT, NWidgetPartAlignment{align}};
 }

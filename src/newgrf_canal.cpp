@@ -17,7 +17,7 @@
 #include "safeguards.h"
 
 /** Table of canal 'feature' sprite groups */
-std::array<WaterFeature, CF_END> _water_feature;
+EnumIndexArray<WaterFeature, CanalFeature, CanalFeature::End> _water_feature;
 
 /** Scope resolver of a canal tile. */
 struct CanalScopeResolver : public ScopeResolver {
@@ -40,10 +40,10 @@ struct CanalResolverObject : public ResolverObject {
 	CanalResolverObject(CanalFeature feature, TileIndex tile,
 			CallbackID callback = CBID_NO_CALLBACK, uint32_t callback_param1 = 0, uint32_t callback_param2 = 0);
 
-	ScopeResolver *GetScope(VarSpriteGroupScope scope = VSG_SCOPE_SELF, VarSpriteGroupScopeOffset relative = 0) override
+	ScopeResolver *GetScope(VarSpriteGroupScope scope = VarSpriteGroupScope::Self, VarSpriteGroupScopeOffset relative = 0) override
 	{
 		switch (scope) {
-			case VSG_SCOPE_SELF: return &this->canal_scope;
+			case VarSpriteGroupScope::Self: return &this->canal_scope;
 			default: return ResolverObject::GetScope(scope, relative);
 		}
 	}
@@ -112,7 +112,7 @@ GrfSpecFeature CanalResolverObject::GetFeature() const
 
 uint32_t CanalResolverObject::GetDebugID() const
 {
-	return this->feature;
+	return to_underlying(this->feature);
 }
 
 /**

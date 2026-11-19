@@ -25,6 +25,7 @@
 #include "base_media_music.h"
 #include "base_media_sounds.h"
 #include "sl/saveload.h"
+#include "sl/saveload_func.h"
 #include "company_cmd.h"
 #include "company_func.h"
 #include "company_gui.h"
@@ -319,7 +320,7 @@ static void WriteSavegameInfo(const char *name)
 	buffer.append("NewGRFs:\n");
 	if (_load_check_data.HasNewGrfs()) {
 		for (const auto &c : _load_check_data.grfconfig) {
-			buffer.format("{:08X} {} {}\n", std::byteswap(c->ident.grfid), c->flags.Test(GRFConfigFlag::Compatible) ? c->original_md5sum : c->ident.md5sum, c->filename);
+			buffer.format("{} {} {}\n", c->ident.grfid, c->flags.Test(GRFConfigFlag::Compatible) ? c->original_md5sum : c->ident.md5sum, c->filename);
 		}
 	}
 
@@ -1112,7 +1113,7 @@ static void OnStartGame(bool dedicated_server)
 	/* Update the local company for a loaded game. It is either always
 	 * a company or in the case of a dedicated server a spectator */
 	if (_network_server && !dedicated_server) {
-		NetworkServerDoMove(CLIENT_ID_SERVER, GetDefaultLocalCompany());
+		NetworkServerDoMove(ClientID::Server, GetDefaultLocalCompany());
 	} else {
 		SetLocalCompany(dedicated_server ? COMPANY_SPECTATOR : GetDefaultLocalCompany());
 	}
@@ -1519,9 +1520,9 @@ void WriteVehicleInfo(format_target &buffer, const Vehicle *u, const Vehicle *v,
 	buffer.format(": type {}, vehicle {} ({}), company {}, unit number {}, wagon {}, engine: ",
 			u->type, u->index, v->index, u->owner, v->unitnumber, length);
 	AppendStringInPlace(buffer, STR_ENGINE_NAME, u->engine_type);
-	uint32_t grfid = u->GetGRFID();
-	if (grfid) {
-		buffer.format(", GRF:{:08X}", std::byteswap(grfid));
+	GrfID grfid = u->GetGRFID();
+	if (!grfid.Empty()) {
+		buffer.format(", GRF:{}", grfid);
 		GRFConfig *grfconfig = GetGRFConfig(grfid);
 		if (grfconfig) {
 			buffer.format(", {}, {}", grfconfig->GetName(), grfconfig->filename);
@@ -1542,13 +1543,13 @@ void StateGameLoop()
 
 	/* Don't execute the state loop during pause or when modal windows are open. */
 	if (_pause_mode.Any() || HasModalProgress()) {
-		PerformanceMeasurer::Paused(PFE_GAMELOOP);
-		PerformanceMeasurer::Paused(PFE_GL_ECONOMY);
-		PerformanceMeasurer::Paused(PFE_GL_TRAINS);
-		PerformanceMeasurer::Paused(PFE_GL_ROADVEHS);
-		PerformanceMeasurer::Paused(PFE_GL_SHIPS);
-		PerformanceMeasurer::Paused(PFE_GL_AIRCRAFT);
-		PerformanceMeasurer::Paused(PFE_GL_LANDSCAPE);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoop);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopEconomy);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopTrains);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopRoadVehicles);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopShips);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopAircraft);
+		PerformanceMeasurer::Paused(PerformanceElement::GameLoopLandscape);
 
 		if (!HasModalProgress()) UpdateLandscapingLimits();
 #ifndef DEBUG_DUMP_COMMANDS
@@ -1557,8 +1558,8 @@ void StateGameLoop()
 		return;
 	}
 
-	PerformanceMeasurer framerate(PFE_GAMELOOP);
-	PerformanceAccumulator::Reset(PFE_GL_LANDSCAPE);
+	PerformanceMeasurer framerate(PerformanceElement::GameLoop);
+	PerformanceAccumulator::Reset(PerformanceElement::GameLoopLandscape);
 
 	if (_game_mode == GameMode::Editor) {
 		BasePersistentStorageArray::SwitchMode(PSM_ENTER_GAMELOOP);
@@ -1631,7 +1632,7 @@ void StateGameLoop()
 
 #ifndef DEBUG_DUMP_COMMANDS
 		{
-			PerformanceMeasurer script_framerate(PFE_ALLSCRIPTS);
+			PerformanceMeasurer script_framerate(PerformanceElement::AllScripts);
 			AI::GameLoop();
 			Game::GameLoop();
 		}

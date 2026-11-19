@@ -110,7 +110,7 @@ public:
 	void DrawWidget(const Rect &r, WidgetID widget) const override
 	{
 		if (widget == WID_BEM_MESSAGE) {
-			DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext), STR_MISSING_GRAPHICS_ERROR, TextColour::FromString, SA_CENTER);
+			DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext), STR_MISSING_GRAPHICS_ERROR, TextColour::FromString, {AlignmentH::Centre, AlignmentV::Middle});
 		}
 	}
 
@@ -212,15 +212,15 @@ public:
 		this->Window::Close();
 	}
 
+	void OnInit() override
+	{
+		this->button_size = maxdim(GetStringBoundingBox(STR_MISSING_GRAPHICS_YES_DOWNLOAD), GetStringBoundingBox(STR_MISSING_GRAPHICS_NO_QUIT));
+		this->button_size.width += WidgetDimensions::scaled.frametext.Horizontal();
+		this->button_size.height += WidgetDimensions::scaled.frametext.Vertical();
+	}
+
 	void UpdateWidgetSize(WidgetID widget, Dimension &size, [[maybe_unused]] const Dimension &padding, [[maybe_unused]] Dimension &fill, [[maybe_unused]] Dimension &resize) override
 	{
-		/* We cache the button size. This is safe as no reinit can happen here. */
-		if (this->button_size.width == 0) {
-			this->button_size = maxdim(GetStringBoundingBox(STR_MISSING_GRAPHICS_YES_DOWNLOAD), GetStringBoundingBox(STR_MISSING_GRAPHICS_NO_QUIT));
-			this->button_size.width += WidgetDimensions::scaled.frametext.Horizontal();
-			this->button_size.height += WidgetDimensions::scaled.frametext.Vertical();
-		}
-
 		switch (widget) {
 			case WID_BAFD_QUESTION:
 				/* The question is twice as wide as the buttons, and determine the height based on the width. */
@@ -239,7 +239,7 @@ public:
 	{
 		if (widget != WID_BAFD_QUESTION) return;
 
-		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext), STR_MISSING_GRAPHICS_SET_MESSAGE, TextColour::FromString, SA_CENTER);
+		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext), STR_MISSING_GRAPHICS_SET_MESSAGE, TextColour::FromString, {AlignmentH::Centre, AlignmentV::Middle});
 	}
 
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
@@ -380,14 +380,14 @@ bool HandleBootstrap()
 	/* Initialise the font cache. */
 	InitializeUnicodeGlyphMap();
 	/* Next "force" finding a suitable non-sprite font as the local font is missing. */
-	CheckForMissingGlyphs();
+	CheckForMissingGlyphs(FontSize::Normal);
 
 	/* Initialise the palette. The biggest step is 'faking' some recolour sprites.
 	 * This way the mauve and gray colours work and we can show the user interface. */
 	GfxInitPalettes();
 	static const EnumIndexArray<uint8_t, Colours, Colours::End> offsets = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0x04, 0x08 };
-	for (Colours i = Colours::Begin; i != Colours::End; i++) {
-		for (Shade j = Shade::Begin; j < Shade::End; j++) {
+	for (Colours i : EnumRange(Colours::End)) {
+		for (Shade j : EnumRange(Shade::End)) {
 			SetColourGradient(i, j, PixelColour(offsets[i] + to_underlying(j)));
 		}
 	}

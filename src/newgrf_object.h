@@ -40,6 +40,8 @@ enum class ObjectFlag : uint8_t {
 	AnimRandomBits   = 12, ///< Object wants random bits in "next animation frame" callback.
 	ScaleByWater     = 13, ///< Object count is roughly scaled by water amount at edges.
 };
+
+/** Bitset of \c ObjectFlag elements. */
 using ObjectFlags = EnumBitSet<ObjectFlag, uint16_t>;
 
 enum class ObjectCtrlFlag : uint8_t {
@@ -170,13 +172,13 @@ struct ObjectResolverObject : public ResolverObject {
 	ObjectResolverObject(const ObjectSpec *spec, Object *o, TileIndex tile, uint8_t view = 0,
 			CallbackID callback = CBID_NO_CALLBACK, uint32_t param1 = 0, uint32_t param2 = 0);
 
-	ScopeResolver *GetScope(VarSpriteGroupScope scope = VSG_SCOPE_SELF, VarSpriteGroupScopeOffset relative = 0) override
+	ScopeResolver *GetScope(VarSpriteGroupScope scope = VarSpriteGroupScope::Self, VarSpriteGroupScopeOffset relative = 0) override
 	{
 		switch (scope) {
-			case VSG_SCOPE_SELF:
+			case VarSpriteGroupScope::Self:
 				return &this->object_scope;
 
-			case VSG_SCOPE_PARENT: {
+			case VarSpriteGroupScope::Parent: {
 				TownScopeResolver *tsr = this->GetTown();
 				if (tsr != nullptr) return tsr;
 				[[fallthrough]];

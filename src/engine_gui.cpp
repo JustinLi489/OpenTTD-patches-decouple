@@ -118,7 +118,7 @@ struct EnginePreviewWindow : Window {
 		switch (widget) {
 			case WID_EP_QUESTION: {
 				/* Get size of engine sprite, on loan from depot_gui.cpp */
-				EngineImageType image_type = EIT_PREVIEW;
+				EngineImageType image_type = EngineImageType::Preview;
 
 				/* First determine required the horizontal size. */
 				this->vehicle_space = ScaleSpriteTrad(40);
@@ -171,15 +171,15 @@ struct EnginePreviewWindow : Window {
 		if (this->selected_index >= this->engines.size()) return;
 
 		EngineID engine = this->engines[selected_index];
-		int y = DrawStringMultiLine(r, GetString(STR_ENGINE_PREVIEW_MESSAGE, GetEngineCategoryName(engine)), TextColour::FromString, SA_HOR_CENTER | SA_TOP) + WidgetDimensions::scaled.vsep_wide;
+		int y = DrawStringMultiLine(r, GetString(STR_ENGINE_PREVIEW_MESSAGE, GetEngineCategoryName(engine)), TextColour::FromString, {AlignmentH::Centre, AlignmentV::Top}) + WidgetDimensions::scaled.vsep_wide;
 
-		DrawString(r.left, r.right, y, GetString(STR_ENGINE_NAME, PackEngineNameDParam(engine, EngineNameContext::PreviewNews)), TextColour::Black, SA_HOR_CENTER);
+		DrawString(r.left, r.right, y, GetString(STR_ENGINE_NAME, PackEngineNameDParam(engine, EngineNameContext::PreviewNews)), TextColour::Black, AlignmentH::Centre);
 		y += GetCharacterHeight(FontSize::Normal);
 
-		DrawVehicleEngine(r.left, r.right, this->width >> 1, y + this->vehicle_space / 2, engine, GetEnginePalette(engine, _local_company), EIT_PREVIEW);
+		DrawVehicleEngine(r.left, r.right, this->width >> 1, y + this->vehicle_space / 2, engine, GetEnginePalette(engine, _local_company), EngineImageType::Preview);
 
 		y += this->vehicle_space;
-		DrawStringMultiLine(r.left, r.right, y, r.bottom, GetEngineInfoString(engine), TextColour::Black, SA_CENTER);
+		DrawStringMultiLine(r.left, r.right, y, r.bottom, GetEngineInfoString(engine), TextColour::Black, {AlignmentH::Centre, AlignmentV::Middle});
 	}
 
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
@@ -374,7 +374,7 @@ static std::string GetTrainEngineInfoString(const Engine &e)
 		is_maglev &= GetRailTypeInfo(rt)->acceleration_type == VehicleAccelerationModel::Maglev;
 	}
 
-	if (_settings_game.vehicle.train_acceleration_model != AM_ORIGINAL && !is_maglev) {
+	if (_settings_game.vehicle.train_acceleration_model != AccelerationModel::Original && !is_maglev) {
 		AppendStringInPlace(res, STR_ENGINE_PREVIEW_SPEED_POWER_MAX_TE, PackVelocity(e.GetDisplayMaxSpeed(), e.type), e.GetPower(), e.GetDisplayMaxTractiveEffort());
 		res.push_back('\n');
 	} else {
@@ -424,7 +424,7 @@ static std::string GetRoadVehEngineInfoString(const Engine &e)
 {
 	format_buffer res;
 
-	if (_settings_game.vehicle.roadveh_acceleration_model == AM_ORIGINAL) {
+	if (_settings_game.vehicle.roadveh_acceleration_model == AccelerationModel::Original) {
 		AppendStringInPlace(res, STR_ENGINE_PREVIEW_COST_MAX_SPEED, e.GetCost(), PackVelocity(e.GetDisplayMaxSpeed(), e.type));
 		res.push_back('\n');
 	} else {

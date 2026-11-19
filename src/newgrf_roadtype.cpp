@@ -121,7 +121,7 @@ GrfSpecFeature RoadTypeResolverObject::GetFeature() const
 
 uint32_t RoadTypeResolverObject::GetDebugID() const
 {
-	return this->roadtype_scope.rti->label;
+	return FlattenNewGRFLabel(this->roadtype_scope.rti->label);
 }
 
 /**
@@ -237,7 +237,7 @@ void ConvertRoadTypes()
 		roadtype_conversion_map.push_back(rt);
 
 		/* Conversion is needed if the road type is in a different position than the list. */
-		if (it->label != 0 && rt != std::distance(std::begin(_roadtype_list), it)) needs_conversion = true;
+		if (!it->label.Empty() && rt != std::distance(std::begin(_roadtype_list), it)) needs_conversion = true;
 	}
 	if (!needs_conversion) return;
 
@@ -256,7 +256,7 @@ void ConvertRoadTypes()
 				break;
 
 			case TileType::TunnelBridge:
-				if (GetTunnelBridgeTransportType(t) == TRANSPORT_ROAD) {
+				if (GetTunnelBridgeTransportType(t) == TransportType::Road) {
 					if (RoadType rt = GetRoadTypeRoad(t); rt != INVALID_ROADTYPE) SetRoadTypeRoad(t, roadtype_conversion_map[rt]);
 					if (RoadType rt = GetRoadTypeTram(t); rt != INVALID_ROADTYPE) SetRoadTypeTram(t, roadtype_conversion_map[rt]);
 				}
@@ -272,7 +272,7 @@ void ConvertRoadTypes()
 void SetCurrentRoadTypeLabelList()
 {
 	_roadtype_list.clear();
-	for (RoadType rt = ROADTYPE_BEGIN; rt != ROADTYPE_END; rt++) {
+	for (RoadType rt : EnumRange(ROADTYPE_END)) {
 		_roadtype_list.emplace_back(GetRoadTypeInfo(rt)->label, to_underlying(GetRoadTramType(rt)));
 	}
 }
@@ -307,7 +307,7 @@ void DumpRoadTypeSpriteGroup(RoadType rt, SpriteGroupDumper &dumper)
 			buffer.clear();
 			buffer.format("{}: {}", RoadTypeIsTram(rt) ? "Tram" : "Road", sprite_group_names[rtsg]);
 			if (rti->grffile[rtsg] != nullptr) {
-				buffer.format(", GRF: {:08X}", std::byteswap(rti->grffile[rtsg]->grfid));
+				buffer.format(", GRF: {}", rti->grffile[rtsg]->grfid);
 			}
 			dumper.Print(buffer);
 			dumper.DumpSpriteGroup(rti->group[rtsg], 0);

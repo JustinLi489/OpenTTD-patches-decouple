@@ -12,22 +12,11 @@
 
 #include "core/enum_type.hpp"
 #include "core/geometry_type.hpp"
+#include "sprite_id_type.h"
 #include "strings_type_trait.h"
 #include "zoom_type.h"
 #include <bit>
 #include <vector>
-
-typedef uint32_t SpriteID;  ///< The number of a sprite, without mapping bits and colourtables
-typedef uint32_t PaletteID; ///< The number of the palette
-typedef uint32_t CursorID;  ///< The number of the cursor (sprite)
-
-/** Combination of a palette sprite and a 'real' sprite */
-struct PalSpriteID {
-	SpriteID sprite{};  ///< The 'real' sprite
-	PaletteID pal{};    ///< The palette (use \c PAL_NONE) if not needed)
-
-	auto operator<=>(const PalSpriteID&) const = default;
-};
 
 enum WindowKeyCodes : uint16_t {
 	WKC_SHIFT = 0x8000,
@@ -252,8 +241,8 @@ enum class FontSize : uint8_t {
 	End, ///< Marker for the end of the enumerations.
 	Begin = FontSize::Normal, ///< Marker for the first font in the enumeration.
 };
-DECLARE_INCREMENT_DECREMENT_OPERATORS(FontSize)
 
+/** Bitset of \c FontSize elements. */
 using FontSizes = EnumBitSet<FontSize, uint8_t>;
 
 template <>
@@ -346,6 +335,7 @@ enum class ExtendedTextColourFlag : uint8_t{
 	NoShade, ///< Do not add shading to this text colour.
 	Forced, ///< Ignore colour changes from strings.
 };
+
 using ExtendedTextColourFlags = EnumBitSet<ExtendedTextColourFlag, uint8_t>; ///< Bitset of the flags of ExtendedTextColour. */
 
 /** Container for the text colour and some text colour related flags for drawing. */
@@ -378,7 +368,7 @@ struct ExtendedTextColour {
 	 * @param tc The network encoded colour.
 	 * @return The decoded colour.
 	 */
-	constexpr static ExtendedTextColour FromNetwork(uint16_t tc) { return ExtendedTextColour{static_cast<TextColour>(tc & 0xFF), ExtendedTextColourFlags(tc >> 8)}; }
+	static constexpr ExtendedTextColour FromNetwork(uint16_t tc) { return ExtendedTextColour{static_cast<TextColour>(tc & 0xFF), ExtendedTextColourFlags(tc >> 8)}; }
 
 	/**
 	 * Encode this text colour for sending over the network.
@@ -436,24 +426,6 @@ enum class Support8bpp : uint8_t {
 	System, ///< No 8bpp support by hardware, do not try to use 8bpp video modes or hardware palettes.
 	Hardware, ///< Full 8bpp support by OS and hardware.
 };
-
-	/** How to align the to-be drawn text. */
-enum StringAlignment : uint8_t {
-	SA_LEFT        = 0 << 0, ///< Left align the text.
-	SA_HOR_CENTER  = 1 << 0, ///< Horizontally center the text.
-	SA_RIGHT       = 2 << 0, ///< Right align the text (must be a single bit).
-	SA_HOR_MASK    = 3 << 0, ///< Mask for horizontal alignment.
-
-	SA_TOP         = 0 << 2, ///< Top align the text.
-	SA_VERT_CENTER = 1 << 2, ///< Vertically center the text.
-	SA_BOTTOM      = 2 << 2, ///< Bottom align the text.
-	SA_VERT_MASK   = 3 << 2, ///< Mask for vertical alignment.
-
-	SA_CENTER      = SA_HOR_CENTER | SA_VERT_CENTER, ///< Center both horizontally and vertically.
-
-	SA_FORCE       = 1 << 4, ///< Force the alignment, i.e. don't swap for RTL languages.
-};
-DECLARE_ENUM_AS_BIT_SET(StringAlignment)
 
 /** The four direction keys on a keyboard. */
 enum class DirectionKey {

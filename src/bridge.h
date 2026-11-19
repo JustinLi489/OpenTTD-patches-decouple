@@ -10,14 +10,15 @@
 #ifndef BRIDGE_H
 #define BRIDGE_H
 
-#include "gfx_type.h"
 #include "command_type_fwd_declare.h"
 #include "date_type.h"
 #include "direction_type.h"
 #include "slope_type.h"
+#include "sprite_id_type.h"
 #include "strings_id_type.h"
 #include "tile_type.h"
 #include "transport_type.h"
+#include <vector>
 
 struct TileInfo;
 
@@ -80,10 +81,11 @@ struct BridgeSpec {
 	PaletteID pal;               ///< the palette which is used in the GUI
 	StringID material;           ///< the string that contains the bridge description
 	StringID transport_name[2];  ///< description of the bridge, when built for road or rail
-	std::vector<std::vector<PalSpriteID>> sprite_table; ///< table of sprites for drawing the bridge
-	uint8_t flags;               ///< bit 0 set: disable drawing of far pillars.
-	uint8_t ctrl_flags;          ///< control flags
 	uint8_t pillar_flags[12];    ///< bridge pillar flags: 6 x pairs of x and y flags
+	uint8_t flags = 0;           ///< bit 0 set: disable drawing of far pillars.
+
+	uint8_t ctrl_flags = 0;      ///< control flags
+	std::vector<std::vector<PalSpriteID>> sprite_table{}; ///< table of sprites for drawing the bridge
 };
 
 extern BridgeSpec _bridge[MAX_BRIDGES];

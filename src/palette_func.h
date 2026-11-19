@@ -82,7 +82,6 @@ enum class Shade : uint8_t {
 	End, ///< End marker for iteration.
 	Begin = Shade::Darkest, ///< Begin marker for iteration.
 };
-DECLARE_INCREMENT_DECREMENT_OPERATORS(Shade)
 
 PixelColour GetColourGradient(Colours colour, Shade shade);
 void SetColourGradient(Colours colour, Shade shade, PixelColour palette_colour);
@@ -92,7 +91,7 @@ void SetColourGradient(Colours colour, Shade shade, PixelColour palette_colour);
  * @param level Intensity, 0 = black, 15 = white
  * @return colour
  */
-inline constexpr PixelColour GREY_SCALE(uint8_t level) { return PixelColour{level}; }
+constexpr PixelColour GREY_SCALE(uint8_t level) { return PixelColour{level}; }
 
 static constexpr PixelColour PC_BLACK              {GREY_SCALE(1)};  ///< Black palette colour.
 static constexpr PixelColour PC_DARK_GREY          {GREY_SCALE(6)};  ///< Dark grey palette colour.

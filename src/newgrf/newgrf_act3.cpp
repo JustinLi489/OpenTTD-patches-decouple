@@ -59,11 +59,11 @@ static CargoType TranslateCargo(GrfSpecFeature feature, uint8_t ctype)
 
 	CargoType cargo_type = GetCargoTypeByLabel(cl);
 	if (!IsValidCargoType(cargo_type)) {
-		GrfMsg(5, "TranslateCargo: Cargo '{:c}{:c}{:c}{:c}' unsupported, skipping.", GB(cl.base(), 24, 8), GB(cl.base(), 16, 8), GB(cl.base(), 8, 8), GB(cl.base(), 0, 8));
+		GrfMsg(5, "TranslateCargo: Cargo '{}' unsupported, skipping.", cl.AsString());
 		return INVALID_CARGO;
 	}
 
-	GrfMsg(6, "TranslateCargo: Cargo '{:c}{:c}{:c}{:c}' mapped to cargo type {}.", GB(cl.base(), 24, 8), GB(cl.base(), 16, 8), GB(cl.base(), 8, 8), GB(cl.base(), 0, 8), cargo_type);
+	GrfMsg(6, "TranslateCargo: Cargo '{}' mapped to cargo type {}.", cl.AsString(), cargo_type);
 	return cargo_type;
 }
 
@@ -179,13 +179,14 @@ static void CanalMapSpriteGroup(ByteReader &buf, uint8_t idcount)
 	for (uint i = 0; i < idcount; i++) {
 		uint16_t cf = cfs[i];
 
-		if (cf >= CF_END) {
+		if (cf >= to_underlying(CanalFeature::End)) {
 			GrfMsg(1, "CanalMapSpriteGroup: Canal subset {} out of range, skipping", cf);
 			continue;
 		}
 
-		_water_feature[cf].grffile = _cur_gps.grffile;
-		_water_feature[cf].group = GetGroupByID(groupid);
+		auto &feature = _water_feature[static_cast<CanalFeature>(cf)];
+		feature.grffile = _cur_gps.grffile;
+		feature.group = GetGroupByID(groupid);
 	}
 }
 

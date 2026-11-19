@@ -11,6 +11,7 @@
 #define ENGINE_BASE_H
 
 #include "engine_type.h"
+#include "newgrf.h"
 #include "vehicle_type.h"
 #include "core/alloc_type.hpp"
 #include "core/enum_type.hpp"
@@ -35,6 +36,7 @@ enum class EngineDisplayFlag : uint8_t {
 	Shaded, ///< Set if engine should be masked.
 };
 
+/** Bitset of \c EngineDisplayFlag elements. */
 using EngineDisplayFlags = EnumBitSet<EngineDisplayFlag, uint8_t>;
 
 typedef Pool<Engine, EngineID, 64> EnginePool;
@@ -200,7 +202,7 @@ public:
 		return this->grf_prop.grffile;
 	}
 
-	uint32_t GetGRFID() const;
+	GrfID GetGRFID() const;
 
 	struct EngineTypeFilter {
 		VehicleType vt;

@@ -88,7 +88,7 @@ void AirportTileOverrideManager::SetEntitySpec(AirportTileSpec &&airpts)
 		overridden_airpts->grf_prop.override_id = airpt_id;
 		overridden_airpts->enabled = false;
 		this->entity_overrides[i] = this->invalid_id;
-		this->grfid_overrides[i] = 0;
+		this->grfid_overrides[i] = {};
 	}
 }
 
@@ -130,7 +130,7 @@ static uint32_t GetNearbyAirportTileInformation(uint8_t parameter, TileIndex til
  * @param cur_grfid GRFID of the current callback
  * @return value encoded as per NFO specs
  */
-static uint32_t GetAirportTileIDAtOffset(TileIndex tile, const Station *st, uint32_t cur_grfid)
+static uint32_t GetAirportTileIDAtOffset(TileIndex tile, const Station *st, GrfID cur_grfid)
 {
 	if (!st->TileBelongsToAirport(tile)) {
 		return 0xFFFF;
@@ -326,7 +326,7 @@ bool TriggerAirportTileAnimation(Station *st, TileIndex tile, AirportAnimationTr
 
 bool TriggerAirportAnimation(Station *st, AirportAnimationTrigger trigger, CargoType cargo_type)
 {
-	if (st->airport.tile == INVALID_TILE) return false;
+	if (st->airport.IsEmpty()) return false;
 
 	bool ret = true;
 	uint32_t random = Random();
