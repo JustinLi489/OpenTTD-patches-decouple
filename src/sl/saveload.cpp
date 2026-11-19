@@ -108,7 +108,8 @@ uint32_t _ttdp_version;       ///< version of TTDP savegame (if applicable)
 SaveLoadVersion _sl_version;  ///< the major savegame version identifier
 uint8_t _sl_minor_version;    ///< the minor savegame version, DO NOT USE!
 std::string _savegame_format; ///< how to compress savegames
-bool _do_autosave;            ///< are we doing an autosave at the moment?
+bool _do_autosave;             ///< are we doing an autosave at the moment?
+bool _sl_r3r_legacy_numbering; ///< set while loading a savegame written with the pre-merge R3R numbering
 
 extern bool _sl_is_ext_version;
 extern bool _sl_maybe_springpp;
@@ -502,7 +503,7 @@ struct ThreadSlErrorException {
 		FILE *r3rf = R3RFopenDbg("a");
 		if (r3rf != nullptr) {
 			fprintf(r3rf, "SLERROR action=%d stringid=%u chunk=%u arr=%d msg=%s\n",
-					(int)_sl.action, (unsigned)string, (unsigned)_sl.current_chunk_id, _sl.array_index, extra_msg.c_str());
+					(int)_sl.action, (unsigned)string.base(), (unsigned)_sl.current_chunk_id, _sl.array_index, extra_msg.c_str());
 			fclose(r3rf);
 		}
 	}
@@ -4067,6 +4068,8 @@ static SaveLoadResult DoSave(std::shared_ptr<SaveFilter> writer, bool threaded)
 	_sl.dumper = std::make_unique<MemoryDumper>();
 	_sl.sf = std::move(writer);
 
+	/* Saving always uses the current numbering, so never carry the legacy remap flag over. */
+	_sl_r3r_legacy_numbering = false;
 	_sl_version = SAVEGAME_VERSION;
 	SlXvSetCurrentState();
 
@@ -4240,6 +4243,11 @@ static SaveLoadResult DoLoad(std::shared_ptr<LoadFilter> reader, bool load_check
 	}
 
 	SlXvResetState();
+	/* SlXvResetState() does not clear this flag any more, because it is set below
+	 * (while the base version is parsed) and has to survive into Load_SLXI(), whose
+	 * own SlXvResetState() call would otherwise drop it before loadUV() can remap
+	 * the stored upstream version of a legacy R3R savegame. Reset it per load here. */
+	_sl_r3r_legacy_numbering = false;
 	SlResetVENC();
 	SlResetTNNC();
 	SlResetERNC();
@@ -4299,10 +4307,26 @@ static SaveLoadResult DoLoad(std::shared_ptr<LoadFilter> reader, bool load_check
 
 			if (_sl_version >= SLV_SAVELOAD_LIST_LENGTH) {
 				if (_sl_is_ext_version) {
-					/* R3R branch: SAVEGAME_VERSION is SLV_R3R_ARTIC_OVERRIDE (in the R3R-defined extension
-					 * range, past the upstream mode range), so R3R extended savegames legitimately carry
-					 * a base version here. Anything else in the upstream range with the EXT flag is
-					 * contradictory and must be rejected. */
+					/* R3R branch: extended savegames are written by R3R builds and carry the R3R
+					 * savegame version as their base version. Anything with the EXT flag below
+					 * SLV_R3R_LEGACY_FIRST was written before the upstream block existed and needs
+					 * no remapping (the numbering below 367 did not move).
+					 *
+					 * Versions 367/368 are ambiguous: they are either a *legacy* R3R savegame
+					 * (SLV_R3R_ARTIC_OVERRIDE / SLV_R3R_PARKED in the pre-merge numbering) or an
+					 * upstream version with the EXT flag, which no build ever wrote. Shift the
+					 * legacy ones onto the current numbering, otherwise SLV_R3R_PARKED would be
+					 * treated as unreached and Train::r3r_parked would stay unread in the stream,
+					 * shifting every field after it. */
+					if (_sl_version >= SLV_R3R_LEGACY_FIRST && _sl_version <= SLV_R3R_LEGACY_LAST) {
+						const SaveLoadVersion legacy_version = _sl_version;
+						_sl_version = (SaveLoadVersion)((uint)_sl_version + SLV_R3R_LEGACY_SHIFT);
+						_sl_r3r_legacy_numbering = true;
+						Debug(sl, 1, "Remapping legacy R3R savegame version {} to {}", legacy_version, _sl_version);
+					}
+
+					/* The upper bound follows MAX_LOAD_SAVEGAME_VERSION, so bumping
+					 * SAVEGAME_VERSION needs no change here. */
 					if (_sl_version >= SLV_R3R_ARTIC_OVERRIDE && _sl_version <= MAX_LOAD_SAVEGAME_VERSION) {
 						Debug(sl, 1, "Loading R3R extended savegame version {}", _sl_version);
 					} else {

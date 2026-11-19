@@ -395,7 +395,7 @@ void BaseVehicleListWindow::BuildVehicleList()
 			 * the group is the one of its control segment -- or of any of its hidden segments
 			 * (vehiclelist.cpp), so without this filter a segment of a neighbouring group
 			 * would show up as a sub-row of this group's train. */
-			const bool filter_by_group = (this->vli.type == VL_GROUP_LIST && this->vli.index != ALL_GROUP);
+			const bool filter_by_group = (this->vli.type == VehicleListType::Group && this->vli.index != ALL_GROUP);
 			const GroupID list_group = filter_by_group ? this->vli.ToGroupID() : GroupID::Invalid();
 			for (const Vehicle *const seg : R3RSegmentHiddenHeads(v)) {
 				if (filter_by_group && !GroupIsInGroup(R3RSegmentSectionGroupID(seg), list_group)) continue;
@@ -1095,7 +1095,7 @@ struct RefitWindow : public Window {
 						if (r3r_refit_dbg != nullptr && v->type == VehicleType::Train && refit_cyc < 8) {
 							fprintf(r3r_refit_dbg, "R3R-REFIT-SUB idx=%d cargo=%u cyc=%u fv=%d sid=%u empty=%d sf=%d\n",
 									(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
-									first_vehicle ? 1 : 0, (unsigned)subtype,
+									first_vehicle ? 1 : 0, (unsigned)subtype.base(),
 									subtype == STR_EMPTY ? 1 : 0,
 									Train::From(v)->IsSegmentFront() ? 1 : 0);
 						}
@@ -1139,7 +1139,7 @@ struct RefitWindow : public Window {
 										if (r3r_refit_dbg != nullptr) {
 											fprintf(r3r_refit_dbg, "R3R-REFIT-SUB-KEEP idx=%d cargo=%u cyc=%u keep=%u got=%u\n",
 													(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
-													(unsigned)list[pos].string, (unsigned)subtype);
+													(unsigned)list[pos].string.base(), (unsigned)subtype.base());
 										}
 									} else {
 										/* String mismatch, remove item keeping the order */
@@ -2270,7 +2270,7 @@ static std::string GetVehicleTimetableGroupString(const Vehicle *v)
  */
 static Rect R3RSegmentSubRowImageRect(const Rect &ir, int image_left, int image_right, const Vehicle *front, bool rtl)
 {
-	const int width = std::min<int>(GetSingleVehicleWidth(front, EIT_IN_LIST), image_right - image_left);
+	const int width = std::min<int>(GetSingleVehicleWidth(front, EngineImageType::InList), image_right - image_left);
 	return rtl ? ir.WithX(image_right - width, image_right) : ir.WithX(image_left, image_left + width);
 }
 
@@ -2452,7 +2452,7 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 			const Vehicle *const shown = sub_row ? vehgroup.r3r_hidden_section : v;
 			const VehicleID line_sel = R3RListLineSelection(vehgroup, shown, selected_vehicle);
 
-			DrawVehicleImage(shown, sub_row ? R3RSegmentSubRowImageRect(ir, image_left, image_right, shown, rtl) : ir.WithX(image_left, image_right), line_sel, EIT_IN_LIST, 0);
+			DrawVehicleImage(shown, sub_row ? R3RSegmentSubRowImageRect(ir, image_left, image_right, shown, rtl) : ir.WithX(image_left, image_right), line_sel, EngineImageType::InList, 0);
 			if (!sub_row) {
 				DrawString(tr.left, tr.right, ir.top + line_height - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom - 1, GetStringWithArgs(str, params), TextColour::Black);
 			}

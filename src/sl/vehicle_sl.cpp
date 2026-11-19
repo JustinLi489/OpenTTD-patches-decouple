@@ -1415,6 +1415,15 @@ NamedSaveLoadTable GetVehicleDescription(VehicleType vt)
 		NSL("signal_speed_restriction", SLE_CONDVAR_X(Train, signal_speed_restriction,  SLE_UINT16,                  SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_TRAIN_SPEED_ADAPTATION))),
 		NSL("critical_breakdown_count", SLE_CONDVAR_X(Train, critical_breakdown_count,  SLE_UINT8,                   SL_MIN_VERSION, SL_MAX_VERSION, SlXvFeatureTest(XSLFTO_AND, XSLFI_IMPROVED_BREAKDOWNS, 2))),
 
+		/* R3R: baked consist statistics of a de-articulated artic group (see
+		 * Train::weight_override / power_override / max_speed_override). They are only
+		 * written from SLV_R3R_ARTIC_OVERRIDE_SAVED onwards: earlier R3R savegames carry
+		 * no bytes for them here, so gating them on SLV_R3R_ARTIC_OVERRIDE would shift
+		 * the remainder of the train record. */
+		NSL("weight_override", SLE_CONDVAR(Train, weight_override, SLE_UINT16, SLV_R3R_ARTIC_OVERRIDE_SAVED, SL_MAX_VERSION)),
+		NSL("power_override", SLE_CONDVAR(Train, power_override, SLE_UINT16, SLV_R3R_ARTIC_OVERRIDE_SAVED, SL_MAX_VERSION)),
+		NSL("max_speed_override", SLE_CONDVAR(Train, max_speed_override, SLE_UINT16, SLV_R3R_ARTIC_OVERRIDE_SAVED, SL_MAX_VERSION)),
+
 		/* R3R KI-118 fix A: depot parking flag of the in-depot GOTO_COUPLE exemption. */
 		NSL("r3r_parked", SLE_CONDVAR(Train, r3r_parked, SLE_BOOL, SLV_R3R_PARKED, SL_MAX_VERSION)),
 

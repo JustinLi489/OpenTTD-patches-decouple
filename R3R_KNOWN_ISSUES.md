@@ -19883,6 +19883,67 @@ CTTF_MARK_STUCK | CTTF_NON_LOOKAHEAD)` ⇒ `JUNC-CHOOSE` 零命中只能是**探
 - **状态**：**已修 · 实机复测通过（第 362 轮，2026-10-29）**。第 361 轮改码 + 构建（EXIT_CODE=0、全量 692 步、exe @16:38 / 52 403 712 B、`RESV-ARB` 字面量已入 exe）；
   第 362 轮实测（`build\R3R_debug.log` 205 728 B / 16:43，产生者即该 exe）判据 ①②③ 全部达成。
   详见 `R3R_veh48_resv_round358_memo.md` **§十三（13.6 问题 / 13.7 拍板 / 13.8 实现约束 / 13.9 落地行号 / 13.10 构建自证）+ §十四（实机复测取证 14.1~14.6）**。
+
+## 第 363 轮（2026-11-19）：KI-666 旧档 rail/road type 全部回落默认类型
+
+### KI-666 读旧 R3R 档后全图 rail/road type 标签字节序反转，所有类型回落默认值
+
+- **来源**：玩家 2026-11-19 复测第 363 轮 exe（`build\openttd.exe` 23:22:11）后报告——
+  「这次存档能读取了，但是我注意到，存档内所有的铁轨类型都变成了最低等级的非电气化的铁路，所有的道路也变成了购买下拉菜单的第一类道路
+  （估计基建也一样），这造成的后果很严重」。
+- **严重度**：高（存档内容被降级：轨道/道路/弯道速度/维护费等全部按默认类型重算；不崩溃但不可接受）。
+- **状态**：已修（第 363 轮，已编译通过；游戏内复测待做）。
+- **定位链（三层）**：
+  1. `RAIL`/`ROTT` 是 **table chunk**，加载时 `upstream_sl::MakeUpstreamChunkHandler<'RAIL', GeneralUpstreamChunkLoadInfo>()`
+     （`src\sl\labelmaps_sl.cpp:24`）会执行
+     `SlExecWithSlVersion(F::GetLoadVersion(), ...)`（`src\sl\saveload.h:158/203`），而
+     `GeneralUpstreamChunkLoadInfo::GetLoadVersion()`（`src\sl\saveload.cpp:4749-4755`）对
+     `ChunkType::Table|SparseTable` 返回 **`_sl_xv_upstream_version`**（不是 `_sl_version`）。
+     ⇒ 第 363 轮的 `_sl_version` +2 平移**对这两个 chunk 完全无效**。
+  2. 真正反序列化 label 的是旧框架 `src\saveload\labelmaps_sl.cpp`（`namespace upstream_sl`，与
+     `src\sl\labelmaps_sl.cpp` 不是同一符号），其 `Load()` 在
+     `:67`（RAIL）/`:106`（ROTT）执行
+     `if (IsSavegameVersionBefore(SaveLoadVersion::LabelOrientationUnification)) std::ranges::reverse(lo.label);`。
+     上游 `LabelOrientationUnification = 367`（`src\saveload\saveload.h:435`，0.73.5 新增）。
+  3. 合并前 R3R 的 `SL_UPSTREAM_VERSION = MAX_LOAD_SAVEGAME_VERSION = SLV_R3R_PARKED = 368`，写档时由
+     `saveUV()`（`src\sl\extended_ver_sl.cpp:786`）无条件写进 `XSLFI_UPSTREAM_VERSION` 子块
+     （该子块是 `XSCF_NULL` 类型 ⇒ 每档必有）⇒ 旧档 `_sl_xv_upstream_version = 368`。
+     **368 ≥ 367 ⇒ 不反转**，而旧档 label 确实是旧字节序 ⇒ `GetRailTypeByLabel`/`GetRoadTypeByLabel` 全部失配
+     ⇒ `AfterLoadLabelMaps()` 把整张图的类型退回默认（铁路 = 最基础非电气化、道路 = 第一种）。
+- **为什么第 363 轮没发现**：`_sl_version` 平移只覆盖 base 版本；UV 是"上游版本"的第二套编号，独立存储、独立读取。
+  第 363 轮论证里"table chunk 用 UV ⇒ 不受 `_sl_version` 平移影响"只证明了**不受影响**，没意识到
+  **UV 自身也需要重映射**。
+- **修法（3 个文件，全在 `src\sl\`）**：
+  ① `src\sl\saveload_common.h`：`SLV_R3R_LEGACY_SHIFT` 之后新增
+     `extern bool _sl_r3r_legacy_numbering;`（带完整注释说明 UV 与 label 方向的关系）；
+  ② `src\sl\saveload.cpp`：`:110` 定义 `bool _sl_r3r_legacy_numbering;`；`:4313` 的 ext 平移块里
+     置 `_sl_r3r_legacy_numbering = true;`；
+  ③ `src\sl\extended_ver_sl.cpp`：`SlXvResetState()`（`:306`）末尾复位 `= false`；
+     `loadUV()`（`:770`）读入 UV 后、`> SL_UPSTREAM_VERSION` 检查**之前**，若
+     `_sl_r3r_legacy_numbering && UV ∈ [SLV_R3R_LEGACY_FIRST(367), SLV_R3R_LEGACY_LAST(368)]`
+     则 `UV -= SLV_R3R_LEGACY_SHIFT`，并打 `Debug(sl, 1, "Remapping legacy R3R upstream savegame version {} to {}")`。
+- **为什么钳到 366 是正确语义**：合并前上游版本列表止于 `366 SLV_DEPOTS_UNDER_BRIDGES`；旧档里根本不存在
+  367/368 这两个上游特性，所以把 UV 拉回 366 后，一切 `IsSavegameVersionBefore(上游 X)` 与
+  `IsEffectiveUpstreamSavegameVersionBefore()` 都按"旧档真实状态"求值。
+- **边界**：
+  - 上游 JGRPP 档（`raw=0x016A`，`base=362`，`ext=False`）走 `_sl_upstream_mode`，`_sl_r3r_legacy_numbering` 为 false ⇒ 一字不动。
+  - 第 363 轮之后新写的档：`saveUV()` 写 `SL_UPSTREAM_VERSION`（= `MAX_LOAD_SAVEGAME_VERSION` = 371），
+    `≥ 367` ⇒ 不反转（新档 label 已是新顺序），`_sl_r3r_legacy_numbering` 也不会置位 ⇒ 不受本修复影响。
+  - 若某旧档没有 UV 子块（理论上不存在），`_sl_xv_upstream_version = SL_MIN_VERSION` ⇒ 也 `< 367` ⇒ 反转正确。
+- **已知遗留（不影响本修复）**：`SL_UPSTREAM_VERSION` 定义为 `MAX_LOAD_SAVEGAME_VERSION`，
+  当前值是 371，而"上游真正版本"只到 368（`DoubleEndedShips`）。写成 371 只是"断言所有上游特性都具备"，
+  语义偏脏但无害（上游 369+ 不存在）。若要修正需同时改 `loadUV()` 的 too-new 检查，避免旧版 exe 拒读新档，
+  故本轮**不动**。
+- **复测判据**：
+  1. 打开旧 R3R 档（如 `T8701-2_4.sav`）后，地图上所有已建铁路保持原 rail type（电气化/单轨/磁悬浮/各 GRF 自定义轨型
+     与存档前一致），**不再**全部变成最基础的非电气化铁路。
+  2. 所有道路保持原 road type（含 tram），**不再**全部变成购买菜单第一项。
+  3. 车库/购买列表里新建同类轨道时，默认选中的仍是该线路原有类型。
+  4. `build\R3R_debug.log` 出现一行 `Remapping legacy R3R upstream savegame version 368 to 366`（level 1，需 `-d sl=1`），
+     且无 `TOO_NEW_FEATURE_VERSION`。
+  5. 新存一档再读回：无任何 remap 行，轨型/路型保持。
+  6. 上游 JGRPP 档（base=362）照旧可读、轨型正确。
+  7. 负判据：新档（base=371）读入后不出现 remap 行、轨型不变。
 - **第 361 轮落地行号**：`src\pbs.cpp:2060 R3RIsWaitingCoupleTrain`（Q1 只认 `OT_WAIT_COUPLE`）、`:2072 R3RResvArbLog`（探针 `RESV-ARB`，`R3RDbgOn` + 按格去重）、
   `:2106 R3RArbitrateReservationOwner`、`:2137 GetTrainForReservationArbitrated`、`:2209 GetTrainForWholeTileReservationArbitrated`；
   `src\pbs.h` 两条声明；唯一调用点改动 `src\train_cmd.cpp:17463` 与 `:17469`。其它 `GetTrainForReservation` 调用点（审计/清账/REDSIG）**一字不动**。
@@ -25666,4 +25727,101 @@ weight，`power_override` 同理，两者独立；ref 用 `R3RConsistReferenceEn
   `findstr` 在 exe 内命中 `ARTIC-BAKE-HEAL head=%d n=%u` 与 `ARTIC-BAKE-SKIP head=%d n=%u reason=real-artic-parts`。
   状态＝**已实现 + 已编译**，游戏内复测待做（判据见上）。发布树 `build-release` 未编（按约定）。
 - 未确认：U-2 `idx=4` 同时 `sub=08(ENGINE)` + `ARTH=1` + `ARTM=1`（既是组头又是成员）是否正常，本轮未查。
+
+## KI-662（第 468 轮，2026-11-19）合并上游 JGRPP 0.73.5 + 工作区改名为 `D:\R3R`
+
+- **描述**：本 fork 基于 `jgrpp-0.73.1`，官方已到 `jgrpp-0.73.5`；玩家要求用 `git merge` 合入上游，并把工作区目录 `D:\sourcecode of JGRPP` 改名为 `D:\R3R`。
+- **来源**：玩家 2026-11-19 指令 + 临时报告 `R3R_upstream_merge_0735_memo.md`。
+- **状态**：**合并已完成 + 内测树全量构建通过**（2026-11-19 21:11；`[698/698] Linking`、`EXIT_CODE=0`、错误计数 0、`build\openttd.exe` 54 360 064 B）。**目录改名未做**（仍在 `D:\sourcecode of JGRPP`），游戏内复测未做，未提交。
+- **严重度**：高（合并失败会毁掉 121 个文件的 R3R 改动；改名会让 build 树全部绝对路径失效）。
+- **已实证事实**：分支 `feature/decouple`，工作树干净，HEAD `3ce0c55699`；`merge-base HEAD jgrpp-0.73.5` = `611aabd7ba` = `jgrpp-0.73.1` 本身；0.73.1→0.73.5 共 **562 提交**；我方相对 0.73.1 改动 `src/` **121 文件 +45 979/−3 734**；`D:\JGRPP` 的 0.73.5 tag `5389ea187f` 与本仓库一致（但其 `jgrpp` 分支是 0.73.6 开发线 `1454103c7d`，**不得**当合并目标）。
+- **冲突试算**（`git merge-tree --write-tree`，只写对象库）：**18 个冲突文件** —— `articulated_vehicles.cpp`、`depot_gui.cpp`、`economy.cpp`、`fios_gui.cpp`、`framerate_gui.cpp`、`group_gui.cpp`、`lang/simplified_chinese.txt`、`order_gui.cpp`、`saveload/vehicle_sl.cpp`、`settings_type.h`、`sl/order_sl.cpp`、`sl/saveload.cpp`、`train_cmd.cpp`、`vehicle.cpp`、`vehicle_base.h`、`vehicle_gui.cpp`、`vehicle_gui_base.h`、`window.cpp`。
+- **策略**：禁止 `-X ours` 一刀切（会丢上游 SLV 版本推进与字段迁移，毁存档兼容）；存档/设置/布局类（`sl/*`、`saveload/vehicle_sl.cpp`、`settings_type.h`、`vehicle_base.h`）以上游为准再补 R3R 块，其余按 hunk 取并集；合并结果单独提交。
+- **安全措施**：合并前打 `backup/pre-merge-0735` 分支 + `r3r-stable-2026-11-19-premerge` 标签；随时可 `git merge --abort`。
+- **改名已知约束**：`build/CMakeCache.txt` 与 `build/build.ninja` 内含旧绝对路径 ⇒ 改名后必须删二者重新 configure（等于全量重编）；当前 IDE 占用该目录会阻止改名；`R3R_fullbuild.cmd`/`R3R_inc_guard.ps1` 用 `%~dp0` 无需改；`R3R_AB_probe.cmd` 的 `%WORK%` 与 `config.txt` 的 `r3rexe` 是硬编码，需同步。建议顺序：先合并到可编译 → 再改名 → 改名后重新 configure + 一次全量。
+- **待复测判据**：①`git log --oneline` 出现单个 merge 提交、`git status` 干净 ②`jgrpp-0.73.5` 是 HEAD 祖先 ③全量编译 `EXIT_CODE=0`、`[n/n] Linking`、`read_lints` 0 ④读档 0.73.1 时期存档不报 "Referencing invalid"、SLV 版本号随上游推进 ⑤R3R 侧回归：耦合/解挂/段拖动/容量页各跑一次，无新断言 ⑥改名后 exe 在 `D:\R3R\build\` 正常产出，且 `R3R_perf.log` 跟随 exe 目录。
+
+## KI-663（第 468 轮续，2026-11-19）合并后 `SaveLoadVersion` 顺延的存档兼容风险
+
+- **描述**：合并 `jgrpp-0.73.5` 时 `src/saveload/saveload.h` 的 `enum class SaveLoadVersion` 取上游侧（该侧已推进到 `368 DoubleEndedShips`），R3R 的两个自定义版本号条目被挤掉。为让 `src/saveload/vehicle_sl.cpp` 编译，已按「接在上游末尾」补回 `369 R3RArticOverride`、`370 R3RParked`。
+- **来源**：本轮编译收敛第二轮；临时报告 `R3R_upstream_merge_0735_memo.md` §十。
+- **状态**：**已定性，见 KI-664**（编译已通过，`static_assert(to_underlying(MaxVersion) == SL_MAX_VERSION)` 成立；REG-663-A 已答：`src/saveload/` 是摘掉入口的死副本，369/370 的补偿只影响死代码）。
+- **严重度**：高（若编号与原 R3R 值不一致，旧档里的 R3R 字段会按错误版本门限解析）。
+- **存疑点（REG-663-A）**：`git show 3ce0c55699:src/saveload/saveload.h` 里**全无 `R3R` 字样**，说明合并前该文件是纯上游内容，R3R 侧的存档版本常量在 `src/sl/saveload_common.h`（`SLV_R3R_ARTIC_OVERRIDE` / `SLV_R3R_PARKED`）。因此本轮的 369/370 究竟是「恢复原值」还是「重新引入」**尚未证实**；且工程里 `src/saveload/` 与 `src/sl/` 两套 `*_sl.cpp` 同时被编译（合并前 `3ce0c55699` 亦然），需确认运行时到底哪一套 chunk handler 生效。
+- **待验证判据**：①用合并前 exe 存一张含 R3R 停放状态（`R3VP`）与去铰接覆写（artic override）的档，用新 exe 读入不报错、`r3r_*` 字段值正确 ②`MaxVersion` / `SAVEGAME_VERSION` 与 `src/sl/saveload_common.h` 的 R3R 常量一致 ③确认 `src/saveload/vehicle_sl.cpp` 的 `VEHS` 与 `src/sl/vehicle_sl.cpp` 的 `veh_chunk_handlers` 只有一套被注册（否则存档会双写 chunk）。
+
+## KI-664（第 468 轮续二，2026-11-19）`src/saveload` 是死副本 ⇒ 去铰接覆盖字段从未真正落盘
+
+- **描述**：R3R 的 `Train::weight_override` / `power_override` / `max_speed_override`（`R3RDearticulateOneGroup()` 烘焙的去铰接组守恒值）**在新框架 `src/sl` 里没有任何存档描述**，只存在于 `src/saveload/vehicle_sl.cpp:210-212` —— 而那个目录是摘掉入口的死副本。结果是去铰接组存档往返后三个字段回落到 `UINT16_MAX`，功率/重量/最高速度退回原型值（守恒被破坏）。上一轮按 `SaveLoadVersion::R3RArticOverride` 补回 `src/saveload/saveload.h` 的 369/370 对运行期完全无效。
+- **来源**：REG-663-A 的追问；临时报告 `R3R_upstream_merge_0735_memo.md` §十一。
+- **状态**：**已修（已编译；游戏内复测待做）**。
+- **严重度**：高（静默丢数据：存档往返后列车性能变化）。
+- **取证（`src/sl` 是活的）**：①`src/CMakeLists.txt:23/:24` 两套目录都在编译，`build\CMakeFiles\openttd_lib.dir\src\{saveload,sl}\saveload.cpp.obj` 都存在且都早于 exe；②但 `src\saveload\saveload.cpp`（2 066 行 / 80 153 B）里 **`SaveOrLoad` 零命中**，`src\sl\saveload.cpp`（4 115 行 / 155 805 B）含完整实现 ⇒ 旧目录入口被掏空，链接期无重复符号；③该双目录结构在 `3ce0c55699`（合并前）就存在，不是本次合并引入；④`git show 3ce0c55699:src/sl/vehicle_sl.cpp` 同样没有三条覆盖字段 ⇒ 这个缺口在合并前就存在。
+- **约束（为何不能直接复用 369）**：现存 R3R 档版本号是 370（`SAVEGAME_VERSION = SLV_R3R_PARKED`），而 369/370 档的列车记录里没有这三个 uint16 的字节；把字段挂在 `[SLV_R3R_ARTIC_OVERRIDE, MAX)` 会让读旧档时多读 6 字节 ⇒ 整条列车记录错位。
+- **修法（仅 `src/sl`，3 个文件）**：①`src/sl/saveload_common.h` 新增 `SLV_R3R_ARTIC_OVERRIDE_SAVED`（371），`SAVEGAME_VERSION` 改为它，并把 `SLV_R3R_ARTIC_OVERRIDE` 注释改为"保留边界、无字段使用"；②`src/sl/vehicle_sl.cpp` 的 `_train_desc` 在 `r3r_parked` 之前插入三条 `SLE_CONDVAR(..., SLE_UINT16, SLV_R3R_ARTIC_OVERRIDE_SAVED, SL_MAX_VERSION)`（放在 `critical_breakdown_count` 之后，避开 chilpp `CONDNULL` 兼容占位区）；③`src/sl/saveload.cpp:4302` 的过时注释订正。`MAX_LOAD_SAVEGAME_VERSION` 自动跟随；patchpack 拒绝区间 220–286 不含 371；`SL_UPSTREAM_VERSION` 为 XSLFI 子块自写自读标记，随之上移无副作用。
+- **补记（死副本版本门同步，2026-11-19）**：`src/saveload/vehicle_sl.cpp:206-212` 三条字段的版本门由 `R3RArticOverride`(369) 改为 `R3RArticOverrideSaved`(371) 并加注释。原写"死代码不追改"会让两套表口径矛盾（未来若把 `src/saveload` 接回入口、或按死表断言"369 已有数据"写迁移，370 旧档会多读 6 字节导致 `VEHS` 记录错位）；改后死表与活表在字段集合/顺序/门限上逐项一致（写法仍是 `SaveLoadTable` + `VarTypes::U16`）。运行期零影响（该目录不定义 `SaveOrLoad`），仅多编一个 obj。详见 `R3R_upstream_merge_0735_memo.md` §11.5。
+- **未做**：`src/saveload/` 死目录未删除（需单独拍板：删目录 + `src/CMakeLists.txt` 两行 + 一次全量重编，且需先解耦 `src/sl` 对该目录头文件的 include）。
+- **待复测判据**：①去铰接组列车存档→读档后功率/重量/最高速度与存档前一致（不回落原型值）②370 旧档仍能正常读入、字段保持 `UINT16_MAX`、无错位/报错 ③新档版本值为 371 ④原生（未去铰接）列车存档往返逐项不变。
+
+## KI-665（第 468 轮续三，2026-11-19）合并后读不了合并前的 R3R 存档（TOO_NEW_SAVEGAME）
+
+- **描述**：合并 `jgrpp-0.73.5` 后的内测 exe 打开 2026-11-19 之前由 R3R 旧 exe 存出的任意存档，一律弹「存档版本太新」而拒绝加载。
+- **来源**：玩家 2026-11-19「我注意到无法读取旧存档的问题依然存在」；本轮取证见下。
+- **状态**：**已修（已编译；游戏内读档待复测）**。
+- **严重度**：高（老档全部读不进去）。
+- **取证 1（报错串）**：`build\R3R_debug.log` 里读档失败行 `SLERROR ... stringid=4237 ... chunk=0 arr=0`；`build\generated\table\strings.h` 中 `0x108D = 4237 = STR_GAME_SAVELOAD_ERROR_TOO_NEW_SAVEGAME`。`chunk=0 arr=0` ⇒ 报错发生在文件头版本校验阶段，还没开始读 chunk。
+- **取证 2（存档头实测）**：`build\R3R_savhdr.txt`（本轮把 `Documents\OpenTTD\save\*.sav` 最近 15 个按 mtime 倒序解析，读前 8 字节：`OTTX` + 大端 16 位版本）——R3R 旧档 **15 个里有 13 个 `raw=0x8170` ⇒ `ext=True`、`base=368`**；只有两个上游 JGRPP 档是 `raw=0x016A`（`base=362`、`ext=False`）。⇒ 「旧档 = 368 + EXT 位」是唯一形态。
+- **取证 3（合并前编号）**：`git show 3ce0c55699:src/sl/saveload_common.h`（合并前 R3R，tag `r3r-stable-2026-11-19-premerge`）里上游列表止于 `366 SLV_DEPOTS_UNDER_BRIDGES`，其后是 R3R 自己的 `367 SLV_R3R_ARTIC_OVERRIDE`、`368 SLV_R3R_PARKED`，且 `SAVEGAME_VERSION = SLV_R3R_PARKED`（=368）、`MAX_LOAD_SAVEGAME_VERSION = 368`。⇒ 0x8170 的 base 368 就是「合并前 R3R 的当前版本」。
+- **根因（一）直接被拒**：合并 0.73.5 后上游新增 `367 SLV_LABEL_ORIENTATION_UNIFICATION`、`368 SLV_DOUBLE_ENDED_SHIPS`，R3R 两个版本被挤到 `369/370`（本轮再加 `371 SLV_R3R_ARTIC_OVERRIDE_SAVED`）。`src\sl\saveload.cpp` 原有的守卫按「ext 档的 base 必须 ≥ `SLV_R3R_ARTIC_OVERRIDE`(369)」判定，旧档 base=368 < 369 ⇒ `SlError(TOO_NEW)`。
+- **根因（二）放行也会毁档（真正危险的一层）**：`SLV_R3R_PARKED` 现在是 370，旧档 `_sl_version=368` 会让 `IsSavegameVersionBefore(370)` 为真 ⇒ `Train::r3r_parked`（`src\sl\vehicle_sl.cpp:1428`）不读，而文件里这个字节存在（合并前 `SAVEGAME_VERSION=368` 已写入）⇒ `VEHS` 列车记录整体错位 1 字节，后续字段全乱。所以不能只把守卫放宽。
+- **修法（2 个文件）**：①`src\sl\saveload_common.h` 新增 `SLV_R3R_LEGACY_FIRST = SLV_DEPOTS_UNDER_BRIDGES+1`(367)、`SLV_R3R_LEGACY_LAST = SLV_DEPOTS_UNDER_BRIDGES+2`(368)、`SLV_R3R_LEGACY_SHIFT = SLV_R3R_ARTIC_OVERRIDE - SLV_R3R_LEGACY_FIRST`(2)，附完整注释；②`src\sl\saveload.cpp` 的 ext 分支在守卫**之前**把 367/368 平移 +2 变成 369/370，并打 `Debug(sl,1,"Remapping legacy R3R savegame version ...")`。`SAVEGAME_VERSION`/`MAX_LOAD_SAVEGAME_VERSION` 不动。
+- **为何安全（逐项已证）**：①上游 367/368 全树**零字段门** —— `grep SLV_LABEL_ORIENTATION_UNIFICATION|SLV_DOUBLE_ENDED_SHIPS src` 只命中 `extended_ver_sl.cpp` 的 XSLFI 特性表，没有任何 `IsSavegameVersionBefore()` 落在它们上面，所以「把 368 当 370 看」不会多读字节；②上游 side 的 table chunk 用 `_sl_xv_upstream_version`（`SlExecWithSlVersion`，旧档随 XSLFI_UPSTREAM_VERSION 记的是 368，等价 ≤366），不受 `_sl_version` 平移影响；③新增的 `weight/power/max_speed_override` 门在 371，旧档 368→370 仍 <371 ⇒ 照旧跳过，与合并前 `_train_desc` 里「只有 r3r_parked、无三条 override」的落盘布局逐字一致（对照 `git show 3ce0c55699:src/sl/vehicle_sl.cpp`）；④非 ext 档（上游 JGRPP 档，`_sl_upstream_mode`）走 else 分支，一字未动。
+- **同时更正 KI-664 的一处错记**：那里写「现存 R3R 档版本号是 370」，实测是 **368（raw=0x8170）**；370 只是合并后被重排的新编号。KI-664 修法（overrides 挂 371）本身仍然正确，且与本修复互补。
+- **构建自证（2026-11-19）**：复用既有 `R3R_fullbuild.cmd inc detach`（未新建任何 `.cmd`）；改 `src\sl\saveload_common.h` ⇒ 护栏判全量，`build\R3R_incbuild.log` 尾部 `[698/698] Linking CXX executable openttd.exe` + `==== R3R build ended 2026/11/19 23:22:31.99 MODE=inc EXIT_CODE=0`，`build\R3R_incbuild.done` = `EXIT_CODE=0`，错误计数 0；
+  时间戳 `src\sl\saveload_common.h` 22:56:46 → `src\sl\saveload.cpp` 22:57:12 → `build\CMakeFiles\openttd_lib.dir\src\sl\saveload.cpp.obj` 23:08:03 → `build\openttd.exe` 23:22:11（54 361 600 B，晚于全部源码）；`read_lints` 0 条。发布树 `build-release` 未编（按约定）。
+  **过程教训**：本条修法涉及 `src\sl\saveload_common.h`，本应在全量构建**开始之前**一次性定稿；本轮是先起构建、到 666/698 才发现仍需改该头文件，导致全量白跑一遍（玩家已就此提出批评）。此后凡触及 `src\*.h` 的修复，必须在启动构建前把全部头文件改动落地并复核。
+- **待复测判据**：①打开 `T8701-2_4.sav` 等 11-19 之前的 R3R 旧档不再弹「版本太新」，能进主界面 ②进入后列车「停放」状态（`r3r_parked`）仍在、无「Referencing invalid Vehicle」之类错位报错 ③旧档里原本已耦合/去铰接的列车读入后链序、车号、段标记与存档前一致 ④新存一档再读回正常（`raw=0x8171`，base=371）⑤上游 JGRPP 档（base=362、无 EXT 位）照旧能读（`_sl_upstream_mode` 未受影响）。
+
+## KI-667（第 364 轮，2026-11-20）构建日志里的 44 条编译警告（40 条语言串 + 4 条 C4267）
+
+- **描述**：玩家指出 `build\R3R_incbuild.log` 中存在警告，且 `station_yard_sl.cpp` 附近也有报错。全量清点：`strgen` 报 **40 条** `warning: STR_xxx: Param idx #N '...' doesn't match with template command '...'`（全部落在 `src\lang\simplified_chinese.txt`），编译器报 **4 条** `warning C4267`（全部在 `src\sl\station_yard_sl.cpp` 的 124/156/212/278 行）。日志内**无** `error C*` / `fatal error` / `LNK` 错误。
+- **来源**：玩家 2026-11-20「我注意到 station_yard_sl.cpp 附近也有一些报错」；分析报告 `R3R_build_warnings_round364_memo.md`。
+- **状态**：**已修（已编译；构建日志复核见下）**。
+- **严重度**：低（不阻断构建），但 40 条语言串警告里有 **17 条是真实翻译缺陷**，会在游戏内显示 `(invalid parameter)` 或把公司名当 `StringID` 解析（`std::out_of_range`）。
+- **A 组（17 条，真缺陷，改 `simplified_chinese.txt`）**：
+  - `STR_GRAPH_X_LABEL_MONTH_YEAR`：多一个 `{STRING}` ⇒ 去掉，保留 `{TINY_FONT}{STRING}{} {NUM}`。
+  - `STR_NEWS_SERVICE_SUBSIDY_OFFERED`：硬写「为期一年」丢了 `{UNITS_YEARS_OR_MINUTES}` ⇒ 补回。
+  - `STR_NEWS_SERVICE_SUBSIDY_AWARDED_{HALF,DOUBLE,TRIPLE,QUADRUPLE}`：同样丢时长参数 ⇒ 补 `{UNITS_YEARS_OR_MINUTES}`；另把公司名参数由 `{STRING}` 改为 `{RAW_STRING}`（C++ 侧传 `GetEncodedString(..., std::move(company_name), ...)` 的 `std::string`，`{STRING}` 会按 `StringID` 取参并抛 `std::out_of_range`）。
+  - `STR_LAND_AREA_INFORMATION_CARGO_ACCEPTED`、`STR_VEHICLE_DETAILS_TRAIN_ARTICULATED_RV_CAPACITY`：缺 `{RAW_STRING}` ⇒ 补回（原本「接受货物：」「运力：」后面是空的）。
+  - `STR_TOWN_DIRECTORY_CAPTION`、`STR_INDUSTRY_DIRECTORY_CAPTION`：缺 `({COMMA} of {COMMA})` ⇒ 补 `（{COMMA} / {COMMA}）`。
+  - `STR_REPLACE_REMOVE_WAGON`：缺挂车数量 `{STRING1}` ⇒ 补 `（{STRING1}）`。
+  - `STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS`：英文 3 个 `{COMMA}`（当前/上限/抛锚次数），中文只有 2 个 ⇒ 补 `（最高：{COMMA}%）`。
+  - `STR_ORDER_GO_TO_NEAREST_DEPOT_FORMAT`、`STR_ORDER_GO_TO_STATION`：各多一个 `{STRING}`（会读到上一个订单的残留参数）⇒ 删除。
+- **B 组（23 条，`strgen` 检查器假阳性，改 `src\strgen\strgen_base.cpp`）**：`STR_R3R_*`、`STR_ORDER_R3R_*`、`STR_ORDER_COUPLE_TEMP_GROUP_*`、`STR_COUPLE_GROUP_*`、`STR_DEPOT_CHAIN_GROUP_OWNER`、`STR_VEHICLE_INFO_COUPLE_GROUP` 的中文与英文**两侧都写 `{RAW_STRING}`**（逐字相同），却报 `'STRING'` 与 `'RAW_STRING'` 不匹配。根因在 `CheckCommandsMatch`：`if (TranslateCmdForCompare(templ.consuming_commands[i]) != lang.consuming_commands[i])` —— **模板侧做了归一化、语言侧没做**，`TranslateCmdForCompare` 把 `RAW_STRING` 映射成 `STRING`，于是两侧同为 `RAW_STRING` 也判不等。修法=两侧对称调用 `TranslateCmdForCompare`（并加注释说明为何）。
+- **刻意不改语言文件**：不能把中文的 `{RAW_STRING}` 改成 `{STRING}` 来「消除」警告——`StringParameters::GetNextParameter<StringID>()` 对 `std::string` 参数会抛 `std::out_of_range`（`strings_type.h` 的强类型 variant），那是把警告换成运行时崩溃。
+- **C4267 组（4 条，`station_yard_sl.cpp`）**：`R3RPackName` / `R3RPackPool` / `R3RPackProgram` / `R3REncodeYards` 里 `static_cast<TileIndex>(size_t)` 走 `StrongType<TileIndex, uint32_t>` 的 `const unsigned int` 形参 ⇒ 窄化告警。修法=统一写成 `static_cast<TileIndex>(static_cast<uint32_t>(x))`。解码侧已有上限保护（`SYRD_MAX_NAME_BYTES`、`SYRD_MAX_POOL_ENTRIES`、`R3R_DISPATCH_PROGRAM_MAX`、逐格 `p < in.size()`），故写侧截断风险仅为「理论上 >4G 条目」。
+- **第一轮构建暴露的回归（已回退重改）**：4 条 `STR_NEWS_SERVICE_SUBSIDY_AWARDED_*` 首版把 `{UNITS_YEARS_OR_MINUTES}` 插在「今后 …中将」处（参数位 #1），导致三个 `{STRING}` 整体后移 ⇒ `strgen` 报 8 条新警告（`Param idx #1 'UNITS_YEARS_OR_MINUTES' doesn't match with template command 'STRING'` 及其镜像 #4）。参数编号是**位置**语义，必须保持 `RAW_STRING(#0), STRING(#1), STRING(#2), STRING(#3), UNITS(#4)` 的顺序；现改为「…将 {STRING} 从 {STRING} 运送到 {STRING}，今后 {UNITS_YEARS_OR_MINUTES} 将获得…」。该次构建已 `taskkill` 中止（语言包已按错序生成，作废）。**旁证**：该次日志除这 8 条外无其它警告 ⇒ A 组 17 条真缺陷与 B 组 23 条假阳性均已消除。
+- **构建自证（第二次，成功）**：入口 `R3R_fullbuild.cmd inc detach`（复用既有脚本，未新建 `.cmd`）；构建前 `openttd.exe` 未运行；护栏判 `GUARD: 1 header/lang file(s) are newer than the newest object file`（`src\lang\simplified_chinese.txt` 00:12:04 新于最新 obj 00:11:57）⇒ `REMOVED 34 object file(s) - upgrading this build to a FULL rebuild`；结果 `[708/708] Linking CXX executable openttd.exe`、`MODE=inc EXIT_CODE=0`（2026-11-20 00:37:54）、`build\R3R_incbuild.done` = `EXIT_CODE=0`；**`find /c "warning" build\R3R_incbuild.log` = 0**、`find /c "error C"` = 0；`station_yard_sl.cpp` 00:06:23 → obj 00:24、`strgen_base.cpp` → obj 00:17、`build\lang\simplified_chinese.lng` 00:13（231 454 B）、`build\openttd.exe` 2026-11-20 00:37（54 363 136 B）晚于全部源码与 obj；`read_lints` 两文件 0 条。发布树 `build-release` 未编。
+- **待复测判据**：①重新构建后 `build\R3R_incbuild.log` 内 `warning` 计数为 0（`findstr /C:"warning C"` 与语言串警告均空）②游戏内「城镇」「工业设施」列表标题带 `(x / y)` ③「接受货物：」「运力：」后面有内容 ④服务补贴新闻显示公司名与时长（不再 `(invalid parameter)`）⑤车辆详情可靠性一行出现「（最高：NN%）」⑥「前往最近的机务段」订单文案无多余空白/错字。
+
+## KI-668（第 365 轮，2026-11-20）KI-666 首次修法未生效：`SlXvResetState()` 在 `loadUV()` 之前把 legacy 标志清掉
+
+- **描述**：第 363 轮 KI-666 声称已修「读旧 R3R 档后全图 rail/road type 回落为建造列表第一项」。玩家用 2026-11-20 00:37 的 exe 复测反馈仍回落 ⇒ 那次修复**从未生效**（不是漏编）。
+- **来源**：玩家 2026-11-20「我注意到轨道仍然读档时变为建造列表的第一项，也就是非电气化的很低速的轨道，说明你的修复还没生效」；分析报告 `R3R_label_round365_memo.md`（含 §八 落地记录与构建自证）。
+- **状态**：**已修（第 365 轮二次修法，已编译；游戏内复测待做）**。
+- **严重度**：高（老档全图轨型/路型错误，车辆无法按原轨型运行）。
+- **根因（时序，已定位到行）**：`_sl_r3r_legacy_numbering` 的置位发生在 `src\sl\saveload.cpp` 的 `DoLoad()` 读文件头阶段（base=368 ⇒ 平移为 370，同时置 true），但同一函数在**更早**的 `SlXvResetState();` 之后才解析版本；随后 `Load_SLXI()`（`src\sl\extended_ver_sl.cpp`）**开头又调一次 `SlXvResetState()`**，而该函数末尾（原 `:317`）写着 `_sl_r3r_legacy_numbering = false;` ⇒ 标志在 `loadUV()`（`:770` 起，唯一执行 UV remap 的地方）读到它之前就被清零 ⇒ `:783` 的 remap 分支永不进入 ⇒ `_sl_xv_upstream_version` 保持文件里的 368 ⇒ `IsSavegameVersionBefore(367)` 为假 ⇒ `src\saveload\labelmaps_sl.cpp` 的 `RAIL`/`ROTT` **不做** `std::ranges::reverse(lo.label)` ⇒ label 字节序错误 ⇒ 匹配不到任何轨型 ⇒ 回落默认第一项。
+- **为何第 363 轮没发现**：原代码 remap 只打 `Debug(sl, 1, ...)`，而 `-d sl=1` 平时不开；且 `RAIL`/`ROTT` 是 table chunk，其版本判定走 `SlExecWithSlVersion(GetLoadVersion())`（UV），不看 `_sl_version`，所以「base 平移成功」与「UV 未 remap」两个事实在日志里完全不可区分 ⇒ 只靠静态论证就宣告已修。
+- **二级确认（本轮顺带查实）**：`RAIL`/`ROTT` 是 table chunk，`GeneralUpstreamChunkLoadInfo` 的 `GetLoadVersion()` 返回 UV，加载期间通过 `SlExecWithSlVersion(F::GetLoadVersion(), ...)` 临时替换 `_sl_version`，故 `labelmaps_sl.cpp` 里的 `IsSavegameVersionBefore(367)` 实际比较的就是 UV —— 修复点唯一且充分。
+- **修法（三个 .cpp，未碰任何 .h，增量合规）**：
+  1. `src\sl\extended_ver_sl.cpp` 的 `SlXvResetState()`：**删除** `_sl_r3r_legacy_numbering = false;`，改为注释说明「该标志由 base 版本解析置位，必须活到 `loadUV()`」。
+  2. `src\sl\saveload.cpp` 的 `DoLoad()`：在 `SlXvResetState();` 之后显式 `_sl_r3r_legacy_numbering = false;`（每次读档复位一次）。
+  3. `src\sl\saveload.cpp` 的 `DoSave()`：在 `_sl_version = SAVEGAME_VERSION;` 之前显式复位（保存永不走 legacy 编号）。
+  - 不能改为「在 `Load_SLXI()` 里反推」：平移前的 base 版本存在 `DoLoad()` 的局部变量里，`Load_SLXI()` 拿不到；用 `_sl_version` 反推会与新档的 369/370/371 混淆。
+- **新增只读探针（本轮的关键补充，走 `R3RDbgWrite` 恒定写 `build\R3R_debug.log`，不依赖 `-d`）**：
+  - `R3R-VER-REMAP upstream %u -> %u`（remap 命中）；`R3R-VER-NOREMAP upstream=%u legacy_flag=%d`（未命中，用于识别「标志又被清了」的回归）。
+  - `R3R-LABEL-REV kind=rail|road n=%u legacy=%d ver=%u`（`labelmaps_sl.cpp` 两个 `Load()` 末尾汇总；`legacy=1` 表示本轮确实做了字节反转）。
+- **构建自证（内测树，探针 ON）**：入口改用手工 `cmd /c start "R3R build" /min "d:\sourcecode of JGRPP\R3R_fullbuild.cmd" inc`（原 `Start-Process -ArgumentList 'inc detach'` 在本环境被 shim 吞掉、进程根本没起来，已弃用该方式）；构建前 `openttd.exe` 未运行；`build\R3R_incbuild.guard.log` = `GUARD: incremental is safe`；`build\R3R_incbuild.done` = `EXIT_CODE=0`（01:18）；时间戳链 `src\sl\saveload.cpp`+`extended_ver_sl.cpp` @00:57、`src\saveload\labelmaps_sl.cpp` @00:58 → 三个 obj @01:10 → `build\openttd.exe` @2026-11-20 01:17（54 364 672 B）；`read_lints` 三文件 0 条；exe 字面量命中 `R3R-LABEL-REV` 与 `R3R-VER-NOREMAP`。注：本轮 `build\R3R_incbuild.log` 为 0 字节（ninja 重定向块缓冲未 flush），**不能**据此判失败，以 `.done` + exe/obj 时间戳为准。发布树 `build-release` 未编。
+- **待复测判据**：①读旧 R3R 档（如 `T8701-2_4.sav`）后全图铁轨/道路（含 tram）保持原类型，不再回落购买菜单第一项 ②`build\R3R_debug.log` 出现 `R3R-VER-REMAP upstream 368 -> 366`，且紧随 `R3R-LABEL-REV kind=rail ... legacy=1 ver=366` 与 `kind=road ... legacy=1 ver=366` ③`-d sl=1` 下出现两行 remap（`368 to 370` 与 `368 to 366`）④新存一档再读回：`R3R-VER-NOREMAP` 且 `legacy=0`，轨型不变 ⑤负判据：上游 JGRPP 档（无 EXT 位）可读、轨型正确、无 remap 行 ⑥负判据：不出现 `R3R-VER-NOREMAP upstream=368 legacy_flag=0`（出现即标志又被清）。
+- **未确认**：U-1 若判据 ② 成立但轨型仍回落，则问题在**写入侧**（`RAIL`/`ROTT` 保存路径），届时转查 `labelmaps_sl.cpp` 的 `Save()` 与 `SLE_VAR(LABEL)` 写入字节序；U-2 KI-666 的「购买列表默认选中原轨型」从未实测，本轮一并复测。
 

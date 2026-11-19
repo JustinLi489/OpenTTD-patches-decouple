@@ -435,6 +435,10 @@ enum class SaveLoadVersion : uint16_t {
 	LabelOrientationUnification, ///< Saveload version: 367, GitHub pull request: 15888\n Unify the orientation in which labels are written.
 	DoubleEndedShips, ///< Saveload version: 368, GitHub pull request: 16002\n Double-ended (NewGRF-only) ships can reverse without turning.
 
+	R3RArticOverride, ///< Saveload version: 369, R3R: placeholder, no field is gated on it (this copy is not the live framework).
+	R3RParked, ///< Saveload version: 370, R3R: Train::r3r_parked, the depot parking flag of the in-depot GOTO_COUPLE exemption (KI-118 fix A).
+	R3RArticOverrideSaved, ///< Saveload version: 371, R3R: baked overrides are written to the savegame (mirror of the live src/sl constant).
+
 	MaxVersion, ///< Highest possible saveload version.
 };
 static_assert(to_underlying(SaveLoadVersion::MaxVersion) == to_underlying(SL_MAX_VERSION));

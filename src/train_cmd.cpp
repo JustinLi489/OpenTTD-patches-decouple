@@ -4138,7 +4138,7 @@ static void R3RDumpAttachFail(Train *head, Train *part, int allowed_len, uint16_
 			part != nullptr ? (int)part->index.base() : -1,
 			part != nullptr ? (int)part->engine_type.base() : -1,
 			part != nullptr ? (part->IsEngine() ? 1 : 0) : -1,
-			(unsigned)callback, allowed_len, (unsigned)error);
+			(unsigned)callback, allowed_len, (unsigned)error.base());
 	fclose(dbg);
 }
 
@@ -4280,7 +4280,7 @@ static CommandCost ValidateTrains(Train *original_dst, Train *dst, Train *origin
 	FILE *vdbg = R3RFopenDbg("a");
 	auto probe = [vdbg](const char *stage, const CommandCost &cc) {
 		if (vdbg == nullptr) return;
-		fprintf(vdbg, "VALIDATE-FAIL stage=%s err=0x%X\n", stage, (unsigned)cc.GetErrorMessage());
+		fprintf(vdbg, "VALIDATE-FAIL stage=%s err=0x%X\n", stage, (unsigned)cc.GetErrorMessage().base());
 	};
 	/* Check whether we may actually construct the trains. */
 	CommandCost ret = CheckTrainAttachment(src);
@@ -10012,12 +10012,12 @@ static bool TryTrainDecouple(Train *v, Train *u)
 
 	bool ok = !ret.Failed();
 	if (R3RDbgEdge(R3REDGE_DECOUPLETRY, td_try_key,
-			(uint64_t)(ok ? 1u : 0u) | ((uint64_t)(unsigned)ret.GetErrorMessage() << 1))) {
+			(uint64_t)(ok ? 1u : 0u) | ((uint64_t)ret.GetErrorMessage().base() << 1))) {
 		FILE *dbg = R3RFopenDbg("a");
 		if (dbg != nullptr) {
 			fprintf(dbg, "TDTRY ok=%d v=%d u=%d err=0x%X v_head=%d u_head=%d borrowed=%d u_eng=%d v_eng=%d u_next=%d\n",
 					(int)ok, (int)((td_try_key >> 16) & 0xFFFF), (int)(td_try_key & 0xFFFF),
-					(unsigned)ret.GetErrorMessage(),
+					(unsigned)ret.GetErrorMessage().base(),
 					(int)v->index.base(), (int)u->index.base(),
 					(int)(v->r3r_orders_borrowed ? 1 : 0),
 					(int)(u->IsEngine() ? 1 : 0), (int)(v->IsEngine() ? 1 : 0),
@@ -10251,9 +10251,8 @@ static int R3RNormaliseMixedChainDrivingBackwards(Train *head, const char *tag)
 
 		/* Mirror ReverseTrainDirection()'s backup branch: the going-up/down bits
 		 * are tied to the flag, so they are inverted together with it. */
-		if (HasBit(w->gv_flags, GVF_GOINGUP_BIT) || HasBit(w->gv_flags, GVF_GOINGDOWN_BIT)) {
-			ToggleBit(w->gv_flags, GVF_GOINGDOWN_BIT);
-			ToggleBit(w->gv_flags, GVF_GOINGUP_BIT);
+		if (w->gv_flags.Any({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown})) {
+			w->gv_flags.Flip({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
 		}
 		UpdateStatusAfterSwap(w, false);
 	}
@@ -10974,8 +10973,8 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * keeps running" no longer identifies a single side. The old code relied
 		 * on the released part resting on its WAIT_COUPLE and never re-entering
 		 * loading, which is exactly the assumption this change removes. */
-		SetBit(v->GetGroundVehicleFlags(), GVF_SUPPRESS_IMPLICIT_ORDERS);
-		SetBit(u->GetGroundVehicleFlags(), GVF_SUPPRESS_IMPLICIT_ORDERS);
+		v->GetGroundVehicleFlags().Set(GroundVehicleFlag::SuppressImplicitOrders);
+		u->GetGroundVehicleFlags().Set(GroundVehicleFlag::SuppressImplicitOrders);
 		/* R3R (2026-09-27, 玩家口径拍板): 解出的那半不再"搜 DECOUPLE 之后的第一个
 		 * WAIT_COUPLE"钉住，而是与 v 走同一条推进规则（R3RAdvanceAfterDecouple）。
 		 * 分支由【控制段归属】决定，不由 u/v 的先后决定，也不预设谁是动力方：
@@ -14194,7 +14193,7 @@ static void Couple(Train *v, Train *u)
 		 * (a scheduled station, waypoint or depot), so normal mid-route recording
 		 * resumes immediately afterwards. Must come AFTER the
 		 * DeleteUnreachedImplicitOrders() call above, which clears the bit. */
-		SetBit(v->GetGroundVehicleFlags(), GVF_SUPPRESS_IMPLICIT_ORDERS);
+		v->GetGroundVehicleFlags().Set(GroundVehicleFlag::SuppressImplicitOrders);
 
 		v->UpdateRealOrderIndex();
 		if (v->GetNumOrders() > 0 && v->GetOrder(v->cur_real_order_index)->IsType(OT_WAIT_COUPLE)) {
@@ -14535,9 +14534,8 @@ static void Couple(Train *v, Train *u)
 			u->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
 
 			/* Invert going up/down, as ReverseTrainDirection does. */
-			if (HasBit(u->gv_flags, GVF_GOINGUP_BIT) || HasBit(u->gv_flags, GVF_GOINGDOWN_BIT)) {
-				ToggleBit(u->gv_flags, GVF_GOINGDOWN_BIT);
-				ToggleBit(u->gv_flags, GVF_GOINGUP_BIT);
+			if (u->gv_flags.Any({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown})) {
+				u->gv_flags.Flip({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
 			}
 			UpdateStatusAfterSwap(u, false);
 		}
@@ -20586,7 +20584,7 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		const Trackdir r3r_re_td = (r3r_re_la != nullptr) ? r3r_re_la->reservation_end_trackdir : INVALID_TRACKDIR;
 		const int r3r_re_pos = (r3r_re_la != nullptr) ? (int)r3r_re_la->reservation_end_position : -1;
 		const int r3r_re_cur = (r3r_re_la != nullptr) ? (int)r3r_re_la->current_position : -1;
-		const uint r3r_re_bits = IsValidTile(r3r_re_tile) ? (uint)GetTileTrackdirBits(r3r_re_tile, TRANSPORT_RAIL, 0) : 0u;
+		const uint r3r_re_bits = IsValidTile(r3r_re_tile) ? (uint)GetTileTrackdirBits(r3r_re_tile, TransportType::Rail, 0) : 0u;
 		const TrackBits r3r_re_tb = TrackdirBitsToTrackBits((TrackdirBits)(r3r_re_bits & 0xFFFF));
 		const int r3r_re_junc = (KillFirstBit(r3r_re_tb) != TRACK_BIT_NONE) ? 1 : 0;
 		/* R3R（第 404 轮, REG-403-A/B）：把"预留终点在行进方向的前方还是后方"打出来。
@@ -24937,7 +24935,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					const int r3r_la_td = (r3r_la != nullptr) ? (int)r3r_la->reservation_end_trackdir : -1;
 					const int r3r_la_end = (r3r_la != nullptr) ? (int)r3r_la->reservation_end_position : -1;
 					const int r3r_la_cur = (r3r_la != nullptr) ? (int)r3r_la->current_position : -1;
-					const uint r3r_la_bits = IsValidTile(r3r_la_tile) ? (uint)GetTileTrackdirBits(r3r_la_tile, TRANSPORT_RAIL, 0) : 0u;
+					const uint r3r_la_bits = IsValidTile(r3r_la_tile) ? (uint)GetTileTrackdirBits(r3r_la_tile, TransportType::Rail, 0) : 0u;
 					/* R3R（第 404 轮, REG-403-A/B）：与 RESV-END 同口径补"终点在行进方向的哪一侧"。
 					 * 现场 `:1767` 这一行是 `tile=248,127 j=256 spd=2 db=1 curPos=0` 且此后
 					 * 不再出现（payload 只用 tile 去重），无法判断是"方向反"还是"物理顶住"。

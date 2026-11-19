@@ -16,6 +16,7 @@
 #include "../road.h"
 #include "../newgrf_railtype.h"
 #include "../newgrf_roadtype.h"
+#include "../r3r_perf.h"
 
 #include "../safeguards.h"
 
@@ -61,12 +62,19 @@ struct RAILChunkHandler : ChunkHandler {
 		_railtype_list.reserve(RAILTYPE_END);
 
 		LabelObject<RailTypeLabel> lo;
+		const bool legacy_label_order = IsSavegameVersionBefore(SaveLoadVersion::LabelOrientationUnification);
+		uint reversed = 0;
 
 		while (SlIterateArray() != -1) {
 			SlObject(&lo, slt);
-			 if (IsSavegameVersionBefore(SaveLoadVersion::LabelOrientationUnification)) std::ranges::reverse(lo.label);
+			if (legacy_label_order) {
+				std::ranges::reverse(lo.label);
+				reversed++;
+			}
 			_railtype_list.push_back(lo);
 		}
+
+		if (R3RDbgOn()) R3RDbgWrite("R3R-LABEL-REV kind=rail n=%u legacy=%d ver=%u\n", reversed, legacy_label_order ? 1 : 0, (uint)_sl_version);
 	}
 };
 
@@ -100,12 +108,19 @@ struct ROTTChunkHandler : ChunkHandler {
 		_roadtype_list.reserve(ROADTYPE_END);
 
 		LabelObject<RoadTypeLabel> lo;
+		const bool legacy_label_order = IsSavegameVersionBefore(SaveLoadVersion::LabelOrientationUnification);
+		uint reversed = 0;
 
 		while (SlIterateArray() != -1) {
 			SlObject(&lo, slt);
-			 if (IsSavegameVersionBefore(SaveLoadVersion::LabelOrientationUnification)) std::ranges::reverse(lo.label);
+			if (legacy_label_order) {
+				std::ranges::reverse(lo.label);
+				reversed++;
+			}
 			_roadtype_list.push_back(lo);
 		}
+
+		if (R3RDbgOn()) R3RDbgWrite("R3R-LABEL-REV kind=road n=%u legacy=%d ver=%u\n", reversed, legacy_label_order ? 1 : 0, (uint)_sl_version);
 	}
 };
 

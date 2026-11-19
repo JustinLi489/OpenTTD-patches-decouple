@@ -263,7 +263,7 @@ public:
 	{
 		if (widget == WID_SCHED_HINT) {
 			const Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
-			DrawStringMultiLine(ir.left, ir.right, ir.top, ir.bottom, GetString(STR_R3R_SCHEDULE_HINT), TextColour::White, SA_TOP | SA_HOR_CENTER);
+			DrawStringMultiLine(ir.left, ir.right, ir.top, ir.bottom, GetString(STR_R3R_SCHEDULE_HINT), TextColour::White, {AlignmentH::Centre, AlignmentV::Top});
 			return;
 		}
 		if (widget != WID_SCHED_LIST) return;
@@ -588,7 +588,7 @@ public:
 		const Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
 
 		if (this->rows.empty()) {
-			DrawStringMultiLine(ir.left, ir.right, ir.top, ir.bottom, GetString(STR_R3R_SCHEDULE_ASSIGN_PICK_EMPTY), TextColour::White, SA_TOP | SA_HOR_CENTER);
+			DrawStringMultiLine(ir.left, ir.right, ir.top, ir.bottom, GetString(STR_R3R_SCHEDULE_ASSIGN_PICK_EMPTY), TextColour::White, {AlignmentH::Centre, AlignmentV::Top});
 			return;
 		}
 
@@ -615,7 +615,7 @@ public:
 			}
 			thumb_width = std::min(thumb_width, thumb_limit);
 			const Rect thumb = row.WithWidth(thumb_width, rtl).WithHeight(image_height, false).Translate(0, (step - image_height) / 2);
-			DrawVehicleImage(t, thumb, VehicleID::Invalid(), EIT_IN_LIST, 0);
+			DrawVehicleImage(t, thumb, VehicleID::Invalid(), EngineImageType::InList, 0);
 
 			const Rect tr = row.Indent(thumb_width + WidgetDimensions::scaled.hsep_normal, rtl);
 			const std::string text = GetString(STR_R3R_SCHEDULE_ASSIGN_ROW,

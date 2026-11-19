@@ -358,7 +358,7 @@ static void TrainDepotMoveSegment(const Train *front, const Vehicle *wagon)
 		 * removed when it was coupled on) ends up as a free wagon chain: promote
 		 * it straight to an independent segment. R3R now has only two levels -
 		 * loose free wagons and segments - so this is the one-step upgrade. */
-		Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, tile, seg->index, INVALID_CLIENT_ID);
+		Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, tile, seg->index, ClientID::Invalid);
 	}
 }
 
@@ -812,9 +812,9 @@ struct DepotWindow : Window {
 			uint self_index = 0;
 			uint self_total = 0;
 			R3RGetSegmentPosition(v, &self_index, &self_total);
-			DrawString(tag, GetString(STR_DEPOT_CHAIN_SEGMENT_POS, self_index, self_total), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
+			DrawString(tag, GetString(STR_DEPOT_CHAIN_SEGMENT_POS, self_index, self_total), TextColour::Black, rtl ? AlignmentH::ForceRight : AlignmentH::Start, false, FontSize::Small);
 		} else {
-			DrawString(tag, GetString(STR_DEPOT_CHAIN_LOOSE), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
+			DrawString(tag, GetString(STR_DEPOT_CHAIN_LOOSE), TextColour::Black, rtl ? AlignmentH::ForceRight : AlignmentH::Start, false, FontSize::Small);
 		}
 
 		/* R3R (KI-170): a chain which runs a "go to and couple" order holds a temporary
@@ -823,7 +823,7 @@ struct DepotWindow : Window {
 		 * the depot tells "this one is on its way to couple" apart from an ordinary
 		 * unassigned chain. */
 		if (R3RHasTempCoupleGroup(v)) {
-			DrawString(tag, GetString(STR_R3R_TEMP_COUPLE_GROUP), TextColour::Orange, rtl ? SA_LEFT : SA_RIGHT, false, FontSize::Small);
+			DrawString(tag, GetString(STR_R3R_TEMP_COUPLE_GROUP), TextColour::Orange, rtl ? AlignmentH::Start : AlignmentH::ForceRight, false, FontSize::Small);
 		}
 
 		if (!grouped && !segmented) return;
@@ -833,7 +833,7 @@ struct DepotWindow : Window {
 		name = ShortenCoupleGroupName(name, this->tag_name_budget);
 
 		tag = tag.Translate(0, GetCharacterHeight(FontSize::Small));
-		DrawString(tag, GetString(STR_DEPOT_CHAIN_GROUP_OWNER, name, index, total), TextColour::Black, rtl ? SA_RIGHT : SA_LEFT, false, FontSize::Small);
+		DrawString(tag, GetString(STR_DEPOT_CHAIN_GROUP_OWNER, name, index, total), TextColour::Black, rtl ? AlignmentH::ForceRight : AlignmentH::Start, false, FontSize::Small);
 	}
 
 	/**
@@ -874,28 +874,20 @@ struct DepotWindow : Window {
 						ScaleSpriteTrad(_consistent_train_width != 0 ? _consistent_train_width : TRAININFO_DEFAULT_VEHICLE_WIDTH) :
 						0;
 
-<<<<<<< HEAD
 				/* R3R: when a coupled-on segment is dragged, frame it as a whole,
 				 * whatever vehicle inside it was grabbed. */
 				const Train *drag_seg_front = this->GetDraggedSegmentFront();
-				DrawTrainImage(u, image.Indent(x_space, rtl), drag_seg_front != nullptr ? drag_seg_front->index : this->sel, EIT_IN_DEPOT, free_wagon ? 0 : this->hscroll->GetPosition(), this->vehicle_over);
-=======
-				DrawTrainImage(u, image.Indent(x_space, rtl), this->sel, EngineImageType::InDepot, free_wagon ? 0 : this->hscroll->GetPosition(), this->vehicle_over);
->>>>>>> jgrpp-0.73.5^{commit}
+				DrawTrainImage(u, image.Indent(x_space, rtl), drag_seg_front != nullptr ? drag_seg_front->index : this->sel, EngineImageType::InDepot, free_wagon ? 0 : this->hscroll->GetPosition(), this->vehicle_over);
 
 				/* Length of consist in tiles with 1 fractional digit (rounded up) */
 				uint length = u->gcache.cached_total_length + this->CountDraggedLength(u);
 				Rect count = text.WithWidth(this->count_width - WidgetDimensions::scaled.hsep_normal, !rtl);
 				DrawString(count.left, count.right, count.bottom - GetCharacterHeight(FontSize::Small) + 1,
 						GetString(STR_JUST_DECIMAL, CeilDiv(length * 10, TILE_SIZE), 1),
-<<<<<<< HEAD
-						TextColour::Black, SA_RIGHT | SA_FORCE, false, FontSize::Small); // Draw the counter
+						TextColour::Black, AlignmentH::ForceRight, false, FontSize::Small); // Draw the counter
 
 				/* R3R: tag the chain state so the player can tell loose chains and segments apart. */
 				this->DrawChainStateTag(u, r, rtl);
-=======
-						TextColour::Black, AlignmentH::ForceRight, false, FontSize::Small); // Draw the counter
->>>>>>> jgrpp-0.73.5^{commit}
 				break;
 			}
 
@@ -920,13 +912,8 @@ struct DepotWindow : Window {
 		if (free_wagon) {
 			DrawString(text, STR_DEPOT_NO_ENGINE);
 		} else {
-<<<<<<< HEAD
 			Rect flag = r.Indent(this->tag_width, rtl).WithWidth(this->flag_size.width, rtl).WithHeight(this->flag_size.height).Translate(0, diff_y);
-			DrawSpriteIgnorePadding((v->vehstatus.Test(VehState::Stopped)) ? SPR_FLAG_VEH_STOPPED : SPR_FLAG_VEH_RUNNING, PAL_NONE, flag, SA_CENTER);
-=======
-			Rect flag = r.WithWidth(this->flag_size.width, rtl).WithHeight(this->flag_size.height).Translate(0, diff_y);
 			DrawSpriteIgnorePadding((v->vehstatus.Test(VehState::Stopped)) ? SPR_FLAG_VEH_STOPPED : SPR_FLAG_VEH_RUNNING, PAL_NONE, flag, {AlignmentH::Centre, AlignmentV::Middle});
->>>>>>> jgrpp-0.73.5^{commit}
 
 			DrawString(text, GetString(STR_JUST_COMMA, v->unitnumber), (v->max_age - DAYS_IN_LEAP_YEAR) >= v->age ? TextColour::Black : TextColour::Red);
 		}
@@ -1155,12 +1142,7 @@ struct DepotWindow : Window {
 					TrainDepotMoveVehicle(v, sel, result.vehicle);
 				} else if (v != nullptr) {
 					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_DRAG, this);
-<<<<<<< HEAD
-					SetMouseCursorVehicle(v, EIT_IN_DEPOT);
-=======
 					SetMouseCursorVehicle(v, EngineImageType::InDepot);
-					_cursor.vehchain = _ctrl_pressed;
->>>>>>> jgrpp-0.73.5^{commit}
 
 					this->sel = v->index;
 					/* R3R: dragging a vehicle inside a coupled-on segment always drags
@@ -1589,7 +1571,7 @@ struct DepotWindow : Window {
 			this->RaiseWidget(WID_D_MAKE_SEGMENT);
 			this->SetWidgetDirty(WID_D_MAKE_SEGMENT);
 			ResetObjectToPlace();
-			Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
+			Command<Commands::MakeSegment>::Post(STR_ERROR_CAN_T_MAKE_SEGMENT, TileIndex(this->window_number), v->index, ClientID::Invalid);
 			return true;
 		}
 		if (this->IsWidgetLowered(WID_D_DEMOTE_SEGMENT)) {
@@ -1598,7 +1580,7 @@ struct DepotWindow : Window {
 			this->RaiseWidget(WID_D_DEMOTE_SEGMENT);
 			this->SetWidgetDirty(WID_D_DEMOTE_SEGMENT);
 			ResetObjectToPlace();
-			Command<Commands::DemoteSegment>::Post(STR_ERROR_CAN_T_DEMOTE_SEGMENT, TileIndex(this->window_number), v->index, INVALID_CLIENT_ID);
+			Command<Commands::DemoteSegment>::Post(STR_ERROR_CAN_T_DEMOTE_SEGMENT, TileIndex(this->window_number), v->index, ClientID::Invalid);
 			return true;
 		}
 
@@ -1806,7 +1788,6 @@ struct DepotWindow : Window {
 
 				VehicleID sell_id = v->index;
 				SellVehicleFlags sell_flags = SellVehicleFlags::BackupOrder;
-<<<<<<< HEAD
 				if (v->type == VehicleType::Train) {
 					if (widget == WID_D_SELL_CHAIN || _ctrl_pressed) sell_flags |= SellVehicleFlags::SellChain;
 					/* R3R: a coupled-on segment is an operational unit — selling any
@@ -1821,11 +1802,7 @@ struct DepotWindow : Window {
 						sell_flags |= SellVehicleFlags::SellChain;
 					}
 				}
-				Command<Commands::SellVehicle>::Post(GetCmdSellVehMsg(v->type), v->tile, sell_id, sell_flags, INVALID_CLIENT_ID);
-=======
-				if (v->type == VehicleType::Train && (widget == WID_D_SELL_CHAIN || _ctrl_pressed)) sell_flags |= SellVehicleFlags::SellChain;
-				Command<Commands::SellVehicle>::Post(GetCmdSellVehMsg(v->type), v->tile, v->index, sell_flags, ClientID::Invalid);
->>>>>>> jgrpp-0.73.5^{commit}
+				Command<Commands::SellVehicle>::Post(GetCmdSellVehMsg(v->type), v->tile, sell_id, sell_flags, ClientID::Invalid);
 				break;
 			}
 

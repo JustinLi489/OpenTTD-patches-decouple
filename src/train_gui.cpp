@@ -360,7 +360,7 @@ static EngineID R3RConsistRepresentativeEngine(const Train *v)
 			seen[n_seen++] = v->index.base();
 			R3RDbgWrite("R3R-NAME v=%d fe=%d eng=%d sid=%d cb=%d nm=%d needs=%d\n",
 					(int)v->index.base(), v->IsFrontEngine() ? 1 : 0, (int)v->engine_type.base(),
-					(int)v->GetEngine()->info.string_id,
+					(int)v->GetEngine()->info.string_id.base(),
 					v->GetEngine()->info.callback_mask.Test(VehicleCallbackMask::Name) ? 1 : 0,
 					R3REngineHasDisplayName(v->engine_type) ? 1 : 0, needs ? 1 : 0);
 		}

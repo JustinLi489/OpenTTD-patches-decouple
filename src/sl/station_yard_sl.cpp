@@ -121,7 +121,7 @@ static constexpr uint32_t SYRD_MAX_NAME_BYTES = MAX_LENGTH_STATION_NAME_CHARS * 
 static void R3RPackName(std::vector<TileIndex> &out, const std::string &name)
 {
 	const size_t len = name.size();
-	out.push_back(static_cast<TileIndex>(len));
+	out.push_back(static_cast<TileIndex>(static_cast<uint32_t>(len)));
 	for (size_t i = 0; i < len; i += 4) {
 		uint32_t word = 0;
 		for (size_t k = 0; k < 4 && i + k < len; k++) {
@@ -153,7 +153,7 @@ static std::string R3RUnpackName(const std::vector<TileIndex> &in, size_t &p)
 /** R3R: 把调度池打包进 SYRD word 流（v8 起的编码，v7 的整站块复用同一格式）。 */
 static void R3RPackPool(std::vector<TileIndex> &out, const std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> &pool)
 {
-	out.push_back(static_cast<TileIndex>(pool.size()));
+	out.push_back(static_cast<TileIndex>(static_cast<uint32_t>(pool.size())));
 	for (const Station::R3RStationYard::R3RDispatchPoolEntry &e : pool) {
 		out.push_back(static_cast<TileIndex>(e.host == VehicleID::Invalid() ? 0 : e.host.base() + 1));
 		out.push_back(static_cast<TileIndex>(e.limit));
@@ -209,7 +209,7 @@ static std::vector<Station::R3RStationYard::R3RDispatchPoolEntry> R3RUnpackPool(
  * 之后是 value、extra）。 */
 static void R3RPackProgram(std::vector<TileIndex> &out, const std::vector<R3RDispatchInstruction> &program)
 {
-	out.push_back(static_cast<TileIndex>(program.size()));
+	out.push_back(static_cast<TileIndex>(static_cast<uint32_t>(program.size())));
 	for (const R3RDispatchInstruction &ins : program) {
 		const uint32_t packed = static_cast<uint32_t>(static_cast<uint8_t>(ins.kind)) |
 				(static_cast<uint32_t>(static_cast<uint8_t>(ins.var)) << 8) |
@@ -275,7 +275,7 @@ static void R3REncodeYards(Station *st)
 		R3RPackName(out, y.name);
 		/* v6: 调度池（宿主车序号 + 1，0 表示无效；v8 起追加排程）。 */
 		R3RPackPool(out, y.pool);
-		out.push_back(static_cast<TileIndex>(y.tiles.size()));
+		out.push_back(static_cast<TileIndex>(static_cast<uint32_t>(y.tiles.size())));
 		out.insert(out.end(), y.tiles.begin(), y.tiles.end());
 		/* v10: 本场的「分配规则」程序（追加在场块末尾，旧版本不读即忽略）。 */
 		R3RPackProgram(out, y.program);
@@ -425,7 +425,7 @@ static void Save_SYRD()
 }
 
 extern const ChunkHandler station_yard_chunk_handlers[] = {
-	{ 'SYRD', Save_SYRD, Load_SYRD, nullptr, nullptr, CH_SPARSE_TABLE }, // R3R Station Yard chunk
+	{ 'SYRD', Save_SYRD, Load_SYRD, nullptr, nullptr, ChunkType::SparseTable }, // R3R Station Yard chunk
 };
 
 extern const ChunkHandlerTable _station_yard_chunk_handlers(station_yard_chunk_handlers);

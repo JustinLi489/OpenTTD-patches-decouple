@@ -429,8 +429,9 @@ enum SaveLoadVersion : uint16_t {
 	SLV_LABEL_ORIENTATION_UNIFICATION,      ///< 367  PR#15888 Unify the orientation in which labels are written.
 	SLV_DOUBLE_ENDED_SHIPS,                 ///< 368  PR#16002 Double-ended (NewGRF-only) ships can reverse without turning.
 
-	SLV_R3R_ARTIC_OVERRIDE,                 ///< R3R: per-train baked weight/power/max-speed overrides for de-articulated groups.
+	SLV_R3R_ARTIC_OVERRIDE,                 ///< R3R: reserved boundary for the de-articulated-group baked overrides. No field is gated on it: the overrides were only ever described in the abandoned src/saveload copy, never written by this framework, so savegames at 369/370 do not contain them.
 	SLV_R3R_PARKED,                         ///< R3R: Train::r3r_parked, the depot parking flag of the in-depot GOTO_COUPLE exemption (KI-118 fix A).
+	SLV_R3R_ARTIC_OVERRIDE_SAVED,           ///< R3R: the baked weight/power/max-speed overrides (Train::*_override) are actually written to the savegame. Must stay a new version: savegames at 369/370 have no room for these three fields.
 
 	SL_MAX_VERSION,                         ///< Highest possible saveload version
 
@@ -459,7 +460,40 @@ enum SaveLoadVersion : uint16_t {
 	SL_CHILLPP_233 = 233,
 };
 
-static constexpr SaveLoadVersion SAVEGAME_VERSION = SLV_R3R_PARKED;                                  ///< Current savegame version of OpenTTD (R3R branch).
+/**
+ * Pre-merge R3R savegame numbering.
+ *
+ * Before upstream 0.73.5 was merged, the upstream version list stopped at
+ * SLV_DEPOTS_UNDER_BRIDGES (366) and the two R3R-only versions occupied 367 and 368.
+ * Upstream 0.73.5 inserted SLV_LABEL_ORIENTATION_UNIFICATION and SLV_DOUBLE_ENDED_SHIPS
+ * into that very range, so an extended (R3R) savegame carrying 367/368 was written with
+ * the *old* numbering and has to be shifted by SLV_R3R_LEGACY_SHIFT to line up with the
+ * current R3R versions (otherwise SLV_R3R_PARKED would look "not yet reached" and
+ * Train::r3r_parked would be left unread in the stream, shifting everything after it).
+ * Treating the two inserted upstream versions as present is harmless: neither of them
+ * gates a saved field, their features are recorded in the extended-version chunk.
+ */
+static constexpr SaveLoadVersion SLV_R3R_LEGACY_FIRST = (SaveLoadVersion)(SLV_DEPOTS_UNDER_BRIDGES + 1); ///< First R3R-only version in the pre-merge numbering.
+static constexpr SaveLoadVersion SLV_R3R_LEGACY_LAST = (SaveLoadVersion)(SLV_DEPOTS_UNDER_BRIDGES + 2);  ///< Last R3R-only version in the pre-merge numbering.
+static constexpr uint SLV_R3R_LEGACY_SHIFT = (uint)SLV_R3R_ARTIC_OVERRIDE - (uint)SLV_R3R_LEGACY_FIRST;  ///< Number of upstream versions inserted in front of the R3R block.
+
+/**
+ * True while loading a savegame written with the pre-merge R3R numbering, i.e. one
+ * whose base version had to be shifted by SLV_R3R_LEGACY_SHIFT.
+ *
+ * Such a savegame also stores the *old* upstream numbering in its SLXI upstream
+ * version sub-chunk: pre-merge SL_UPSTREAM_VERSION was MAX_LOAD_SAVEGAME_VERSION,
+ * which pointed at SLV_R3R_LEGACY_LAST, while the newly inserted upstream versions
+ * were never part of that savegame. The stored upstream version must therefore be
+ * pulled back onto the pre-merge numbering, otherwise every "upstream version before
+ * X" test gated on it is evaluated wrongly. The most visible consequence is the
+ * rail/road type label orientation (SLV_LABEL_ORIENTATION_UNIFICATION): the labels
+ * are read byte-reversed, no label matches, and AfterLoadLabelMaps() falls back to
+ * the default rail/road types for the whole map.
+ */
+extern bool _sl_r3r_legacy_numbering;
+
+static constexpr SaveLoadVersion SAVEGAME_VERSION = SLV_R3R_ARTIC_OVERRIDE_SAVED;                    ///< Current savegame version of OpenTTD (R3R branch).
 static constexpr SaveLoadVersion MAX_LOAD_SAVEGAME_VERSION = (SaveLoadVersion)(SL_MAX_VERSION - 1); ///< Max loadable savegame version of OpenTTD.
 static constexpr SaveLoadVersion SL_UPSTREAM_VERSION = MAX_LOAD_SAVEGAME_VERSION;                   ///< Savegame version to save/load in XSLFI_UPSTREAM_VERSION sub-chunk
 

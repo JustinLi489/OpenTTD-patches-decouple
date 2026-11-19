@@ -2642,7 +2642,7 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				 * reads as genuine artic (and then gets moved/flipped as one), roll
 				 * the whole clone back -- buy nothing instead of buying something
 				 * broken. */
-				Command<Commands::SellVehicle>::Do(flags, w_front->tile, w_front->index, SellVehicleFlags::SellChain, INVALID_CLIENT_ID);
+				Command<Commands::SellVehicle>::Do(flags, w_front->tile, w_front->index, SellVehicleFlags::SellChain, ClientID::Invalid);
 				return CommandCost(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST);
 			}
 

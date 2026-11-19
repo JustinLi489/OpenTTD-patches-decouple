@@ -45,6 +45,7 @@
 #include "../rev.h"
 #include "../strings_func.h"
 #include "../company_func.h"
+#include "../r3r_perf.h"
 #include "../3rdparty/robin_hood/robin_hood.h"
 #include "table/strings.h"
 
@@ -314,6 +315,10 @@ void SlXvResetState()
 	std::fill(_sl_xv_feature_versions.begin(), _sl_xv_feature_versions.end(), 0);
 	_sl_xv_version_label.clear();
 	_sl_xv_upstream_version = SL_MIN_VERSION;
+	/* _sl_r3r_legacy_numbering is intentionally NOT reset here: it is set while the
+	 * base savegame version is parsed in DoLoad(), which happens before Load_SLXI()
+	 * calls this function, and it has to survive until loadUV() remaps the stored
+	 * upstream version. It is reset explicitly in DoLoad()/DoSave(). */
 }
 
 /**
@@ -771,6 +776,24 @@ static void loadUV(const SlxiSubChunkInfo &info, uint32_t length)
 {
 	if (length == 2) {
 		_sl_xv_upstream_version = (SaveLoadVersion)SlReadUint16();
+
+		/* A savegame written before the upstream merge stores the pre-merge upstream
+		 * numbering here, which is the R3R base version (SL_UPSTREAM_VERSION was
+		 * MAX_LOAD_SAVEGAME_VERSION). The two upstream versions inserted by the merge
+		 * did not exist for that savegame, so pull the stored value back onto the
+		 * pre-merge numbering. Without this, e.g. SLV_LABEL_ORIENTATION_UNIFICATION is
+		 * considered already applied and every rail/road/object type label is read
+		 * byte-reversed, which makes the whole map fall back to the default types. */
+		if (_sl_r3r_legacy_numbering && _sl_xv_upstream_version >= SLV_R3R_LEGACY_FIRST && _sl_xv_upstream_version <= SLV_R3R_LEGACY_LAST) {
+			const SaveLoadVersion legacy_upstream_version = _sl_xv_upstream_version;
+			_sl_xv_upstream_version = (SaveLoadVersion)((uint)_sl_xv_upstream_version - SLV_R3R_LEGACY_SHIFT);
+			Debug(sl, 1, "Remapping legacy R3R upstream savegame version {} to {}", legacy_upstream_version, _sl_xv_upstream_version);
+			if (R3RDbgOn()) R3RDbgWrite("R3R-VER-REMAP upstream %u -> %u\n", (uint)legacy_upstream_version, (uint)_sl_xv_upstream_version);
+		} else if (R3RDbgOn()) {
+			/* No remap: either a current savegame or a legacy one whose flag got lost. */
+			R3RDbgWrite("R3R-VER-NOREMAP upstream=%u legacy_flag=%d\n", (uint)_sl_xv_upstream_version, _sl_r3r_legacy_numbering ? 1 : 0);
+		}
+
 		if (_sl_xv_upstream_version > SL_UPSTREAM_VERSION) {
 			auto tmp_params = MakeParameters(_sl_xv_version_label.empty() ? STR_EMPTY : STR_GAME_SAVELOAD_FROM_VERSION, _sl_xv_version_label, "upstream savegame version", _sl_xv_upstream_version, SL_UPSTREAM_VERSION);
 			SlError(STR_JUST_RAW_STRING, GetStringWithArgs(STR_GAME_SAVELOAD_ERROR_TOO_NEW_FEATURE_VERSION, tmp_params));

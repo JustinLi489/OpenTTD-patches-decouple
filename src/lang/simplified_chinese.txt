@@ -614,7 +614,7 @@ STR_MONTH_DEC                                                   :12月
 STR_GRAPH_KEY_BUTTON                                            :{BLACK}索引
 STR_GRAPH_KEY_TOOLTIP                                           :{BLACK}显示图表的公司索引
 STR_GRAPH_X_LABEL_MONTH                                         :{TINY_FONT}{STRING}
-STR_GRAPH_X_LABEL_MONTH_YEAR                                    :{TINY_FONT}{STRING}{} {STRING}{}{NUM}
+STR_GRAPH_X_LABEL_MONTH_YEAR                                    :{TINY_FONT}{STRING}{} {NUM}
 STR_GRAPH_Y_LABEL                                               :{TINY_FONT}{STRING}
 STR_GRAPH_Y_LABEL_NUMBER                                        :{TINY_FONT}{COMMA}
 
@@ -960,12 +960,12 @@ STR_NEWS_STATION_NOW_ACCEPTS_CARGO_LIST                         :{WHITE}{STATION
 
 STR_NEWS_OFFER_OF_SUBSIDY_EXPIRED                               :{BIG_FONT}{BLACK}财政补贴项目到期：{}{}将 {STRING} 从 {STRING} 运送到 {STRING} 将不再获得财政补贴。
 STR_NEWS_SUBSIDY_WITHDRAWN_SERVICE                              :{BIG_FONT}{BLACK}财政补贴项目流标：{}{}将 {STRING} 从 {STRING} 运送到 {STRING} 将不是财政补贴项目。
-STR_NEWS_SERVICE_SUBSIDY_OFFERED                                :{BIG_FONT}{BLACK}财政补贴项目招标：{}{}第一个将 {STRING} 从 {STRING} 运送到 {STRING} 的公司将获得地方政府为期一年的财政补贴！
+STR_NEWS_SERVICE_SUBSIDY_OFFERED                                :{BIG_FONT}{BLACK}财政补贴项目招标：{}{}第一个将 {STRING} 从 {STRING} 运送到 {STRING} 的公司将获得地方政府为期 {UNITS_YEARS_OR_MINUTES} 的财政补贴！
 ###length 4
-STR_NEWS_SERVICE_SUBSIDY_AWARDED_HALF                           :{BIG_FONT}{BLACK}{STRING} 获得财政补贴！{}{}今后一年中将 {STRING} 从 {STRING} 运送到 {STRING} 将获得 50% 的额外报酬！
-STR_NEWS_SERVICE_SUBSIDY_AWARDED_DOUBLE                         :{BIG_FONT}{BLACK}{STRING} 获得财政补贴！{}{}今后一年中将 {STRING} 从 {STRING} 运送到 {STRING} 将获得双倍的报酬！
-STR_NEWS_SERVICE_SUBSIDY_AWARDED_TRIPLE                         :{BIG_FONT}{BLACK}{STRING} 获得财政补贴！{}{}今后一年中将 {STRING} 从 {STRING} 运送到 {STRING} 将获得三倍的报酬！
-STR_NEWS_SERVICE_SUBSIDY_AWARDED_QUADRUPLE                      :{BIG_FONT}{BLACK}{STRING} 获得财政补贴！{}{}今后一年中将 {STRING} 从 {STRING} 运送到 {STRING} 将获得四倍的报酬！
+STR_NEWS_SERVICE_SUBSIDY_AWARDED_HALF                           :{BIG_FONT}{BLACK}服务补贴授予 {RAW_STRING}！{}{}将 {STRING} 从 {STRING} 运送到 {STRING}，今后 {UNITS_YEARS_OR_MINUTES} 将获得 50% 的额外报酬！
+STR_NEWS_SERVICE_SUBSIDY_AWARDED_DOUBLE                         :{BIG_FONT}{BLACK}服务补贴授予 {RAW_STRING}！{}{}将 {STRING} 从 {STRING} 运送到 {STRING}，今后 {UNITS_YEARS_OR_MINUTES} 将获得双倍的报酬！
+STR_NEWS_SERVICE_SUBSIDY_AWARDED_TRIPLE                         :{BIG_FONT}{BLACK}服务补贴授予 {RAW_STRING}！{}{}将 {STRING} 从 {STRING} 运送到 {STRING}，今后 {UNITS_YEARS_OR_MINUTES} 将获得三倍的报酬！
+STR_NEWS_SERVICE_SUBSIDY_AWARDED_QUADRUPLE                      :{BIG_FONT}{BLACK}服务补贴授予 {RAW_STRING}！{}{}将 {STRING} 从 {STRING} 运送到 {STRING}，今后 {UNITS_YEARS_OR_MINUTES} 将获得四倍的报酬！
 
 STR_NEWS_ROAD_REBUILDING_MONTHS                                 :{BIG_FONT}{BLACK}{TOWN}的混乱交通！{}{}由{STRING}资助的道路重建计划将给驾车者带来长达 6 个月的堵塞！
 STR_NEWS_ROAD_REBUILDING_MINUTES                                :{BIG_FONT}{BLACK}{TOWN}的混乱交通！{}{}由{STRING}资助的道路重建计划将给驾车者带来长达 6 分钟的堵塞！
@@ -3216,7 +3216,7 @@ STR_LAND_AREA_INFORMATION_AIRPORT_CLASS                         :{BLACK}飞机�
 STR_LAND_AREA_INFORMATION_AIRPORT_NAME                          :{BLACK}飞机场名字: {LTBLUE}{STRING}
 STR_LAND_AREA_INFORMATION_AIRPORTTILE_NAME                      :{BLACK}机场区域名称: {LTBLUE}{STRING}
 STR_LAND_AREA_INFORMATION_NEWGRF_NAME                           :{BLACK}NewGRF：{LTBLUE}{STRING}
-STR_LAND_AREA_INFORMATION_CARGO_ACCEPTED                        :{BLACK}接受货物：{LTBLUE}
+STR_LAND_AREA_INFORMATION_CARGO_ACCEPTED                        :{BLACK}接受货物：{LTBLUE}{RAW_STRING}
 STR_LAND_AREA_INFORMATION_CARGO_EIGHTS                          :({COMMA}/8 {STRING})
 STR_LANG_AREA_INFORMATION_RAIL_TYPE                             :{BLACK}铁轨类型： {LTBLUE}{STRING}
 STR_LANG_AREA_INFORMATION_ROAD_TYPE                             :{BLACK}道路类型：{LTBLUE}{STRING}
@@ -3763,7 +3763,7 @@ STR_EDIT_SIGN_TEXT_COLOUR_TOOLTIP                               :{BLACK}标志�
 STR_EDIT_SIGN_SIGN_OSKTITLE                                     :{BLACK}为标记起名
 
 # Town directory window
-STR_TOWN_DIRECTORY_CAPTION                                      :{WHITE}城镇
+STR_TOWN_DIRECTORY_CAPTION                                      :{WHITE}城镇（{COMMA} / {COMMA}）
 STR_TOWN_DIRECTORY_NONE                                         :{ORANGE}- 没有 -
 STR_TOWN_DIRECTORY_TOWN                                         :{ORANGE}{TOWN}{BLACK} ({COMMA})
 STR_TOWN_DIRECTORY_CITY                                         :{ORANGE}{TOWN}{YELLOW} (都市){BLACK} ({COMMA})
@@ -4305,7 +4305,7 @@ STR_COMPANY_INFRASTRUCTURE_VIEW_TOTAL_YEAR                      :{WHITE}{CURRENC
 STR_COMPANY_INFRASTRUCTURE_VIEW_TOTAL_PERIOD                    :{WHITE}{CURRENCY_LONG}/周期
 
 # Industry directory
-STR_INDUSTRY_DIRECTORY_CAPTION                                  :{WHITE}工业设施
+STR_INDUSTRY_DIRECTORY_CAPTION                                  :{WHITE}工业设施（{COMMA} / {COMMA}）
 STR_INDUSTRY_DIRECTORY_NONE                                     :{ORANGE}- 没有 -
 STR_INDUSTRY_DIRECTORY_ITEM_INFO                                :{BLACK}{CARGO_LONG}{STRING}{YELLOW}（已运输 {COMMA}%）
 STR_INDUSTRY_DIRECTORY_ITEM_NOPROD                              :{ORANGE}{INDUSTRY}
@@ -4727,7 +4727,7 @@ STR_REPLACE_MAGLEV_VEHICLES                                     :磁悬浮列车
 STR_REPLACE_ROAD_VEHICLES                                       :路面交通工具
 STR_REPLACE_TRAM_VEHICLES                                       :电车
 
-STR_REPLACE_REMOVE_WAGON                                        :{BLACK}清理挂车：{ORANGE}{STRING}
+STR_REPLACE_REMOVE_WAGON                                        :{BLACK}清理挂车（{STRING1}）：{ORANGE}{STRING}
 STR_REPLACE_REMOVE_WAGON_TOOLTIP                                :{BLACK}如果替换会使列车更长。则从列车前方开始自动移除车厢以维持目前长度
 STR_REPLACE_REMOVE_WAGON_GROUP_HELP                             :{STRING}。按住 <Ctrl> 键点击以套用至所有子分组
 
@@ -4833,7 +4833,7 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR                     :{BLACK}今年�
 STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}今年损益：{LTBLUE}{CURRENCY_LONG}（去年损益：{CURRENCY_LONG}）{BLACK}最小功率：{LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}本期损益：{LTBLUE}{CURRENCY_LONG}（上期损益：{CURRENCY_LONG}）
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}本期损益：{LTBLUE}{CURRENCY_LONG}（上期损益：{CURRENCY_LONG}）{BLACK}最小功率：{LTBLUE}{POWER_TO_WEIGHT}
-STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}可靠性：{LTBLUE}{COMMA}%  {BLACK}上次保养后抛锚的次数：{LTBLUE}{COMMA}
+STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}可靠性：{LTBLUE}{COMMA}%（最高：{COMMA}%）  {BLACK}上次保养后抛锚的次数：{LTBLUE}{COMMA}
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}建造年份：{LTBLUE}{NUM}{BLACK} 价值：{LTBLUE}{CURRENCY_LONG}
 STR_VEHICLE_INFO_NO_CAPACITY                                    :{BLACK}运载能力： {LTBLUE}无{STRING}
@@ -4888,7 +4888,7 @@ STR_VEHICLE_DETAILS_TRAIN_CAPACITIES_TOOLTIP                    :{BLACK}显示�
 STR_VEHICLE_DETAIL_TAB_TOTAL_CARGO                              :{BLACK}全部货物
 STR_VEHICLE_DETAILS_TRAIN_TOTAL_CARGO_TOOLTIP                   :{BLACK}根据不同的挂车种类显示相应的总运力
 
-STR_VEHICLE_DETAILS_TRAIN_ARTICULATED_RV_CAPACITY               :{BLACK}运力： {LTBLUE}
+STR_VEHICLE_DETAILS_TRAIN_ARTICULATED_RV_CAPACITY               :{BLACK}运力：{LTBLUE}{RAW_STRING}
 
 # Vehicle refit
 STR_REFIT_CAPTION                                               :{WHITE}{VEHICLE} (改装)
@@ -5061,7 +5061,7 @@ STR_ORDER_SHIP_DEPOT                                            :船坞
 ###next-name-looks-similar
 
 STR_ORDER_GO_TO_NEAREST_HANGAR_FORMAT                           :{STRING}最近的机库
-STR_ORDER_GO_TO_NEAREST_DEPOT_FORMAT                            :{STRING} {STRING} {STRING}
+STR_ORDER_GO_TO_NEAREST_DEPOT_FORMAT                            :{STRING}最近的{STRING}
 STR_ORDER_GO_TO_DEPOT_FORMAT                                    :{STRING} {DEPOT}
 
 STR_ORDER_REFIT_ORDER                                           :(改装为 {STRING})
@@ -5070,7 +5070,7 @@ STR_ORDER_STOP_ORDER                                            :(停留)
 
 STR_ORDER_WAIT_TO_UNBUNCH                                       :（等待调节班次）
 
-STR_ORDER_GO_TO_STATION                                         :{STRING} {STATION} {STRING}
+STR_ORDER_GO_TO_STATION                                         :{STRING} {STATION}
 STR_ORDER_GO_TO_STATION_CAN_T_USE_STATION                       :{PUSH_COLOUR}{RED}（不能使用车站）{POP_COLOUR} {STRING} {STATION}
 
 STR_ORDER_IMPLICIT                                              :(自动)

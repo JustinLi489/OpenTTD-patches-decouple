@@ -1126,7 +1126,7 @@ void ConPrintFramerate()
  */
 double R3RGetTrainsMs()
 {
-	auto &pf = _pf_data[PFE_GL_TRAINS];
+	auto &pf = _pf_data[PerformanceElement::GameLoopTrains];
 	if (pf.num_valid == 0) return -1.0;
 	return pf.GetAverageDurationMilliseconds(NUM_FRAMERATE_POINTS / 4);
 }

@@ -572,7 +572,7 @@ public:
 				if (this->group_has_children[i] != 0) {
 					const Dimension d = GetScaledSpriteSize(SPR_CIRCLE_FOLDED);
 					const Rect fr(node_x - d.width / 2, y, node_x + d.width / 2, bottom);
-					DrawSpriteIgnorePadding(this->IsGroupFolded(this->groups[i]) ? SPR_CIRCLE_FOLDED : SPR_CIRCLE_UNFOLDED, PAL_NONE, fr, SA_CENTER);
+					DrawSpriteIgnorePadding(this->IsGroupFolded(this->groups[i]) ? SPR_CIRCLE_FOLDED : SPR_CIRCLE_UNFOLDED, PAL_NONE, fr, {AlignmentH::Centre, AlignmentV::Middle});
 				} else {
 					GfxDrawLine(node_x, ycentre, node_x + (rtl ? -1 : 1) * (step / 2), ycentre, linecolour, WidgetDimensions::scaled.fullbevel.top);
 				}
@@ -637,7 +637,7 @@ public:
 					}
 				}
 				Rect thumb = row.WithWidth(thumb_width, rtl).WithHeight(image_height, false).Translate(0, (row_height - image_height) / 2);
-				DrawVehicleImage(t, thumb, VehicleID::Invalid(), EIT_IN_LIST, 0);
+				DrawVehicleImage(t, thumb, VehicleID::Invalid(), EngineImageType::InList, 0);
 				Rect tr = row.Indent(thumb_width + WidgetDimensions::scaled.hsep_normal, rtl);
 				DrawString(tr, text);
 			}

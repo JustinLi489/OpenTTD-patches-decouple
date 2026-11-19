@@ -162,7 +162,7 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 	 * the ledger row and leaves the bit on the map -- so nobody ever frees it and the
 	 * next train is walled in for the rest of the game (KI-422). */
 	if (IsValidTile(tile) && GetTileType(tile) == TileType::TunnelBridge &&
-			GetTunnelBridgeTransportType(tile) == TRANSPORT_RAIL) {
+			GetTunnelBridgeTransportType(tile) == TransportType::Rail) {
 		const TrackBits bits = GetTunnelBridgeReservationTrackBits(tile);
 		if (bits == TRACK_BIT_NONE) {
 			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s-gone\n",

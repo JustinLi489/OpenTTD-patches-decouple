@@ -207,9 +207,12 @@ public:
 		 SLE_CONDVAR(Train, flags, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::Yapp, SaveLoadVersion::MaxVersion),
 		 SLE_CONDVAR(Train, wait_counter, VarTypes::U16, SaveLoadVersion::SplitLoadWaitCounters, SaveLoadVersion::MaxVersion),
 		 SLE_CONDVAR(Train, gv_flags, VarTypes::U16, SaveLoadVersion::RvRealisticAcceleration, SaveLoadVersion::MaxVersion),
-		 SLE_CONDVAR(Train, weight_override, VarTypes::U16, SaveLoadVersion::R3RArticOverride, SaveLoadVersion::MaxVersion),
-		 SLE_CONDVAR(Train, power_override, VarTypes::U16, SaveLoadVersion::R3RArticOverride, SaveLoadVersion::MaxVersion),
-		 SLE_CONDVAR(Train, max_speed_override, VarTypes::U16, SaveLoadVersion::R3RArticOverride, SaveLoadVersion::MaxVersion),
+		 /* R3R: gated on R3RArticOverrideSaved, never on R3RArticOverride. Savegames at 369/370 carry no
+		  * bytes for these three fields, because the live framework (src/sl) only starts writing them at
+		  * SLV_R3R_ARTIC_OVERRIDE_SAVED; gating them earlier would misalign the rest of the train record. */
+		 SLE_CONDVAR(Train, weight_override, VarTypes::U16, SaveLoadVersion::R3RArticOverrideSaved, SaveLoadVersion::MaxVersion),
+		 SLE_CONDVAR(Train, power_override, VarTypes::U16, SaveLoadVersion::R3RArticOverrideSaved, SaveLoadVersion::MaxVersion),
+		 SLE_CONDVAR(Train, max_speed_override, VarTypes::U16, SaveLoadVersion::R3RArticOverrideSaved, SaveLoadVersion::MaxVersion),
 	};
 	static inline const SaveLoadCompatTable compat_description = _vehicle_train_sl_compat;
 

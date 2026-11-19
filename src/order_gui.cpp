@@ -6066,7 +6066,7 @@ public:
 		const Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
 
 		if (ol == nullptr || ol->GetNumOrders() == 0) {
-			DrawString(ir, STR_R3R_SCHEDULE_EDITOR_EMPTY, TextColour::FromString, SA_CENTER);
+			DrawString(ir, STR_R3R_SCHEDULE_EDITOR_EMPTY, TextColour::FromString, AlignmentH::Centre);
 			return;
 		}
 

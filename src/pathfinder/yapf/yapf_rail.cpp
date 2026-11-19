@@ -632,7 +632,7 @@ private:
 			 * (SetRailStationReservation)，`track` 参数在那一支一次都没被读——
 			 * 只被 545 行的断言检查。所以这里改用**该格真实存在的轨道**喂进去，
 			 * 对预留语义零影响，只是让断言拿到一个必然成立的值。 */
-			const TrackBits plat_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, ::TransportType::TRANSPORT_RAIL, 0));
+			const TrackBits plat_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, ::TransportType::Rail, 0));
 			if (plat_tracks == TRACK_BIT_NONE) return false;
 			const Track plat_track = FindFirstTrack(plat_tracks);
 			if (plat_track != TrackdirToTrack(td)) {
@@ -1600,7 +1600,7 @@ public:
 		 * （REACH 里的 bits= 经 TrackdirBitsToTrackBits 压缩过，正是 REG-330-B
 		 * 里 16,14 显示 bits=0x1 与 CPL-TRACE tdb=0x101 对不上的来源）。 */
 		{
-			const TrackdirBits r3r_ob = GetTileTrackdirBits(v->tile, ::TransportType::TRANSPORT_RAIL, 0);
+			const TrackdirBits r3r_ob = GetTileTrackdirBits(v->tile, ::TransportType::Rail, 0);
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
 				fprintf(dbg, "CPL-ORIGIN-TD veh=%d tile=%d,%d tdb=0x%x tbits=0x%x\n",
@@ -1822,7 +1822,7 @@ public:
 			if (depth <= 15) {
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
+					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::Rail, 0)));
 					fclose(dbg);
 				}
 			}
@@ -1836,7 +1836,7 @@ public:
 			 * follow_track.hpp:140 的 dbg_assert_tile 对跨格的一对会直接断言崩溃，
 			 * 任何调用方（含将来的）都不该把这种对子喂进来。 */
 			if (cur_td == INVALID_TRACKDIR ||
-					!HasBit(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0), cur_td)) {
+					!HasBit(GetTileTrackdirBits(cur, ::TransportType::Rail, 0), cur_td)) {
 				return false;
 			}
 			TrackFollower f2(v, Yapf().GetCompatibleRailTypes());
@@ -1862,7 +1862,7 @@ public:
 			return false;
 		};
 		TrackdirBits tdb;
-		tdb = GetTileTrackdirBits(st, ::TransportType::TRANSPORT_RAIL, 0);
+		tdb = GetTileTrackdirBits(st, ::TransportType::Rail, 0);
 		{
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
@@ -1893,7 +1893,7 @@ public:
 		 * 车库守卫拒掉）时同样回落，保证该分支与改动前逐字一致。 */
 		const TileIndex first_tile = pPrev->GetTile();
 		const Trackdir yapf_first_td = pPrev->GetTrackdir();
-		const TrackdirBits first_tdb = GetTileTrackdirBits(first_tile, ::TransportType::TRANSPORT_RAIL, 0);
+		const TrackdirBits first_tdb = GetTileTrackdirBits(first_tile, ::TransportType::Rail, 0);
 		const bool first_td_on_tile = (yapf_first_td != INVALID_TRACKDIR) && HasBit(first_tdb, yapf_first_td);
 		const bool yapf_first_ok = (r3r_hops > 1) && first_td_on_tile &&
 				(first_tile != st) && reach(first_tile, yapf_first_td, 0);
@@ -1936,7 +1936,7 @@ public:
 					if (depth <= 15) {
 						FILE *dbg = R3RFopenDbg("a");
 						if (dbg != nullptr) {
-							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0)));
+							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::Rail, 0)));
 							fclose(dbg);
 						}
 					}
@@ -1966,7 +1966,7 @@ public:
 					if (IsRailDepotTile(cur) && cur != st) return false;
 					/* R3R (第 333 轮): 同 reach()，Follow 之前自证 (cur, cur_td) 同格。 */
 					if (cur_td == INVALID_TRACKDIR ||
-							!HasBit(GetTileTrackdirBits(cur, ::TransportType::TRANSPORT_RAIL, 0), cur_td)) {
+							!HasBit(GetTileTrackdirBits(cur, ::TransportType::Rail, 0), cur_td)) {
 						return false;
 					}
 					TrackFollower f3(v, Yapf().GetCompatibleRailTypes());

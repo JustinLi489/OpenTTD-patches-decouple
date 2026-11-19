@@ -450,9 +450,12 @@ static bool CheckCommandsMatch(std::string_view a, std::string_view b, std::stri
 	}
 
 	/* if we reach here, all non consumer commands match up.
-	 * Check if the non consumer commands match up also. */
+	 * Check if the non consumer commands match up also.
+	 * Both sides must be normalised: the template side always was, but the language
+	 * side was compared as parsed, so a translation which correctly repeated the
+	 * template command (e.g. {RAW_STRING} in both files) was reported as a mismatch. */
 	for (size_t i = 0; i < templ.consuming_commands.max_size(); i++) {
-		if (TranslateCmdForCompare(templ.consuming_commands[i]) != lang.consuming_commands[i]) {
+		if (TranslateCmdForCompare(templ.consuming_commands[i]) != TranslateCmdForCompare(lang.consuming_commands[i])) {
 			StrgenWarning("{}: Param idx #{} '{}' doesn't match with template command '{}'", name, i,
 				lang.consuming_commands[i]  == nullptr ? "<empty>" : TranslateCmdForCompare(lang.consuming_commands[i])->cmd,
 				templ.consuming_commands[i] == nullptr ? "<empty>" : templ.consuming_commands[i]->cmd);

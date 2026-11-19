@@ -422,11 +422,11 @@ static void Ptrs_R3SG()
 }
 
 extern const ChunkHandler couple_group_chunk_handlers[] = {
-	{ 'CGPP', Save_CGPP, Load_CGPP, nullptr, nullptr, CH_TABLE },          // Couple Group Pool chunk
-	{ 'CGVR', Save_CGVR, Load_CGVR, nullptr, nullptr, CH_SPARSE_TABLE },   // Couple Group Vehicle mapping chunk
-	{ 'R3VP', Save_R3VP, Load_R3VP, Ptrs_R3VP, nullptr, CH_SPARSE_TABLE }, // R3R parked schedule / segment bookkeeping chunk
-	{ 'R3SG', Save_R3SG, Load_R3SG, Ptrs_R3SG, nullptr, CH_SPARSE_TABLE }, // R3R segment identity table chunk
-	{ 'R3DS', Save_R3DS, Load_R3DS, nullptr, nullptr, CH_SPARSE_TABLE },   // R3R decouple seam / orphan age chunk
+	{ 'CGPP', Save_CGPP, Load_CGPP, nullptr, nullptr, ChunkType::Table },          // Couple Group Pool chunk
+	{ 'CGVR', Save_CGVR, Load_CGVR, nullptr, nullptr, ChunkType::SparseTable },   // Couple Group Vehicle mapping chunk
+	{ 'R3VP', Save_R3VP, Load_R3VP, Ptrs_R3VP, nullptr, ChunkType::SparseTable }, // R3R parked schedule / segment bookkeeping chunk
+	{ 'R3SG', Save_R3SG, Load_R3SG, Ptrs_R3SG, nullptr, ChunkType::SparseTable }, // R3R segment identity table chunk
+	{ 'R3DS', Save_R3DS, Load_R3DS, nullptr, nullptr, ChunkType::SparseTable },   // R3R decouple seam / orphan age chunk
 };
 
 extern const ChunkHandlerTable _couple_group_chunk_handlers(couple_group_chunk_handlers);
