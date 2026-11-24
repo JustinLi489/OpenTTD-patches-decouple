@@ -25825,3 +25825,82 @@ weight，`power_override` 同理，两者独立；ref 用 `R3RConsistReferenceEn
 - **待复测判据**：①读旧 R3R 档（如 `T8701-2_4.sav`）后全图铁轨/道路（含 tram）保持原类型，不再回落购买菜单第一项 ②`build\R3R_debug.log` 出现 `R3R-VER-REMAP upstream 368 -> 366`，且紧随 `R3R-LABEL-REV kind=rail ... legacy=1 ver=366` 与 `kind=road ... legacy=1 ver=366` ③`-d sl=1` 下出现两行 remap（`368 to 370` 与 `368 to 366`）④新存一档再读回：`R3R-VER-NOREMAP` 且 `legacy=0`，轨型不变 ⑤负判据：上游 JGRPP 档（无 EXT 位）可读、轨型正确、无 remap 行 ⑥负判据：不出现 `R3R-VER-NOREMAP upstream=368 legacy_flag=0`（出现即标志又被清）。
 - **未确认**：U-1 若判据 ② 成立但轨型仍回落，则问题在**写入侧**（`RAIL`/`ROTT` 保存路径），届时转查 `labelmaps_sl.cpp` 的 `Save()` 与 `SLE_VAR(LABEL)` 写入字节序；U-2 KI-666 的「购买列表默认选中原轨型」从未实测，本轮一并复测。
 
+## 第 501 轮（2026-11-24）挂接寻路：S2「锚定站台排」落地
+
+> 编号说明：本清单自 KI-668 之后未再追加条目，但 `R3R_couple_pf_static_target_round497_memo.md` 第 491 轮起已使用 **KI-676** 指代「平行站台/到发线误接受」，本轮沿用该编号以保持备忘可追溯；KI-669..675 未登记（缺口照实记录，不补编号）。
+
+### KI-676 挂接终点判定不含"排号"⇒ YAPF 把平行到发线判为到达（第 491 轮提出，第 501 轮二次修法）
+
+- **描述**：车底实停 `y=1874` 那条到发线（占 `1424..1437,1874`），挂接寻路却把同 x 的平行轨 `1424,1875` / `1424,1876` 判成"到达"，于是 `best` 与预留全铺到平行线上，机车永远追不上耦合端（第 491 轮现场 `CPL-BEST`；第 475 轮的「钉单格」修法又引入 `TrackFollower` 跳站台 `endhit=0` 死锁，已回退）。
+- **来源**：第 491 轮现场日志 + `R3R_couple_pf_static_target_round497_memo.md` §十七（含 S1/S2/S4 方案比较与 §17.9 玩家拍板）。
+- **状态**：**已修（第 501 轮 S2，已编译；游戏内复测待做）**。
+- **严重度**：高（挂接永久失败 + 预留铺到错误到发线，占用别人的线路）。
+- **根因（结构性）**：`CYapfDestinationTrainRailT::PfDetectDestination()` 的接受集合 = 「全站能扫出等待车底的站台格」，`IsCompatibleTrainStationTile()` 只保证 同站 / 同轴 / 同类型 / 同轨型，**不含排号（同一排到发线）** ⇒ 只要平行排上也有兼容格且能扫到同一列车，就一律接受。而第 497 轮复核确认：回退到 `aeb31dedda` 后，第 470~499 轮的快照字段（`r3r_dest_end_tile` 等）已不存在，原「快照单格」路线前提失效。
+- **修法（S2，玩家拍板口径；仅 `src\pathfinder\yapf\yapf_destrail.hpp` 一个文件，无新字段、无存档影响）**：
+  1. 新增 `static bool R3RSameParkingLine(TileIndex tile, const Train *t)`（`:412-428`）：同站（`GetStationIndex` 相等）+ 同站台轴（`GetRailStationAxis` 相等）+ 轴 `Axis::X` 时 `TileY` 相等 / 轴 `Axis::Y` 时 `TileX` 相等。任一格非站台格（depot 格、站台外连接轨）⇒ 返回 `true`（放行），故只收紧站台挂接。
+  2. 闸门插在 `R3RIsCoupleTarget()` 通过之后、两处 accept 之前（`:669-688`）：`if (!dest_order.GetCoupleIsDepot() && !R3RSameParkingLine(tile, t)) { r3r_dest_reject(4, tile, t); return false; }`。**depot 挂接整段跳过**（玩家 Q-501-2：depot 一律不动、继续走扫描分支）。
+  3. 统计：`_r3r_cpl_scan_rej[4]`（=LINE）新增并纳入 `Reset`；`CPL-SCAN` 改为 `rej=%u/%u/%u/%u/%u`。`r3r_dest_reject` 的 `names[5]` 加 `"PFD-REJ-LINE"`（节流 1/64）；`_r3r_cpl_scan_last_why` 把 LINE（内部 4）**映射为 7**、`why_names[8]` 加 `"LINE"`，**保持 4/5/6 = acc-car/acc-wait/cut-wp 的旧日志口径不变**。
+  4. 不钉单格的理由（已在代码注释写明）：`TrackFollower` 进站台格一步跳到末端（`tiles_skipped = length-1`），钉单格必然复现第 475 轮 `endhit=0` 死锁；接受集合保持整排即可消除异排接受。代价（玩家已接受）：该排不可达时表现为 `found=0`（挂接失败），而不是错铺。
+- **构建自证（内测树，探针 ON）**：入口=**删 obj 后直接 ninja**（`yapf_destrail.hpp` 全库只被 `yapf_rail.cpp:16` 包含 ⇒ 1 TU + 链接，未新建任何 `.cmd`、未跑全量护栏）。删除 `build\CMakeFiles\openttd_lib.dir\src\pathfinder\yapf\yapf_rail.cpp.obj`；命令 `cmd /c 'call "D:\VISUAL STUDIO\MAIN PACK\VC\Auxiliary\Build\vcvars64.bat" >nul && "D:\gcc new\mingw64\bin\ninja.exe" -C build openttd.exe > build\R3R_inc501.log 2>&1'`；结果 `[2/3] Building CXX object ...yapf_rail.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`，无 error/warning C。时间戳链：`yapf_destrail.hpp` 15:41:06 → `yapf_rail.cpp.obj` 15:41:37（9 895 868 B）→ `build\openttd.exe` 2026-11-24 15:42:29（54 364 672 B）。`read_lints` 0 条；`findstr /m /c:"PFD-REJ-LINE" build\openttd.exe` 命中。首次构建的错误已修：`yapf_destrail.hpp(427): error C2065/C3861 "AXIS_X"` —— 本项目 `Axis` 是 `enum class`，只有 `Axis::X`/`Axis::Y`，无 `AXIS_X`。发布树 `build-release` 未编。
+- **待复测判据**：①车底在 `y=1874` 时不再接受 `1424,1875/1876`，`CPL-SCAN` 的 `rej` 第 5 位（LINE）非 0，必要时可见 `PFD-REJ-LINE` ②该排不可达时应为 `found=0` + `why=LINE` 且机车不卡死 ③depot 挂接无 `PFD-REJ-LINE`、行为逐字不变 ④正常同排挂接 `COUPLE-OK` 不减少、`acc=car/wait` 同量级 ⑤负判据：车底链头停在站台外连接轨（非站台格）时放行，不得因 LINE 导致 `found=0`。
+- **未确认**：U-1 判据取 `t->tile`（车底链头格），跨排停放的极端场景未实测；U-2 同一 y 上拼两块同向站台时本判据视为同排而放行（一般由不可通行间隔兜住），若误接受再补同站台块判定；U-3 §17.6 的 S4（`rp()` 平台整格补订）未做，预留仍可能铺得比需要更宽，但已不会铺到异排。
+
+## 第 502 轮（2026-11-24）挂接寻路：S2b 静态快照 + S2c 启发同源 + S4 端点静态化
+
+> 玩家指令原文：「按 S2b → S2c → S4 顺序做吧」。本轮只在 `src\pathfinder\yapf\yapf_destrail.hpp` 与 `src\pathfinder\yapf\yapf_rail.cpp` 两个文件内做，未新增结构体/字段、未碰存档、未改任何函数签名；`build-release` 未编（按既定口径，发布版只在明确要求时编）。详细取证与逐条判断见工作区 `R3R_couple_pf_static_target_round502_memo.md`。
+
+### KI-676（续）S2b 快照 + S2c 启发同源 —— 终点判定从"每节点扫世界"降为 O(1)
+
+- **状态**：**已实现 + 已编译（第 502 轮）；游戏内复测待做**。严重度仍为高（原症状=挂接永不成立/铺错到发线）。
+- **S2b（判据静态化）**：`CYapfDestinationTrainRailT` 新增只读快照 `snap_valid / snap_veh / snap_tile / snap_stn / snap_axis / snap_row / snap_car_only / snap_rej`，由 `R3RTakeStaticTargetSnapshot(v)` 在 `SetDestination()` 里**一次**算出（站 + 轴 + 排号 + 四道闸门的评估结果）；`PfDetectDestination(TileIndex, Trackdir)` 走新增的静态分支：`R3RStaticTargetValid()`（ID 有效、仍是 `OT_WAIT_COUPLE` 主车、`t->tile == snap_tile`）→ `R3RStaticIsSameLine(tile)`（同站 + 同轴 + 同排号）→ `snap_rej` 直读，打印 `PFD-STATIC kind=... stn=... row=...`。原动态扫描链（`GetTrainForReservation` 反查主人 + 站台横向扫描 + `R3RSameParkingLine` + 四道闸门）**原样保留**作为快照失效时的回退，故无行为回归面。
+- **S2c（启发同源）**：快照成立时 `this->dest_tile = snap_tile`（伙伴车底链头格），不再用 `v->dest_tile`（`CalcClosestStationTile` 的近似落点，可能落在同站别的排）。A* 的 estimate 与 accept 从此共用同一锚点；快照失效时 `dest_tile` 逐字保持旧值。
+- **设计取舍（已论证）**：快照**不查 reservation**，直接信配对锁（`r3r_couple_target`）。理由：反查预留主人会被"机车自己铺过去的预留"命中（KI-432 的成因），而配对锁本身已由 `R3RCouplePairMatches()` 校验；这也省掉"自己盖住站台格"的特判。粒度保持**一排**而非单格（`TrackFollower` 进站台一步跳末端，钉单格必然复现第 475 轮 `endhit=0` 死锁）。
+
+### KI-677 S4：端点解析静态化（`tg` 不再从 `pPrev` / 预留主人反推）
+
+- **状态**：**已实现 + 已编译（第 502 轮）；游戏内复测待做**。严重度：中（性能 + 结构复杂度；无既有症状）。
+- **改动 1（暴露 O(1) 出口）**：`yapf_destrail.hpp` 新增三个 public 访问器 `R3RStaticTargetVehicle()` / `R3RStaticTargetTile()` / `R3RStaticTargetFarTile()`（后者取车底链尾格，供"取近端"只比两个已知格）。
+- **改动 2（`yapf_rail.cpp` 回溯阶段）**：`TileIndex consist_head_tile` 的解析前面插入静态分支（`:1666` 起）：快照命中 ⇒ 只用 `VehiclesOnTile(pNode->GetLastTile())` 判断 `best_on_consist`（比较 `tr->First()->index == snap_veh`），然后 `best_on_consist ? pNode->GetLastTile() : (近端) snap_far : snap_tile`，日志 `CPL-HEAD-STATIC veh= best= snap= farvalid= head= on=`。静态命中时**整块不动执行**下面那套动态解析（`GetTrainForReservation` → 排除自己（KI-432）→ 扫别的链 → 曼哈顿选近端（KI-200））。
+- **tg 的落点**：`TileIndex tg = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pPrev->GetLastTile();`（`:1857`）未改，静态命中后它自然取快照值 ⇒ 满足"tg 用快照终点替换 pPrev 推导"。
+- **本轮刻意不删的三条补丁（判断已给出，等玩家拍板如需物理删除再做）**：
+  1. `:780-790` 的 `last_safe` 扫描跳过站台格：它服务的对象是 `steps`（`rp()` 摸出的路径格序列）里含站台跳格，与 `tg` 来源无关；删掉会让"最后一个安全位"落到站台格，中段截断回归（第 569/REG-399 家族）。
+  2. `:900-910`（站台段不算等待位 + 终点例外）：同上，`rp_impl` 仍会走到站台格与 `tg`，跳格分支 `R3RSkippedStationStretchContains()` 仍必须存在。
+  3. `:1796-1812` 的两遍法（先摸后订）：治的是 `TryReservePath` 根节点零次循环与 KI-504"边摸边订被自己挡住"，与终点动态无关。
+  ⇒ 真正"因终点动态而生"的只有回溯阶段那一套端点解析，本轮已让静态路径完全不执行它；动态路径保留作回退。
+
+- **构建自证（内测树，探针 ON）**：入口=删 obj 后直接 ninja（`yapf_destrail.hpp` 全库仅被 `yapf_rail.cpp:16` 包含 ⇒ 1 TU + 链接；未新建任何 `.cmd`、未跑全量护栏）。命令 `cmd /c 'call "D:\VISUAL STUDIO\MAIN PACK\VC\Auxiliary\Build\vcvars64.bat" >nul && "D:\gcc new\mingw64\bin\ninja.exe" -C build openttd.exe > build\R3R_inc502.log 2>&1'`，每轮前 `Remove-Item` 掉 `build\CMakeFiles\openttd_lib.dir\src\pathfinder\yapf\yapf_rail.cpp.obj`。三次结果均 `[2/3] Building CXX ...yapf_rail.cpp.obj` → `[3/3] Linking CXX executable openttd.exe`，`error C|fatal error|FAILED:|build stopped` 计数 **0**；最终 `build\openttd.exe` 2026-11-24 16:09:46。`read_lints` 两文件 0 条。首次构建的 2 条错误已修：`yapf_destrail.hpp(381)/(408): error C3861/C2065 "INVALID_STATION"` —— 本 TU 未引入该宏且 `StationID` 是强类型，改用 `StationID::Invalid()`。
+- **待复测判据**：①正常同排挂接出现 `CPL-HEAD-STATIC ... on=0|1` 且紧接 `COUPLE-OK` ②`CPL-SCAN` 的 `expanded`（closed+enter）较第 501 轮明显下降（S2c 的直接收益）③车底在 `y=1874` 时仍不接受 `1424,1875/1876`（`PFD-STATIC` 与 `PFD-REJ-LINE` 二选一出现，`rej` 第 5 位非 0）④快照失效场景（无配对锁 / 车底移走 / depot 挂接）走回退：日志仍为旧 `CPL-HEAD`，行为逐字不变 ⑤负判据：`best` 落在车底自己占着的格时 `on=1` 且 `head == best`（KI-200 不回归）⑥机车预留不得铺到车底另一侧（`CPL-TRACE/RP` 序列长度不增加）。
+- **未确认**：U-1 S2c 把 `dest_tile` 指向车底格后，estimate 的 admissible 性只做了"octile 对固定目标点满足三角不等式"的静态论证，未在异排场景实测展开数；U-2 快照只在 `SetDestination()` 取一次，寻路期间车底若被移走/被挂走，`R3RStaticTargetValid()` 的 `t->tile == snap_tile` 会失败而回退动态，但**同一次搜索内**不做二次快照（预期：本次搜索作废，下一 tick 重来）；U-3 `R3RStaticTargetFarTile()` 对"车底恰在掉头/多格跨越"的极端形态未实测；U-4 S4 未把 `res_target_tile`/`SetReservationTarget` 也改成读快照（它们已由 `consist_head_tile` 驱动，等价）。
+
+## 第 503 轮（2026-11-24）挂接预留：道口/桥隧 partner-air 补齐 + `TryReservePath` 三参拆分
+
+> 玩家在 `R3R_couple_full_commit_reservation_20261124_memo.md` 的逐条拍板原文：
+> R1「把道口，桥隧纳入air即可」／R2「这算是一个需要搁置的内容」／R3「同R2搁置，我暂时想不到问题」／
+> R4「这是另外一个搁置的"配对锁解除的判据收紧"干的事情」／C2「你为什么会改原生的东西啊」／
+> C3「按你推荐的来」／C4「按你推荐的来」，随后「好，开工吧」。
+> 本轮只做清单 1~3（全 `.cpp`，走增量）；清单 4（`Couple()` 合并提交点释放接触格）随 R3 不做；
+> `build-release` 未编（发布版只在明确要求时编）。轮次口径更正见备忘 §五 开头（备忘名沿用第 496 轮的日期编号）。
+
+### KI-678（第 503 轮）道口 / 铁路隧道桥的预留对**挂接伙伴**视为空气（R1 落地）
+
+- **状态**：**已实现 + 已编译（第 503 轮）；游戏内复测待做**。严重度：中（挂接路径被伙伴自己的道口/桥隧预留挡住 ⇒ 等不到也过不去）。
+- **背景**：第 345 轮起 `R3RReservationHeldByCouplePartner()` 已覆盖 plain rail 与站台整格，但那两个分支的豁免只写在 `IsWaitingPositionFree()`（读侧）与 `TryReserveRailTrack()` 的 plain rail/station 分支（写侧）；道口与隧道桥两个 case 在写侧仍是「`!HasCrossingReservation` / `!HasTunnelReservation` 才订，否则 `break` → `return false`」⇒ 伙伴订着就必然失败。
+- **改动 1（读侧，`src\pbs.cpp`）**：`R3RReservationHeldByCouplePartner()` 的 `switch` 补两个 case —— `TileType::Road`：`IsLevelCrossing(tile) && HasCrossingReservation(tile)`；`TileType::TunnelBridge`：`GetTunnelBridgeTransportType(tile) == TransportType::Rail && HasAcrossTunnelBridgeReservation(tile)`。两者的 owner 都靠 `GetFirstVehicleOnTile(tile, VehicleType::Train)` 推断后比 `->First() == partner`（这两种预留只有布尔位、无 owner 字段）。
+- **改动 2（写侧，`src\pbs.cpp` 的 `TryReserveRailTrack()`）**：`case TileType::Road` 的 `if (IsLevelCrossing && !HasCrossingReservation)` 展开成两层判断，伙伴订着时走 partner-air ⇒ 打 `RESV-PAIR-AIR ... kind=crossing` + `return true`；`case TileType::TunnelBridge` 在隧道头/桥头两次订位尝试之后追加同一豁免 ⇒ `kind=tunnelbridge`。与 plain rail/station 分支完全同构：**不写地图**（R2 搁置：归属仍归伙伴，合链后由其自行释放）。
+- **刻意保留的保守边界**：隧道内部格上无车 ⇒ owner 推不出 ⇒ 判非伙伴 ⇒ 仍冲突，挂接等在隧道口。**宁可等，不撞。**
+- **刻意没做**：`R3RReservationHeldBySelf()`（第 368 轮 REG-359-L 自豁免）未往这两个分支加，避免顺手扩大范围；若复测出现"自己订着的道口挡住自己"，另立条目。
+- **未确认**：U-1 `TryReserveRailBridgeHead()` 对桥中间格与桥头格的判定差异未取数，`HasAcrossTunnelBridgeReservation()` 在桥中格上是否等价未证；U-2 伙伴车恰好停在道口**相邻格**（`adjacent_crossings` 打开时整排检查）时，我方的道口预订仍会因 `IsCrossingOccupiedByRoadVehicle` 之外的伙伴占位被拒 —— 本轮未取数。
+
+### KI-679（第 503 轮）`TryReservePath()` 的 `unsafe_pos` 单布尔拆成三个显式参数
+
+- **状态**：**已实现 + 已编译（第 503 轮）；游戏内复测待做**。严重度：中（`CPL-RESERVE reserved=1` 空心成功 = KI-243 附记事实 7 的根源）。
+- **背景**：`unsafe_pos` 一个布尔同时管三件事（跳过终点检查 / 失败不回滚 / 不写答案本），挂接路径为绕过伙伴终点只能传 `true` ⇒ 整段预订变成"格级失败不回滚"，于是 `reserved=1` 可能一格都没真正置位。
+- **改动（`src\pathfinder\yapf\yapf_rail.cpp`）**：签名改为
+  `bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool atomic = true, bool check_target_free = true, bool record_answer = true)`，
+  旧用法逐项映射：`!unsafe_pos` → `check_target_free`（`:1058` 的 `IsWaitingPositionFree`）、→ `record_answer`（`:1107` 答案本）、→ `atomic`（`:1133` 的 `res_fail_tile` 回滚）；日志字段名保留 `unsafe=` 不动、值改为 `(int)!atomic`（`:1126`），避免破坏下游解析。
+- **唯一行为变更点**：挂接摸路的调用点（`:2113-2114`）由 `unsafe_pos=true` 改为 `atomic=true, check_target_free=true, record_answer=false` ⇒ 终点判据与写侧一致（靠 KI-678 的 partner-air 放行）、格级失败整段回滚、答案本仍不参与（挂接有自己的两遍法摸路）。
+- **对价（玩家已接受）**：`atomic=true` 让"只能订一半"变成"一格不订" ⇒ 表现为预留预览从"半条路"变成"没有"，可能多等几 tick。这就是 R4 抖动问题，玩家明确归入"配对锁解除的判据收紧"那一轮处理。
+- **有意为之**：原生 `ExtendTrainReservation()` **一行不动**（玩家原话「你为什么会改原生的东西啊」）。原生本就是逐格推进、失败即 `break` 且已订格不撤 —— 那正是"对齐普通列车"的形态，而且 `r3r_couple_stuck_retry`（`src\train_cmd.cpp:18409-18410`）依赖它，动它会复活 KI-484 死锁。原子性因此只作用于 YAPF 段。
+- **构建自证（内测树，探针 ON）**：入口 `R3R_fullbuild.cmd inc detach`（复用既有入口，未新建任何 `.cmd`）；护栏 `GUARD: incremental is safe`；三次增量分别覆盖「读侧 + 三参拆分」「注释轮次修正」「写侧 Road/TunnelBridge」；最终 `build\R3R_incbuild.log` = `[2/3] Building CXX ...\pbs.cpp.obj` → `[3/3] Linking CXX executable openttd.exe` → `MODE=inc EXIT_CODE=0`（17:01:18），错误计数 0，`build\openttd.exe` 17:01:14；`read_lints` 两文件 0 条；`findstr` 在 exe 命中 `RESV-PAIR-AIR` / `kind=crossing` / `kind=tunnelbridge`。**坑记一笔**：三版 exe 大小恒为 54 364 672 B 一位不变（PE 对齐填充吸收），判"是否真链接"只看 `[n/n] Linking` + exe mtime + 字面量命中，不能看大小。
+- **待复测判据 6 条**（同备忘 §5.4）：①伙伴订着的道口不再 `CPL-RES-FAIL` ②伙伴订着的隧道桥头同上，隧道内部格仍失败但整段回滚 ③负判据：第三方订着仍失败 ④`CPL-RESERVE reserved=1` 必伴随 `nOK>0` ⑤`RPFAIL` 的 `unsafe=` 在挂接路径恒 0 ⑥挂接成功率不下降（可多等几 tick 但终须 `COUPLE-OK`）。
+

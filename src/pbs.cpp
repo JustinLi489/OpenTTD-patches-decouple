@@ -483,8 +483,18 @@ static bool R3RReservationHeldBySelf(TileIndex tile, Track track);
  *    its head carries an OT_GOTO_COUPLE order;
  *  - only a live two-sided pair counts (R3RGetCouplePairPartner), so a stale or
  *    one-sided lock changes nothing;
- *  - only plain rail and station/waypoint rails are inspected; depot, level
- *    crossing, tunnel and bridge reservations are left alone.
+ *  - plain rail, station/waypoint, level crossing and rail tunnel/bridge
+ *    reservations are inspected; depot reservations are left alone (a depot tile
+ *    holds at most one train, so it can never be contested by the partner).
+ *
+ * R3R (第 503 轮): the tile-type list was widened on the player's instruction
+ * ("把道口，桥隧纳入air即可"). Those two store their reservation as a bare boolean
+ * (SetCrossingReservation / SetAcrossTunnelBridgeReservation) with no owner recorded
+ * anywhere, so the owner can only be *inferred*: a train standing on the tile owns
+ * it. That inference is exact for a level crossing (a train can stand on it) and for
+ * a tunnel/bridge head, but it cannot resolve a tunnel's interior tiles -- no vehicle
+ * is ever there. Interior tiles therefore stay a conflict on purpose: the couple path
+ * waits at the tunnel mouth instead of driving in. Wait, don't crash.
  *
  * @param tile the tile whose reservation is being contested
  * @return true when every reservation on the tile belongs to our pair partner
@@ -519,6 +529,28 @@ static bool R3RReservationHeldByCouplePartner(TileIndex tile)
 			if (!HasStationRail(tile) || !HasStationReservation(tile)) return false;
 			const Train *const owner = GetTrainForWholeTileReservation(tile);
 			return owner != nullptr && owner->First() == partner;
+		}
+
+		case TileType::Road: {
+			/* Level crossing: whole-tile boolean, no owner field. A train standing on
+			 * the crossing is the only train that can have booked it (the crossing is
+			 * reserved by the train that is on/entering it), so "the tile's train is our
+			 * partner" is the tightest answer available. */
+			if (!IsLevelCrossing(tile) || !HasCrossingReservation(tile)) return false;
+			const Vehicle *const v = GetFirstVehicleOnTile(tile, VehicleType::Train);
+			return v != nullptr && static_cast<const Train *>(v)->First() == partner;
+		}
+
+		case TileType::TunnelBridge: {
+			/* Rail tunnel / bridge: HasAcrossTunnelBridgeReservation() is a boolean as
+			 * well (tunnel: HasTunnelReservation, bridge: reserved trackdir bits). Same
+			 * inference, same deliberate blind spot: an interior tunnel tile never
+			 * carries a vehicle, so the owner cannot be resolved there and this returns
+			 * false -- the tile stays a conflict and the couple path waits outside. */
+			if (GetTunnelBridgeTransportType(tile) != TransportType::Rail) return false;
+			if (!HasAcrossTunnelBridgeReservation(tile)) return false;
+			const Vehicle *const v = GetFirstVehicleOnTile(tile, VehicleType::Train);
+			return v != nullptr && static_cast<const Train *>(v)->First() == partner;
 		}
 
 		default:
@@ -579,23 +611,34 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 			break;
 
 		case TileType::Road:
-			if (IsLevelCrossing(tile) && !HasCrossingReservation(tile)) {
-				if (_settings_game.vehicle.safer_crossings) {
-					if (IsCrossingOccupiedByRoadVehicle(tile)) return false;
-					if (_settings_game.vehicle.adjacent_crossings) {
-						const Axis axis = GetCrossingRoadAxis(tile);
-						for (TileIndex t = tile; t < Map::Size() && IsLevelCrossingTile(t) && GetCrossingRoadAxis(t) == axis; t = TileAddByDiagDir(t, AxisToDiagDir(GetCrossingRoadAxis(t)))) {
-							if (IsCrossingOccupiedByRoadVehicle(t)) return false;
-						}
-						for (TileIndex t = tile; t < Map::Size() && IsLevelCrossingTile(t) && GetCrossingRoadAxis(t) == axis; t = TileAddByDiagDir(t, ReverseDiagDir(AxisToDiagDir(GetCrossingRoadAxis(t))))) {
-							if (IsCrossingOccupiedByRoadVehicle(t)) return false;
+			if (IsLevelCrossing(tile)) {
+				if (!HasCrossingReservation(tile)) {
+					if (_settings_game.vehicle.safer_crossings) {
+						if (IsCrossingOccupiedByRoadVehicle(tile)) return false;
+						if (_settings_game.vehicle.adjacent_crossings) {
+							const Axis axis = GetCrossingRoadAxis(tile);
+							for (TileIndex t = tile; t < Map::Size() && IsLevelCrossingTile(t) && GetCrossingRoadAxis(t) == axis; t = TileAddByDiagDir(t, AxisToDiagDir(GetCrossingRoadAxis(t)))) {
+								if (IsCrossingOccupiedByRoadVehicle(t)) return false;
+							}
+							for (TileIndex t = tile; t < Map::Size() && IsLevelCrossingTile(t) && GetCrossingRoadAxis(t) == axis; t = TileAddByDiagDir(t, ReverseDiagDir(AxisToDiagDir(GetCrossingRoadAxis(t))))) {
+								if (IsCrossingOccupiedByRoadVehicle(t)) return false;
+							}
 						}
 					}
+					SetCrossingReservation(tile, true);
+					UpdateLevelCrossing(tile, false);
+					if (_settings_client.gui.show_track_reservation) MarkTileGroundDirtyByTile(tile, VMDF_NOT_MAP_MODE);
+					return true;
 				}
-				SetCrossingReservation(tile, true);
-				UpdateLevelCrossing(tile, false);
-				if (_settings_client.gui.show_track_reservation) MarkTileGroundDirtyByTile(tile, VMDF_NOT_MAP_MODE);
-				return true;
+				/* R3R (第 503 轮): the crossing is already booked by our pair partner.
+				 * Same rule as the plain rail / station branches above: air for us, and
+				 * nothing is written -- the partner keeps the bit and releases it once the
+				 * two chains are joined (R2/R3 deliberately deferred). */
+				if (R3RReservationHeldByCouplePartner(tile)) {
+					R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=crossing\n",
+							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
+					return true;
+				}
 			}
 			break;
 
@@ -635,6 +678,15 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 				}
 				if (IsBridge(tile) && TryReserveRailBridgeHead(tile, track)) {
 					MarkBridgeOrTunnelDirtyOnReservationChange(tile, VMDF_NOT_MAP_MODE);
+					return true;
+				}
+				/* R3R (第 503 轮): already booked by our pair partner -- air for us.
+				 * The owner inference behind R3RReservationHeldByCouplePartner() only
+				 * resolves tiles that carry a train, so a tunnel's interior tiles stay a
+				 * conflict and the couple path waits at the mouth (conservative). */
+				if (R3RReservationHeldByCouplePartner(tile)) {
+					R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=tunnelbridge\n",
+							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
 					return true;
 				}
 			}
@@ -2825,8 +2877,17 @@ bool IsWaitingPositionFree(const Train *v, TileIndex tile, Trackdir trackdir, bo
 	Track     track = TrackdirToTrack(trackdir);
 	TrackBits reserved = GetReservedTrackbits(tile);
 
-	/* Tile reserved? Can never be a free waiting position. */
-	if (TrackOverlapsTracks(reserved, track)) return false;
+	/* Tile reserved? Can never be a free waiting position.
+	 *
+	 * R3R (第 503 轮): unless the reservation is our locked couple partner's -- the
+	 * couple path has to be able to *end* on the partner's tile, because that tile is
+	 * exactly where the two halves get joined; the partner releases those bits itself
+	 * right after the merge (TryReserveRailTrack() has honoured the same exemption
+	 * since 第 345 轮, but the ending test never did, which is what forced the couple
+	 * pathfinder to bypass it with unsafe_pos=true). Same narrow gate as the write
+	 * side: the booking vehicle must be a GOTO_COUPLE head with a live two-sided pair,
+	 * and the tile's reservation must actually resolve to that partner. */
+	if (TrackOverlapsTracks(reserved, track) && !R3RReservationHeldByCouplePartner(tile)) return false;
 
 	/* Not reserved and depot or not a pbs signal -> free. */
 	if (IsRailDepotTile(tile)) return true;

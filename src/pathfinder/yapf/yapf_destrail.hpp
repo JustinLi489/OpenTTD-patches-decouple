@@ -37,12 +37,14 @@ inline uint32_t _r3r_cpl_scan_noplat = 0;    ///< 早退：不是站台/车库�
 inline uint32_t _r3r_cpl_scan_nores = 0;     ///< 早退：站台格但没有预留位且非站台分支
 inline uint32_t _r3r_cpl_scan_noconsist = 0; ///< 早退：格合格但格上扫不出合法车底
 inline uint32_t _r3r_cpl_scan_consist = 0;   ///< 扫到车底，进入三道闸门
-inline uint32_t _r3r_cpl_scan_rej[4] = { 0, 0, 0, 0 }; ///< GROUP / FIT / TARGET / ORDER
+inline uint32_t _r3r_cpl_scan_rej[5] = { 0, 0, 0, 0, 0 }; ///< GROUP / FIT / TARGET / ORDER / LINE
 inline uint32_t _r3r_cpl_scan_acc[2] = { 0, 0 };       ///< car-only / waiting
 inline uint32_t _r3r_cpl_scan_accwp = 0;      ///< R3R 第 276 轮：等待区路点被接受为终点（截断模式）
 inline uint32_t _r3r_cpl_scan_last_tile = 0;  ///< 最近扫到的车底所在格（TileIndex::base()）
 inline int _r3r_cpl_scan_last_veh = -1;       ///< 最近扫到的车底链头车号（-1=无）
-inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait / 6=cut-wp
+/* R3R（第 501 轮, S2）：新增 LINE 一类（rej[4]），为了不打乱旧日志的判读口径，
+ * 它在 last_why 里固定映射到 7（0..3 仍是原四类 rej，4/5/6 仍是 acc-car/acc-wait/cut-wp）。 */
+inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait / 6=cut-wp / 7=LINE
 /* R3R（第 330 轮取证，只读，KI-446）：noconsist 早退的格坐标 dump 配额。
  * noconsist 是"搜索走到了合格站台/车库格、但格上扫不出车底"，它的坐标集合就是
  * 搜索树的**落点分布**——用来判定第二次搜索到底有没有进入 y=15 那一行（27-G）。
@@ -59,7 +61,7 @@ inline void R3RCoupleScanReset()
 	_r3r_cpl_scan_nores = 0;
 	_r3r_cpl_scan_noconsist = 0;
 	_r3r_cpl_scan_consist = 0;
-	_r3r_cpl_scan_rej[0] = _r3r_cpl_scan_rej[1] = _r3r_cpl_scan_rej[2] = _r3r_cpl_scan_rej[3] = 0;
+	_r3r_cpl_scan_rej[0] = _r3r_cpl_scan_rej[1] = _r3r_cpl_scan_rej[2] = _r3r_cpl_scan_rej[3] = _r3r_cpl_scan_rej[4] = 0;
 	_r3r_cpl_scan_acc[0] = _r3r_cpl_scan_acc[1] = 0;
 	_r3r_cpl_scan_accwp = 0;
 	_r3r_cpl_scan_last_tile = 0;
@@ -76,21 +78,22 @@ inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit, uint 
 {
 	FILE *dbg = R3RFopenDbg("a");
 	if (dbg == nullptr) return;
-	static const char * const why_names[7] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait", "cut-wp" };
+	static const char * const why_names[8] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait", "cut-wp", "LINE" };
 	const bool has_last = (_r3r_cpl_scan_last_why >= 0);
-	const char *why = (has_last && _r3r_cpl_scan_last_why < 7) ? why_names[_r3r_cpl_scan_last_why] : "none";
+	const char *why = (has_last && _r3r_cpl_scan_last_why < 8) ? why_names[_r3r_cpl_scan_last_why] : "none";
 	/* R3R (第 255 轮, P0)：补 tick= 与 nodes=。tick 是同步 tick（30/s），有了它才能把
 	 * "一次挂接在 YAPF 里烧掉多少节点"与"挂车总耗时多久"直接相减；nodes = closed + enter
 	 * 是本次搜索真正走过的节点规模（enter 含 PfCalcEstimate 的重复访问，closed 只算扩展），
 	 * 二者一起才能回答"大地图上一次搜索是不是 O(地图)"。 */
 	fprintf(dbg, "CPL-SCAN tick=%u veh=%d found=%d closed=%u limit=%u nodes=%u enter=%u noplat=%u nores=%u noconsist=%u consist=%u "
-			"rej=%u/%u/%u/%u acc=%u/%u accwp=%u last=%d,%d lastveh=%d why=%s\n",
+			"rej=%u/%u/%u/%u/%u acc=%u/%u accwp=%u last=%d,%d lastveh=%d why=%s\n",
 			(unsigned)tick, veh, found, closed, limit, (unsigned)nodes,
 			(unsigned)_r3r_cpl_scan_enter, (unsigned)_r3r_cpl_scan_noplat,
 			(unsigned)_r3r_cpl_scan_nores, (unsigned)_r3r_cpl_scan_noconsist,
 			(unsigned)_r3r_cpl_scan_consist,
 			(unsigned)_r3r_cpl_scan_rej[0], (unsigned)_r3r_cpl_scan_rej[1],
 			(unsigned)_r3r_cpl_scan_rej[2], (unsigned)_r3r_cpl_scan_rej[3],
+			(unsigned)_r3r_cpl_scan_rej[4],
 			(unsigned)_r3r_cpl_scan_acc[0], (unsigned)_r3r_cpl_scan_acc[1],
 			(unsigned)_r3r_cpl_scan_accwp,
 			has_last ? (int)TileX(TileIndex(_r3r_cpl_scan_last_tile)) : -1,
@@ -363,12 +366,136 @@ protected:
 protected:
 	Order dest_order; ///< Copy of the locomotive's GOTO_COUPLE order (pxp-decouple reference).
 
+	/* R3R（第 502 轮, S2b, KI-676）：静态终点快照。
+	 *
+	 * 前提（玩家 2026-11-24 拍板）：挂接寻路的被动方是**静态等待**的 —— 只要配对锁
+	 * 建立并存在，主动方要去的那个"排"就是固定的。于是 SetDestination() 里算一次
+	 * 「车底停在哪一排 + 订单约束过不过」，之后每个节点只做 O(1) 比较，不再
+	 * 逐格扫站台、逐格反查预留、逐格重跑四次闸门。
+	 *
+	 * 快照失效（车底没了/被移走/订单变了/主动方配对锁改指）时 snap_valid 置假，
+	 * PfDetectDestination() 回落到原来的动态扫描链 —— 保证行为不回归。 */
+	bool snap_valid = false;                    ///< 快照可用（配对锁成立 + 车底在站台 + 订单约束已评估）
+	VehicleID snap_veh = VehicleID::Invalid();  ///< 车底链头
+	TileIndex snap_tile = INVALID_TILE;         ///< 车底链头所在格（复验用）
+	StationID snap_stn = StationID::Invalid();  ///< 车底所在车站
+	Axis snap_axis = Axis::X;                   ///< 车底所在站台轴
+	uint16_t snap_row = 0;                      ///< 排号：轴 X 时 = TileY，轴 Y 时 = TileX
+	bool snap_car_only = false;                 ///< 车底是纯车底链（accept kind=car-only）还是等待段
+	int snap_rej = -1;                          ///< -1=可接受；0..3 = GROUP/FIT/TARGET/ORDER
+
 public:
 	void SetDestination(const Train *v)
 	{
 		this->dest_order.AssignOrder(v->current_order);
 		this->CYapfDestinationRailBase::SetDestination(v);
 		this->dest_tile = (v->dest_tile == INVALID_TILE) ? TileIndex{} : v->dest_tile;
+		this->R3RTakeStaticTargetSnapshot(v);
+		/* R3R（第 502 轮, S2c, KI-676）：启发与接受同源。
+		 *
+		 * 快照成立时，A* 真正的目标不是"订单目的地附近随便哪一格"（v->dest_tile
+		 * 是 CalcClosestStationTile 的近似落点，可能落在同站别的排上），而是车底
+		 * 实际停着的这一格。把 dest_tile 钉到 snap_tile 后：
+		 *   ① 启发值对整排的估计更紧，展开数下降（S2b 已把接受判据收到同一排）；
+		 *   ② 与 S4 的"tg 用快照终点"共用同一个锚，不再有两套目标口径。
+		 * 快照失效时 dest_tile 保持订单目的地，行为与改动前逐字相同。 */
+		if (this->snap_valid) this->dest_tile = this->snap_tile;
+	}
+
+	/** R3R（第 502 轮, S2b）：在 SetDestination() 时一次性评估终点，见 snap_* 字段说明。
+	 *
+	 * 不查预留（reservation）：车底的身份与位置直接来自配对锁 r3r_couple_target，
+	 * 比"谁占着这一格"稳 —— 后者在机车自己的预留盖住站台格时还得特判（见
+	 * PfDetectDestination() 里那段 "the consist is never GOTO_COUPLE" 补丁）。 */
+	void R3RTakeStaticTargetSnapshot(const Train *v)
+	{
+		snap_valid = false;
+		snap_rej = -1;
+		snap_car_only = false;
+		snap_veh = VehicleID::Invalid();
+		snap_tile = INVALID_TILE;
+		snap_stn = StationID::Invalid();
+		snap_row = 0;
+
+		/* depot 挂接一律不动：继续走原来的扫描分支（玩家 Q-501-2 口径）。 */
+		if (dest_order.GetCoupleIsDepot()) return;
+
+		const Train *act = Train::From(v);
+		const Train *ch = (act != nullptr) ? Train::From(act->First()) : nullptr;
+		if (ch == nullptr) return;
+		if (ch->r3r_couple_target == VehicleID::Invalid()) return;
+		if (!Train::IsValidID(ch->r3r_couple_target)) return;
+		Train *t = Train::Get(ch->r3r_couple_target);
+		if (t == nullptr || !t->IsPrimaryVehicle()) return;
+		if (!t->current_order.IsType(OT_WAIT_COUPLE)) return;
+		/* 车底不在站台格（库内/连接轨上）：快照没有"排"可锚，交回动态扫描。 */
+		if (!IsRailStationTile(t->tile)) return;
+		/* 配对锁必须双向成立 —— 与扫描层、回溯安全位、到点闸门同一条判据。 */
+		if (!R3RCouplePairMatches(act, t)) return;
+
+		snap_veh = t->index;
+		snap_tile = t->tile;
+		snap_stn = GetStationIndex(t->tile);
+		snap_axis = GetRailStationAxis(t->tile);
+		snap_row = (snap_axis == Axis::X) ? TileY(t->tile) : TileX(t->tile);
+		snap_car_only = R3RIsCarOnlyFormation(t);
+		snap_valid = true;
+
+		/* 订单约束一次性评估：这些都是"同一列固定车底"的属性，逐节点重算没有意义。 */
+		if (!R3RCoupleAllowed(act, t)) {
+			snap_rej = 0;
+		} else if (!TrainFitStation(t)) {
+			snap_rej = 1;
+		} else if (!R3RIsCoupleTarget(t)) {
+			snap_rej = 2;
+		} else if (!(CheckOrderLoad(t) && CheckOrderCargoType(t) && CheckNumberOfWagons(t))) {
+			snap_rej = 3;
+		}
+	}
+
+	/** R3R（第 502 轮, S2b）：快照是否仍然成立（O(1) 复验，不含任何扫描）。 */
+	bool R3RStaticTargetValid() const
+	{
+		if (!snap_valid) return false;
+		if (!Train::IsValidID(snap_veh)) return false;
+		const Train *t = Train::Get(snap_veh);
+		if (t == nullptr || !t->IsPrimaryVehicle()) return false;
+		if (!t->current_order.IsType(OT_WAIT_COUPLE)) return false;
+		/* 车底被移走（另一个 tick/另一条命令）⇒ 快照的"排"不再可信。 */
+		if (t->tile != snap_tile) return false;
+		return true;
+	}
+
+	/** R3R（第 502 轮, S2b）：tile 是否落在快照锚定的那一排上（同站 + 同轴 + 同排号）。 */
+	bool R3RStaticIsSameLine(TileIndex tile) const
+	{
+		if (!IsRailStationTile(tile)) return true; // 库格/非站台格：放行，由动态分支处理
+		if (GetStationIndex(tile) != snap_stn) return false;
+		if (GetRailStationAxis(tile) != snap_axis) return false;
+		return ((snap_axis == Axis::X) ? TileY(tile) : TileX(tile)) == snap_row;
+	}
+
+	/* R3R（第 502 轮, S4, KI-676）：把静态终点交回 yapf_rail.cpp 的回溯/摸路阶段。
+	 *
+	 * 这三个访问器都是 O(1)，不含任何世界扫描。命中时回溯阶段不再需要
+	 * "反查预留主人 + 排除自己 + 站台横向扫描" 那一整套动态端点解析 ——
+	 * 会合点由配对锁唯一确定。 */
+	VehicleID R3RStaticTargetVehicle() const
+	{
+		return this->R3RStaticTargetValid() ? snap_veh : VehicleID::Invalid();
+	}
+
+	TileIndex R3RStaticTargetTile() const
+	{
+		return this->R3RStaticTargetValid() ? snap_tile : INVALID_TILE;
+	}
+
+	/** 车底另一端（链尾）所在格，供"取近端"做 O(1) 比较。 */
+	TileIndex R3RStaticTargetFarTile() const
+	{
+		if (!this->R3RStaticTargetValid()) return INVALID_TILE;
+		const Train *t = Train::Get(snap_veh);
+		return (t == nullptr) ? INVALID_TILE : t->Last()->tile;
 	}
 
 	/** @copydoc CYapfBaseT::PfDetectDestinationFunc */
@@ -404,6 +531,24 @@ public:
 	{
 		if (dest_order.GetNumCouple() == 0) return true;
 		return dest_order.GetNumCouple() == CountVehiclesInChain(t);
+	}
+
+	/** R3R（第 501 轮, S2, KI-676）：接受格与车底实际停靠格是否在同一条到发线上。
+	 *
+	 * 同一条到发线 = 同一个车站 + 同一个站台轴 + 同一排（轴为 X 时比 TileY，轴为 Y
+	 * 时比 TileX）。IsCompatibleTrainStationTile() 只覆盖前两项，**排号必须自己比**
+	 * —— 平行站台误判（车底在 y=1874，YAPF 判到达落在 1424,1875/1876）就出在缺这一项。
+	 *
+	 * 任一格不是站台格时返回 true（depot 挂接、车底链头停在站台外的连接轨上）：
+	 * 这道闸只收紧站台挂接，不对其它形态引入新拒绝。 */
+	static bool R3RSameParkingLine(TileIndex tile, const Train *t)
+	{
+		const TileIndex parked = t->tile;
+		if (!IsRailStationTile(tile) || !IsRailStationTile(parked)) return true;
+		if (GetStationIndex(tile) != GetStationIndex(parked)) return false;
+		const Axis axis = GetRailStationAxis(tile);
+		if (axis != GetRailStationAxis(parked)) return false;
+		return (axis == Axis::X) ? (TileY(tile) == TileY(parked)) : (TileX(tile) == TileX(parked));
 	}
 
 	/* R3R (第 109 轮, 2026-09-24): CheckOrderSlot() 已废除。
@@ -444,6 +589,53 @@ public:
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) {
 			++_r3r_cpl_scan_noplat;
 			return false;
+		}
+
+		/* R3R（第 502 轮, S2b, KI-676）：静态终点判定（O(1)）。
+		 *
+		 * 前提：被动方是静态等待的，配对锁一建立，「车底停在哪一排」就固定了。
+		 * 于是 SetDestination() 已把「排 + 订单约束」算进 snap_*，这里只做比较：
+		 *   异排 -> reject(LINE)；同排但订单约束不过 -> reject(snap_rej)；否则 accept。
+		 * 不再逐格扫站台、不再反查预留、不再逐格重跑四次闸门。
+		 *
+		 * 只对站台格生效：库格（depot 挂接）仍走下面的动态扫描，行为逐字不变。
+		 * 快照失效（车底被移走/订单变了/配对锁改指）时自动回落到动态链。 */
+		if (snap_valid && IsRailStationTile(tile) && R3RStaticTargetValid()) {
+			if (!R3RStaticIsSameLine(tile)) {
+				++_r3r_cpl_scan_consist;
+				++_r3r_cpl_scan_rej[4];
+				_r3r_cpl_scan_last_tile = tile.base();
+				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+				_r3r_cpl_scan_last_why = 7;
+				return false;
+			}
+			if (snap_rej >= 0) {
+				++_r3r_cpl_scan_consist;
+				++_r3r_cpl_scan_rej[snap_rej];
+				_r3r_cpl_scan_last_tile = tile.base();
+				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+				_r3r_cpl_scan_last_why = snap_rej;
+				return false;
+			}
+			/* 不能复用下面的 r3r_dest_accept lambda（它在本函数后半段才定义），
+			 * 故自带计数与一行节流日志；acc/rej 口径与旧统计合并，不倒退。 */
+			++_r3r_cpl_scan_consist;
+			++_r3r_cpl_scan_acc[snap_car_only ? 0 : 1];
+			_r3r_cpl_scan_last_tile = tile.base();
+			_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+			_r3r_cpl_scan_last_why = snap_car_only ? 4 : 5;
+			static uint32_t r3r_static_acc_seen = 0;
+			if (++r3r_static_acc_seen <= 16) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFD-STATIC kind=%s tile=%d,%d t=%d row=%d stn=%d n=%u\n",
+							snap_car_only ? "car-only" : "waiting",
+							(int)TileX(tile), (int)TileY(tile), (int)snap_veh.base(),
+							(int)snap_row, (int)snap_stn.base(), (unsigned)r3r_static_acc_seen);
+					fclose(dbg);
+				}
+			}
+			return true;
 		}
 
 		/* R3R (KI-165): the GOTO_COUPLE order's own destination is enforced one
@@ -536,16 +728,18 @@ public:
 		 * are private to train_cmd.cpp), so rejections are throttled by a tiny
 		 * per-reason counter and accepts are printed one for one (they are rare and
 		 * are the interesting case). */
-		static uint32_t r3r_dest_rej_seen[4] = { 0, 0, 0, 0 };
+		static uint32_t r3r_dest_rej_seen[5] = { 0, 0, 0, 0, 0 };
 		auto r3r_dest_reject = [](int why, TileIndex tile, const Train *t) {
-			static const char * const names[4] = { "PFD-REJ-GROUP", "PFD-REJ-FIT", "PFD-REJ-TARGET", "PFD-REJ-ORDER" };
-			if (why < 0 || why >= 4) return;
+			static const char * const names[5] = { "PFD-REJ-GROUP", "PFD-REJ-FIT", "PFD-REJ-TARGET", "PFD-REJ-ORDER", "PFD-REJ-LINE" };
+			if (why < 0 || why >= 5) return;
 			/* R3R (第 236 轮, KI-344): 计入本次扫描汇总 —— 必须在节流 return 之前，
 			 * 否则 found=0 现场只会看到 1/64 的样本。 */
 			++_r3r_cpl_scan_rej[why];
 			_r3r_cpl_scan_last_tile = tile.base();
 			_r3r_cpl_scan_last_veh = (int)t->index.base();
-			_r3r_cpl_scan_last_why = why;
+			/* R3R（第 501 轮, S2）：LINE 是 rej[4]，但 last_why 为了让旧日志口径不变
+			 * （4/5/6 = acc-car/acc-wait/cut-wp）映射到 7。 */
+			_r3r_cpl_scan_last_why = (why == 4) ? 7 : why;
 			if (++r3r_dest_rej_seen[why] % 64 != 0) return;
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
@@ -640,6 +834,27 @@ public:
 		 * which order it held. */
 		if (!R3RIsCoupleTarget(t)) {
 			r3r_dest_reject(2, tile, t);
+			return false;
+		}
+
+		/* R3R（第 501 轮, S2, KI-676）：站台挂接的接受格必须落在**车底实际停着的
+		 * 那一排到发线**上（同站 + 同轴 + 同排号）。
+		 *
+		 * 基线判据只要求"这一格能扫出一个等待车底"，而整站台预留会把同站其它排的格
+		 * 也覆盖进来，于是 YAPF 把平行线判成到达（现场：车底在 y=1874，判到达落在
+		 * 1424,1875 / 1424,1876），回溯与预留一并铺到平行线上，机车永远追不上耦合端。
+		 * IsCompatibleTrainStationTile() 只保证同站同轴、不含排号，所以整条扫描链都
+		 * 看不出这个差别 —— 这道闸就是补上排号。
+		 *
+		 * 为什么不钉成单格：TrackFollower 进站台一步跳到末端，钉单格会让中间格永远
+		 * 判不到（第 475 轮 endhit=0 死锁）。接受集合仍是整排站台格，跳过站台后的
+		 * 落点仍在排内，故不会复发。
+		 *
+		 * 代价（玩家 2026-11-24 已拍板接受）：车底那一排不可达时，结果从"错铺到平行
+		 * 线"变成 found=0（挂接失败），而不是错误铺轨。
+		 * depot 挂接一律不动；判不了排（非站台格）一律放行。 */
+		if (!dest_order.GetCoupleIsDepot() && !R3RSameParkingLine(tile, t)) {
+			r3r_dest_reject(4, tile, t);
 			return false;
 		}
 

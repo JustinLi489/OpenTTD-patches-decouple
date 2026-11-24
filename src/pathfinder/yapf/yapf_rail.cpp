@@ -1008,11 +1008,27 @@ public:
 
 	/**
 	 * Try to reserve the path till the reservation target.
+	 *
+	 * R3R (第 503 轮): the old third parameter `unsafe_pos` was one boolean doing three
+	 * unrelated jobs (skip the endpoint test / do not roll back on a failed tile / do
+	 * not feed the answer book), which is why the couple path could not be made atomic
+	 * without also losing its answer-book opt-out. It is now three explicit flags.
+	 *
 	 * @param target End location of the reservation.
 	 * @param origin Start location of the reservation.
+	 * @param atomic All-or-nothing: on the first tile that cannot be booked, undo
+	 *        everything this call reserved and return \c false. The couple path used to
+	 *        pass `unsafe_pos=true` (i.e. non-atomic), and that is exactly what produced
+	 *        "half a path reserved, then the train is sent down an unreserved branch".
+	 * @param check_target_free Run the endpoint test (IsWaitingPositionFree) first. The
+	 *        couple path can pass \c true now that pbs.cpp treats the pair partner's own
+	 *        reservation as air there; it used to have to skip the test because its
+	 *        destination always lies *on* the partner.
+	 * @param record_answer Push the walked tiles into the answer book (main pathfinding
+	 *        only; the couple path keeps its own two-pass walk).
 	 * @return \c true iff the path could be reserved.
 	 */
-	bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool unsafe_pos = false)
+	bool TryReservePath(PBSTileInfo *target, TileIndex origin, bool atomic = true, bool check_target_free = true, bool record_answer = true)
 	{
 		/* R3R (KI-207): every pathfinder-made reservation passes through here, so
 		 * record which train is booking.
@@ -1039,7 +1055,7 @@ public:
 		/* Don't bother if the target is reserved. */
 		PBSWaitingPositionRestrictedSignalState restricted_signal_state;
 		restricted_signal_state.defer_test_if_slot_conditional = true;
-		if (!unsafe_pos && !IsWaitingPositionFree(Yapf().GetVehicle(), this->res_dest_tile, this->res_dest_td, false, &restricted_signal_state)) return false;
+		if (check_target_free && !IsWaitingPositionFree(Yapf().GetVehicle(), this->res_dest_tile, this->res_dest_td, false, &restricted_signal_state)) return false;
 
 		/* The temporary slot state only needs to be pushed to the stack (i.e. activated) on first use */
 		static TraceRestrictSlotTemporaryState temporary_slot_state;
@@ -1059,11 +1075,10 @@ public:
 
 		/* R3R 探针 (第 343 轮, KI-505): 只数"真正置位成功了多少格"。
 		 * 动机：同一 tick 出现 CPL-RESERVE reserved=1 与 CPL-RET res=0x0 并存
-		 * （build\R3R_debug.log:1406-1407），而 unsafe_pos=true 的调用路径
-		 * （本文件 :1380 挂接寻路）在格级失败时既不回滚也不早退 ——
-		 * 见下方 `if (!unsafe_pos && this->res_fail_tile != INVALID_TILE)`，
-		 * 于是"reserved=1"可能是空心的（一格都没订上却返回成功）。
-		 * 这两个计数器是该判断的唯一依据，零行为改动。 */
+		 * （build\R3R_debug.log:1406-1407），而当时 unsafe_pos=true 的挂接路径
+		 * 在格级失败时既不回滚也不早退 ⇒ "reserved=1"可能是空心的。
+		 * 第 503 轮把 unsafe_pos 拆成 atomic/check_target_free/record_answer 三参，
+		 * 挂接也改走 atomic=true，空心成功已结构性不可能；计数器保留继续兜底。 */
 		int r3r_ntry = 0;
 		int r3r_nok = 0;
 
@@ -1088,8 +1103,8 @@ public:
 				}
 
 				const bool r3r_tok = this->ReserveSingleTrack(tile, td);
-				/* R3R (答案本): 只记主寻路这条路径的格；挂接寻路(unsafe_pos)不参与。 */
-				if (r3r_tok && !unsafe_pos) _r3r_answer_build.push_back(R3RAnswerStep{tile, td});
+				/* R3R (答案本): 只记主寻路这条路径的格；挂接寻路(record_answer=false)不参与。 */
+				if (r3r_tok && record_answer) _r3r_answer_build.push_back(R3RAnswerStep{tile, td});
 				++r3r_ntry;
 				if (r3r_tok) {
 					++r3r_nok;
@@ -1108,14 +1123,14 @@ public:
 									(int)r3r_vid, (uint)_tick_counter,
 									(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
 									(int)TileX(tile), (int)TileY(tile), (int)td,
-									(int)unsafe_pos, r3r_ntry, r3r_nok);
+									(int)!atomic, r3r_ntry, r3r_nok);
 							fclose(dbg);
 						}
 					}
 				}
 				return r3r_tok;
 			});
-			if (!unsafe_pos && this->res_fail_tile != INVALID_TILE) {
+			if (atomic && this->res_fail_tile != INVALID_TILE) {
 				/* Reservation failed, undo. */
 				Node *fail_node = this->res_dest_node;
 				TileIndex stop_tile = this->res_fail_tile;
@@ -1217,7 +1232,7 @@ public:
 							(int)TileX(this->res_dest_tile), (int)TileY(this->res_dest_tile), (int)this->res_dest_td,
 							(int)TileX(r3r_node_tile), (int)TileY(r3r_node_tile),
 							(this->res_dest_node->parent == nullptr) ? 1 : 0,
-							(int)unsafe_pos, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0,
+							(int)!atomic, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0,
 							r3r_vtx, r3r_vty,
 							(int)TileX(r3r_v->dest_tile), (int)TileY(r3r_v->dest_tile),
 							r3r_ogap, r3r_osrc);
@@ -1665,7 +1680,48 @@ public:
 		 * cut straight through it. */
 		TileIndex consist_head_tile = INVALID_TILE;
 		bool best_on_consist = false;
-		if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
+		/* R3R（第 502 轮, S4, KI-676）：静态终点接管。
+		 *
+		 * 配对锁一旦建立，"会合点在哪"就只由车底自身决定，与"best 格上是谁"无关。
+		 * 因此先读 S2b 快照（O(1) 纯比较），命中就整块跳过下面的动态解析：
+		 *   反查 GetTrainForReservation 的预留主人 → 排除自己（KI-432）→
+		 *   扫格上别的链 → 按曼哈顿距离选近端（KI-200）。
+		 *
+		 * 那套动态解析存在的唯一理由是"终点动态"（不知道车底是谁，只能从地图上
+		 * 猜）。快照失效时（无配对锁 / 车底已不在站台 / 被移走）它原样保留作回退，
+		 * 所以本次是"静态优先、动态兜底"，不存在删掉既有补丁分支的风险。
+		 *
+		 * best_on_consist 仍必须算：YAPF 若停在车底自己占着的那一格，路径终点就是
+		 * 它，预留目标必须同格（KI-200 的硬约束），绝不能用"近端"覆盖。 */
+		const TileIndex r3r_snap_tile = Yapf().R3RStaticTargetTile();
+		if (pNode != nullptr && r3r_snap_tile != INVALID_TILE) {
+			const VehicleID r3r_snap_veh = Yapf().R3RStaticTargetVehicle();
+			for (Train *tr : VehiclesOnTile<VehicleType::Train>(pNode->GetLastTile())) {
+				if (tr->First()->index == r3r_snap_veh) { best_on_consist = true; break; }
+			}
+			const TileIndex r3r_snap_far = Yapf().R3RStaticTargetFarTile();
+			if (best_on_consist) {
+				consist_head_tile = pNode->GetLastTile();
+			} else if (r3r_snap_far != INVALID_TILE &&
+					DistanceManhattan(v->tile, r3r_snap_far) < DistanceManhattan(v->tile, r3r_snap_tile)) {
+				consist_head_tile = r3r_snap_far;
+			} else {
+				consist_head_tile = r3r_snap_tile;
+			}
+			{
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-HEAD-STATIC veh=%d best=%d,%d snap=%d,%d farvalid=%d head=%d,%d on=%d\n",
+							(int)v->index.base(),
+							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
+							(int)TileX(r3r_snap_tile), (int)TileY(r3r_snap_tile),
+							(int)(r3r_snap_far != INVALID_TILE),
+							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile),
+							(int)best_on_consist);
+					fclose(dbg);
+				}
+			}
+		} else if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
 			/* R3R (第 276 轮续, KI-432): 绝不能把"自己"认成等待车底。
 			 * 放行之后 TryReservePath() 把路径铺到 best 节点，那一格的预留记在
 			 * 本车名下；下一 tick 在这里解析"谁等在这格"时 GetTrainForReservation()
@@ -2050,7 +2106,12 @@ public:
 			}
 			/* 摸路一格都没给出 ⇒ 没有可订的东西，直接报失败（不许空手成功）。 */
 		} else {
-			reserved = this->TryReservePath(nullptr, pNode->GetLastTile(), true);
+			/* R3R (第 503 轮): 挂接摸路也走"全有或全无"。原来这里传 unsafe_pos=true，
+			 * 即"不查终点、格级失败不回滚、答案本不参与"；现在终点交给
+			 * pbs.cpp 的 partner-air 豁免放行（check_target_free=true），格级失败
+			 * 整段回滚（atomic=true），答案本仍不参与（record_answer=false）。 */
+			reserved = this->TryReservePath(nullptr, pNode->GetLastTile(),
+					/*atomic*/ true, /*check_target_free*/ true, /*record_answer*/ false);
 		}
 			{
 				FILE *dbg = R3RFopenDbg("a");
