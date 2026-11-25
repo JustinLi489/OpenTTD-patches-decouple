@@ -647,6 +647,11 @@ public:
 				/* We just entered the loop. First transition cost goes to segment entry cost)*/
 				segment_entry_cost = transition_cost;
 
+				/* R3R（第 504 轮, KI-676）：会合点激活时禁用段缓存。
+				 * 缓存段通常是别的寻路（机车自身）算好并推到 1424 的整段，
+				 * 直接复用会把段中间的会合点 1439 整段跳过。 */
+				if (is_cached_segment && Yapf().R3RMeetActive()) is_cached_segment = false;
+
 				/* It is the right time now to look if we can reuse the cached segment cost. */
 				if (is_cached_segment) {
 					/* Yes, we already know the segment cost. */
@@ -874,6 +879,17 @@ no_entry_cost: // jump here at the beginning if the node has no parent (it is th
 				break;
 			}
 
+			/* R3R（第 504 轮, KI-676）：会合点强制断段。
+			 * 段会把无信号的连续轨道一次吞掉，而 PfDetectDestination() 只在
+			 * 段的两端被调用 —— 落在段中间的会合点因此永远判不到（现场：
+			 * 1441 的段一路推到 1424，会合点 1439 被整段跳过，found=0）。
+			 * 这里在段推进的每一格上问一次终点判定，命中就把该格钉成段末，
+			 * 与 road 类型 YAPF 的 "PfDetectDestinationTile 命中即断段" 同一做法。 */
+			if (Yapf().R3RMeetActive() && Yapf().PfDetectDestination(cur.tile, cur.td)) {
+				end_segment_reason.Set(EndSegmentReason::Station);
+				break;
+			}
+
 			/* For the next loop set new prev and cur tile info. */
 			prev = cur;
 			cur = next;
@@ -923,8 +939,12 @@ no_entry_cost: // jump here at the beginning if the node has no parent (it is th
 				}
 			}
 
-			/* Station platform-length penalty. */
-			if (end_segment_reason.Test(EndSegmentReason::Station)) {
+			/* Station platform-length penalty.
+			 * R3R（第 508 轮, KI-685）：EndSegmentReason::Station 现在也被上方「会合点强制断段」
+			 * 复用，而会合点可能落在普通轨道格上（现场 1439,1874 stn=0）⇒ 必须先确认段末
+			 * 真的是站台格，否则 BaseStation::GetByTile() 会在
+			 * station_map.h:31 的 GetStationIndex() 前置断言上崩掉。 */
+			if (end_segment_reason.Test(EndSegmentReason::Station) && IsRailStationTile(n.GetLastTile())) {
 				const BaseStation *st = BaseStation::GetByTile(n.GetLastTile());
 				dbg_assert(st != nullptr);
 				uint platform_length = st->GetPlatformLength(n.GetLastTile(), ReverseDiagDir(TrackdirToExitdir(n.GetLastTrackdir())));

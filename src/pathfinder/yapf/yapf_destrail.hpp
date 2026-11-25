@@ -122,6 +122,11 @@ public:
 	{
 		return this->compatible_railtypes;
 	}
+
+	/* R3R: 会合点断段开关的默认实现。
+	 * 只有挂接寻路（CYapfDestinationTrainRailT）会覆盖它；其余 rail 目的地类型
+	 * （任意车库 / 任意安全位 / 到站）必须走这里返回 false，保持上游行为。 */
+	bool R3RMeetActive() const { return false; }
 };
 
 template <class Types>
@@ -313,6 +318,11 @@ public:
 		return (tile == this->dest_tile) && HasTrackdir(this->dest_trackdirs, td);
 	}
 
+	/** R3R（第 504 轮, KI-676）：会合点断段是否启用。
+	 *  默认关闭（普通 rail 寻路保持原行为）；挂接寻路在快照成立时覆盖它为 true，
+	 *  让 yapf_costrail.hpp 的段推进逐格问终点、并在命中处把段截断。 */
+	bool R3RMeetActive() const { return false; }
+
 	/** @copydoc CYapfBaseT::PfCalcEstimateFunc */
 	inline bool PfCalcEstimate(Node &n)
 	{
@@ -382,6 +392,14 @@ protected:
 	Axis snap_axis = Axis::X;                   ///< 车底所在站台轴
 	uint16_t snap_row = 0;                      ///< 排号：轴 X 时 = TileY，轴 Y 时 = TileX
 	bool snap_car_only = false;                 ///< 车底是纯车底链（accept kind=car-only）还是等待段
+	/* R3R（第 503 轮, S5, KI-676）：会合点格 = 车底近端「预留所在格」按轨型再往外一格。
+	 *
+	 * 玩家 2026-11-25 口径（原话）：「车底近端那一端的预留所在格，再按轨型往外一格」。
+	 * 现场：车底 1424..1437,1874，站台近端末格 1438 是车底站台整格预留的边界，
+	 * 会合点 = 1439,1874 —— 该格既无车底的车也无车底的预留，机车可以正常开进去。
+	 * INVALID_TILE 表示这一端算不出（车底不在站台/两端同格），此时终点判定退回
+	 * 原来的「同排」口径，行为与改动前逐字一致。 */
+	TileIndex snap_meet_tile = INVALID_TILE;
 	int snap_rej = -1;                          ///< -1=可接受；0..3 = GROUP/FIT/TARGET/ORDER
 
 public:
@@ -399,7 +417,13 @@ public:
 		 *   ① 启发值对整排的估计更紧，展开数下降（S2b 已把接受判据收到同一排）；
 		 *   ② 与 S4 的"tg 用快照终点"共用同一个锚，不再有两套目标口径。
 		 * 快照失效时 dest_tile 保持订单目的地，行为与改动前逐字相同。 */
-		if (this->snap_valid) this->dest_tile = this->snap_tile;
+		/* R3R（第 503 轮, S5, KI-676）：锚点改到会合点格。原来钉在 snap_tile（车底
+		 * 链头，现场 1424）会把 A* 强烈拉向背离机车的那一端 —— 这是 20/23 条现场
+		 * 停在远端 1424 的直接推手。现在启发锚 = 接受格 = 会合点，三者同源。 */
+		{
+			const TileIndex meet = this->R3RStaticTargetTile();
+			if (meet != INVALID_TILE) this->dest_tile = meet;
+		}
 	}
 
 	/** R3R（第 502 轮, S2b）：在 SetDestination() 时一次性评估终点，见 snap_* 字段说明。
@@ -416,6 +440,7 @@ public:
 		snap_tile = INVALID_TILE;
 		snap_stn = StationID::Invalid();
 		snap_row = 0;
+		snap_meet_tile = INVALID_TILE;
 
 		/* depot 挂接一律不动：继续走原来的扫描分支（玩家 Q-501-2 口径）。 */
 		if (dest_order.GetCoupleIsDepot()) return;
@@ -439,6 +464,16 @@ public:
 		snap_axis = GetRailStationAxis(t->tile);
 		snap_row = (snap_axis == Axis::X) ? TileY(t->tile) : TileX(t->tile);
 		snap_car_only = R3RIsCarOnlyFormation(t);
+		/* R3R（第 503 轮, S5, KI-676）：会合点 = 近端（离机车那一端）预留边界格再往外一格。
+		 * 近端由曼哈顿距离判定，与回溯阶段的口径一致；两端同格或近端不在站台时
+		 * R3RComputeMeetTile() 返回 INVALID_TILE，终点退回「同排」口径。 */
+		{
+			const TileIndex cons_head = t->tile;
+			const TileIndex cons_tail = t->Last()->tile;
+			const bool head_is_near = DistanceManhattan(v->tile, cons_head) <= DistanceManhattan(v->tile, cons_tail);
+			snap_meet_tile = R3RComputeMeetTile(head_is_near ? cons_head : cons_tail,
+					head_is_near ? cons_tail : cons_head);
+		}
 		snap_valid = true;
 
 		/* 订单约束一次性评估：这些都是"同一列固定车底"的属性，逐节点重算没有意义。 */
@@ -450,6 +485,29 @@ public:
 			snap_rej = 2;
 		} else if (!(CheckOrderLoad(t) && CheckOrderCargoType(t) && CheckNumberOfWagons(t))) {
 			snap_rej = 3;
+		}
+
+		/* R3R（第 503 轮续, S5-dbg, KI-676）：会合点自身的唯一出口。
+		 *
+		 * 为什么需要它：`CPL-HEAD-STATIC` 只在 path_found==true 之后才打印，于是
+		 * found=0 的现场（本次 279 次 rej[4]、consist=0、acc=0）看不到 meet 到底是
+		 * 哪一格，无法区分"算错格"和"算对但不可达"。本行只读、节流前 12 次。 */
+		if (snap_valid && snap_meet_tile != INVALID_TILE) {
+			static uint32_t r3r_snap_meet_seen = 0;
+			if (++r3r_snap_meet_seen <= 12) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "CPL-SNAP veh=%d near=%d,%d meet=%d,%d head=%d,%d tail=%d,%d rej=%d\n",
+							(int)v->index.base(),
+							(int)TileX(DistanceManhattan(v->tile, t->tile) <= DistanceManhattan(v->tile, t->Last()->tile) ? t->tile : t->Last()->tile),
+							(int)TileY(DistanceManhattan(v->tile, t->tile) <= DistanceManhattan(v->tile, t->Last()->tile) ? t->tile : t->Last()->tile),
+							(int)TileX(snap_meet_tile), (int)TileY(snap_meet_tile),
+							(int)TileX(t->tile), (int)TileY(t->tile),
+							(int)TileX(t->Last()->tile), (int)TileY(t->Last()->tile),
+							snap_rej);
+					fclose(dbg);
+				}
+			}
 		}
 	}
 
@@ -487,7 +545,26 @@ public:
 
 	TileIndex R3RStaticTargetTile() const
 	{
-		return this->R3RStaticTargetValid() ? snap_tile : INVALID_TILE;
+		if (!this->R3RStaticTargetValid()) return INVALID_TILE;
+		/* R3R（第 503 轮, S5, KI-676）：有会合点就用会合点（站台外一格），
+		 * 算不出（库内挂接 / 车底两端同格 / 近端不在站台）时退回链头格，
+		 * 由 yapf_rail.cpp 的回溯阶段继续按原来的"取近端"逻辑处理。 */
+		return (snap_meet_tile != INVALID_TILE) ? snap_meet_tile : snap_tile;
+	}
+
+	/** 会合点格（车底近端预留边界再往外一格）；INVALID_TILE = 本形态没有会合点。 */
+	TileIndex R3RStaticMeetTile() const
+	{
+		if (!this->R3RStaticTargetValid()) return INVALID_TILE;
+		return snap_meet_tile;
+	}
+
+	/** R3R（第 504 轮, KI-676）：会合点断段开关（覆盖基类的默认 false）。
+	 *  段会把无信号连续轨道一次吞掉，会合点落在段中间就永远判不到；
+	 *  打开后 cost 计算会逐格判定并截断段，同时禁用跨寻路的段缓存。 */
+	bool R3RMeetActive() const
+	{
+		return this->R3RStaticMeetTile() != INVALID_TILE;
 	}
 
 	/** 车底另一端（链尾）所在格，供"取近端"做 O(1) 比较。 */
@@ -551,6 +628,52 @@ public:
 		return (axis == Axis::X) ? (TileY(tile) == TileY(parked)) : (TileX(tile) == TileX(parked));
 	}
 
+	/** R3R（第 503 轮, S5, KI-676）：求「车底近端预留所在格再往外一格」。
+	 *
+	 * 车底在站台上停稳后，它自己的站台整格预留覆盖到站台近端末格（现场 1438），
+	 * 那一格仍属于车底，机车开不进去；再往外一格（1439）才是合法的会合点。
+	 *
+	 * 求法：以近端车格为起点、沿站台轴朝着「背离车底」的方向逐格前进，第一个
+	 * 不再是同一站台格的格即为会合点（O(站台剩余长度)，上限 64 格）。
+	 *
+	 * @param near_tile 离机车近的那一端车节所在格
+	 * @param far_tile  另一端车节所在格，只用来定方向
+	 * @return 会合点格；近端不在站台、两端同格或方向判不出时返回 INVALID_TILE
+	 *         （调用方据此退回原来的「同排」终点口径） */
+	static TileIndex R3RComputeMeetTile(TileIndex near_tile, TileIndex far_tile)
+	{
+		if (near_tile == far_tile) return INVALID_TILE;
+		if (!IsRailStationTile(near_tile)) return INVALID_TILE;
+		const Axis axis = GetRailStationAxis(near_tile);
+		const int near_c = (axis == Axis::X) ? (int)TileX(near_tile) : (int)TileY(near_tile);
+		const int far_c = (axis == Axis::X) ? (int)TileX(far_tile) : (int)TileY(far_tile);
+		if (near_c == far_c) return INVALID_TILE;
+		/* R3R (KI-687, 第 518 轮, 2026-11-26): 紧贴车底近端车格**一格**，不再走到
+		 * 站台外第一格。
+		 *
+		 * 旧实现沿站台轴一路前进，把车底近端与站台端点之间的**空格**也算进"车底
+		 * 的预留"，于是在站台外第一格收尾。现场（build\R3R_debug.log，第 517 轮
+		 * exe，2026-11-26 03:26）：
+		 *   CPL-PAIRLOCK ... tgt=18 tgtTile=1424,1874 tgtLen=216
+		 *   CPL-SNAP veh=15 near=1437,1874 meet=1439,1874 head=1424,1874 tail=1437,1874
+		 *   CPL-RES-OK veh=15 total=45 booked=45 tiles=…;1440,1874/0;1439,1874/0
+		 * 车底车尾在 1437（车底占 1424..1437），会合点却算出 1439 ⇒ 机车停在 1439
+		 * 时与车尾 1437 之间隔着一个空的站台格 1438，两车钩头相距一格，
+		 * 本场 COUPLE-OK 出现 0 次。挂接要求两车钩头相邻，所以会合点必须是
+		 * 「近端车格沿轴向背离车底的那一格」= 1438。
+		 *
+		 * 站台整格预留允许同站台按段分配（车底 1424..1437，机车进 1438 不重叠），
+		 * 这一格可订；若它不可通行（非铁轨/非法格）才退回旧的 INVALID_TILE 口径，
+		 * 由调用方退回「同排」判据，行为与改动前一致。 */
+		const int step_sign = (near_c > far_c) ? 1 : -1;
+		const int step_dx = (axis == Axis::X) ? step_sign : 0;
+		const int step_dy = (axis == Axis::X) ? 0 : step_sign;
+		const TileIndex meet = TileAddWrap(near_tile, step_dx, step_dy);
+		if (meet == INVALID_TILE) return INVALID_TILE;
+		if (!IsTileType(meet, TileType::Railway) && !IsRailStationTile(meet)) return INVALID_TILE;
+		return meet;
+	}
+
 	/* R3R (第 109 轮, 2026-09-24): CheckOrderSlot() 已废除。
 	 *
 	 * 玩家口径：「废除常规分组和路签对挂接的影响」——候选车底是否落在机车那条
@@ -584,6 +707,81 @@ public:
 		 * couple_wait_cut 为真时这里只接受等待区路点作终点（并打
 		 * PFD-ACCEPT kind=waitwp），使回溯/预留止于路点。现在一律走下面的
 		 * 普通终点判定。 */
+
+		/* R3R（第 503 轮, S5, KI-676）：会合点精确判据 —— 必须放在"只收站台/库格"之前。
+		 *
+		 * 会合点（站台近端预留边界格再往外一格）通常**不是站台格**（现场 1439,1874
+		 * 在站台外），先被下面那道站台闸拒掉就永远到不了。这里一旦有会合点，就把它
+		 * 当作唯一合法终点，其余格一律 reject：
+		 *   车底 1424..1437 + 站台到 1438 ⇒ 会合点 1439 ⇒ 机车从东侧进来即停。
+		 * 这也是 20/23 条现场停在远端 1424、3/23 停在近端车格 1437 的直接解法。
+		 * 会合点算不出（库内挂接/车底两端同格）时整段跳过，行为与改动前逐字一致。 */
+		if (snap_valid && snap_meet_tile != INVALID_TILE && R3RStaticTargetValid()) {
+			/* R3R (KI-687, 第 518 轮续, 2026-11-26): 会合点落在**连续站台段内部**时的兜底。
+			 *
+			 * TrackFollower 进入站台格会一步跳段（follow_track.hpp 的 CanEnterNewTile:
+			 * new_tile += step*(length-1)），该段内部每一格都不会作为节点被探测 ⇒
+			 * 精确判据 `tile == snap_meet_tile` 永不可达。现场（build\R3R_debug.log，
+			 * 第 518 轮 exe，2026-11-26 03:42）：
+			 *   :1420 CPL-SNAP veh=15 meet=1438,1874 head=1424,1874 tail=1437,1874
+			 *   :1463 PFX-GEO t=1438,1874 ... stn=1   （1439 才是站台外）
+			 *   :2084 CPL-SCAN found=0 consist=0 rej=0/0/0/0/761 why=LINE last=1406,1869
+			 * 即 1438 从未被探测，761 个被检查格全部落在别的排/别的站。
+			 * 兜底口径 = 「同站 + 同轴 + 同排」，与 S2b 逐字一致：
+			 * 平行线（现场 y=1873/1875）仍被拒，KI-684 不回退；
+			 * 物理停位与预设终点仍由 R3RStaticTargetTile()/回溯阶段收紧。 */
+			const bool meet_unreachable_in_platform = IsRailStationTile(snap_meet_tile) &&
+					IsRailStationTile(tile) &&
+					GetStationIndex(snap_meet_tile) == snap_stn &&
+					GetRailStationAxis(snap_meet_tile) == snap_axis &&
+					R3RStaticIsSameLine(tile);
+			if (tile != snap_meet_tile && !meet_unreachable_in_platform) {
+				/* R3R（第 503 轮续, S5-dbg, KI-676）：记录搜索到底探了哪些格。
+				 * 只读、节流前 40 次（即第一次找路的前 40 个探测格），用于判断
+				 * "meet 算错"还是"meet 算对但搜索没走到"。 */
+				static uint32_t r3r_meet_miss_seen = 0;
+				if (++r3r_meet_miss_seen <= 40) {
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "PFD-MEETMISS tile=%d,%d meet=%d,%d n=%u\n",
+								(int)TileX(tile), (int)TileY(tile),
+								(int)TileX(snap_meet_tile), (int)TileY(snap_meet_tile),
+								(unsigned)r3r_meet_miss_seen);
+						fclose(dbg);
+					}
+				}
+				/* 计入 LINE 一类（异排/非会合点），保持 census 口径不新增桶。 */
+				++_r3r_cpl_scan_rej[4];
+				_r3r_cpl_scan_last_tile = tile.base();
+				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+				_r3r_cpl_scan_last_why = 7;
+				return false;
+			}
+			if (snap_rej >= 0) {
+				++_r3r_cpl_scan_rej[snap_rej];
+				_r3r_cpl_scan_last_tile = tile.base();
+				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+				_r3r_cpl_scan_last_why = snap_rej;
+				return false;
+			}
+			++_r3r_cpl_scan_consist;
+			++_r3r_cpl_scan_acc[snap_car_only ? 0 : 1];
+			_r3r_cpl_scan_last_tile = tile.base();
+			_r3r_cpl_scan_last_veh = (int)snap_veh.base();
+			_r3r_cpl_scan_last_why = snap_car_only ? 4 : 5;
+			static uint32_t r3r_meet_acc_seen = 0;
+			if (++r3r_meet_acc_seen <= 16) {
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFD-MEET kind=%s tile=%d,%d t=%d n=%u\n",
+							snap_car_only ? "car-only" : "waiting",
+							(int)TileX(tile), (int)TileY(tile),
+							(int)snap_veh.base(), (unsigned)r3r_meet_acc_seen);
+					fclose(dbg);
+				}
+			}
+			return true;
+		}
 
 		/* Only platform or depot tiles qualify. */
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) {

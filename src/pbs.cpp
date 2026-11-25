@@ -88,8 +88,23 @@ static const std::vector<TileIndex> &R3RWatchedResvTiles()
 	return tiles;
 }
 
+/** R3R (KI-684, 第 517 轮, 2026-11-26, REG-517-B): the overrun band the player
+ * reported. The platform's lo end is 1424,1874 and the ghost bits showed up on
+ * 1423..1419, on both of the two parallel lines. Watched tiles take the direct
+ * branch in R3RResvWatchLog(), so they are never folded into the per-(kind, phase)
+ * aggregation -- which is the only way to learn *who* writes there (memo §28.8).
+ * Expressed as a rectangle instead of ten list entries so the hot path stays one
+ * arithmetic test per call. */
+static inline bool R3RIsOverrunBandTile(TileIndex tile)
+{
+	const int x = (int)TileX(tile);
+	const int y = (int)TileY(tile);
+	return x >= 1419 && x <= 1423 && (y == 1873 || y == 1874);
+}
+
 bool R3RIsWatchedResvTile(TileIndex tile)
 {
+	if (R3RIsOverrunBandTile(tile)) return true;
 	for (TileIndex t : R3RWatchedResvTiles()) {
 		if (t == tile) return true;
 	}

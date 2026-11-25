@@ -309,3 +309,30 @@ reserved = this->TryReservePath(nullptr, pNode->GetLastTile(),
   （`src\pathfinder\yapf\yapf_destrail.hpp:186-190`）是否也需同一豁免（它服务普通寻路，
   挂接走另一条 destination 判据）。
 - **U-2**：站台整段 `ReserveRailStationPlatform` 在原子提交失败时的回滚粒度。
+
+## 六、「挂接寻路 vs 原生寻路」对比口径订正（陈误清单）
+
+起因：玩家质疑上一轮对比回答里含陈旧记忆。逐条复核代码后，**六条错误成立**，
+其余结论有锚点支撑。以下为订正后的口径（锚点均为本轮实测，非记忆）。
+
+### 6.1 六条陈误
+
+| # | 错误说法 | 实测事实 |
+| --- | --- | --- |
+| E1 | 挂接起点 = 机车脚下 `PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false)` | **错**。origin 与原生同源：`FollowTrainReservation(consist, nullptr, OkayUnused)`（`train_cmd.cpp:18627`；原生 `yapf_rail.cpp:2309`）。起点机制无差异。 |
+| E2 | `ExtendTrainReservation` 是原生专属的预留铺设 | **错**。它是 `if (do_track_reservation)` 的**共同前置**（`train_cmd.cpp:18630-18631`），挂接也先跑它，之后才 `DoTrainCouplePathfind(consist, true)`（:18796）。两者是「共同基线 + 各自后段」，不是两套互斥算法。 |
+| E3 | 挂接预留非原子/保留已订格，原生整段回滚 | **只对单段分支成立**。单段两遍法走 `R3RReservePathSequence`（`yapf_rail.cpp:2098`）保留已订格；非单段回退分支是 `atomic=true`（:2113-2114），与本 memo §5.5 一致。原生 `ChooseRailTrack` 全默认 `atomic=true`（:2366）。 |
+| E4 | 安全位判定：挂接用 `FindSafePositionOnNode`，原生用 `FindSafePositionOnSafePositionNodes` | **半错**。后者只是遍历 safe-position 节点集合去调前者（:1001-1005），同一套函数，非差异点。 |
+| E5 | `YapfTrainCoupleTrack` 在 `yapf_rail.cpp:2876` | 实为 **:2854**（2876 是 `stFindNearestCoupleTrain` 的分派行）。 |
+| E6 | `CPL-PF-FALLBACK` 在 `train_cmd.cpp:18819` | 实为 **:18836**。 |
+
+补充：`CYapfDestinationTrainRailT` 定义在 `yapf_destrail.hpp:352`（不在 `yapf_rail.cpp`）。
+
+### 6.2 复核后仍成立的真实差异
+
+1. **寻路器组合**（`yapf_rail.cpp:2463-2470`）：原生 `CYapfDestinationTileOrStationRailT + CYapfFollowRailT`；挂接 `CYapfDestinationTrainRailT + CYapfFollowCoupleRailT`（终点是列车本体）。
+2. **终点动态解析**：静态快照优先（`yapf_rail.cpp:1696` / `yapf_destrail.hpp:488`，第 502 轮 KI-676）→ 排除自己（:1725，KI-432）→ 近端 + 「路径终点与预留终点同端」硬约束（:1753，KI-200）；原生无此层。
+3. **两遍法**（仅单段）：摸路只读、刻意不订（:1867 / :1999，KI-504 E1b）→ 第二遍逐格订（:2098）→ 部分预留把终点收到最后一格已订（:2099-2105，KI-563）。
+4. **`TryReservePath` 三参数**（:1031）与调用差异：原生 `TryReservePath(target, node->GetLastTile())` 全默认 + `R3RAnswerCommit`（:2366-2368）；挂接 `(nullptr, ..., true, true, false)`，**不参与答案本**（:2113-2114）。
+5. **partner-air 豁免**（`pbs.cpp:502`）：挂接终点常落在目标车底本体上，`check_target_free` 靠它放行（挂接侧说明见 `yapf_rail.cpp:2111`）；原生不需要。
+6. **失败链**：挂接每 tick 强制 `do_track_reservation=true`（`train_cmd.cpp:18796`）；失败且非「节流/车库/第三方挡」→ `CPL-PF-FALLBACK` 降级普通寻路（:18836）；被第三方挡则原地等（KI-516，`yapf_rail.cpp:35/1654/1853`）。

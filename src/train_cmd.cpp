@@ -9379,6 +9379,7 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_RESVPROBE,    ///< 第 357 轮 (KI-533): a *whole* reservation attempt and the end it produced (R48-1..R48-3)
 	R3REDGE_JUNCCHOOSE,   ///< 第 357 轮 (KI-533): ChooseTrainTrack's per-tile verdict, tracked on *every* tile (R48-4)
 	R3REDGE_EXTGOALEXEMPT, ///< 第 406 轮 (REG-405-A): the choice refusal was waived -- the platform belongs to our locked couple partner
+	R3REDGE_EXTEXIT,      ///< REG-505-32-A: which *success* exit ExtendTrainReservation() took (choose/safe/eol)
 	R3REDGE_COUNT,
 };
 
@@ -17221,6 +17222,29 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 {
 	CFollowTrackRail ft(v);
 
+	/* R3R（第 522 轮, KI-684 B 修法）：挂接机车在站台上做前瞻时，只准在
+	 * 「origin 所在的那一个站台」里往前铺；下一步就要踏出该站台的第一格，立即
+	 * 停手，把剩下的路交回寻路器（走下面既有的 choose 出口，okay=false）。
+	 *
+	 * 取代第 521 轮 X-2 的做法（那一版直接在函数开头 return origin/tracks=NONE/
+	 * okay=true）。X-2 的判据没错，错在返回码语义：它对上层说「预留成功，终点就是
+	 * 你自己脚下这一格」，上层于是每 tick 都认为「我只有 1 格预留，得再订」——
+	 * 表现为边走边铺；同时前瞻永远填不上，`r3r_couple_no_lookahead` 恒真，永不吃
+	 * `early-haverserved` 捷径，自锁。第 522 轮日志侧证：RESV-HAVERES nolook=1
+	 * 235 条、RP cur= 63 条。
+	 *
+	 * B 修法保留 X-2 的范围（不越出站台），但不再撒谎：站台内该铺几格就铺几格，
+	 * 到边界如实报「路径到此有效、剩下交给寻路器」，由 DoTrainCouplePathfind() /
+	 * R3RReservePathSequence() 接手站台外到会合点的那一段。
+	 *
+	 * 触发面与 X-2 逐字相同（四条判据）：①订单是 GOTO_COUPLE；②非车库型；③本车
+	 * 已站在站台格（区间行驶阶段不命中）；④已有配对锁。其余订单与车库型挂接不变。 */
+	const bool r3r_stn_bounded = v->current_order.IsType(OT_GOTO_COUPLE) &&
+			!v->current_order.GetCoupleIsDepot() &&
+			IsRailStationTile(origin.tile) &&
+			R3RGetCouplePairPartner(v) != nullptr;
+	const StationID r3r_stn_bound_id = r3r_stn_bounded ? GetStationIndex(origin.tile) : StationID::Invalid();
+
 	/* R3R (第 251 轮, KI-384): replay a recently memoised closed-loop abort. See
 	 * R3R_LOOP_MEMO_TICKS above for why this cannot change the verdict. */
 	const uint64_t r3r_memo_key = ((uint64_t)v->index.base() << 29) | ((uint64_t)origin.tile.base() << 4) | (uint64_t)origin.trackdir;
@@ -17305,6 +17329,32 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 		if (ft.tiles_skipped == 0 && Rail90DegTurnDisallowedTilesFromTrackdir(ft.old_tile, ft.new_tile, ft.old_td, _settings_game.pf.forbid_90_deg)) {
 			ft.new_td_bits &= ~TrackdirCrossesTrackdirs(ft.old_td);
 			if (ft.new_td_bits == TRACKDIR_BIT_NONE) { r3r_backout_reason = "90deg-turn"; break; }
+		}
+
+		/* R3R（第 522 轮, KI-684 B 修法）：站台边界闸门。
+		 *
+		 * 只对「挂接机车从站台上起步」这一种情形生效（r3r_stn_bounded，四条判据与
+		 * 第 521 轮 X-2 逐字相同）。判据是「下一格还算不算同一个站台」：
+		 * IsRailStationTile 且同一个 StationID 才算站台内。tiles_skipped != 0 表示
+		 * 这一跳跨了桥/隧道，两端都不可能是站台，故不在此判定，交给 below 的
+		 * backtrack 逻辑照旧处理。
+		 *
+		 * 越界时走与下面 choose 出口完全一致的返回（okay=false，附带 next_td_bits
+		 * 与 exitdir），只是多打一条探针。okay=false 的语义是「路径到此有效，剩下
+		 * 交给寻路器」，上层 19260 分支对非车库型挂接订单的处理正是保留这半截预留
+		 * + 用 FillTrainReservationLookAhead 重建前瞻（cpl-partial-res），不会释放。 */
+		if (r3r_stn_bounded && ft.tiles_skipped == 0 &&
+				!(IsRailStationTile(ft.new_tile) && GetStationIndex(ft.new_tile) == r3r_stn_bound_id)) {
+			if (new_tracks != nullptr) *new_tracks = TrackdirBitsToTrackBits(ft.new_td_bits);
+			if (enterdir != nullptr) *enterdir = ft.exitdir;
+			if (R3RDbgEdge(R3REDGE_EXTEXIT,
+					((uint64_t)v->index.base() << 40) | ((uint64_t)ft.new_tile.base() << 8) | 3, 3)) {
+				R3RDbgWrite("RESV-EXT-STNEDGE veh=%u origin=%d,%d/%d stn=%u edge=%d,%d td=%d nextbits=0x%X steps=%u spd=%u\n",
+						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+						(uint)r3r_stn_bound_id.base(), (int)TileX(ft.new_tile), (int)TileY(ft.new_tile), (int)ft.old_td,
+						(uint)ft.new_td_bits, (unsigned)r3r_walk_steps, (uint)v->cur_speed);
+			}
+			return PBSTileInfo(ft.new_tile, ft.old_td, false);
 		}
 
 		/* Station, depot or waypoint are a possible target. */
@@ -17413,6 +17463,16 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			/* Choice found, path valid but not okay. Save info about the choice tile as well. */
 			if (new_tracks != nullptr) *new_tracks = TrackdirBitsToTrackBits(ft.new_td_bits);
 			if (enterdir != nullptr) *enterdir = ft.exitdir;
+			/* R3R (REG-505-32-A): the three *success* exits of this walk had no log at all, so
+			 * "the reservation stopped early" could not be told apart from "it backed out".
+			 * Read-only: nothing below this line changes any decision (no break, no booking). */
+			if (R3RDbgEdge(R3REDGE_EXTEXIT,
+					((uint64_t)v->index.base() << 40) | ((uint64_t)ft.new_tile.base() << 8) | 1, 1)) {
+				R3RDbgWrite("RESV-EXT-EXIT veh=%u kind=choose origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u\n",
+						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+						(int)TileX(ft.new_tile), (int)TileY(ft.new_tile), (int)ft.old_td,
+						(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps);
+			}
 			return PBSTileInfo(ft.new_tile, ft.old_td, false);
 		}
 
@@ -17453,6 +17513,14 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			bool wp_free = IsWaitingPositionFree(v, tile, cur_td, _settings_game.pf.forbid_90_deg, &restricted_signal_state);
 			if (!(wp_free && TryReserveRailTrackdir(v, tile, cur_td))) { r3r_backout_reason = wp_free ? "safe-reserve-fail" : "safe-not-free"; break; }
 			/* Safe position is all good, path valid and okay. */
+			/* R3R (REG-505-32-A): safe-waiting-position success exit, see the choice exit above. */
+			if (R3RDbgEdge(R3REDGE_EXTEXIT,
+					((uint64_t)v->index.base() << 40) | ((uint64_t)tile.base() << 8) | 2, 2)) {
+				R3RDbgWrite("RESV-EXT-EXIT veh=%u kind=safe origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u\n",
+						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+						(int)TileX(tile), (int)TileY(tile), (int)cur_td,
+						(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps);
+			}
 			restricted_signal_state.TraceRestrictExecuteResEndSlot(v);
 			return PBSTileInfo(tile, cur_td, true);
 		}
@@ -17493,6 +17561,15 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 
 	if (ft.err == CFollowTrackRail::ErrorCode::Owner || ft.err == CFollowTrackRail::ErrorCode::NoWay) {
 		/* End of line, path valid and okay. */
+		/* R3R (REG-505-32-A): end-of-line success exit, see the choice exit above. */
+		if (R3RDbgEdge(R3REDGE_EXTEXIT,
+				((uint64_t)v->index.base() << 40) | ((uint64_t)ft.old_tile.base() << 8) | 3, 3)) {
+			R3RDbgWrite("EXT-EXIT veh=%u kind=eol origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u err=%d\n",
+					(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
+					(int)TileX(ft.old_tile), (int)TileY(ft.old_tile), (int)ft.old_td,
+					(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps,
+					(int)ft.err);
+		}
 		return PBSTileInfo(ft.old_tile, ft.old_td, true);
 	}
 
@@ -18517,6 +18594,32 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
 					(uint)res_tracks, (uint)tracks,
 					(int)consist->cur_speed, (int)consist->cur_real_order_index);
+		}
+	}
+	/* R3R (第 505 轮续, REG-505-32-C): `early-haverserved` 这条 return 此前一个字都不打，
+	 * 是最大的探针盲区（详见 R3R_couple_resv_unsafe_turnout_20261124_memo.md §32.10）。
+	 * 它排在下面 if (do_track_reservation) 之前，一旦命中就不调 ExtendTrainReservation()、
+	 * 也不调 yapf，日志里于是只剩 RP cur= 而 EXT-* 全 0。这里在判定前补一条签名去重探针，
+	 * 只读：四个豁免的取值直接说明是哪一条把"必须重算路径"的要求放过去了。
+	 * key=veh，签名含 res/tile/spd/look，同一形态只打一次，不刷屏。 */
+	if (R3RDbgOn()) {
+		static std::map<uint32_t, uint64_t> r3r_haveres_seen;
+		const uint64_t hr_sig = ((uint64_t)(uint32_t)res_tracks << 40)
+				| ((uint64_t)(uint32_t)tile.base() << 12)
+				| ((uint64_t)(consist->cur_speed & 0xFF) << 2)
+				| ((uint64_t)(consist->lookahead != nullptr ? 1 : 0));
+		uint64_t &hr_seen = r3r_haveres_seen[consist->index.base()];
+		if (hr_seen != hr_sig) {
+			hr_seen = hr_sig;
+			R3RDbgWrite("RESV-HAVERES veh=%d tile=%d,%d enterdir=%d res=0x%X tracks=0x%X spd=%d real=%d order=%d stuckretry=%d split=%d foreign=%d nolook=%d look=%d\n",
+					consist->index.base(),
+					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
+					(uint)res_tracks, (uint)tracks,
+					(int)consist->cur_speed, (int)consist->cur_real_order_index,
+					(int)consist->current_order.GetType(),
+					r3r_couple_stuck_retry ? 1 : 0, r3r_couple_split_res ? 1 : 0,
+					r3r_couple_foreign_res ? 1 : 0, r3r_couple_no_lookahead ? 1 : 0,
+					consist->lookahead != nullptr ? 1 : 0);
 		}
 	}
 	/* Do we have a suitable reserved track? */

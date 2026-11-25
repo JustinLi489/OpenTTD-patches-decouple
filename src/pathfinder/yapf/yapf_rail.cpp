@@ -754,44 +754,198 @@ public:
 		 *   selfheld       —— 归属者与询路车同链(自锁)；0 表示第三方
 		 *   type/plain/st/depot —— 格型，区分"站台整格位冲突"与"普通轨位冲突"
 		 * 本探针不改控制流: 失败仍然整批回滚。 */
-		bool stopped_at_safe = false;
+		bool stopped_at_goal = false;
 		Train *const r3r_coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
-		const bool r3r_forbid_90deg = _settings_game.pf.forbid_90_deg;
-		/* R3R (第 399 轮, REG-399-C 收口): 终点例外 —— 先找出**最后一个**安全位。
+		/* R3R (第 511 轮, KI-684 A 方案): 挂接预留的**站台硬边界**。
 		 *
-		 * 原生 PBS 的预留终止于「第一个安全停车位」，这把尺子对**路径中段**
-		 * 完全正确：列车在那里停下等下一个安全位空出来，下一 tick 从车头位置
-		 * 重算再往前顶一格（ExtendTrainReservation 每 tick 都重算）。
+		 * 玩家口径（2026-11-26 原话）：「KI684 的核心是 veh15 的挂接寻路预留超出
+		 * 站台，也就是说，预留从站台一边进入，又从另一边出来，但 veh15 的命令是
+		 * 去那个站台挂接。」⇒ 缺陷维度是**范围**（预留终止边界缺失），不是槽位、
+		 * 不是双写、不是撞车。
 		 *
-		 * 但**终点段**不成立。挂接的会合点常常就在线路末端（现场 248,133，
-		 * 248,134 已无铁轨），而 248,127 那个信号格是路径上最后一个安全位。
-		 * 按原生口径预留止于 248,127 ⇒ 248,128~248,133 六格无人订 ⇒ 机车最多
-		 * 开到 248,128 就再没有已订的格可进 ⇒ TrainController 无路 ⇒ 停住 ⇒
-		 * 下一次 TryReservePath 的起点仍是 248,128 ⇒ **自锁**，挂接永远不成立。
-		 * 这里没有"下一 tick 自己长出来"的可能：续订的驱动是机车往前开，而
-		 * 往前开的前提是前面已经订好。
+		 * 判据只有一条：**配对伙伴所在的那一段站台（连续同站、同轴、同轨，直到
+		 * 遇到不可兼容格为止）就是预留范围的右界**。摸路一旦踩进这段站台，之后
+		 * 就不再往站台外铺；站台被 TrackFollower 整段跳格（tiles_skipped 让
+		 * r3r_resv_path 里根本没有站台格）时，用同排坐标的"整段跨过"判据兜住。
 		 *
-		 * 口径：若安全位就是**最后一个**安全位（它之后直到会合点再无安全位），
-		 * 则不在它截断，继续订满到会合点。会合点不需要满足"安全停车位"——列车
-		 * 到达即结束，不在那里等待让行。路径中段有多个安全位时仍按第一个截断，
-		 * 不会因为本例外多占别人的轨道。 */
-		size_t r3r_last_safe = steps.size();
-		for (size_t k = steps.size(); k-- > 0; ) {
-			/* R3R (第 400 轮, KI-569): 站台跳格补压的 tg 落在平台末端，而
-			 * IsSafeWaitingPosition() 对"跟随失败"（含尽头站台的最后一格）按
-			 * include_line_end 判安全。若把它算进"最后一个安全位"，就会把真正的
-			 * 等待位（平台前那一格）退化成中段截断点 ⇒ 平台段又订不上。站台格
-			 * 只可能出现在终点段，故本扫描直接跳过。 */
-			if (IsRailStationTile(steps[k].first)) continue;
-			if (IsSafeWaitingPosition(r3r_coupler, steps[k].first, steps[k].second, true, r3r_forbid_90deg)) {
-				r3r_last_safe = k;
-				break;
+		 * 停止优先于延伸：最坏结果是少订一格（机车多等一 tick 重算再续订），绝不
+		 * 多订到站台外 —— 后者正是玩家看到的"预留从站台一边穿到另一边"。
+		 *
+		 * 作用域刻意收窄：只对"配对伙伴停在站台上"的挂接生效。伙伴在库里/野地/
+		 * 路点上时 r3r_plat_ref 保持 INVALID_TILE，本段逻辑整块不参与，行为逐字
+		 * 不变（普通行驶列车根本不进这个函数）。 */
+		TileIndex r3r_plat_ref = INVALID_TILE;
+		int r3r_pair_idx = -1;
+		{
+			const Train *r3r_partner = R3RGetCouplePairPartner(r3r_coupler);
+			if (r3r_partner != nullptr) r3r_pair_idx = (int)r3r_partner->index.base();
+			for (const Train *t = r3r_partner; t != nullptr; t = t->Next()) {
+				if (IsRailStationTile(t->tile) && !IsRailWaypointTile(t->tile)) {
+					r3r_plat_ref = t->tile;
+					break;
+				}
+			}
+			/* R3R (第 515 轮, KI-684): 配对锁不是可靠锚点。
+			 * 现场读数 `CPL-PAIRSCAN tick=41925 act=15 ... best=118 bestDist=23
+			 * paired=-1` —— 寻路那一刻 veh=15 的锁还没建立（锁是 CPL-PAIRLOCK 在
+			 * 别的 tick 扫出来的，且属于 75/18 那一对），于是
+			 * R3RGetCouplePairPartner() 返回 nullptr、整块站台判据被静默跳过，
+			 * 第 514 轮才会"EXT-STOP 一次都不出现"。
+			 *
+			 * 补两个不依赖锁的锚点（顺序即优先级）：
+			 *   ① 摸路终点 steps.back()：它是 SetReservationTarget() 收到的会合点，
+			 *      必然紧邻配对车底；
+			 *   ② 会合点同排 ±8 格内第一个真站台格（排除路点）。
+			 * 都找不到才放弃 —— 此时行为退回第 511 轮之前，逐字不变。 */
+			if (r3r_plat_ref == INVALID_TILE && !steps.empty()) {
+				const TileIndex r3r_goal = steps.back().first;
+				if (IsRailStationTile(r3r_goal) && !IsRailWaypointTile(r3r_goal)) {
+					r3r_plat_ref = r3r_goal;
+				} else {
+					for (int d = 1; d <= 8 && r3r_plat_ref == INVALID_TILE; d++) {
+						const int dx4[4] = { d, -d, 0, 0 };
+						const int dy4[4] = { 0, 0, d, -d };
+						for (int k = 0; k < 4; k++) {
+							const TileIndex nt = TileAddWrap(r3r_goal, dx4[k], dy4[k]);
+							if (nt == INVALID_TILE) continue;
+							if (IsRailStationTile(nt) && !IsRailWaypointTile(nt)) {
+								r3r_plat_ref = nt;
+								break;
+							}
+						}
+					}
+				}
+			}
+			/* 判据完全没有锚点时也必须留痕：否则"日志里没有"无法与"没走到这里"
+			 * 区分（第 514 轮就栽在这上面）。按车号节流，每车只报一次。 */
+			if (r3r_plat_ref == INVALID_TILE) {
+				static uint32_t r3r_noref_seen[64] = { 0 };
+				const uint32_t r3r_vk = (uint32_t)r3r_coupler->index.base() + 1;
+				bool r3r_seen = false;
+				for (int k = 0; k < 64; k++) {
+					if (r3r_noref_seen[k] == r3r_vk) { r3r_seen = true; break; }
+				}
+				if (!r3r_seen) {
+					for (int k = 0; k < 63; k++) r3r_noref_seen[k] = r3r_noref_seen[k + 1];
+					r3r_noref_seen[63] = r3r_vk;
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "EXT-NOREF veh=%d pair=%d steps=%u goal=%d,%d\n",
+								(int)r3r_coupler->index.base(), r3r_pair_idx, (unsigned)steps.size(),
+								steps.empty() ? -1 : (int)TileX(steps.back().first),
+								steps.empty() ? -1 : (int)TileY(steps.back().first));
+						fclose(dbg);
+					}
+				}
 			}
 		}
-		bool term_exempt = false;
+		int r3r_plat_lo = 0;      ///< 站台沿轴向的低端坐标（含）
+		int r3r_plat_hi = 0;      ///< 站台沿轴向的高端坐标（含）
+		int r3r_plat_perp = 0;    ///< 站台所在那一排的垂直坐标（Axis::X ⇒ TileY）
+		bool r3r_plat_row_x = true; ///< 站台轴向是 X（沿 x 延伸）还是 Y
+		if (r3r_plat_ref != INVALID_TILE) {
+			r3r_plat_row_x = (GetRailStationAxis(r3r_plat_ref) == Axis::X);
+			r3r_plat_perp = r3r_plat_row_x ? (int)TileY(r3r_plat_ref) : (int)TileX(r3r_plat_ref);
+			const int r3r_plat_dx = r3r_plat_row_x ? 1 : 0;
+			const int r3r_plat_dy = r3r_plat_row_x ? 0 : 1;
+			TileIndex r3r_plat_end = r3r_plat_ref;
+			for (int k = 0; k < 64; k++) {
+				const TileIndex nt = TileAddWrap(r3r_plat_end, r3r_plat_dx, r3r_plat_dy);
+				if (nt == INVALID_TILE || !IsCompatibleTrainStationTile(nt, r3r_plat_ref)) break;
+				r3r_plat_end = nt;
+			}
+			r3r_plat_hi = r3r_plat_row_x ? (int)TileX(r3r_plat_end) : (int)TileY(r3r_plat_end);
+			r3r_plat_end = r3r_plat_ref;
+			for (int k = 0; k < 64; k++) {
+				const TileIndex nt = TileAddWrap(r3r_plat_end, -r3r_plat_dx, -r3r_plat_dy);
+				if (nt == INVALID_TILE || !IsCompatibleTrainStationTile(nt, r3r_plat_ref)) break;
+				r3r_plat_end = nt;
+			}
+			r3r_plat_lo = r3r_plat_row_x ? (int)TileX(r3r_plat_end) : (int)TileY(r3r_plat_end);
+		}
+		bool r3r_plat_entered = false; ///< 本轮摸路已经踩进伙伴所在那段站台
+		bool r3r_plat_seen_lo = false; ///< 同排、轴向坐标低于站台起点（从低侧接近）
+		bool r3r_plat_seen_hi = false; ///< 同排、轴向坐标高于站台终点（从高侧接近）
+		/* R3R (第 504 轮收口, REG-504-E, 玩家 2026-11-24 拍板 C-6/C-7):
+		 * 「安全位」在本函数里只保留一个含义 —— **本车要去挂的目的地**。
+		 *
+		 * 这一刀同时否掉两块东西：
+		 *  ① 终点例外（REG-399-C）：例外之所以存在，是因为原判据
+		 *     (IsSafeWaitingPosition) 看不见「这格是我的目的地」这个维度 ——
+		 *     它对会合点和一个无关的空道岔给出**完全相同**的答案。改用
+		 *     「目的地即安全位」之后，会合点天然是安全位，"找不到最后一个
+		 *     安全位"这种状态不会发生，例外连同它的 steps.size() 兜底初值
+		 *     一起失去存在理由（例外加例外 = 意外）。
+		 *  ② 单轨格限制（REG-504-A / M1）：M1 靠"必须单轨"来排除被误判成
+		 *     线路尽头的道岔（现场 1457,1874）。玩家的判据更准 —— 道岔能否
+		 *     当安全位的条件是"上面有没有我的等待列车"，不是"单轨/多轨"。
+		 *     只订到目的地之后，中途格根本不参与安全位判定，M1 的尺子即不需要。
+		 *
+		 * 于是正向扫退化为一条规则：**逐格订，订到目的地为止，中途一律不截断**。
+		 * 中段信号/道岔/站台都不再是截断点 —— 这正是挂接需要的语义：机车要
+		 * 一路开到会合点合并，中途停下就自锁（REG-399-C 的原始推导）。
+		 *
+		 * 第三方占用仍由 ReserveSingleTrack 的失败分支兜住（KI-563 A：保留
+		 * 已订格并原地返回），不会因为删掉安全位判据而多占别人的轨道。 */
 		for (size_t i = 0; i < steps.size(); ++i) {
 			const TileIndex stile = steps[i].first;
 			const Trackdir stdir = steps[i].second;
+			/* R3R (第 511 轮, KI-684 A): 站台硬边界，判据见函数开头。 */
+			if (r3r_plat_ref != INVALID_TILE) {
+				const int r3r_axial = r3r_plat_row_x ? (int)TileX(stile) : (int)TileY(stile);
+				const int r3r_perp = r3r_plat_row_x ? (int)TileY(stile) : (int)TileX(stile);
+				const bool r3r_same_row = (r3r_perp == r3r_plat_perp);
+				/* 站台段内的格理论上不会进 steps（r3r_resv_path 明确排除站台格），
+				 * 只有"整段跨过"分支会把会合点自身补进来。保留 on_piece 是为了让
+				 * entered 仍有确切定义：踩上站台段的那一格。 */
+				const bool r3r_on_piece = r3r_same_row && r3r_axial >= r3r_plat_lo && r3r_axial <= r3r_plat_hi;
+				/* below/above 只认站台两端±8 格内的"贴边格"：同排但隔着几百格的
+				 * 另一段线路不是接近侧，不能参与"整段跨过"判据（否则同 y 坐标的
+				 * 远处线路会让跳格判据误触发）。跳格落点恰好是 hi+1 / lo-1。 */
+				const bool r3r_below = r3r_same_row && r3r_axial < r3r_plat_lo && r3r_axial >= r3r_plat_lo - 8;
+				const bool r3r_above = r3r_same_row && r3r_axial > r3r_plat_hi && r3r_axial <= r3r_plat_hi + 8;
+				/* 判据 ①（同排整段跨过）：从低侧贴过站台、现在却已经跑到站台高侧之外
+				 * （或反之），说明 TrackFollower 把整段站台一步跳过去了 —— 这一格已
+				 * 经在站台外。 */
+				const bool r3r_leaped = (r3r_below && r3r_plat_seen_hi) || (r3r_above && r3r_plat_seen_lo);
+				/* 判据 ②（踩进去之后的任何越界）：第 514 轮把它写成 `entered` 单独
+				 * 成立就停，既等于"第二次踩上站台就停"（错），又因为站台格被
+				 * r3r_resv_path 排除而恒不可达（更错）。现在只保留正确语义：踩上
+				 * 站台段之后，**任何**不在该段内的格都算越界 —— 换排、轴向越端都算。 */
+				const bool r3r_off_piece = r3r_plat_entered && !r3r_on_piece;
+				/* 判据 ③（换排拐出，REG-515-A）：现场越界形态是"从站台这一排拐到
+				 * 相邻排再穿出去"（站台 y=1874 → 越界格 y=1873/1875/1876），此时
+				 * 判据 ①② 的"同排"前提全部为假，一行都不会响。定义：已经在站台
+				 * 自己那一排读到过贴边格（说明正在朝站台开），下一格却落到相邻排
+				 * 且轴向仍落在站台±8 格范围内 —— 那是绕着站台走，不是进站。 */
+				const bool r3r_adj_row = (r3r_perp == r3r_plat_perp - 1) || (r3r_perp == r3r_plat_perp + 1);
+				const bool r3r_cross_row = r3r_adj_row
+						&& (r3r_plat_seen_hi || r3r_plat_seen_lo)
+						&& r3r_axial >= r3r_plat_lo - 8 && r3r_axial <= r3r_plat_hi + 8;
+				if (r3r_leaped || r3r_off_piece || r3r_cross_row) {
+					const char *const r3r_why = r3r_cross_row ? "cross-row"
+							: (r3r_leaped ? "leaped" : "off-platform");
+					FILE *dbg = R3RFopenDbg("a");
+					if (dbg != nullptr) {
+						fprintf(dbg, "EXT-STOP veh=%d reason=%s nth=%u/%u tile=%d,%d td=%d plat=%d,%d axis=%d lo=%d hi=%d perp=%d platperp=%d entered=%d leaped=%d crossrow=%d booked=%u\n",
+								(int)r3r_coupler->index.base(), r3r_why,
+								(unsigned)i, (unsigned)steps.size(),
+								(int)TileX(stile), (int)TileY(stile), (int)stdir,
+								(int)TileX(r3r_plat_ref), (int)TileY(r3r_plat_ref),
+								r3r_plat_row_x ? (int)Axis::X : (int)Axis::Y,
+								r3r_plat_lo, r3r_plat_hi, r3r_perp, r3r_plat_perp,
+								(int)r3r_plat_entered, (int)r3r_leaped, (int)r3r_cross_row,
+								(unsigned)booked);
+						fclose(dbg);
+					}
+					/* 不订这一格，就地收尾：booked 里已经是站台内/站台前的格，调用方
+					 * （booked < steps.size()）会把预留终点收到最后一格已订。 */
+					break;
+				}
+				if (r3r_on_piece) r3r_plat_entered = true;
+				if (r3r_below) r3r_plat_seen_lo = true;
+				if (r3r_above) r3r_plat_seen_hi = true;
+			}
 			this->ReserveSingleTrack(stile, stdir);
 			if (this->res_fail_tile != INVALID_TILE) {
 				{
@@ -867,66 +1021,34 @@ public:
 				return false;
 			}
 			++booked;
-			/* R3R (第 395 轮, KI-563 修法 D): 预留终点 = 第一个「安全停车位」，
-			 * 不是第一个「带信号的格」。
+			/* R3R (第 504 轮收口, REG-504-E): 目的地即终点，且是**唯一**的终点。
 			 *
-			 * 第 394 轮按"格上有信号"截断是**语法**判据：它不区分该信号是不是
-			 * 允许停车的位（PBS 信号本身并不安全，要看下一格 / NoEntry /
-			 * AlwaysReserveThrough / TRPRF_RESERVE_THROUGH），于是既能漏截一串
-			 * PBS 信号、也会在错的一侧早停。修法 D 换成**语义**判据，与原生 PBS
-			 * 一致：预留终止于下一个安全停车位；"带信号的格"只是它最常见的形态。
+			 * 本格是摸路的最后一格 —— rp()/reach() 摸到会合点即停，steps.back()
+			 * 就是车底前沿那一格，调用方（:2142 一带）也已经先把预留终点设成它。
+			 * 订上它之后立即结束，不再做任何"安全位"判定：
 			 *
-			 * IsSafeWaitingPosition() 就是这把尺子（pbs.cpp），驾驶预留
-			 * ExtendTrainReservation()（train_cmd.cpp:16130）与本文件
-			 * FindSafePositionProc()（:162）用的都是它 —— 挂接预留与驾驶预留
-			 * 从此在同一条边界上收尾。
+			 *  · 中段信号不再截断。原生 PBS 按"第一个安全位"收尾是对的，因为
+			 *    驾驶侧下一 tick 从车头重算、能自己往前长；挂接预留是一次性摸
+			 *    完整条路再订，中途停下就自锁（REG-399-C 的原始推导）。
+			 *  · 中段道岔/站台不再需要任何排除。M1 的单轨尺子是用来防"道岔被
+			 *    误判成线路尽头"的，现在中段根本不判，尺子自然不需要。
+			 *  · 不再有"最后一个安全位"的反向扫描，也就不存在"遍寻不着 ⇒ 兜底
+			 *    订满"这条把异常当常态的路径（玩家口径：例外加例外 = 意外）。
 			 *
-			 * 判在**订成功之后**而不是之前，有两个原因：
-			 *  ① 安全位自己要被订下（车头可以停上去），而"已订"的判据只能由
-			 *     ReserveSingleTrack 给出 —— 上一次 tick 自己铺下的格会走
-			 *     KI-361 自订豁免而成功（IsWaitingPositionFree 不排除自己，先问
-			 *     它会把自有格误判成占用、把终点收到车尾后面）；
-			 *  ② 安全位被**第三方**占着时，ReserveSingleTrack 本就会失败，下面的
-			 *     KI-563 A 分支保留已订格并就地返回 —— 正是 V-D3 要的"停在它
-			 *     之前、保留已订"，与 ExtendTrainReservation 的整段 back-out 不同。
+			 * 判在**订成功之后**：目的地格自己必须被订下（机车要开进去贴住车底）。
+			 * 若它被第三方或车底占着，上面的 KI-563 A 分支会保留已订格并就地
+			 * 返回，与原生 PBS 的粒度一致。
 			 *
-			 * 兜底：全程没有任何安全位（密信号/无岔口/纯弯）时循环照旧订满 ——
-			 * 最后一格是会合点，ChooseTrainTrack 已保证预留终点安全，所以不会比
-			 * 改动前订得更少。
-			 *
-			 * 停在第 i 格后，调用方把预留终点收到 booked-1（:1712-1715），
-			 * 终点即这个安全位。 */
-			/* R3R (第 400 轮, KI-569): 站台段是终点段（会合点必在其上），不是等待位。
-			 * 按"尽头站台 ⇒ 安全位"去截断恰好会把整段平台挡在预留之外，正是本轮
-			 * 机车自锁的直接原因；平台是否可用交由 ReserveSingleTrack() 的整段
-			 * 平台预订去判（被占则 PARTIAL，停在平台前，不越权）。 */
-			if (!IsRailStationTile(stile) && IsSafeWaitingPosition(r3r_coupler, stile, stdir, true, r3r_forbid_90deg)) {
-				if (i == r3r_last_safe) {
-					/* 终点例外（第 399 轮, REG-399-C）：这是路径上**最后一个**安全位，
-					 * 它之后直到会合点再无安全位。若仍在此截断，会合点那几格永远无人
-					 * 订，机车最多开到它前面一格就自锁（详见函数头的推导）。继续订满，
-					 * 预留终点因此留在会合点，调用方的收缩分支不会触发。 */
-					term_exempt = true;
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "CPL-RES-TERM-EXEMPT veh=%d nth=%u/%u tile=%d,%d td=%d booked=%u\n",
-								(int)r3r_coupler->index.base(),
-								(unsigned)i, (unsigned)steps.size(),
-								(int)TileX(stile), (int)TileY(stile), (int)stdir,
-								(unsigned)booked);
-						fclose(dbg);
-					}
-					continue;
-				}
-				stopped_at_safe = true;
+			 * 因为这里 break 时 booked 已包含最后一格，调用方的
+			 * `booked < steps.size()` 收缩分支不会触发，预留终点保持在会合点。 */
+			if (i + 1 == steps.size()) {
+				stopped_at_goal = true;
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-RES-SAFE-STOP veh=%d nth=%u/%u tile=%d,%d td=%d sig=%d booked=%u\n",
+					fprintf(dbg, "CPL-RES-SAFE-STOP veh=%d nth=%u/%u tile=%d,%d td=%d booked=%u goal=1\n",
 							(int)r3r_coupler->index.base(),
 							(unsigned)i, (unsigned)steps.size(),
 							(int)TileX(stile), (int)TileY(stile), (int)stdir,
-							(int)(IsTileType(stile, TileType::Railway) && HasSignals(stile) &&
-									HasSignalOnTrack(stile, TrackdirToTrack(stdir))),
 							(unsigned)booked);
 					fclose(dbg);
 				}
@@ -935,14 +1057,17 @@ public:
 		}
 		/* R3R (REG-359-K 探针, 只读): 成功时列出本次实际订下的格序，用来回答
 		 * "第 5 次 booked=6 究竟订了哪 6 格、有没有覆盖 36,12/37,12"。
-		 * 第 394 轮起会被截断（第 395 轮起截断点是第一个安全停车位），故 total
-		 * 后面补 booked=/stop_safe=，tiles 只列真正订下的。 */
+		 *
+		 * R3R (第 504 轮收口): `term_exempt=` 字段已删除（终点例外机制整体不再
+		 * 存在）。保留 `stop_safe=` 只为兼容既有判读，它与新的 `goal=` 现在
+		 * 同义 —— 都是"本轮预留是否在目的地收尾"。因为正常路径恒在最后一格
+		 * break，健康形态是 `total=N booked=N stop_safe=1 goal=1`。 */
 		if (!steps.empty()) {
 			FILE *dbg = R3RFopenDbg("a");
 			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-RES-OK veh=%d total=%u booked=%u stop_safe=%d term_exempt=%d tiles=",
+				fprintf(dbg, "CPL-RES-OK veh=%d total=%u booked=%u stop_safe=%d goal=%d tiles=",
 						(int)Train::From(Yapf().GetVehicle())->index.base(), (unsigned)steps.size(),
-						(unsigned)booked, (int)stopped_at_safe, (int)term_exempt);
+						(unsigned)booked, (int)stopped_at_goal, (int)stopped_at_goal);
 				for (size_t i = 0; i < booked && i < 16; ++i) {
 					fprintf(dbg, "%s%d,%d/%d", (i == 0) ? "" : ";",
 							(int)TileX(steps[i].first), (int)TileY(steps[i].first), (int)TrackdirToTrack(steps[i].second));
@@ -1571,7 +1696,55 @@ public:
 		/* R3R: a depot tile is a dead end - never extend a path through it. */
 		if (IsRailDepotTile(old_node.GetLastTile()) && old_node.parent != nullptr) return;
 		TrackFollower F(Yapf().GetVehicle(), Yapf().GetCompatibleRailTypes());
-		if (F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir())) {
+		/* R3R（KI-676）：挂接寻路必须逐格走站台。默认的 TrackFollower 一进站台就整段跳到站台
+		 * 末端（follow_track.hpp 的 platform leap），会合点（如 1439,1874）因此从不成为节点，
+		 * 精确格判定永远 found=0。这里关掉跳跃，只作用于挂接寻路。 */
+		F.platform_leap = false;
+		/* R3R（KI-676 诊断 S5-cpp）：只对 y=1874、x∈[1436,1446] 这一排定点取证。
+		 * 放在 .cpp 而不是 yapf_destrail.hpp，是因为本树的 ninja 不跟踪头文件依赖
+		 * （KI-15），改头文件必须全量重编，改 .cpp 只重编本 TU。 */
+		const TileIndex ot = old_node.GetLastTile();
+		const TileIndex kt = old_node.GetKey().tile;
+		const bool probe_geo = (TileY(ot) == 1874 && TileX(ot) >= 1436 && TileX(ot) <= 1446);
+		const bool probe = (TileY(kt) == 1874 && TileX(kt) >= 1436 && TileX(kt) <= 1446);
+		static bool r3r_pfx_geo_dumped = false;
+		if (probe_geo && !r3r_pfx_geo_dumped) {
+			r3r_pfx_geo_dumped = true;
+			FILE *dbg = R3RFopenDbg("a");
+			if (dbg != nullptr) {
+				for (uint x = 1436; x <= 1444; x++) {
+					const TileIndex t = TileXY(x, 1874);
+					const bool rail = IsTileType(t, TileType::Railway);
+					const uint rb = rail ? (uint)(uint8_t)GetRailTileType(t) : 0xFF;
+					const uint tb = rail ? (uint)(uint8_t)GetTrackBits(t) : 0;
+					const uint rs = rail ? (uint)(uint8_t)GetReservedTrackbits(t) : 0;
+					fprintf(dbg, "PFX-GEO t=%u,1874 rail=%d rtype=%u tb=0x%x tdb=0x%x res=0x%x stn=%d\n",
+							x, (int)rail, rb, tb,
+							(unsigned)GetTileTrackdirBits(t, ::TransportType::Rail, 0),
+							rs, (int)IsRailStationTile(t));
+				}
+				fclose(dbg);
+			}
+		}
+		const bool pfx_ok = F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir());
+		if (probe) {
+			static uint32_t r3r_pfx_seen[16] = {0};
+			const uint px = TileX(kt) - 1436;
+			if (px < 16 && r3r_pfx_seen[px] < 3) {
+				++r3r_pfx_seen[px];
+				FILE *dbg = R3RFopenDbg("a");
+				if (dbg != nullptr) {
+					fprintf(dbg, "PFX-%s from=%d,%d last=%d,%d td=%d err=%d exitdir=%d new=%d,%d nbits=0x%x skip=%d stn=%d cost=%d est=%d\n",
+							pfx_ok ? "OK" : "FAIL", (int)TileX(kt), (int)TileY(kt), (int)TileX(ot), (int)TileY(ot),
+							(int)(uint8_t)old_node.GetLastTrackdir(), (int)(uint8_t)F.err, (int)(uint8_t)F.exitdir,
+							(int)TileX(F.new_tile), (int)TileY(F.new_tile),
+							(unsigned)F.new_td_bits, F.tiles_skipped, (int)F.is_station,
+							old_node.GetCost(), old_node.GetCostEstimate());
+					fclose(dbg);
+				}
+			}
+		}
+		if (pfx_ok) {
 			Yapf().AddMultipleNodes(&old_node, F);
 		}
 	}
@@ -1700,7 +1873,20 @@ public:
 				if (tr->First()->index == r3r_snap_veh) { best_on_consist = true; break; }
 			}
 			const TileIndex r3r_snap_far = Yapf().R3RStaticTargetFarTile();
-			if (best_on_consist) {
+			/* R3R（第 503 轮, S5, KI-676）：会合点优先。
+			 *
+			 * 会合点 = 车底近端「预留所在格」按轨型再往外一格（现场 1439,1874），
+			 * 由快照 O(1) 算出。它一旦成立，"终点在哪"就没有第二种可能，下面那套
+			 * "best 落在车底上取 best 格 / 否则按曼哈顿选近端"的端选逻辑整块跳过 ——
+			 * 那套逻辑正是 20/23 条现场停在远端 1424（穿过整条车底、越站台后被
+			 * 道岔轨型带进 1873）的来源。
+			 *
+			 * best_on_consist 只作诊断保留：终点收到会合点后，YAPF 不会停在车底
+			 * 占着的格上，所以正常应为 0。 */
+			const TileIndex r3r_meet = Yapf().R3RStaticMeetTile();
+			if (r3r_meet != INVALID_TILE) {
+				consist_head_tile = r3r_meet;
+			} else if (best_on_consist) {
 				consist_head_tile = pNode->GetLastTile();
 			} else if (r3r_snap_far != INVALID_TILE &&
 					DistanceManhattan(v->tile, r3r_snap_far) < DistanceManhattan(v->tile, r3r_snap_tile)) {
@@ -1711,10 +1897,13 @@ public:
 			{
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-HEAD-STATIC veh=%d best=%d,%d snap=%d,%d farvalid=%d head=%d,%d on=%d\n",
+					fprintf(dbg, "CPL-HEAD-STATIC veh=%d best=%d,%d snap=%d,%d meetvalid=%d meet=%d,%d farvalid=%d head=%d,%d on=%d\n",
 							(int)v->index.base(),
 							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
 							(int)TileX(r3r_snap_tile), (int)TileY(r3r_snap_tile),
+							(int)(r3r_meet != INVALID_TILE),
+							(int)((r3r_meet != INVALID_TILE) ? TileX(r3r_meet) : 0),
+							(int)((r3r_meet != INVALID_TILE) ? TileY(r3r_meet) : 0),
 							(int)(r3r_snap_far != INVALID_TILE),
 							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile),
 							(int)best_on_consist);
@@ -2008,7 +2197,26 @@ public:
 					 * plus the loco's normal PBS reservation protect the route. E2 replaces
 					 * this with ExtendTrainReservation, E4 deletes rp() altogether. */
 					if (depth > 512) return false;
-					if (cur == tg) return true;
+					if (cur == tg) {
+						/* R3R (KI-684, 第 517 轮, 2026-11-26, E-1): returning here meant the meeting
+						 * tile itself never entered r3r_resv_path, so a plain-rail tg was never
+						 * booked -- only the station-jump branch below ever pushed tg (KI-569).
+						 * Live case: tg = 1439,1874 is a plain PBS signal tile, so 1439 was never
+						 * reserved: the loco could not enter the last tile and the couple never
+						 * fired (CPL-RES-OK ended at 1440,1874, RESV-SELF-AIR 1439,1874 had zero
+						 * lines, only one COUPLE-OK in the whole session).
+						 * Book tg like every other tile the loco has to drive into. Station and
+						 * depot tiles keep the old rule -- the reservation stops at the platform
+						 * and the station branch below books the whole platform in one step.
+						 * Safety: if the bit is already ours, TryReserveRailTrack() answers
+						 * RESV-SELF-AIR and counts it as a success (pbs.cpp R3RReservationHeldBySelf);
+						 * if it is someone else's, the booking fails and leaves CPL-SAFE-FAIL on this
+						 * very tile -- which is the diagnostic we want instead of a silent gap. */
+						if ((cur != st || depth != 0) && !IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
+							r3r_resv_path.push_back(R3RCoupleStep{cur, cur_td});
+						}
+						return true;
+					}
 					if (!IsRailStationTile(cur) && !IsRailDepotTile(cur)) {
 						/* 只记录物理走过、且需要预订的格：站台/车库不订（与 rp_last_tile
 						 * 的口径一致——预留止于会合点，不越过车底）；起点格也不订

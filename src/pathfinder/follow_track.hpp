@@ -48,6 +48,7 @@ struct CFollowTrackT {
 	bool                is_bridge;     ///< last turn passed bridge ramp
 	bool                is_station;    ///< last turn passed station
 	int                 tiles_skipped; ///< number of skipped tunnel or station tiles
+	bool                platform_leap; ///< R3R: jump a whole platform in one step (couple search disables it)
 	ErrorCode           err;
 	RailTypes           railtypes;
 
@@ -85,6 +86,7 @@ struct CFollowTrackT {
 		this->is_bridge = false;
 		this->is_tunnel = false;
 		this->tiles_skipped = 0;
+		this->platform_leap = true;
 		this->err = ErrorCode::None;
 		this->railtypes = railtype_override;
 	}
@@ -412,7 +414,7 @@ protected:
 		}
 
 		/* special handling for rail stations - get to the end of platform */
-		if (IsRailTT() && this->is_station) {
+		if (IsRailTT() && this->is_station && this->platform_leap) {
 			/* entered railway station
 			 * get platform length */
 			uint length = BaseStation::GetByTile(this->new_tile)->GetPlatformLength(this->new_tile, TrackdirToExitdir(this->old_td));
