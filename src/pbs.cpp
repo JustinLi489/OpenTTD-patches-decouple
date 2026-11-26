@@ -479,6 +479,9 @@ bool TryReserveRailTrackdir(const Train *v, TileIndex tile, Trackdir td, bool tr
 /* R3R (第 368 轮, REG-359-L): defined next to the other reservation-ownership
  * helpers far below; needed here by TryReserveRailTrack(). */
 static bool R3RReservationHeldBySelf(TileIndex tile, Track track);
+/* R3R (第 525 轮续, KI-692): "沿预留走到最近的车体就停"的助手，定义在 :2177 一带；
+ * R3RReservationHeldByCouplePartner() 要用它判"这一位到底是车底压着的还是自己的"。 */
+static Train *R3RFollowReservationToNearbyTrain(TileIndex tile, Trackdir trackdir, RailTypes rts);
 
 /**
  * R3R (第 345 轮): is this tile's reservation held *only* by the couple partner of
@@ -532,10 +535,46 @@ static bool R3RReservationHeldByCouplePartner(TileIndex tile)
 			if (!IsPlainRail(tile)) return false;
 			const TrackBits held = GetRailReservationTrackBits(tile);
 			if (held == TRACK_BIT_NONE) return false;
+			/* R3R (第 525 轮续, KI-692): "车底压着的位" ≠ "沿预留走到尽头是车底"。
+			 *
+			 * 旧写法只用 GetTrainForReservation()，它把**整条连续预留链**走到末端再问
+			 * "谁站在那儿"。机车自己的位与车底的站台位在几何上首尾相接，于是从机车位
+			 * 往西走先到车底 ⇒ 机车铺的整段路被判成"车底的空气"，一格都没写地图，
+			 * 而 booked 照样计数。现场（build\R3R_debug.log:3148-3151，第 525 轮续）：
+			 *   RESV-PAIR-AIR veh=15 tile=1455,1874 track=4 kind=rail
+			 *   CPL-RES-OK veh=15 total=20 booked=20
+			 *   CPL-RET veh=15 … ret=0x10 why=nores-final     ← 20 格全是假账
+			 * 更糟的是：路径第一步（1455,1874/4）因 PAIR-AIR 没写地图，于是它后面
+			 * y=1873 那一串位与机车之间断开，成了"无主位"，被本轮新加的孤儿回收一次
+			 * 清掉 9 格（:3232-3242）—— 清的是机车上一 tick 刚铺的活位。
+			 *
+			 * 收紧判据：一根轨只有在满足下列之一时才算"车底的空气"：
+			 *   ① 车底本链真有一节压在这根轨上（这是本豁免原本的语义："站着的格"）；
+			 *   ② 沿这一位往两头走，**第一个碰到的车体**都是车底（走到链尽头没人则忽略
+			 *      该方向，至少一个方向要碰到车）。
+			 * 于是"机车自己 → 车底"之间那一段不再被判成车底的：往东第一个碰到的是
+			 * 机车自己 ⇒ 不是空气 ⇒ 真写地图、真算自己的。
+			 * 双向都靠 R3RFollowReservationToNearbyTrain()（它在第一个有车的格停下，
+			 * 见 :2154-2176 的注释），不是走到尽头的 GetTrainForReservation()。 */
 			for (Track t = TRACK_BEGIN; t < TRACK_END; t++) {
 				if (!HasBit(held, t)) continue;
-				const Train *const owner = GetTrainForReservation(tile, t);
-				if (owner == nullptr || owner->First() != partner) return false;
+				bool partner_here = false;
+				for (const Train *tr : VehiclesOnTile<VehicleType::Train>(tile)) {
+					if (tr->track == TRACK_BIT_WORMHOLE) continue;
+					if (tr->First() != partner) continue;
+					if (HasBit((TrackBits)((uint)tr->track & (uint)TRACK_BIT_MASK), t)) { partner_here = true; break; }
+				}
+				if (partner_here) continue;
+				const RailTypes rts = GetRailTypeInfo(GetTileRailTypeByTrack(tile, t))->indirect_compatible_railtypes;
+				const Trackdir td0 = TrackToTrackdir(t);
+				bool saw_body = false;
+				for (int dir = 0; dir < 2; dir++) {
+					const Train *const near = R3RFollowReservationToNearbyTrain(tile, (dir == 0) ? td0 : ReverseTrackdir(td0), rts);
+					if (near == nullptr) continue;
+					if (near->First() != partner) return false;
+					saw_body = true;
+				}
+				if (!saw_body) return false;
 			}
 			return true;
 		}
@@ -711,6 +750,80 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 			break;
 	}
 	return false;
+}
+
+/**
+ * R3R (第 525 轮, KI-690): 回收"无主"的普通轨预留位。
+ *
+ * 预留位在地图上不记主人，归属只能靠 FollowReservation() 沿链走到末端再问"谁站在那儿"
+ * （GetTrainForReservation）。一旦链末端既没有车、又没有任何链的可达范围覆盖该格，这个位
+ * 就是孤儿：它永远挡着别人，却没有任何车会来释放它（第 243 轮续十二的定期审计
+ * R3RReservationAudit()/RESV-REAP 已不在当前源码里，日志亦零条）。
+ *
+ * 四条判据同时成立才清，且只清冲突的**那一根 Track**：
+ *  1. plain rail（站台/车库/桥隧/道口的预留是整格布尔值，语义不同，一律不碰）；
+ *  2. 顺预留找不到主人（GetTrainForReservation == nullptr）；
+ *  3. 所有链头的可达范围都不覆盖该格（TrainReservationPassesThroughTile 全 false，
+ *     与既有探针 FSCP-REACH-NONE 同一把尺子）；
+ *  4. 该格上没有任何车节压在这根 Track 上（绝不清车脚下的位）。
+ *
+ * @return 清掉的 Track 数（0 = 该格没有孤儿）
+ */
+int R3RReapOrphanReservationBits(TileIndex tile)
+{
+	if (!IsTileType(tile, TileType::Railway) || !IsPlainRail(tile)) return 0;
+	const TrackBits held = GetRailReservationTrackBits(tile);
+	if (held == TRACK_BIT_NONE) return 0;
+
+	TrackBits occupied = TRACK_BIT_NONE;
+	for (const Train *tr : VehiclesOnTile<VehicleType::Train>(tile)) {
+		if (tr->track == TRACK_BIT_WORMHOLE) continue;
+		occupied |= (TrackBits)((uint)tr->track & (uint)TRACK_BIT_MASK);
+	}
+
+	/* KI-561 盲区：停在车库里的车，其门外那一段预订无法被 FollowReservation() 追到
+	 * （走不回车库格），三条判据会同时成立而其实是活车的位。紧贴车库的格一律不动 ——
+	 * 宁可少清一格，也不能把活车的路线当孤儿清掉。 */
+	for (DiagDirection d : EnumRange(DiagDirection::Begin, DiagDirection::End)) {
+		if (IsRailDepotTile(tile + TileOffsByDiagDir(d))) return 0;
+	}
+
+	int cleared = 0;
+	for (Track t = TRACK_BEGIN; t < TRACK_END; t++) {
+		if (!HasBit(held, t)) continue;
+		if (HasBit(occupied, t)) continue;
+		if (GetTrainForReservation(tile, t) != nullptr) continue;
+		bool reached = false;
+		for (Train *tr : Train::Iterate()) {
+			if (tr->First() != tr) continue;
+			if (TrainReservationPassesThroughTile(tr, tile)) { reached = true; break; }
+		}
+		if (reached) continue;
+		/* R3R (第 525 轮续, KI-692): 必须**跨 tick 陈旧**才清。
+		 *
+		 * 只看一瞬间不够：机车刚铺下的位，若它的入口格当 tick 恰好被判成"车底的空气"
+		 * （RESV-PAIR-AIR 不写地图），这一串位与机车之间就断开，三条判据全部成立 ——
+		 * 现场（build\R3R_debug.log:3232-3242）一次清掉 9 格刚铺的活位，接着
+		 * CPL-NORES-BLOCK / COUPLE-FAIL，机车钉死 100 tick。
+		 * 判据改成"同一位至少在**上一个 tick** 也被判无主"。真正的孤儿（车底开走留下的）
+		 * 天然满足；刚铺的位在下一 tick 一旦被正常归属就会把记录抹掉。 */
+		static std::map<uint64_t, uint32_t> r3r_orphan_seen;
+		const uint64_t r3r_orphan_key = ((uint64_t)tile.base() << 3) | (uint64_t)t;
+		const auto r3r_orphan_it = r3r_orphan_seen.find(r3r_orphan_key);
+		if (r3r_orphan_it == r3r_orphan_seen.end()) {
+			if (r3r_orphan_seen.size() > 8192) r3r_orphan_seen.clear();
+			r3r_orphan_seen[r3r_orphan_key] = (uint32_t)_tick_counter;
+			continue;
+		}
+		if ((uint32_t)(_tick_counter - r3r_orphan_it->second) < 2) continue;
+		const uint32_t r3r_orphan_age = (uint32_t)_tick_counter - r3r_orphan_it->second;
+		r3r_orphan_seen.erase(r3r_orphan_it);
+		R3RDbgWrite("RESV-ORPHAN-CLEAR tile=%d,%d track=%u reason=ownerless age=%u\n",
+				(int)TileX(tile), (int)TileY(tile), (uint)t, (unsigned)r3r_orphan_age);
+		UnreserveRailTrack(tile, t);
+		++cleared;
+	}
+	return cleared;
 }
 
 #if R3R_PROBES

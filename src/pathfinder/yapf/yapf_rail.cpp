@@ -56,6 +56,10 @@ bool R3RCouplePathBlockedByThirdParty()
 	return _r3r_couple_path_blocked;
 }
 
+/* R3R (第 525 轮, KI-690): pbs.cpp 里的"无主预留位回收"。手写前向声明，不改 .h
+ * （本树 ninja 不跟踪头文件依赖，改 .h 会触发全量重编）。 */
+int R3RReapOrphanReservationBits(TileIndex tile);
+
 /* R3R (第 342 轮, 方案 ε-A): 把"自锁交叉"这个失败原因交回调用方。
  *
  * 背景（§37/§38 定案）：挂接寻路在某一格失败，可能是**自己的车节占住了交叉位**
@@ -677,7 +681,16 @@ private:
 				this->res_fail_td = td;
 			}
 		} else {
-			if (!TryReserveRailTrackdir(veh, tile, td)) {
+			bool r3r_track_reserved = TryReserveRailTrackdir(veh, tile, td);
+			if (!r3r_track_reserved) {
+				/* R3R (第 525 轮, KI-690): 订不上时先看是不是"无主位"在挡路 —— 无主位不是
+				 * 合法障碍（没有任何车会来释放它，见 pbs.cpp 的 R3RReapOrphanReservationBits），
+				 * 清掉冲突的那根 Track 再重试一次。只有真订不上才付这个代价。 */
+				if (R3RReapOrphanReservationBits(tile) > 0) {
+					r3r_track_reserved = TryReserveRailTrackdir(veh, tile, td);
+				}
+			}
+			if (!r3r_track_reserved) {
 				/* Tile couldn't be reserved, undo. */
 				this->res_fail_tile = tile;
 				this->res_fail_td = td;
@@ -1122,6 +1135,38 @@ public:
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * R3R (第 525 轮续, KI-691): CheckSafePositionOnNode() 的"判到 stop_tile 为止"版本。
+	 *
+	 * 节点的 segment 可能是「整段站台跳格」（现场 1442 → 1424 一步跨过整个站台），
+	 * 于是判据会去判车底远端那几格 —— 那些格本车永远不会开过去，判它们只会把
+	 * 整条路误判成不通。本函数走到 stop_tile（= 会合点）即停，之后的格一概不问。
+	 *
+	 * 必须在基类里实现：FindSafeCouplePositionProc 是 private，派生类
+	 * CYapfFollowCoupleRailT 拿不到成员指针。
+	 *
+	 * @param node       待检查的节点
+	 * @param stop_tile  行驶终点（含）。到达该格即停止检查，不再往后判。
+	 * @param fail_tile  出参：判据失败的那一格（未失败时不动）。
+	 * @return true 表示从节点起点到 stop_tile 为止全部通过。
+	 */
+	inline bool CheckSafePositionOnNodeTo(Node *node, TileIndex stop_tile, TileIndex *fail_tile)
+	{
+		dbg_assert(node->parent != nullptr);
+
+		bool ok = true;
+		node->template IterateTiles<CYapfReserveTrack>(Yapf().GetVehicle(), Yapf(), [&](TileIndex tile, Trackdir td) -> bool {
+			if (tile == stop_tile) return false;   // 行驶终点之后是车底自己的位置，与本次行驶无关
+			if (!this->FindSafeCouplePositionProc(tile, td)) {
+				ok = false;
+				if (fail_tile != nullptr) *fail_tile = tile;
+				return false;
+			}
+			return true;
+		});
+		return ok;
 	}	/** Find a reservation target on the path ending at this node. */
 	void FindSafePositionOnSafePositionNodes()
 	{
@@ -2018,6 +2063,40 @@ public:
 		std::vector<R3RCoupleStep> r3r_resv_path;
 		bool r3r_single_seg = false;   ///< 走的是单段分支（rp() 摸路的那一支）
 		uint r3r_hops = 0;
+		/* R3R (第 525 轮, KI-690): 回溯段失败不再把整条路径作废，而是"截断到最后一格
+		 * 已验证位"—— 这就是原版预留循环的粒度（铺到下一个安全位为止，下一 tick 再试）。
+		 * 判据见下面注释；零进展时仍走旧行为。 */
+		bool r3r_truncated = false;
+		TileIndex r3r_trunc_tile = INVALID_TILE;
+		/* R3R (第 525 轮续, KI-691): 安全位判据只能覆盖"本车真的要开过去的那一段"。
+		 *
+		 * 现场（build\R3R_debug.log:1966-1978，第 525 轮盘）：
+		 *   CPL-BACK pPrev=1424,1874 parent=1442,1874     ← YAPF 的 best 落在车底远端
+		 *   FSCP tile=1424,1874 skip=multihead-blocked n=2 h=18,75
+		 *   CPL-SAFE-FAIL veh=15 tile=1424,1874
+		 *   CPL-SAFE-TRUNC veh=15 from=1474,1884 tile=1442,1874
+		 *   CPL-RES-SAFE-STOP … tile=1442,1874 booked=42 goal=1
+		 * 1424,1874 是**车底自己那一排**的远端（车底长 216 节，18/75 两条链都压在那格），
+		 * 本车根本不会开到那里 —— 它要去的只是会合点 `consist_head_tile`（现场 1438,1874）。
+		 * 但 best 节点的 segment 是「整段站台跳格」（1442 → 1424 一步跨过），于是
+		 * ① 判据在 1424 上失败 ⇒ ② 整条路被截断到 1442（比会合点还靠后 4 格）⇒
+		 * ③ 预留就截止在 1442——而那正是岔口 1441（X|LOWER）前一格，不安全、且下一 tick
+		 *    ExtendTrainReservation 从 1442 再往前只看见 choice（steps=0），永远长不出去。
+		 *
+		 * 所以：行驶终点 `r3r_drive_end`（= 会合点）之后的节点一律不参与安全位判定，
+		 * 且终点所在节点的 segment 只判到会合点为止。判据从此只回答"我要走的路通不通"，
+		 * 不再回答"车底内部能不能站"。 */
+		const TileIndex r3r_drive_end = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pNode->GetLastTile();
+		Node *r3r_goal_node = nullptr;   ///< 行驶终点所在的节点（比它更深的节点都在会合点之外）
+		for (Node *r3r_n = pNode; r3r_n != nullptr; r3r_n = r3r_n->parent) {
+			bool r3r_has_end = false;
+			r3r_n->template IterateTiles<CYapfReserveTrack<Types>>(v, Yapf(), [&](TileIndex t, Trackdir) -> bool {
+				if (t == r3r_drive_end) { r3r_has_end = true; return false; }
+				return true;
+			});
+			if (r3r_has_end) { r3r_goal_node = r3r_n; break; }
+		}
+		bool r3r_goal_passed = (r3r_goal_node == nullptr);
 		while (pNode->parent != nullptr) {
 			pPrev = pNode;
 			pNode = pNode->parent;
@@ -2030,21 +2109,51 @@ public:
 					fclose(dbg);
 				}
 			}
-			if (!this->CheckSafePositionOnNode(pPrev)) {
+			if (!r3r_goal_passed) {
+				/* 比行驶终点更深的节点（车底内部/站台另一侧）：不判、也不截断。 */
+				if (pPrev != r3r_goal_node) continue;
+				r3r_goal_passed = true;
+			}
+			/* 终点所在节点只判到会合点为止：会合点之后是车底自己的位置，与本次行驶无关。 */
+			TileIndex r3r_fail_tile = INVALID_TILE;
+			if (!this->CheckSafePositionOnNodeTo(pPrev, r3r_drive_end, &r3r_fail_tile)) {
 				{
 					FILE *dbg = R3RFopenDbg("a");
 					if (dbg != nullptr) {
-						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d\n",
-								(int)v->index.base(), (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()));
+						/* R3R (第 525 轮续, KI-691)：老写法只打节点的 last tile（可能是整段站台跳格的
+						 * 远端，现场 1424），读起来像"判据在 1424 失败"，其实失败格是 segment 内的
+						 * 另一格。at= 是真正失败的那一格，node= 是节点的末格。 */
+						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d at=%d,%d\n",
+								(int)v->index.base(), (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()),
+								r3r_fail_tile != INVALID_TILE ? (int)TileX(r3r_fail_tile) : -1,
+								r3r_fail_tile != INVALID_TILE ? (int)TileY(r3r_fail_tile) : -1);
 						fclose(dbg);
 					}
 				}
-				/* R3R (第 346 轮续, KI-516): 路径算出来了、只是回溯的安全位判据被别的
-				 * 车否决 ⇒ 标记"被挡"，让 train_cmd.cpp 不要降级去绕别的股道，
-				 * 而是原地等障碍离开后重算（玩家 2026-10-28 口径）。 */
-				_r3r_couple_path_blocked = true;
-				return INVALID_TRACKDIR;
+				/* R3R (第 525 轮, KI-690, 修法 2): 记下"这一段的上一格"作为截断位，继续回溯。
+				 * 回溯顺序是 目标→起点，所以更靠起点的失败会覆盖成更近的截断位 ——
+				 * 最终得到的就是"从起点往前走能走到的最后一格已验证位"。
+				 *
+				 * 旧行为（KI-516）是整条路径作废 + 标记"被第三方挡住" + 原地等下一 tick。
+				 * 它与原版预留循环的差别是致命的：原版遇到挡路只退回本次这一小段，车照样
+				 * 开到能到的地方；旧行为是一格都不铺，车原地不动（本现场 `CPL-SAFE-FAIL
+				 * veh=15 tile=1442,1874` 之后 wait 一路涨到 62）。
+				 *
+				 * 截断位等于起点（一格都过不去）时仍走旧行为，见循环后的判据。 */
+				r3r_truncated = true;
+				r3r_trunc_tile = pNode->GetLastTile();
 			}
+		}
+
+		if (r3r_truncated && (r3r_trunc_tile == INVALID_TILE || r3r_trunc_tile == pNode->GetLastTile())) {
+			/* 一格可走都没有：维持 KI-516 的"原地等"，不要降级去绕别的股道。 */
+			_r3r_couple_path_blocked = true;
+			return INVALID_TRACKDIR;
+		}
+		if (r3r_truncated) {
+			R3RDbgWrite("CPL-SAFE-TRUNC veh=%d from=%d,%d tile=%d,%d hops=%u\n",
+					(int)v->index.base(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
+					(int)TileX(r3r_trunc_tile), (int)TileY(r3r_trunc_tile), (unsigned)r3r_hops);
 		}
 
 		next_trackdir = pPrev->GetTrackdir();
@@ -2059,6 +2168,10 @@ public:
 		TrackFollower ft(v, Yapf().GetCompatibleRailTypes());
 		TileIndex st = pNode->GetLastTile();
 		TileIndex tg = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pPrev->GetLastTile();
+		/* R3R (第 525 轮, KI-690): 回溯段有失败时，摸路终点收到截断位 —— reach() 与 rp()
+		 * 都只走到这里，第二遍就只铺到"能走到的最后一格已验证位"，车开过去停住，
+		 * 下一 tick 重算续铺（与原生 PBS 的逐段推进同构）。 */
+		if (r3r_truncated) tg = r3r_trunc_tile;
 		Trackdir best_td = INVALID_TRACKDIR;
 		/* R3R (第 332 轮): best_td 属于哪一格。贪婪扫描取 st（机车自身格），
 		 * 采纳 YAPF 首步时取首步格 —— 后者才是 new_tile。 */
@@ -2300,6 +2413,59 @@ public:
 			 * train_cmd.cpp 的 KI-316 路径（FreeTrainTrackReservation +
 			 * MarkTrainAsStuck）处置；绝不再出现 "reserved=1 而 nTry=0" 的空真。
 			 */
+			if (!r3r_resv_path.empty()) {
+				/* R3R (第 525 轮续, KI-692)：第一段预留必须铺到**机车脚下那一格**。
+				 *
+				 * 玩家 2026-11-27 原话：「veh15 的第一段预留应该到 1457,1874 截止，但它实际
+				 * 到了 1456,1874 才截止」。现场（build\R3R_debug.log:3033）：
+				 *   CPL-FIRST-TD st=1457,1874 … at=1456,1874 … start=1456,1874
+				 *   CPL-RES-OK … tiles=1456,1874/0;1455,1874/0;…
+				 * `st` 就是机车脚下格，而 `rp()` 从 YAPF 首步格（1456）起步 ——
+				 * rp_impl() 里"跳过起点格"的写法是 `cur != st || depth != 0`，只有 `rp()`
+				 * 从 `st` 起步时才生效；从首步格起步时 `st` 根本没被访问，跳过变成整格丢失。
+				 *
+				 * 补法：把 `{origin.tile, origin.trackdir}`（机车自身格 + 自身轨向）先尽力订
+				 * 一次，订上了才插到清单头。订不上（例如该格交叉轨被别人占）就不插，绝不
+				 * 让整条序列在第一步失败。插进来之后第二遍会以 RESV-SELF-AIR 通过，不影响
+				 * booked 的语义（它本来就是自己压着的格）。 */
+				if (r3r_resv_path.front().first != origin.tile &&
+						origin.trackdir != INVALID_TRACKDIR &&
+						!IsRailStationTile(origin.tile) && !IsRailDepotTile(origin.tile) &&
+						TryReserveRailTrackdir(v, origin.tile, origin.trackdir)) {
+					r3r_resv_path.insert(r3r_resv_path.begin(), R3RCoupleStep{origin.tile, origin.trackdir});
+				}
+				/* R3R (第 525 轮续, KI-691)：被截断的路径必须收在**安全位**上。
+				 *
+				 * 玩家 2026-11-27 原话：「veh15 的预留在不安全的位置截止，不安全的截止位
+				 * 坐标为 (1442,1874)」。原版 ExtendTrainReservation() 只把预留推进到
+				 * 下一个 IsSafeWaitingPosition 为止（:17512-17526），所以它的预留端点
+				 * 永远是安全位；挂接这条被截断的路则是"能走到哪儿算哪儿"，端点落到了
+				 * 岔口 1441（X|LOWER）的**前一格**，既不能停、下一 tick 也再长不出去
+				 * （Extend 从 1442 只看见 choice，steps=0）。
+				 *
+				 * 语义与原生同构：截断时把清单收到路径上**最后一个安全位**（含）；
+				 * 路径上根本没有安全位就一格都不订，交回上层"原地等"。
+				 * 未截断（正常走到会合点）时不参与本判定 —— 会合点本身就是终点。 */
+				if (r3r_truncated) {
+					size_t r3r_safe_len = 0;
+					for (size_t i = 0; i < r3r_resv_path.size(); i++) {
+						if (IsSafeWaitingPosition(v, r3r_resv_path[i].first, r3r_resv_path[i].second, true, !TrackFollower::Allow90degTurns())) {
+							r3r_safe_len = i + 1;
+						}
+					}
+					if (r3r_safe_len < r3r_resv_path.size()) {
+						R3RDbgWrite("CPL-SAFE-CUT veh=%d from=%u to=%u end=%d,%d\n",
+								(int)v->index.base(), (unsigned)r3r_resv_path.size(), (unsigned)r3r_safe_len,
+								r3r_safe_len > 0 ? (int)TileX(r3r_resv_path[r3r_safe_len - 1].first) : -1,
+								r3r_safe_len > 0 ? (int)TileY(r3r_resv_path[r3r_safe_len - 1].first) : -1);
+						r3r_resv_path.resize(r3r_safe_len);
+					}
+					if (r3r_resv_path.empty()) {
+						/* 一路没有安全位：不铺任何预留（绝不铺到不安全位置），原地等。 */
+						_r3r_couple_path_blocked = true;
+					}
+				}
+			}
 			if (!r3r_resv_path.empty()) {
 				const R3RCoupleStep &r3r_last = r3r_resv_path.back();
 				this->SetReservationTarget(pNode, r3r_last.first, r3r_last.second);

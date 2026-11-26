@@ -9380,6 +9380,7 @@ enum R3RDbgEdgeTag : uint32_t {
 	R3REDGE_JUNCCHOOSE,   ///< 第 357 轮 (KI-533): ChooseTrainTrack's per-tile verdict, tracked on *every* tile (R48-4)
 	R3REDGE_EXTGOALEXEMPT, ///< 第 406 轮 (REG-405-A): the choice refusal was waived -- the platform belongs to our locked couple partner
 	R3REDGE_EXTEXIT,      ///< REG-505-32-A: which *success* exit ExtendTrainReservation() took (choose/safe/eol)
+	R3REDGE_BRAKEHOLD,    ///< 第 523 轮续四 (KI-684): held-for-pair speed step under realistic braking (payload = cur_speed)
 	R3REDGE_COUNT,
 };
 
@@ -24935,16 +24936,62 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			if (R3RDbgMaxSpdHold(consist)) {
 				FILE *dbg = R3RFopenDbg("a");
 				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] CPL-HOLD-NATIVE tick=%llu veh=%d tile=%d,%d spd=%d track=0x%X real=%d\n",
+					fprintf(dbg, "[R3R] CPL-HOLD-NATIVE tick=%llu veh=%d tile=%d,%d spd=%d track=0x%X real=%d braking=%d\n",
 							(unsigned long long)_tick_counter, (int)consist->index.base(),
 							TileX(consist->tile), TileY(consist->tile), (int)consist->cur_speed,
-							(uint)consist->track, (int)consist->cur_real_order_index);
+							(uint)consist->track, (int)consist->cur_real_order_index,
+							consist->UsingRealisticBraking() ? 1 : 0);
 					fclose(dbg);
 				}
 			}
-			consist->cur_speed = 0;
-			consist->subspeed = 0;
-			j = 0;
+			/* R3R (第 523 轮续四, KI-684): 玩家口径 —— 「开了真实制动就走慢慢刹车，
+			 * 没开就走原版的反物理刹车」。
+			 *
+			 * 判据是 UsingRealisticBraking()（train.h: tcache.cached_tflags &
+			 * TCF_RL_BRAKING，即设置里的 braking model），**不是** AM_REALISTIC
+			 * —— 后者只是加速模型，两者互相独立。
+			 *
+			 * 真实支不能在这里硬写 0（那正是玩家抱怨的瞬间停住）。改法：把本次的
+			 * 速度上限压成 0，交给 Train::UpdateSpeed() 走引擎自己的制动步长 ——
+			 * GroundVehicle::DoUpdateSpeed() 的 cur_speed > max_speed 分支把
+			 * tempmax 取成 max(cur_speed - cur_speed/10 - 1, max_speed)，即每
+			 * tick 约 -10%，并沿用 tcache.cached_deceleration 与 subspeed 精度。
+			 *
+			 * 唯一补丁是最后那一档：Realistic 加速模型下 GetAccelerationStatus()
+			 * 此刻是 AS_ACCEL ⇒ min_speed = 2（ground_vehicle.cpp 的
+			 * "min_speed overrules the maximum speed"，先压上限再抬下限），
+			 * 引擎自己停不到 0。cur_speed <= 2 时清零并令 j = 0，肉眼与刹停无异，
+			 * 也避免 2 km/h 蠕行（KI-499 的现场读数）。
+			 *
+			 * 已经停住时不再调 UpdateSpeed()：否则它每 tick 会把 cur_speed 从 0
+			 * 抬回 2 再由这里压回去，读数抖动。
+			 *
+			 * 刹车期间 j 仍可能 >= adv_spd，于是本 tick 照原生移动分支滑行一格 ——
+			 * 这是"慢慢刹车"应有的位移；该分支照旧跑 TrainController() 与
+			 * TrainCoupleHandler()，配对锁一建立本判据立刻为假，下一 tick 正常起步。 */
+			if (consist->UsingRealisticBraking()) {
+				if (consist->cur_speed != 0) {
+					const Train::MaxSpeedInfo hold_info{0, 0};
+					j = consist->UpdateSpeed(hold_info);
+					if (R3RDbgEdge(R3REDGE_BRAKEHOLD, (uint64_t)consist->index.base(), (uint64_t)consist->cur_speed)) {
+						R3RDbgWrite("CPL-BRAKE-WAIT veh=%d tick=%llu spd=%d tile=%d,%d order=%d\n",
+								(int)consist->index.base(), (unsigned long long)_tick_counter,
+								(int)consist->cur_speed, TileX(consist->tile), TileY(consist->tile),
+								(int)consist->current_order.GetType());
+					}
+					if (consist->cur_speed <= 2) {
+						consist->cur_speed = 0;
+						consist->subspeed = 0;
+						j = 0;
+					}
+				} else {
+					j = 0;
+				}
+			} else {
+				consist->cur_speed = 0;
+				consist->subspeed = 0;
+				j = 0;
+			}
 		} else {
 			if (!mode) consist->ShowVisualEffect(std::min(max_speed_info.strict_max_speed, max_speed_info.advisory_max_speed));
 			j = consist->UpdateSpeed(max_speed_info);

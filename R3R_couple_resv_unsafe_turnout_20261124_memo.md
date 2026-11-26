@@ -2520,6 +2520,50 @@ if (best_on_consist) {
 - 详见 `R3R_station_map31_round508_memo.md`、`R3R_KNOWN_ISSUES.md` 第 508 轮 KI-685。
 
 
+---
+
+## 33 预留主人判定：何时会用到（2026-11-26 清单，零改码）
+
+查询函数（`src\pbs.cpp`）：`GetTrainForReservation(tile,track)`（plain rail，轨位级）、
+`GetTrainForWholeTileReservation(tile)`（站台/路点整格位）、仲裁版 `...Arbitrated()`（第 361 轮，
+只给挂接归属判据用，不替换全局）。三者的共同语义=**沿预留位走查，遇到的第一辆车即主人**；
+两端无车/中途断档 ⇒ `nullptr`（stray）。**没有账本**（第 303 轮已删，`train_cmd.cpp:17377` 注释残留）。
+
+### 33.1 会改变行为的四处（真正"用上"）
+
+| # | 位置 | 时机 | 判据与后果 |
+|---|---|---|---|
+| B1 | `train_cmd.cpp:18528-18548`（`TryPathReserve` 头部） | 挂接订单机车**每 tick** 决定要不要吃 `early-haverserved` 捷径 | `res_tracks` 里至少一根轨主人是本车链 ⇒ `foreign=0`（可直驱进入）；否则 `foreign=1`，转 `ExtendTrainReservation()+yapf`。**只对 `OT_GOTO_COUPLE` 且非车库生效**，普通订单恒 `foreign=0` ⇒ 别人的预留当空气（REG-506-B）。站台格走整格位仲裁版。 |
+| B2 | `pbs.cpp:598/652/672/702`（`TryReserveRailTrack` 写侧）、`pbs.cpp:2905`（`IsSafePosition`） | 挂接寻路**每铺一格** | `R3RReservationHeldByCouplePartner` ⇒ 该格是我要挂的车底占的 ⇒ 当空气（`RESV-PAIR-AIR`）；`R3RReservationHeldBySelf` ⇒ 是我自己已订的 ⇒ 当空气（`RESV-SELF-AIR`）。判反了就是"铺不过去/把自己顶掉"。 |
+| B3 | `train_cmd.cpp:17080-17130`（`R3RReleaseChainReservations` 第一遍） | 耦合/解挂/车库编辑/等待者清扫**提交点** | 释放前用权威归属复核（站台整格位走 `GetTrainForWholeTileReservation`）：有主就不碰，`nullptr` 才清。 |
+| B4 | `R3RReservationAudit`（`RESV-AUDIT-STRAY`/`RESV-REAP`） | 每 2048 tick（脏标记时 256） | 全图预留位逐个问主人；`nullptr` 记 stray，连续 3 次才 `RESV-REAP`。 |
+
+### 33.2 只读 / 诊断与自愈（问主人但不改判据）
+
+| # | 位置 | 时机 |
+|---|---|---|
+| R1 | `train_cmd.cpp:20352-20353` `FollowTrainReservation(consist,&other_train)` → `TPR-BLOCKED`/`TPR-EXIT` | 起步前"我脚下这条预留被别的车挡着吗"（KI-330）。`other != consist` 即否决。 |
+| R2 | `train_cmd.cpp:3524/3591` `R3RSeamSignalReserved` / `...BeyondSignalHeldByLeader` | 解挂互锁（KI-335）：后车等前车把缝上的预留放掉才起步。REG-522-A 就出在这里。 |
+| R3 | `train_cmd.cpp:5972`（`ReverseTrainDirection`） | 掉头前确认双向隧道/桥入口那条预留不是别人的，才清自己的。 |
+| R4 | `train_cmd.cpp:16515`（`R3RDepotTileOwnedByHead`）、`:16646`（`DEPOT-SELF-RELEASE`） | 出库/库内格归属，决定能不能入库或自释。 |
+| R5 | `train_cmd.cpp:17380-17410`（`ExtendTrainReservation` 回退） | 扩展失败回滚时问"这块是谁的"（`RESV-BACKOUT`），只记日志。 |
+| R6 | `train_cmd.cpp:18681`（`RESV-SIG`）、`:22387`（`REDSIG`）、`:25097`（`CPL-NEXT wholeOwner=`） | 纯探针，不改行为。 |
+| R7 | `pbs.cpp:2051/2063/2081` `CheckTrainsOnTrack`（`FollowTrainReservation` 内部） | 走查本身的"格上有没有车"，是所有归属判定的底层原语。 |
+
+### 33.3 引擎原生（非 R3R 新增，但共用同一套函数）
+
+- 拆轨/拆信号/建桥等命令前置校验（`rail_cmd.cpp`）：该预留上还有没有车 ⇒ 有则拒绝拆除。
+- `IsSafeWaitingPosition`/`IsSafePosition`：格被别人预留则不算安全等待位。
+- 站台/路点整格位的释放路径（`SetRailStationPlatformReservation`）。
+
+### 33.4 结构性边界（回答"为什么会紊乱"）
+
+1. **走查而非记账**：一条预留若跨了三条链（备忘 §32.17.1 的 75/18/15 现场），走查只能报出**端点那一条**，单值 `Train*` 表达不了"多主"。REG-522-A（`picked=veh15` 而 `CPL-NEXT wholeOwner=18`）就是两个不同的走查入口给出两个答案。
+2. **三套编码不能混问**：plain rail 用轨位级（`GetTrainForReservation` 首行断言 `IsPlainRailTile`，KI-207c 教训）；站台/路点用整格位；车库/道口/隧道桥部分**不可问**（调用点直接写 `owned=true` 放行，见 `train_cmd.cpp:18544-18547`）。
+3. **普通订单不查**：`foreign` 只有挂接订单才计算 ⇒ 直行列车撞上别人的预留会直接驶入（REG-506-B 未验）。
+4. 仲裁只在"两端都压车"时才介入；一端有车/两端同链/两端同态一律回退"首试方向优先"，方向顺序是枚举值产物，与谁真订了这条轨无关（KI-330 的原始成因）。
+
+
 
 
 
