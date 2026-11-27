@@ -27105,9 +27105,9 @@ R3DS 的注释已经把危害写清（`:17498-17517`），但同族表远不止 
 
 **玩家要求**：「请把源码提交git，然后编译发行版，打包（版本号依然为R3R-v1.0.7，我要用这个替换既有的github上面的release）」
 
-- 提交：`eca2e718db`（存档/不同步加固，9 文件）、`03fd851b04`（清 yapf_rail.cpp 两处探针残留，2 文件）；工作区干净。
-- 标签：`R3R-v1.0.7` 已用 `-f` 移到 `03fd851b04`，`git describe --tags` = `R3R-v1.0.7`（无 `-dirty`、无 `-1-g` 后缀）。
-- 发行版：`build-release\openttd.exe` 23:47:34 / 30 500 864 B / sha256 `337aec97…`；`rev.cpp` 三个字段逐项正确；exe 内探针串全 0，`R3R state:` 与 `R3R-v1.0.7` 各命中 1；告警 0。
-- 包：`R3R-v1.0.7-win64-2026-11-27.zip` 18 221 137 B / sha256 `2e26d991…` / 142 条 / testzip OK，与旧包仅 `openttd.exe` 不同（旧包已备份为 `build-release\R3R-v1.0.7-win64-2026-11-27.prev.zip`）。以旧包为基底替换，保留玩家加的 `R3R教程.pptx`。
-- 内测树：`build\openttd.exe` 23:51:57 / 53 302 784 B，同源。
+- 提交：`eca2e718db`（存档/不同步加固，9 文件）、`03fd851b04`（清 yapf_rail.cpp 两处探针残留，2 文件）、`65164941b7`（记录重建）、`ed40419d22`（最终数字）；工作区干净。
+- 标签：`R3R-v1.0.7` 已用 `-f` 移到 **`65164941b7`**（= exe 内嵌 `_openttd_revision_hash`，二者一致）。该提交之后还有两个纯文档提交，所以在 HEAD 上 `git describe --tags` 显示 `R3R-v1.0.7-2-g…`，属正常：**发布资产对应标签提交，不是 HEAD**；重编前先 `git checkout R3R-v1.0.7`。
+- 发行版：`build-release\openttd.exe` **23:56:39** / 30 500 864 B / sha256 `000b0ea4eb6befd05b2b2c93e6d3ddf8dcf625fb4376382292e709b37ef85d6e`；`rev.cpp` 四个字段逐项正确（`R3R-v1.0.7` / `0.73.5` / tagged=1 / hash `65164941b7…`）；exe 内探针串全 0，`R3R state:` 与 `R3R-v1.0.7` 各命中 1；告警 0。
+- 包：`R3R-v1.0.7-win64-2026-11-27.zip` **18 221 353 B** / sha256 `2dbba0374d87eb462e47ebd81f587d6adeb0c11e84b380721bdb00af56cd0001` / 142 条 / testzip OK，与旧包仅 `openttd.exe` 不同（旧包已备份为 `build-release\R3R-v1.0.7-win64-2026-11-27.prev.zip`）。以旧包为基底替换，保留玩家加的 `R3R教程.pptx`。
+- 内测树：`build\openttd.exe` 23:51:57 / 53 302 784 B，同源（`03fd851b04`）。
 - **未 push**：按既有口径留给玩家确认。替换 GitHub release 需：`git push --force origin R3R-v1.0.7`，删旧资产后上传新 zip。
