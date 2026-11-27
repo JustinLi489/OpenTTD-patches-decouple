@@ -28,7 +28,6 @@
 #include "couple_group.h"
 #include "couple_group_gui.h"
 #include "r3r_schedule_gui.h"
-#include "r3r_perf.h"
 #include "strings_func.h"
 #include "strings_internal.h"
 #include "core/string_builder.hpp"
@@ -1028,10 +1027,6 @@ struct RefitWindow : public Window {
 		VehicleSet vehicles_to_refit;
 		GetVehicleSet(vehicles_to_refit, Vehicle::Get(this->selected_vehicle), this->num_vehicles);
 
-		/* R3R (KI-458) PROBE ONLY: opened once for the whole unit loop -- one
-		 * fopen/fclose per unit made the refit window visibly stall. */
-		FILE *const r3r_refit_dbg = R3RDbgOn() ? R3RFopenDbg("a") : nullptr;
-
 		do {
 			if (v->type == VehicleType::Train && std::ranges::find(vehicles_to_refit, v->index) == vehicles_to_refit.end()) continue;
 			if (v->type == VehicleType::Ship && this->num_vehicles == 1 && v->index != this->selected_vehicle) continue;
@@ -1039,16 +1034,6 @@ struct RefitWindow : public Window {
 			CargoTypes cmask = e->info.refit_mask;
 			VehicleCallbackMasks callback_mask = e->info.callback_mask;
 
-			/* R3R (KI-458) PROBE ONLY: the cargo identity this list is derived
-			 * from, per unit. Drift between units (or between a unit and its
-			 * group head) is what the livery symptom looks like. */
-			if (r3r_refit_dbg != nullptr && v->type == VehicleType::Train) {
-				fprintf(r3r_refit_dbg, "R3R-REFIT-VEH head=%d idx=%d cargo=%u/%u art=%d gm=%d gh=%d\n",
-						(int)v->First()->index.base(), (int)v->index.base(),
-						(unsigned)v->cargo_type, (unsigned)v->cargo_subtype,
-						v->IsArticulatedPart() ? 1 : 0, v->IsArticGroupMember() ? 1 : 0,
-						v->IsArticGroupHead() ? 1 : 0);
-			}
 
 			/* Skip this engine if it does not carry anything */
 			if (!e->CanCarryCargo()) continue;
@@ -1089,16 +1074,6 @@ struct RefitWindow : public Window {
 
 						StringID subtype = GetCargoSubtypeText(v);
 
-						/* R3R (KI-458) PROBE ONLY: what each unit reports for this
-						 * refit cycle. A unit that reports STR_EMPTY at cyc 0 makes the
-						 * intersection collapse to the single "keep current" option. */
-						if (r3r_refit_dbg != nullptr && v->type == VehicleType::Train && refit_cyc < 8) {
-							fprintf(r3r_refit_dbg, "R3R-REFIT-SUB idx=%d cargo=%u cyc=%u fv=%d sid=%u empty=%d sf=%d\n",
-									(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
-									first_vehicle ? 1 : 0, (unsigned)subtype.base(),
-									subtype == STR_EMPTY ? 1 : 0,
-									Train::From(v)->IsSegmentFront() ? 1 : 0);
-						}
 
 						if (first_vehicle) {
 							/* Append new subtype (don't add duplicates though) */
@@ -1136,11 +1111,6 @@ struct RefitWindow : public Window {
 									 * Only relaxed for vehicles taking part in a fake articulated group,
 									 * so plain vanilla trains keep the strict behaviour. */
 									if (v->IsArticGroupHead() || v->IsArticGroupMember()) {
-										if (r3r_refit_dbg != nullptr) {
-											fprintf(r3r_refit_dbg, "R3R-REFIT-SUB-KEEP idx=%d cargo=%u cyc=%u keep=%u got=%u\n",
-													(int)v->index.base(), (unsigned)cargo_type, (unsigned)refit_cyc,
-													(unsigned)list[pos].string.base(), (unsigned)subtype.base());
-										}
 									} else {
 										/* String mismatch, remove item keeping the order */
 										list.erase(list.begin() + pos);
@@ -1161,9 +1131,6 @@ struct RefitWindow : public Window {
 			}
 		} while (v->IsArticulatedCallbackVehicleType() && (v = v->Next()) != nullptr);
 
-		/* R3R (KI-458) PROBE ONLY: close the handle opened before the loop. */
-		if (r3r_refit_dbg != nullptr) fclose(r3r_refit_dbg);
-
 		/* Restore the previously selected RefitOption. */
 		if (current_refit_option.has_value()) {
 			for (const auto &pair : this->refit_list) {
@@ -1179,20 +1146,7 @@ struct RefitWindow : public Window {
 
 		/* R3R (KI-458) PROBE ONLY: how many options each cargo ended up with.
 		 * More than one for a single cargo means subtypes are enumerated. */
-		if (R3RDbgOn()) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "R3R-REFIT-LIST win=%u sel=%d nveh=%u cargoes=%u auto=%d\n",
-						(unsigned)this->window_number, (int)this->selected_vehicle.base(),
-						(unsigned)this->num_vehicles, (unsigned)this->refit_list.size(),
-						this->auto_refit ? 1 : 0);
-				for (const auto &pair : this->refit_list) {
-					fprintf(dbg, "R3R-REFIT-OPT cargo=%u options=%u\n",
-							(unsigned)pair.first, (unsigned)pair.second.size());
-				}
-				fclose(dbg);
-			}
-		}
+		
 
 		this->SetWidgetDisabledState(WID_VR_REFIT, this->selected_refit == nullptr);
 	}

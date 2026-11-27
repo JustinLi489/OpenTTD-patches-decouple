@@ -71,7 +71,6 @@
 #include "vehicle_cmd.h"
 #include "tile_cmd.h"
 #include "script/api/script_event_types.hpp"
-#include "r3r_perf.h"
 #include "couple_group.h"
 #include "3rdparty/cpp-btree/btree_set.h"
 #include "3rdparty/cpp-btree/btree_map.h"
@@ -1210,8 +1209,6 @@ void Vehicle::PreDestructor()
 			this->unitnumber_backup != 0 && this->unitnumber_backup != this->unitnumber &&
 			!this->R3RUnitNumberOwnedByOther()) {
 		Company::Get(this->owner)->freeunits[this->type].ReleaseID(this->unitnumber_backup);
-		R3RDbgWrite("UNIT-RELBK bk=%u id=%u prim=%d\n", this->unitnumber_backup, this->unitnumber,
-				this->IsPrimaryVehicle() ? 1 : 0);
 	}
 
 	if (this->type == VehicleType::Aircraft && this->IsPrimaryVehicle()) {
@@ -3193,20 +3190,7 @@ LiveryScheme GetEngineLiveryScheme(EngineID engine_type, EngineID parent_engine_
 				 * colours) is taken from the parent engine, not from the vehicle's own
 				 * engine. Logged on the substitution path only, bounded, because it is
 				 * reached from the sprite path. */
-				if (R3RDbgOn()) {
-					static unsigned r3r_liv_lines = 0;
-					if (r3r_liv_lines < 500) {
-						r3r_liv_lines++;
-						FILE *r3r_dbg = R3RFopenDbg("a");
-						if (r3r_dbg != nullptr) {
-							fprintf(r3r_dbg, "LIVERY-SCHEME v=%d own=%d parent=%d useov=%d artgm=%d front=%d head_eng=%d\n",
-									(int)v->index.base(), (int)engine_type.base(), (int)parent_engine_type.base(),
-									UsesWagonOverride(v) ? 1 : 0, v->IsArticGroupMember() ? 1 : 0,
-									(int)v->First()->index.base(), (int)v->First()->engine_type.base());
-							fclose(r3r_dbg);
-						}
-					}
-				}
+				
 				engine_type = parent_engine_type;
 				e = Engine::Get(engine_type);
 				/* Note: Luckily cargo_type is not needed for engines */
@@ -3445,10 +3429,6 @@ PaletteID GetUncachedTrainPaletteIgnoringGroup(const Train *v)
 	return GetEngineColourMap(v->engine_type, v->owner, v->GetGroundVehicleCache()->first_engine, v, true);
 }
 
-/* R3R (第 297 轮 / KI-472 探针, 只读): 定义在 train_cmd.cpp。手写声明而不进
- * 头文件，保持本轮"只改 .cpp"——一旦碰 src\*.h，KI-183 的构建护栏会把全部
- * object 删掉、把增量构建变成全量（约 700 步）。 */
-void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag);
 
 /**
  * Delete all implicit orders which were not reached.
@@ -3465,8 +3445,6 @@ void Vehicle::DeleteUnreachedImplicitOrders()
 	 *
 	 * 判读：入口 impl == 出口 impl 而 n= 变小 ⇒ 就是这里把车留在越界位。
 	 * 玩家 2026-10-25 口径：只加探针、不加 clamp。 */
-	const Train *const r3r_watch_t = (this->type == VehicleType::Train) ? Train::From(this) : nullptr;
-	R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-in", nullptr);
 
 	if (this->IsGroundVehicle()) {
 		GroundVehicleFlags &gv_flags = this->GetGroundVehicleFlags();
@@ -3482,7 +3460,6 @@ void Vehicle::DeleteUnreachedImplicitOrders()
 				}
 			}
 			InvalidateVehicleOrder(this, 0);
-			R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-out", "suppress");
 			return;
 		}
 	}
@@ -3504,7 +3481,6 @@ void Vehicle::DeleteUnreachedImplicitOrders()
 
 		order = this->GetOrder(this->cur_implicit_order_index);
 	}
-	R3RWatchOrderIndexSite(r3r_watch_t, "del-implicit-out", "deleted");
 }
 
 /**
@@ -4020,25 +3996,6 @@ static robin_hood::unordered_map<uint32_t, R3RWaitProbeStamp> _r3r_wp_handle_sta
  * 调用方负责把随 tick 单调变化的字段（current_order_time、剩余 wait_time）
  * 排除在 state 之外，否则每 tick 都算"状态变化"而刷屏。
  */
-static bool R3RWaitProbeDue(robin_hood::unordered_map<uint32_t, R3RWaitProbeStamp> &stamps, uint32_t key, uint32_t state)
-{
-	auto it = stamps.find(key);
-	if (it == stamps.end()) {
-		stamps[key] = R3RWaitProbeStamp{state, _tick_counter};
-		return true;
-	}
-	if (it->second.state != state) {
-		it->second.state = state;
-		it->second.tick = _tick_counter;
-		return true;
-	}
-	if (_tick_counter - it->second.tick >= 256) {
-		it->second.tick = _tick_counter;
-		return true;
-	}
-	return false;
-}
-
 /**
  * R3R (KI-534, 第 370 轮): read-only probe for the two gates that can keep a
  * vehicle parked at a waypoint inside Vehicle::HandleWaiting().
@@ -4053,28 +4010,6 @@ static bool R3RWaitProbeDue(robin_hood::unordered_map<uint32_t, R3RWaitProbeStam
  * the order after the wait leads back to itself. Station/depot halts are not
  * logged so the log stays small.
  */
-static void R3RWaypointWaitProbe(const Vehicle *v, const char *gate, uint wait_time, bool stop_waiting)
-{
-	if (!R3RIsWaypointWait(v)) return;
-	if (!R3RDbgOn()) return;
-
-	uint32_t state = (uint32_t)v->cur_real_order_index * 2654435761u;
-	state ^= ((uint32_t)v->cur_implicit_order_index + 1) * 40503u;
-	state ^= (uint32_t)v->current_order.GetLeaveType() * 8191u;
-	state ^= (uint32_t)gate[0] * 131u;
-	state ^= v->vehicle_flags.Test(VehicleFlag::ConditionalOrderWait) ? 0x4000u : 0u;
-	state ^= stop_waiting ? 0x8000u : 0u;
-	if (!R3RWaitProbeDue(_r3r_wp_waithold_stamps, v->index.base(), state)) return;
-
-	R3RDbgWrite("WP-WAITHOLD gate=%s veh=%d real=%d impl=%d n=%d wtime=%u cot=%u ltype=%u cow=%d stop=%d\n",
-			gate, (int)v->index.base(), (int)v->cur_real_order_index,
-			(int)v->cur_implicit_order_index, (int)v->GetNumOrders(),
-			(unsigned)wait_time, (unsigned)v->current_order_time,
-			(unsigned)v->current_order.GetLeaveType(),
-			v->vehicle_flags.Test(VehicleFlag::ConditionalOrderWait) ? 1 : 0,
-			stop_waiting ? 1 : 0);
-}
-
 /**
  * R3R (KI-534, 第 370 轮补 2): 进入 OT_WAITING 等待分支时的第一手快照。
  *
@@ -4085,34 +4020,6 @@ static void R3RWaypointWaitProbe(const Vehicle *v, const char *gate, uint wait_t
  *  - validWp=0 => current_order 的目的地已不是有效路点，R3R 的路点等待判定恒假；
  *  - wantWp=1 且两道门都不拦 => 之后应看到 WP-WAITHOLD gate=pass / WP-WAIT-KEEP。
  */
-static void R3RWaypointHandleProbe(const Vehicle *v, uint wait_time, bool stop_waiting, bool process_orders)
-{
-	if (v->type != VehicleType::Train) return;
-	if (!R3RDbgOn()) return;
-
-	const StationID dest = v->current_order.GetDestination().ToStationID();
-	const bool want_wp = R3RIsWaypointWait(v);
-	const bool valid_wp = Waypoint::IsValidID(dest);
-
-	uint32_t state = want_wp ? 0x1u : 0u;
-	state |= valid_wp ? 0x2u : 0u;
-	state ^= ((uint32_t)v->cur_real_order_index + 1) * 2654435761u;
-	state ^= ((uint32_t)v->cur_implicit_order_index + 1) * 40503u;
-	state ^= (uint32_t)v->current_order.GetTimetabledWait() * 8191u;
-	state ^= (uint32_t)v->current_order.GetLeaveType() * 131u;
-	state ^= stop_waiting ? 0x100000u : 0u;
-	state ^= process_orders ? 0x200000u : 0u;
-	if (!R3RWaitProbeDue(_r3r_wp_handle_stamps, v->index.base(), state)) return;
-
-	R3RDbgWrite("WP-HANDLE veh=%d wantWp=%d dest=%d validWp=%d waitT=%u lateness=%d wait_time=%u cot=%u ltype=%u sw=%d po=%d tile=%d,%d\n",
-			(int)v->index.base(), want_wp ? 1 : 0, (int)dest.base(), valid_wp ? 1 : 0,
-			(unsigned)v->current_order.GetTimetabledWait(), (int)v->lateness_counter,
-			(unsigned)wait_time, (unsigned)v->current_order_time,
-			(unsigned)v->current_order.GetLeaveType(),
-			stop_waiting ? 1 : 0, process_orders ? 1 : 0,
-			(int)TileX(v->tile), (int)TileY(v->tile));
-}
-
 /**
  * Handle the waiting time everywhere else as in stations (basically in depot but, eventually, also elsewhere ?)
  * Function is called when order's wait_time is defined.
@@ -4126,10 +4033,10 @@ void Vehicle::HandleWaiting(bool stop_waiting, bool process_orders)
 			uint wait_time = std::max<int>(this->current_order.GetTimetabledWait() - this->lateness_counter, 0);
 			/* R3R (KI-534, 第 370 轮补 2): 两道门之前先留快照，用来区分
 			 * "等待块在跑但判定为假" 与 "等待块根本没跑到"。 */
-			R3RWaypointHandleProbe(this, wait_time, stop_waiting, process_orders);
+			
 			/* Vehicles holds on until waiting Timetabled time expires. */
 			if (!stop_waiting && this->current_order_time < wait_time && this->current_order.GetLeaveType() != OLT_LEAVE_EARLY) {
-				R3RWaypointWaitProbe(this, "time", wait_time, stop_waiting);
+				
 				return;
 			}
 			if (!stop_waiting && process_orders) {
@@ -4138,13 +4045,13 @@ void Vehicle::HandleWaiting(bool stop_waiting, bool process_orders)
 				 * the deferred index advance and latches VehicleFlag::ConditionalOrderWait),
 				 * so it must still be called exactly once. */
 				if (ShouldVehicleContinueWaiting(this)) {
-					R3RWaypointWaitProbe(this, "cond", wait_time, stop_waiting);
+					
 					return;
 				}
 			}
 
 			/* When wait_time is expired, we move on. */
-			R3RWaypointWaitProbe(this, "pass", wait_time, stop_waiting);
+			
 			this->vehicle_flags.Reset(VehicleFlag::ConditionalOrderWait);
 			UpdateVehicleTimetable(this, false);
 			/* R3R (KI-534, P1): at a waypoint arrival the implicit index has already
@@ -4168,17 +4075,9 @@ void Vehicle::HandleWaiting(bool stop_waiting, bool process_orders)
 				 * OT_IMPLICIT 订单，若放任 IncrementImplicitOrderIndex() 的
 				 * do{...}while(implicit != real && !IsType(OT_IMPLICIT)) 在没有 implicit 的
 				 * 表里绕圈，就会把 real 一口气吃到后面的订单（玩家报的 4→6 跳条）。 */
-				R3RDbgWrite("WP-WAIT-KEEP veh=%d real=%d impl=%d dest=%d n=%d\n",
-						(int)this->index.base(), (int)this->cur_real_order_index,
-						(int)this->cur_implicit_order_index,
-						(int)this->current_order.GetDestination().base(), (int)this->GetNumOrders());
-				const VehicleOrderID old_real = this->cur_real_order_index;
-				const VehicleOrderID old_impl = this->cur_implicit_order_index;
+				
 				this->SkipToNextRealOrderIndex();
 				this->cur_implicit_order_index = this->cur_real_order_index;
-				R3RDbgWrite("WP-WAIT-ADV veh=%d real=%d->%d impl=%d->%d\n",
-						(int)this->index.base(), (int)old_real, (int)this->cur_real_order_index,
-						(int)old_impl, (int)this->cur_implicit_order_index);
 				InvalidateVehicleOrder(this, 0);
 			} else {
 				this->IncrementImplicitOrderIndex();
@@ -4690,24 +4589,7 @@ void Vehicle::ShowVisualEffect(uint max_speed) const
 			if (effect_model >= VisualEffectSpawnModel::End) effect_model = VisualEffectSpawnModel::None; // unknown spawning model
 		} else {
 			effect_model = static_cast<VisualEffectSpawnModel>(GB(v->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT));
-			if (effect_model == VisualEffectSpawnModel::None) {
-				/* R3R (TEMPORARY DIAGNOSTIC): a resolved visual effect never has the
-				 * default type here, so this is the pre-crash crime scene. Dump the
-				 * whole consist with its cached values so the offending vehicle and
-				 * its chain head can be identified. */
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "VIS-MISS this=%d sub=%02X veh=%d cv=%02X\n",
-							(int)this->index.base(), (int)this->subtype,
-							(int)v->index.base(), (int)v->vcache.cached_vis_effect);
-					unsigned int i = 0;
-					for (const Vehicle *w = this; w != nullptr; w = w->Next(), i++) {
-						fprintf(dbg, "  VIS-MISS[%u] idx=%d cv=%02X st=%02X et=%u\n",
-								i, (int)w->index.base(), (int)w->vcache.cached_vis_effect, (int)w->subtype, (unsigned int)w->engine_type.base());
-					}
-					fclose(dbg);
-				}
-			}
+			
 			assert(to_underlying(effect_model) != to_underlying(VE_TYPE_DEFAULT)); // should have been resolved by UpdateVisualEffect
 			static_assert(to_underlying(VisualEffectSpawnModel::Steam) == to_underlying(VE_TYPE_STEAM));
 			static_assert(to_underlying(VisualEffectSpawnModel::Diesel) == to_underlying(VE_TYPE_DIESEL));

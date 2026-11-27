@@ -8,7 +8,6 @@
 /** @file newgrf_engine.cpp NewGRF handling of engines. */
 
 #include "stdafx.h"
-#include "r3r_perf.h"
 #include "debug.h"
 #include "train.h"
 #include "roadveh.h"
@@ -439,18 +438,6 @@ static const Livery *LiveryHelper(EngineID engine, const Vehicle *v)
  */
 static uint32_t PositionHelper(const Vehicle *v, bool consecutive, bool whole_chain = false)
 {
-	/* R3R perf probe (KI-14): this runs on the sprite path, so its cost is a
-	 * frame-rate cost. pos_steps is the interesting one: the segment walk is
-	 * O(n) per vehicle, i.e. O(n^2) per chain whenever the NewGRF cache is
-	 * invalidated.
-	 * R3R (release audit 2026-09-19): the counters sit behind R3RPerfOn() so a
-	 * release build with the probes compiled out (R3R_PROBES=0) keeps only the
-	 * segment walk -- which is real functionality, not a probe. */
-	R3RPerfCounters &r3rp = R3RP();
-	const bool r3r_probe = R3RPerfOn();
-	if (r3r_probe) r3rp.pos_helper++;
-	R3RPerfTimer r3r_pos_timer(&r3rp.pos_ns);
-
 	const Vehicle *u;
 	uint8_t chain_before = 0;
 	uint8_t chain_after  = 0;
@@ -493,12 +480,6 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive, bool whole_ch
 		u = u->Next();
 	}
 
-	if (r3r_probe) {
-		const uint64_t r3r_steps = (uint64_t)chain_before + chain_after;
-		r3rp.pos_steps += r3r_steps;
-		if (r3r_steps > r3rp.pos_max) r3rp.pos_max = r3r_steps;
-	}
-
 	/* R3R (segment-flip mirror): a segment which was logically reversed
 	 * (R3RFlipChainBySegments) has its chain order swapped inside the segment while
 	 * every vehicle keeps its physical position. Report the pre-flip rank -- i.e.
@@ -513,45 +494,6 @@ static uint32_t PositionHelper(const Vehicle *v, bool consecutive, bool whole_ch
 		const uint8_t tmp = chain_before;
 		chain_before = chain_after;
 		chain_after = tmp;
-	}
-
-	/* R3R (KI-540, round 375): record the whole-chain answer handed to the refit
-	 * capacity callback. That callback runs once per consist change (not on the
-	 * sprite path), so a bounded dump is enough to prove the fix. */
-	if (whole_chain && R3RDbgOn()) {
-		static unsigned r3r_poscap_lines = 0;
-		if (r3r_poscap_lines < 500) {
-			r3r_poscap_lines++;
-			FILE *r3r_dbg = R3RFopenDbg("a");
-			if (r3r_dbg != nullptr) {
-				fprintf(r3r_dbg, "POSCAP veh=%d eng=%d before=%u after=%u consec=%d head=%d\n",
-						(int)v->index.base(), (int)v->engine_type.base(), (unsigned)chain_before,
-						(unsigned)chain_after, consecutive ? 1 : 0, (int)v->First()->index.base());
-				fclose(r3r_dbg);
-			}
-		}
-	}
-
-	/* R3R (第 290 轮, KI-458, L3): record the "position in consist" answer the
-	 * NewGRF actually receives. KI-458 is "each segment's GRF attributes should be
-	 * independent"; 0x40/0x41 are the only properties already answered per segment,
-	 * so this line is the control sample: if these look segment-correct while the
-	 * weight/livery ones go wrong, the defect is not in the segment boundary itself.
-	 * Bounded to the first 500 lines because this sits on the sprite path. */
-	if (!whole_chain && R3RDbgOn()) {
-		static unsigned r3r_pos_lines = 0;
-		if (r3r_pos_lines < 500) {
-			r3r_pos_lines++;
-			FILE *r3r_dbg = R3RFopenDbg("a");
-			if (r3r_dbg != nullptr) {
-				fprintf(r3r_dbg, "POSCONSIST veh=%d eng=%d before=%u after=%u flip=%d consec=%d head=%d\n",
-						(int)v->index.base(), (int)v->engine_type.base(), (unsigned)chain_before,
-						(unsigned)chain_after,
-						(v->type == VehicleType::Train && static_cast<const Train *>(v)->IsSegmentFlipped()) ? 1 : 0,
-						consecutive ? 1 : 0, (int)v->First()->index.base());
-				fclose(r3r_dbg);
-			}
-		}
 	}
 
 	return chain_before | chain_after << 8 | (chain_before + chain_after + consecutive) << 16;
@@ -1251,27 +1193,6 @@ static uint32_t VehicleGetVariable(Vehicle *v, const VehicleScopeResolver *objec
 		case 0x70: break; // not implemented
 		case 0x71: break; // not implemented
 		case 0x72: {
-			/* R3R (KI-458) PROBE ONLY: RefitWindow::BuildRefitList() enumerates
-			 * the available subtypes by temporarily rewriting cargo_type and
-			 * cargo_subtype on the vehicle and asking the GRF. Any fallback done
-			 * here therefore destroys the refit list ("only one refit option").
-			 * Log value changes only, this case is on a very hot path. */
-			if (R3RDbgOn() && v != nullptr && v->type == VehicleType::Train) {
-				static uint16_t _r3r_cb72_seen[4096]; // 0 = unset, otherwise cargo_subtype + 1
-				const uint32_t slot = v->index.base() & 4095u;
-				const uint16_t seen = static_cast<uint16_t>(v->cargo_subtype) + 1u;
-				if (_r3r_cb72_seen[slot] != seen) {
-					_r3r_cb72_seen[slot] = seen;
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "R3R-CB72 idx=%d sub=%u cargo=%u art=%d gm=%d gh=%d\n",
-								(int)v->index.base(), (unsigned)v->cargo_subtype, (unsigned)v->cargo_type,
-								v->IsArticulatedPart() ? 1 : 0, v->IsArticGroupMember() ? 1 : 0,
-								v->IsArticGroupHead() ? 1 : 0);
-						fclose(dbg);
-					}
-				}
-			}
 			return v->cargo_subtype;
 		}
 		case 0x73: break; // vehicle specific, see below
@@ -1634,23 +1555,6 @@ int GetEngineProperty(EngineID engine, PropertyID property, int orig_value, cons
 	}
 	uint16_t callback = object.ResolveCallback();
 	if (callback != CALLBACK_FAILED) {
-		/* R3R (第 290 轮, KI-459, W4): dump the cb36 answer for train weight.
-		 * KI-459 asks "after make-segment the weight is 3x". One of the candidate
-		 * roots is that the GRF weight callback is asked once per vehicle without
-		 * the de-articulation bake, so the same whole-group value gets counted by
-		 * every part. This line shows what the callback actually returns and for
-		 * which vehicle it was asked; the CARGOWEIGHT probe (ground_vehicle.cpp)
-		 * shows what gets summed. Volume is event-scale (weight is queried on
-		 * build/consist change, not per frame). */
-		if (property == PROP_TRAIN_WEIGHT && R3RDbgBulkOn() && R3RDbgOn()) {
-			FILE *r3r_dbg = R3RFopenDbg("a");
-			if (r3r_dbg != nullptr) {
-				fprintf(r3r_dbg, "GRF-WEIGHT eng=%d v=%d ret=%u orig=%d signed=%d\n",
-						(int)engine.base(), v == nullptr ? -1 : (int)v->index.base(),
-						(unsigned)callback, orig_value, is_signed ? 1 : 0);
-				fclose(r3r_dbg);
-			}
-		}
 		if (is_signed) {
 			/* Sign extend 15 bit integer */
 			return static_cast<int16_t>(callback << 1) / 2;

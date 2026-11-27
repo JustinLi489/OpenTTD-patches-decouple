@@ -14,7 +14,6 @@
 #include "../../vehicle_func.h"
 #include "../pathfinder_func.h"
 #include "../pathfinder_type.h"
-#include "../../r3r_perf.h"
 #include "../../couple_group.h"
 
 /* R3R (第 236 轮, KI-344): 挂接目的地扫描的"无条件清点"(census)。
@@ -32,76 +31,10 @@
  * 计数口径：enter 是 PfDetectDestination 的调用次数，**节点级**而非格级 —— YAPF 在
  * 节点扩展与 PfCalcEstimate 里各调一次，故 enter ≈ 2×实际参与判定的节点数。各分支
  * 计数同样按调用次数累计，只用于同一次寻路内部的相对比较，不要当"格数"读。 */
-inline uint32_t _r3r_cpl_scan_enter = 0;     ///< PfDetectDestination 调用次数（节点级）
-inline uint32_t _r3r_cpl_scan_noplat = 0;    ///< 早退：不是站台/车库格
-inline uint32_t _r3r_cpl_scan_nores = 0;     ///< 早退：站台格但没有预留位且非站台分支
-inline uint32_t _r3r_cpl_scan_noconsist = 0; ///< 早退：格合格但格上扫不出合法车底
-inline uint32_t _r3r_cpl_scan_consist = 0;   ///< 扫到车底，进入三道闸门
-inline uint32_t _r3r_cpl_scan_rej[5] = { 0, 0, 0, 0, 0 }; ///< GROUP / FIT / TARGET / ORDER / LINE
-inline uint32_t _r3r_cpl_scan_acc[2] = { 0, 0 };       ///< car-only / waiting
-inline uint32_t _r3r_cpl_scan_accwp = 0;      ///< R3R 第 276 轮：等待区路点被接受为终点（截断模式）
-inline uint32_t _r3r_cpl_scan_last_tile = 0;  ///< 最近扫到的车底所在格（TileIndex::base()）
-inline int _r3r_cpl_scan_last_veh = -1;       ///< 最近扫到的车底链头车号（-1=无）
-/* R3R（第 501 轮, S2）：新增 LINE 一类（rej[4]），为了不打乱旧日志的判读口径，
- * 它在 last_why 里固定映射到 7（0..3 仍是原四类 rej，4/5/6 仍是 acc-car/acc-wait/cut-wp）。 */
-inline int _r3r_cpl_scan_last_why = -1;       ///< -1=无 / 0..3=rej / 4=acc-car / 5=acc-wait / 6=cut-wp / 7=LINE
-/* R3R（第 330 轮取证，只读，KI-446）：noconsist 早退的格坐标 dump 配额。
- * noconsist 是"搜索走到了合格站台/车库格、但格上扫不出车底"，它的坐标集合就是
- * 搜索树的**落点分布**——用来判定第二次搜索到底有没有进入 y=15 那一行（27-G）。
- * 每次扫描最多 8 行（`_nocdump`，随 Reset 清零），全局最多 240 行（`_nocdump_total`，
- * 跨扫描累计、不随 Reset 清零），避免每 tick found=0 时刷屏。 */
-inline uint32_t _r3r_cpl_scan_nocdump = 0;
-inline uint32_t _r3r_cpl_scan_nocdump_total = 0;
-
-/** 每次挂接寻路开始前清零（调用点：CYapfTrainRailT::FindNearestCoupleTrain）。 */
-inline void R3RCoupleScanReset()
-{
-	_r3r_cpl_scan_enter = 0;
-	_r3r_cpl_scan_noplat = 0;
-	_r3r_cpl_scan_nores = 0;
-	_r3r_cpl_scan_noconsist = 0;
-	_r3r_cpl_scan_consist = 0;
-	_r3r_cpl_scan_rej[0] = _r3r_cpl_scan_rej[1] = _r3r_cpl_scan_rej[2] = _r3r_cpl_scan_rej[3] = _r3r_cpl_scan_rej[4] = 0;
-	_r3r_cpl_scan_acc[0] = _r3r_cpl_scan_acc[1] = 0;
-	_r3r_cpl_scan_accwp = 0;
-	_r3r_cpl_scan_last_tile = 0;
-	_r3r_cpl_scan_last_veh = -1;
-	_r3r_cpl_scan_last_why = -1;
-	_r3r_cpl_scan_nocdump = 0;
-}
-
 /** 每次挂接寻路结束后无条件打一行（found 为 YAPF 的最终结果）。
  *  closed / limit 取自 YAPF 自身的节点统计：closed == limit != 0 表示"搜索被节点上限
  *  截断"，此时 found=0 只说明没搜完，**不能**据此断言"候选不在场"；只有 closed < limit
  *  （或 limit == 0 无限）才是"真的穷尽了可达空间"。 */
-inline void R3RCoupleScanDump(int veh, int found, uint closed, uint limit, uint nodes, uint32_t tick)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	static const char * const why_names[8] = { "GROUP", "FIT", "TARGET", "ORDER", "acc-car", "acc-wait", "cut-wp", "LINE" };
-	const bool has_last = (_r3r_cpl_scan_last_why >= 0);
-	const char *why = (has_last && _r3r_cpl_scan_last_why < 8) ? why_names[_r3r_cpl_scan_last_why] : "none";
-	/* R3R (第 255 轮, P0)：补 tick= 与 nodes=。tick 是同步 tick（30/s），有了它才能把
-	 * "一次挂接在 YAPF 里烧掉多少节点"与"挂车总耗时多久"直接相减；nodes = closed + enter
-	 * 是本次搜索真正走过的节点规模（enter 含 PfCalcEstimate 的重复访问，closed 只算扩展），
-	 * 二者一起才能回答"大地图上一次搜索是不是 O(地图)"。 */
-	fprintf(dbg, "CPL-SCAN tick=%u veh=%d found=%d closed=%u limit=%u nodes=%u enter=%u noplat=%u nores=%u noconsist=%u consist=%u "
-			"rej=%u/%u/%u/%u/%u acc=%u/%u accwp=%u last=%d,%d lastveh=%d why=%s\n",
-			(unsigned)tick, veh, found, closed, limit, (unsigned)nodes,
-			(unsigned)_r3r_cpl_scan_enter, (unsigned)_r3r_cpl_scan_noplat,
-			(unsigned)_r3r_cpl_scan_nores, (unsigned)_r3r_cpl_scan_noconsist,
-			(unsigned)_r3r_cpl_scan_consist,
-			(unsigned)_r3r_cpl_scan_rej[0], (unsigned)_r3r_cpl_scan_rej[1],
-			(unsigned)_r3r_cpl_scan_rej[2], (unsigned)_r3r_cpl_scan_rej[3],
-			(unsigned)_r3r_cpl_scan_rej[4],
-			(unsigned)_r3r_cpl_scan_acc[0], (unsigned)_r3r_cpl_scan_acc[1],
-			(unsigned)_r3r_cpl_scan_accwp,
-			has_last ? (int)TileX(TileIndex(_r3r_cpl_scan_last_tile)) : -1,
-			has_last ? (int)TileY(TileIndex(_r3r_cpl_scan_last_tile)) : -1,
-			_r3r_cpl_scan_last_veh, why);
-	fclose(dbg);
-}
-
 class CYapfDestinationRailBase {
 protected:
 	RailTypes compatible_railtypes;
@@ -494,20 +427,7 @@ public:
 		 * 哪一格，无法区分"算错格"和"算对但不可达"。本行只读、节流前 12 次。 */
 		if (snap_valid && snap_meet_tile != INVALID_TILE) {
 			static uint32_t r3r_snap_meet_seen = 0;
-			if (++r3r_snap_meet_seen <= 12) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-SNAP veh=%d near=%d,%d meet=%d,%d head=%d,%d tail=%d,%d rej=%d\n",
-							(int)v->index.base(),
-							(int)TileX(DistanceManhattan(v->tile, t->tile) <= DistanceManhattan(v->tile, t->Last()->tile) ? t->tile : t->Last()->tile),
-							(int)TileY(DistanceManhattan(v->tile, t->tile) <= DistanceManhattan(v->tile, t->Last()->tile) ? t->tile : t->Last()->tile),
-							(int)TileX(snap_meet_tile), (int)TileY(snap_meet_tile),
-							(int)TileX(t->tile), (int)TileY(t->tile),
-							(int)TileX(t->Last()->tile), (int)TileY(t->Last()->tile),
-							snap_rej);
-					fclose(dbg);
-				}
-			}
+			
 		}
 	}
 
@@ -700,9 +620,6 @@ public:
 	/** @copydoc CYapfBaseT::PfDetectDestinationTileFunc */
 	inline bool PfDetectDestination(TileIndex tile, Trackdir td)
 	{
-		/* R3R (第 236 轮, KI-344): 无条件清点本次扫描，见文件头的 census 说明。 */
-		++_r3r_cpl_scan_enter;
-
 		/* R3R (第 386 轮, KI-551): 「等待区路点截断」分支已删除。原先
 		 * couple_wait_cut 为真时这里只接受等待区路点作终点（并打
 		 * PFD-ACCEPT kind=waitwp），使回溯/预留止于路点。现在一律走下面的
@@ -736,56 +653,17 @@ public:
 					GetRailStationAxis(snap_meet_tile) == snap_axis &&
 					R3RStaticIsSameLine(tile);
 			if (tile != snap_meet_tile && !meet_unreachable_in_platform) {
-				/* R3R（第 503 轮续, S5-dbg, KI-676）：记录搜索到底探了哪些格。
-				 * 只读、节流前 40 次（即第一次找路的前 40 个探测格），用于判断
-				 * "meet 算错"还是"meet 算对但搜索没走到"。 */
-				static uint32_t r3r_meet_miss_seen = 0;
-				if (++r3r_meet_miss_seen <= 40) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "PFD-MEETMISS tile=%d,%d meet=%d,%d n=%u\n",
-								(int)TileX(tile), (int)TileY(tile),
-								(int)TileX(snap_meet_tile), (int)TileY(snap_meet_tile),
-								(unsigned)r3r_meet_miss_seen);
-						fclose(dbg);
-					}
-				}
-				/* 计入 LINE 一类（异排/非会合点），保持 census 口径不新增桶。 */
-				++_r3r_cpl_scan_rej[4];
-				_r3r_cpl_scan_last_tile = tile.base();
-				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-				_r3r_cpl_scan_last_why = 7;
 				return false;
 			}
 			if (snap_rej >= 0) {
-				++_r3r_cpl_scan_rej[snap_rej];
-				_r3r_cpl_scan_last_tile = tile.base();
-				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-				_r3r_cpl_scan_last_why = snap_rej;
 				return false;
 			}
-			++_r3r_cpl_scan_consist;
-			++_r3r_cpl_scan_acc[snap_car_only ? 0 : 1];
-			_r3r_cpl_scan_last_tile = tile.base();
-			_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-			_r3r_cpl_scan_last_why = snap_car_only ? 4 : 5;
-			static uint32_t r3r_meet_acc_seen = 0;
-			if (++r3r_meet_acc_seen <= 16) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFD-MEET kind=%s tile=%d,%d t=%d n=%u\n",
-							snap_car_only ? "car-only" : "waiting",
-							(int)TileX(tile), (int)TileY(tile),
-							(int)snap_veh.base(), (unsigned)r3r_meet_acc_seen);
-					fclose(dbg);
-				}
-			}
+			
 			return true;
 		}
 
 		/* Only platform or depot tiles qualify. */
 		if (!IsRailStationTile(tile) && !IsRailDepotTile(tile)) {
-			++_r3r_cpl_scan_noplat;
 			return false;
 		}
 
@@ -800,38 +678,10 @@ public:
 		 * 快照失效（车底被移走/订单变了/配对锁改指）时自动回落到动态链。 */
 		if (snap_valid && IsRailStationTile(tile) && R3RStaticTargetValid()) {
 			if (!R3RStaticIsSameLine(tile)) {
-				++_r3r_cpl_scan_consist;
-				++_r3r_cpl_scan_rej[4];
-				_r3r_cpl_scan_last_tile = tile.base();
-				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-				_r3r_cpl_scan_last_why = 7;
 				return false;
 			}
 			if (snap_rej >= 0) {
-				++_r3r_cpl_scan_consist;
-				++_r3r_cpl_scan_rej[snap_rej];
-				_r3r_cpl_scan_last_tile = tile.base();
-				_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-				_r3r_cpl_scan_last_why = snap_rej;
 				return false;
-			}
-			/* 不能复用下面的 r3r_dest_accept lambda（它在本函数后半段才定义），
-			 * 故自带计数与一行节流日志；acc/rej 口径与旧统计合并，不倒退。 */
-			++_r3r_cpl_scan_consist;
-			++_r3r_cpl_scan_acc[snap_car_only ? 0 : 1];
-			_r3r_cpl_scan_last_tile = tile.base();
-			_r3r_cpl_scan_last_veh = (int)snap_veh.base();
-			_r3r_cpl_scan_last_why = snap_car_only ? 4 : 5;
-			static uint32_t r3r_static_acc_seen = 0;
-			if (++r3r_static_acc_seen <= 16) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFD-STATIC kind=%s tile=%d,%d t=%d row=%d stn=%d n=%u\n",
-							snap_car_only ? "car-only" : "waiting",
-							(int)TileX(tile), (int)TileY(tile), (int)snap_veh.base(),
-							(int)snap_row, (int)snap_stn.base(), (unsigned)r3r_static_acc_seen);
-					fclose(dbg);
-				}
 			}
 			return true;
 		}
@@ -845,7 +695,6 @@ public:
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
 		bool has_res = HasReservedTracks(tile, TrackdirBitsToTrackBits(tdb));
 		if (!has_res && !IsRailStationTile(tile)) {
-			++_r3r_cpl_scan_nores;
 			return false;
 		}
 
@@ -891,25 +740,8 @@ public:
 		if (t == nullptr) {
 			/* R3R (第 236 轮, KI-344): 站台格上没有任何合法车底 —— 这是"等待链不在场"
 			 * 的第一个可辨形态（另有 noplat / nores 两种更早的早退）。 */
-			++_r3r_cpl_scan_noconsist;
-			/* R3R（第 330 轮取证，只读，KI-446）：把"走到了合格格但扫不出车底"的
-			 * 坐标记下来。这一组坐标 = 搜索树在站台/车库上的落点分布，用来判定
-			 * 第二次搜索（found=0）是否真的没进入 y=15 那一行（27-G）。
-			 * 配额见 _r3r_cpl_scan_nocdump 的声明处。 */
-			if (_r3r_cpl_scan_nocdump < 8 && _r3r_cpl_scan_nocdump_total < 240) {
-				++_r3r_cpl_scan_nocdump;
-				++_r3r_cpl_scan_nocdump_total;
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFD-NOCONSIST tile=%d,%d td=%d res=%d n=%u\n",
-							(int)TileX(tile), (int)TileY(tile), (int)td, (int)has_res,
-							(unsigned)_r3r_cpl_scan_noconsist);
-					fclose(dbg);
-				}
-			}
 			return false;
 		}
-		++_r3r_cpl_scan_consist;
 		t = t->First();
 
 		/* R3R (KI-194, 2026-09-24): the destination probe must not report a candidate
@@ -926,46 +758,6 @@ public:
 		 * are private to train_cmd.cpp), so rejections are throttled by a tiny
 		 * per-reason counter and accepts are printed one for one (they are rare and
 		 * are the interesting case). */
-		static uint32_t r3r_dest_rej_seen[5] = { 0, 0, 0, 0, 0 };
-		auto r3r_dest_reject = [](int why, TileIndex tile, const Train *t) {
-			static const char * const names[5] = { "PFD-REJ-GROUP", "PFD-REJ-FIT", "PFD-REJ-TARGET", "PFD-REJ-ORDER", "PFD-REJ-LINE" };
-			if (why < 0 || why >= 5) return;
-			/* R3R (第 236 轮, KI-344): 计入本次扫描汇总 —— 必须在节流 return 之前，
-			 * 否则 found=0 现场只会看到 1/64 的样本。 */
-			++_r3r_cpl_scan_rej[why];
-			_r3r_cpl_scan_last_tile = tile.base();
-			_r3r_cpl_scan_last_veh = (int)t->index.base();
-			/* R3R（第 501 轮, S2）：LINE 是 rej[4]，但 last_why 为了让旧日志口径不变
-			 * （4/5/6 = acc-car/acc-wait/cut-wp）映射到 7。 */
-			_r3r_cpl_scan_last_why = (why == 4) ? 7 : why;
-			if (++r3r_dest_rej_seen[why] % 64 != 0) return;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "%s tile=%d,%d t=%d ordType=%d wc=%d rej=%u\n", names[why],
-						(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
-						(int)t->current_order.GetType(),
-						(int)(t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)),
-						(unsigned)r3r_dest_rej_seen[why]);
-				fclose(dbg);
-			}
-		};
-		auto r3r_dest_accept = [](const char *kind, TileIndex tile, const Train *t) {
-			/* R3R (第 236 轮, KI-344): 计入汇总；kind 首字母区分两种接受分支。 */
-			const bool car_only = (kind[0] == 'c');
-			++_r3r_cpl_scan_acc[car_only ? 0 : 1];
-			_r3r_cpl_scan_last_tile = tile.base();
-			_r3r_cpl_scan_last_veh = (int)t->index.base();
-			_r3r_cpl_scan_last_why = car_only ? 4 : 5;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "PFD-ACCEPT kind=%s tile=%d,%d t=%d ordType=%d wc=%d\n", kind,
-						(int)TileX(tile), (int)TileY(tile), (int)t->index.base(),
-						(int)t->current_order.GetType(),
-						(int)(t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)));
-				fclose(dbg);
-			}
-		};
-
 		/* R3R: couple group whitelist (step 5). A waiting consist whose segment
 		 * belongs to a different couple group is not a candidate at all: it must
 		 * vanish from the destination set (PfDetectDestination returns false) so the
@@ -975,52 +767,11 @@ public:
 		 * every station/depot tile of every path search, so it may not be logged one
 		 * for one. */
 		if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), t)) {
-			/* R3R (第 289 轮, 只读取证): CPL-SCAN 的 rej[0]=3 已经证明拒绝来自
-			 * R3RCoupleAllowed() 的第一个子判据，但「pair 不成立 / 目的地不在本车站 /
-			 * 分组白名单」三种成因在日志里都只能推断，不能直读 —— 扫描层
-			 * TrainCoupleHandler 用的是**不含 pair**的 R3RCoupleAllowedIgnoringPair()，
-			 * 它能过、寻路层却全拒，本身就把嫌疑指向 pair-mismatch，但仍需铁证。
-			 *
-			 * 这一行把三个子判据的真值连同双方锁字段、停驶标志一次打出来：
-			 *   pairOK=0        -> R3RCouplePairMatches() 假（锁为空/只有一半）
-			 *   pairOK=1 ignOK=0 -> 目的地或分组；再看 tStn vs destStn / isDepot
-			 *   aStop/tStop     -> 直接检验「停驶即清锁」那条机制是否在生效
-			 * 限量 16 行/进程（BSS 静态计数），零行为变更。 */
-			static uint32_t r3r_why_seen = 0;
-			if (++r3r_why_seen <= 16) {
-				const Train *r3r_act = Train::From(Yapf().GetVehicle());
-				const Train *r3r_ch = (r3r_act != nullptr) ? Train::From(r3r_act->First()) : nullptr;
-				const Train *r3r_th = Train::From(t->First());
-				if (r3r_act != nullptr && r3r_ch != nullptr && r3r_th != nullptr) {
-					const bool r3r_pair_ok = R3RCouplePairMatches(r3r_act, t);
-					const bool r3r_ign_ok = R3RCoupleAllowedIgnoringPair(r3r_act, t);
-					const Order &r3r_co = r3r_ch->current_order;
-					const bool r3r_is_depot = r3r_co.GetCoupleIsDepot();
-					const uint r3r_dest_stn = r3r_is_depot ? 0u : (uint)r3r_co.GetDestination().ToStationID().base();
-					const uint r3r_a_stn = IsRailStationTile(r3r_ch->tile) ? (uint)GetStationIndex(r3r_ch->tile).base() : 0xFFFFu;
-					const uint r3r_t_stn = IsRailStationTile(r3r_th->tile) ? (uint)GetStationIndex(r3r_th->tile).base() : 0xFFFFu;
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "CPL-WHY node=%d,%d act=%d tgt=%d ch=%d th=%d pairTgt=%d pairReq=%d pairOK=%d ignOK=%d aStn=%d tStn=%d destStn=%d isDepot=%d aStop=%d tStop=%d n=%u\n",
-								(int)TileX(tile), (int)TileY(tile),
-								(int)r3r_act->index.base(), (int)t->index.base(),
-								(int)r3r_ch->index.base(), (int)r3r_th->index.base(),
-								(int)r3r_ch->r3r_couple_target.base(), (int)r3r_th->r3r_couple_requester.base(),
-								(int)r3r_pair_ok, (int)r3r_ign_ok,
-								(int)r3r_a_stn, (int)r3r_t_stn, (int)r3r_dest_stn, (int)r3r_is_depot,
-								(int)r3r_act->vehstatus.Test(VehState::Stopped),
-								(int)t->vehstatus.Test(VehState::Stopped), (unsigned)r3r_why_seen);
-						fclose(dbg);
-					}
-				}
-			}
-			r3r_dest_reject(0, tile, t);
 			return false;
 		}
 
 		/* R3R (pxp-decouple): the waiting formation must fit into its station. */
 		if (!TrainFitStation(t)) {
-			r3r_dest_reject(1, tile, t);
 			return false;
 		}
 
@@ -1031,7 +782,6 @@ public:
 		 * short-circuit, which let any zero-power formation through regardless of
 		 * which order it held. */
 		if (!R3RIsCoupleTarget(t)) {
-			r3r_dest_reject(2, tile, t);
 			return false;
 		}
 
@@ -1052,14 +802,12 @@ public:
 		 * 线"变成 found=0（挂接失败），而不是错误铺轨。
 		 * depot 挂接一律不动；判不了排（非站台格）一律放行。 */
 		if (!dest_order.GetCoupleIsDepot() && !R3RSameParkingLine(tile, t)) {
-			r3r_dest_reject(4, tile, t);
 			return false;
 		}
 
 		/* Target 1: a car-only formation (zero-power train front) waiting to be
 		 * coupled. */
 		if (R3RIsCarOnlyFormation(t)) {
-			r3r_dest_accept("car-only", tile, t);
 			return true;
 		}
 
@@ -1078,10 +826,8 @@ public:
 		if (t->IsPrimaryVehicle() && t->current_order.IsType(OT_WAIT_COUPLE)) {
 			if (CheckOrderLoad(t) && CheckOrderCargoType(t) &&
 					CheckNumberOfWagons(t)) {
-				r3r_dest_accept("waiting", tile, t);
 				return true;
 			}
-			r3r_dest_reject(3, tile, t);
 			return false;
 		}
 

@@ -42,7 +42,6 @@
 #include "tbtr_template_vehicle_func.h"
 #include "scope.h"
 #include "couple_group.h"
-#include "r3r_perf.h"
 
 #include <cstdio>
 
@@ -248,9 +247,7 @@ CommandCost CmdBuildVehicle(DoCommandFlags flags, TileIndex tile, EngineID eid, 
 			/* R3R (KI-147 rev.3) 诊断探针:每次成功购车落一行,给出本次分到的号以及
 			 * 池子里下次会分到的号 —— 复测"卖出耦合的1/2号列车后买新车"时,若
 			 * free_next 不是 1,说明池里还有没回收的记录,据此定位是哪条释放路径漏了。 */
-			R3RDbgWrite("UNIT-NEW id=%u type=%u owner=%u free_next=%u\n",
-					v->unitnumber, (uint)v->type, (uint)v->owner.base(),
-					Company::Get(v->owner)->freeunits[v->type].NextID());
+			
 		}
 
 
@@ -367,142 +364,6 @@ static void R3RStopChainInDepot(Train *t)
  *  the segment-upgrade diagnosis. Real articulated parts show up as the
  *  subtype "artic" bit; de-articulated groups carry ArticGroupHead/Member
  *  railflags instead (subtype artic bit cleared). */
-static void R3RDumpUpgradeDbg(const Train *head, const char *tag)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	if (head == nullptr) {
-		fprintf(dbg, "MAKESEG %s head=NULL\n", tag);
-		fclose(dbg);
-		return;
-	}
-	fprintf(dbg, "MAKESEG %s head=%d\n", tag, (int)head->index.base());
-	int i = 0;
-	uint32_t r3r_sum_w = 0;
-	uint32_t r3r_sum_pw = 0;
-	for (const Train *w = head; w != nullptr; w = w->Next()) {
-		/* R3R (第 290 轮, KI-459): the weight columns. "ov" is the baked
-		 * per-vehicle override (65535 = not baked, so the engine record is
-		 * used), "rw" the raw GRF record weight, "pw" what callback 36
-		 * (PROP_TRAIN_WEIGHT) returns for this very vehicle and "w" what
-		 * GetWeightWithoutCargo() actually contributes. Comparing the sum of
-		 * "w" before and after the split against the raw record sum is what
-		 * settles the reported "weight triples after MakeSegment". */
-		const uint32_t r3r_pw = GetVehicleProperty(w, PROP_TRAIN_WEIGHT, RailVehInfo(w->engine_type)->weight);
-		r3r_sum_w += w->GetWeightWithoutCargo();
-		r3r_sum_pw += r3r_pw;
-		fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x bits(front=%d wagon=%d engine=%d freeW=%d artic=%d) rail(AH=%d AM=%d SF=%d SB=%d) eng=%d ov=%u rw=%u pw=%u w=%u\n",
-			tag,
-			(int)w->index.base(),
-			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
-			w->Next() != nullptr ? (int)w->Next()->index.base() : -1,
-			w->subtype,
-			HasBit(w->subtype, GVSF_FRONT) ? 1 : 0,
-			HasBit(w->subtype, GVSF_WAGON) ? 1 : 0,
-			HasBit(w->subtype, GVSF_ENGINE) ? 1 : 0,
-			HasBit(w->subtype, GVSF_FREE_WAGON) ? 1 : 0,
-			HasBit(w->subtype, GVSF_ARTICULATED_PART) ? 1 : 0,
-			w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
-			w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
-			w->IsSegmentFront() ? 1 : 0,
-			w->IsSegmentBack() ? 1 : 0,
-			(int)w->engine_type.base(),
-			(unsigned)w->weight_override,
-			(unsigned)RailVehInfo(w->engine_type)->weight,
-			(unsigned)r3r_pw,
-			(unsigned)w->GetWeightWithoutCargo());
-		if (++i > 60) break;
-	}
-	fprintf(dbg, "MAKESEG-WEIGHT %s head=%d n=%d sumw=%u sumpw=%u cw=%u dmw=%u\n",
-			tag, (int)head->index.base(), i, (unsigned)r3r_sum_w, (unsigned)r3r_sum_pw,
-			(unsigned)head->gcache.cached_weight, (unsigned)head->GetDisplayMaxWeight());
-	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
-	fclose(dbg);
-}
-
-/**
- * R3R (第 179 轮, KI-270 补): one-line evidence that a clone reproduced *every*
- * segment boundary marker of its source.
- *
- * R3RDumpUpgradeDbg() above only prints when the clone went through the
- * de-articulation path (r3r_identity_rebuilt), i.e. when the source carried a
- * de-articulated group. The hole this round closes is exactly the one that path
- * does not cover: a multi-section chain whose section heads are plain real
- * locomotives. Without this probe the widening would be unverifiable in game, so
- * a clone whose source carries more than the trivial single ★ on its head (or
- * whose marker counts do not match) always leaves one line behind.
- *
- * Read-only; the walk is bounded so a broken chain cannot turn it into a hang.
- */
-static void R3RDbgCloneMarkers(const Train *src, const Train *dst)
-{
-	if (src == nullptr || dst == nullptr || !R3RDbgOn()) return;
-
-	uint n_src_front = 0, n_dst_front = 0;
-	uint n_src_back = 0, n_dst_back = 0;
-	uint diff = 0, n = 0;
-	const Train *s = src;
-	const Train *d = dst;
-	for (; s != nullptr && d != nullptr && n < 512; s = s->Next(), d = d->Next(), n++) {
-		const bool s_front = s->IsSegmentFront();
-		const bool d_front = d->IsSegmentFront();
-		const bool s_back = s->IsSegmentBack();
-		const bool d_back = d->IsSegmentBack();
-		if (s_front) n_src_front++;
-		if (d_front) n_dst_front++;
-		if (s_back) n_src_back++;
-		if (d_back) n_dst_back++;
-		if (s_front != d_front || s_back != d_back) diff++;
-	}
-
-	/* The uninteresting case is the plain single-section train: exactly one ★ on
-	 * the head and no ⊗ anywhere. Everything else is logged, so "the log has no
-	 * CLONE-MARKERS" keeps meaning "there was nothing multi-section to copy". */
-	if (n_src_front <= 1 && n_src_back == 0 && n_src_front == n_dst_front &&
-			n_src_back == n_dst_back && diff == 0) {
-		return;
-	}
-
-	R3RDbgWrite("CLONE-MARKERS src=%d dst=%d cars=%u srcSF=%u dstSF=%u srcSB=%u dstSB=%u diff=%u%s\n",
-			(int)src->index.base(), (int)dst->index.base(), n,
-			n_src_front, n_dst_front, n_src_back, n_dst_back, diff,
-			diff == 0 ? "" : " REPORT-THIS-MISMATCH");
-}
-
-/**
- * R3R (第 225 轮 / KI-332): the per-segment traits a clone inherited.
- *
- * One line per segment of the source chain, source value -> clone value, so the
- * question "did the copy take the segment name / its couple groups / its
- * priority" is decidable from the log alone. Written for every clone in probe
- * builds: unlike R3RDbgCloneMarkers() above, the interesting single-section case
- * (a named train which is in a couple group) has no ★/⊗ at all, so a marker-count
- * gate would hide exactly the case this round is about.
- *
- * Read-only; the walk is bounded like the marker probe.
- */
-static void R3RDbgCloneTraits(const Train *src, const Train *dst)
-{
-	if (src == nullptr || dst == nullptr || !R3RDbgOn()) return;
-
-	uint seg = 0, n = 0;
-	const Train *s = src;
-	const Train *d = dst;
-	for (; s != nullptr && d != nullptr && n < 512; s = s->GetNextVehicle(), d = d->GetNextVehicle(), n++) {
-		if (s != src && !s->IsSegmentFront()) continue;
-
-		const std::string sname = R3RSegmentSectionName(s);
-		const std::string dname = R3RSegmentSectionName(d);
-		R3RDbgWrite("CLONE-TRAIT seg=%u src=%d dst=%d prio=%u->%u grp=%u->%u cgrp=0x%llX->0x%llX name=\"%s\"->\"%s\"\n",
-				seg, (int)s->index.base(), (int)d->index.base(),
-				(unsigned)s->r3r_priority, (unsigned)d->r3r_priority,
-				(unsigned)R3RSegmentSectionGroupID(s).base(), (unsigned)R3RSegmentSectionGroupID(d).base(),
-				(unsigned long long)R3RGetCoupleGroupsOfSegment(s), (unsigned long long)R3RGetCoupleGroupsOfSegment(d),
-				sname.c_str(), dname.c_str());
-		seg++;
-	}
-}
-
 /**
  * R3R: split ONE real articulated group -- the parent @p v plus the contiguous
  * articulated parts right after it -- into independent vehicles, with the baked
@@ -565,30 +426,6 @@ Train *R3RDearticulateOneGroup(Train *v)
 		p->weight_override = w_q;
 		p->power_override = p_q;
 		p->max_speed_override = max_speed;
-	}
-
-	/* R3R (第 290 轮, KI-459): what the split actually baked. "wtot" is the
-	 * snapshot taken from the still-articulated group head (the only vehicle
-	 * that contributes weight while the group is real, because genuine parts
-	 * are skipped by GetWeightWithoutCargo()), so a wrong "n" or a wrong wtot
-	 * shows up here before anything downstream can disguise it. */
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "DEARTIC-SPLIT head=%d n=%u wtot=%u wq=%u wr=%u ptot=%u pq=%u wagon=%d\n",
-				(int)v->index.base(), n_total, (unsigned)total_weight,
-				(unsigned)w_q, (unsigned)w_r, (unsigned)total_power, (unsigned)p_q, wagon_type ? 1 : 0);
-		int k = 0;
-		for (Train *p = v; p != nullptr && k < 64; p = p->Next(), k++) {
-			fprintf(dbg, "DEARTIC-PART head=%d i=%d idx=%d art=%d gm=%d gh=%d eng=%d ov=%u rw=%u w=%u cargo=%u/%u\n",
-					(int)v->index.base(), k, (int)p->index.base(),
-					p->IsArticulatedPart() ? 1 : 0, p->IsArticGroupMember() ? 1 : 0,
-					p->IsArticGroupHead() ? 1 : 0, p->IsEngine() ? 1 : 0,
-					(unsigned)p->weight_override, (unsigned)RailVehInfo(p->engine_type)->weight,
-					(unsigned)p->GetWeightWithoutCargo(),
-					(unsigned)p->cargo_type, (unsigned)p->cargo_subtype);
-			if (p == nxt) break;
-		}
-		fclose(dbg);
 	}
 
 	return nxt;
@@ -825,16 +662,6 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 	ret = CheckInfraUsageAllowed(VehicleType::Train, GetTileOwner(t->tile), t->tile);
 	if (ret.Failed()) return ret;
 
-	/* R3R debug probe: log the command receipt and every validation result. */
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "MAKESEG-CMD veh=%d tile=%d exec=%d resolveHead=%d isEngine=%d isFront=%d stopInDepot=%d chainInDepot=%d nxt=%d\n",
-			(int)veh_id.base(), tile.base(), flags.Test(DoCommandFlag::Execute) ? 1 : 0,
-			(int)t->index.base(), t->IsEngine() ? 1 : 0, t->IsFrontEngine() ? 1 : 0, t->IsStoppedInDepot() ? 1 : 0, t->IsChainInDepot() ? 1 : 0,
-			t->Next() != nullptr ? (int)t->Next()->index.base() : -1);
-		fclose(dbg);
-	}
-
 	if (!t->IsFreeWagon() && (!t->IsEngine() || !t->IsFrontEngine())) return CommandCost(STR_ERROR_CAN_T_MAKE_SEGMENT);
 	/* A chain fully parked inside a depot qualifies even when it was left
 	 * running; it is auto-stopped in the execute phase below. Only a chain that
@@ -854,7 +681,7 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 		 * group-role flags), so the segment can afterwards be rearranged
 		 * vehicle-by-vehicle while GRF callbacks still treat each group as one
 		 * articulated unit. */
-		R3RDumpUpgradeDbg(t, "UPGRADE-BEFORE-SPLIT");
+		
 		DearticulateChainWithSnapshot(t);
 		t->SetSegmentFront();
 		/* R3R segment upgrade rule: when a car-only chain is promoted to a
@@ -867,12 +694,8 @@ CommandCost CmdMakeSegment(DoCommandFlags flags, TileIndex tile, VehicleID veh_i
 		 * the de-articulated path checkable without reading the UI. A car-only
 		 * segment must read at least 1 hp, exactly like one upgraded without a
 		 * ctrl-click de-articulation. */
-		if (R3RDbgOn()) {
-			R3RDbgWrite("SEG-POWER head=%d caronly=%d ovr=%u power=%u\n",
-					(int)t->index.base(), R3RIsCarOnlyFormation(t) ? 1 : 0,
-					(unsigned)t->power_override, (unsigned)t->gcache.cached_power);
-		}
-		R3RDumpUpgradeDbg(t, "UPGRADE-AFTER-SPLIT");
+		
+		
 		InvalidateWindowData(WindowClass::VehicleDepot, tile.base());
 	}
 	return CommandCost();
@@ -1055,7 +878,7 @@ CommandCost CmdSellVehicle(DoCommandFlags flags, TileIndex tile, VehicleID v_id,
 		const bool sell_chain = HasFlag(sell_flags, SellVehicleFlags::SellChain);
 		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
 			if (R3RIsFrozenForeignSegment(w, _current_company)) {
-				if (R3RDbgOn()) R3RDbgWrite("R3R-FROZEN-SELL veh=%d owner=%d company=%d sell_chain=%d\n", (int)w->index.base(), (int)w->owner.base(), (int)_current_company.base(), sell_chain ? 1 : 0);
+				
 				return CommandCost(STR_ERROR_CAN_T_SELL_TRAIN);
 			}
 			/* Only this vehicle (and its rear engine part, which always shares
@@ -1184,11 +1007,6 @@ struct RefitResult {
  */
 static CommandCost RefitVehicle(Vehicle *v, bool only_this, uint8_t num_vehicles, CargoType new_cargo_type, uint8_t new_subtype, DoCommandFlags flags, bool auto_refit)
 {
-	/* R3R (KI-458) PROBE ONLY: `v` below is consumed as the loop cursor
-	 * (`for (; v != nullptr; v = v->Next())`) and is nullptr once the loop
-	 * ends, so any probe placed after the loop must use this snapshot. */
-	Vehicle *const r3r_probe_veh = v;
-
 	CommandCost cost(v->GetExpenseType(false));
 	uint total_capacity = 0;
 	uint total_mail_capacity = 0;
@@ -1302,28 +1120,6 @@ static CommandCost RefitVehicle(Vehicle *v, bool only_this, uint8_t num_vehicles
 		}
 	}
 
-	/* R3R (KI-458) PROBE ONLY: what the refit actually wrote onto every unit of
-	 * the chain. Drift between units (or between a unit and its group head) is
-	 * the livery symptom; this dump is the baseline to compare against. */
-	if (flags.Test(DoCommandFlag::Execute) && r3r_probe_veh != nullptr && r3r_probe_veh->type == VehicleType::Train && R3RDbgOn()) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			const Vehicle *head = r3r_probe_veh->First();
-			fprintf(dbg, "R3R-REFIT-DONE head=%d cargo=%u sub=%u actual=%u\n",
-					(int)head->index.base(), (unsigned)new_cargo_type, (unsigned)new_subtype,
-					(unsigned)actual_subtype);
-			uint k = 0;
-			for (const Vehicle *u = head; u != nullptr && k < 64; u = u->Next(), k++) {
-				fprintf(dbg, "R3R-REFIT-UNIT head=%d i=%u idx=%d cargo=%u/%u art=%d gm=%d gh=%d\n",
-						(int)head->index.base(), k, (int)u->index.base(),
-						(unsigned)u->cargo_type, (unsigned)u->cargo_subtype,
-						u->IsArticulatedPart() ? 1 : 0, u->IsArticGroupMember() ? 1 : 0,
-						u->IsArticGroupHead() ? 1 : 0);
-			}
-			fclose(dbg);
-		}
-	}
-
 	refit_result.clear();
 	_returned_refit_capacity = total_capacity;
 	_returned_mail_refit_capacity = total_mail_capacity;
@@ -1409,7 +1205,7 @@ CommandCost CmdRefitVehicle(DoCommandFlags flags, VehicleID veh_id, CargoType ne
 		if (frozen != nullptr) {
 			/* Auto-refit is driven by the loading logic and may be retried every
 			 * tick, so only the explicit (player / order) refits are logged. */
-			if (!auto_refit && R3RDbgOn()) R3RDbgWrite("R3R-FROZEN-REFIT veh=%d owner=%d company=%d only_this=%d\n", (int)frozen->index.base(), (int)frozen->owner.base(), (int)_current_company.base(), only_this ? 1 : 0);
+			
 			return CommandCost(STR_ERROR_CAN_T_REFIT_TRAIN);
 		}
 	}
@@ -2594,8 +2390,6 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 					}
 
 					if (n_src != n_dst) {
-						R3RDbgWrite("R3R-CLONE-GROUP-MISMATCH src=%d dst=%d n_src=%u n_dst=%u -> sell clone\n",
-								(int)src_walk->index.base(), (int)dst_walk->index.base(), n_src, n_dst);
 						group_mismatch = true;
 						break;
 					}
@@ -2646,9 +2440,6 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 				return CommandCost(STR_ERROR_CAN_T_CLONE_VEHICLE_LIST);
 			}
 
-			/* R3R (第 179 轮): evidence for the multi-section case, which no other
-			 * probe covers. One line per clone that had something to copy. */
-			R3RDbgCloneMarkers(Train::From(v_front), Train::From(w_front));
 		}
 
 		/* R3R (第 179 轮): the "clone's chain head as a safety net" block that
@@ -2671,8 +2462,8 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			 * source (artic=0, head with AH=1, every part with AM=1). The dumps
 			 * are only written when the source actually carried de-articulated
 			 * groups -- a genuine articulated source produces no log line. */
-			R3RDumpUpgradeDbg(Train::From(v_front), "CLONE-SRC");
-			R3RDumpUpgradeDbg(Train::From(w_front), "CLONE-DST");
+			
+			
 			Train::From(w_front)->ConsistChanged(CCF_ARRANGE);
 		}
 
@@ -2697,7 +2488,7 @@ CommandCost CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_
 			R3RSettleClonedChain(w_head);
 			R3RCopyClonedSegmentTraits(v_head, w_head);
 			R3RSettleClonedChain(w_head);
-			R3RDbgCloneTraits(v_head, w_head);
+			
 		}
 
 		/* for trains this needs to be the front engine due to the callback function */

@@ -36,7 +36,6 @@
 #include "news_func.h"
 #include "news_gui.h"
 #include "openttd.h"
-#include "r3r_perf.h"
 #include "scope_info.h"
 #include "command_func.h"
 #include "command_log.h"
@@ -1096,7 +1095,6 @@ static void R3RPruneDesyncLogs()
 		std::error_code rm_ec;
 		if (std::filesystem::remove(files[i].path(), rm_ec) && !rm_ec) removed++;
 	}
-	R3RDbgWrite("DESYNC-LOG-PRUNE removed=%u kept=%u total=%u\n", removed, (uint)keep, (uint)files.size());
 }
 
 /**
@@ -1135,11 +1133,10 @@ void CrashLog::MakeDesyncCrashLog(const std::string *log_in, std::string *log_ou
 	if (bret) {
 		/* KI-380: make the path reachable from R3R_debug.log, so a report does not
 		 * depend on someone having copied the console output. Debug builds only. */
-		R3RDbgWrite("DESYNC-LOG file=%s mode=%s\n", filename, mode);
+		
 		R3RPruneDesyncLogs();
 		printf("Desync log written to %s. Please add this file to any bug reports.\n\n", filename);
 	} else {
-		R3RDbgWrite("DESYNC-LOG-FAIL mode=%s\n", mode);
 		printf("Writing desync log failed.\n\n");
 	}
 

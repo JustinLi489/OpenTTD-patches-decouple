@@ -14,40 +14,21 @@
 #include "direction_type.h"
 #include "track_type.h"
 #include "vehicle_type.h"
-#include "r3r_perf.h"
-#include "r3r_resv_probes.h"
 #include "3rdparty/cpp-ring-buffer/ring_buffer.hpp"
 
-/* R3R (KI-207, 2026-09-25): reservation-origin tracing.
+/* R3R (KI-207, 2026-09-25): reservation-origin context.
  *
  * A "ghost reservation" is a reservation bit no train will ever drive over, left
- * behind by a chain edit (couple / decouple / segment flip). To find out *who*
- * installs one, every write to a watched tile's reservation field is logged
- * together with the "phase" the game was in when it happened -- the phase is set by
- * the RAII guard below at the reservation entry points, and nesting restores the
- * previous value automatically.
- *
- * The writes themselves are reported from the six map-accessor setters that own the
- * reservation bits (see r3r_resv_probes.h), so no call site can be forgotten. The
- * watch list defaults to the tiles reported as ghosts and can be extended without a
- * rebuild by dropping "r3r_resv_watch.txt" (one "x y" pair per line, '#' starts a
- * comment) next to R3R_debug.log in the game working directory.
- *
- * R3R (第 303 轮): the phase/actor context below is compiled unconditionally so
- * that the release/probe entry points keep the same signatures with the probes
- * off; only the watched-tile logging stays behind R3R_PROBES. The reservation
- * ledger that used to be fed from the same hook has been deleted. */
+ * behind by a chain edit (couple / decouple / segment flip). The phase/actor pair
+ * below records *who* was reserving at that moment: the phase is set by the RAII
+ * guard below at the reservation entry points, and nesting restores the previous
+ * value automatically. The arbitration in pbs.cpp reads the actor to decide which
+ * train a contended tile belongs to, so this context is real behaviour and not a
+ * debug aid. */
 extern const char *r3r_resv_phase;
 /** Acting train, as an ID rather than a pointer: the log is reached from deep
  *  inside the map setters, where a raw pointer could outlive the train it names. */
 extern VehicleID r3r_resv_actor;
-#if R3R_PROBES
-bool R3RIsWatchedResvTile(TileIndex tile);
-#else
-/** No-op counterpart for a build with the probes off, for the same reason as
- *  R3RResvPhaseGuard below: the call sites must compile both ways. */
-inline bool R3RIsWatchedResvTile(TileIndex) { return false; }
-#endif
 
 /**
  * Sets the reservation-origin context (phase name and/or the train doing the

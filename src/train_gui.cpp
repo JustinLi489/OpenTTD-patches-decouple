@@ -18,7 +18,6 @@
 #include "zoom_func.h"
 #include "settings_type.h"
 #include "core/backup_type.hpp"
-#include "r3r_perf.h"
 
 #include "table/strings.h"
 
@@ -137,7 +136,6 @@ void DrawTrainImage(const Train *v, const Rect &r, VehicleID selection, EngineIm
 		static int r3r_degenerate_logged = 0;
 		if (r3r_degenerate_logged < 16) {
 			r3r_degenerate_logged++;
-			R3RDbgWrite("GUI-DEGEN-RECT train left=%d top=%d right=%d bottom=%d\n", (int)r.left, (int)r.top, (int)r.right, (int)r.bottom);
 		}
 		return;
 	}
@@ -358,20 +356,12 @@ static EngineID R3RConsistRepresentativeEngine(const Train *v)
 		}
 		if (!known && n_seen < 16) {
 			seen[n_seen++] = v->index.base();
-			R3RDbgWrite("R3R-NAME v=%d fe=%d eng=%d sid=%d cb=%d nm=%d needs=%d\n",
-					(int)v->index.base(), v->IsFrontEngine() ? 1 : 0, (int)v->engine_type.base(),
-					(int)v->GetEngine()->info.string_id.base(),
-					v->GetEngine()->info.callback_mask.Test(VehicleCallbackMask::Name) ? 1 : 0,
-					R3REngineHasDisplayName(v->engine_type) ? 1 : 0, needs ? 1 : 0);
 		}
 	}
 
 	if (!needs) return v->engine_type;
 
 	const EngineID rep = R3RConsistRepresentativeUnit(v)->engine_type;
-	R3RDbgWrite("R3R-REPICK v=%d rep=%d eng=%d repNm=%d\n",
-			(int)v->index.base(), (int)rep.base(), (int)v->engine_type.base(),
-			R3REngineHasDisplayName(rep) ? 1 : 0);
 	return rep;
 }
 
@@ -423,9 +413,6 @@ static void TrainDetailsInfoTab(const Train *v, int left, int right, int y, uint
 		}
 		if (!known && n_seen < 16) {
 			seen[n_seen++] = key;
-			R3RDbgWrite("R3R-DINFO v=%d line=%d rvi=%d fe=%d eng=%d rep=%d\n",
-					(int)v->index.base(), (int)line_number, (int)rvi->railveh_type,
-					v->IsFrontEngine() ? 1 : 0, (int)v->engine_type.base(), (int)rep->engine_type.base());
 		}
 	}
 
@@ -543,58 +530,6 @@ static void TrainDetailsCapacityTab(const CargoSummaryItem *item, int left, int 
  *
  * Read-only.
  */
-static void R3RDbgCargoSummary(const Train *v, const CargoSummary &summary)
-{
-	if (!R3RDbgOn()) return;
-
-	/* Fingerprint the raw capacities so redrawing an unchanged window stays
-	 * silent, while any real change (before/after the reversal) is logged once. */
-	uint32_t fp = 2166136261u;
-	uint32_t sumcap = 0;
-	uint32_t n = 0;
-	for (const Train *u = v; u != nullptr && n < 64; u = u->Next(), n++) {
-		fp = (fp ^ (uint32_t)u->engine_type.base()) * 16777619u;
-		fp = (fp ^ (uint32_t)u->cargo_cap) * 16777619u;
-		fp = (fp ^ (uint32_t)u->cargo_type) * 16777619u;
-		sumcap += u->cargo_cap;
-	}
-	uint32_t linecap = 0;
-	for (const CargoSummaryItem &item : summary) {
-		fp = (fp ^ (uint32_t)item.cargo) * 16777619u;
-		fp = (fp ^ (uint32_t)item.capacity) * 16777619u;
-		linecap += item.capacity;
-	}
-
-	static uint32_t seen[24] = {};
-	static uint32_t seen_fp[24] = {};
-	static int n_seen = 0;
-	for (int i = 0; i < n_seen; i++) {
-		if (seen[i] == v->index.base() && seen_fp[i] == fp) return;
-	}
-	if (n_seen < 24) {
-		seen[n_seen] = v->index.base();
-		seen_fp[n_seen] = fp;
-		n_seen++;
-	}
-
-	/* linecap = the number the capacity tab actually prints for this line,
-	 * sumcap = the raw sum of cargo_cap over the walked units. They differ when
-	 * a unit's prototype cannot carry cargo (CanCarryCargo() == false). */
-	R3RDbgWrite("R3R-CAPSUM head=%d n=%u sumcap=%u linecap=%u items=%u\n",
-			(int)v->index.base(), (unsigned)n, (unsigned)sumcap, (unsigned)linecap,
-			(unsigned)summary.size());
-	uint32_t i = 0;
-	for (const Train *u = v; u != nullptr && i < 64; u = u->Next(), i++) {
-		R3RDbgWrite("R3R-CAPUNIT head=%d veh=%d eng=%d cap=%u carg=%u sub=%u carry=%d role=%d%d%d\n",
-				(int)v->index.base(), (int)u->index.base(), (int)u->engine_type.base(),
-				(unsigned)u->cargo_cap, (unsigned)u->cargo_type, (unsigned)u->cargo_subtype,
-				u->GetEngine()->CanCarryCargo() ? 1 : 0,
-				u->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
-				u->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
-				u->IsArticulatedPart() ? 1 : 0);
-	}
-}
-
 /**
  * Collects the cargo transported
  * @param v Vehicle to process
@@ -637,31 +572,13 @@ static void GetCargoSummaryOfArticulatedVehicle(const Train *v, CargoSummary &su
 
 	if (whole_consist) {
 		for (const Train *u = v; u != nullptr; u = u->Next()) add_unit(u);
-		R3RDbgCargoSummary(v, summary);
+		
 		return;
-	}
-
-	/* R3R (第 468 轮, KI-661 probe): previous rounds only dumped the
-	 * whole-consist line, so the 散链 (native articulated group) state produced
-	 * no R3R-CAP* read-out at all and "散链 2 / 成段 1" could not be decided
-	 * from the log. Dump every line of a chain that still carries real
-	 * articulated parts or R3R group roles. Read-only: nothing below changes a
-	 * single capacity value; the probe is compiled out at runtime when the
-	 * R3R probes are off. */
-	const Train *const dbg_head = v;
-	bool dbg_artic = false;
-	if (R3RDbgOn()) {
-		uint dbg_n = 0;
-		for (const Train *u = dbg_head; u != nullptr && dbg_n < 128; u = u->Next(), dbg_n++) {
-			if (u->IsArticulatedPart() || u->IsArticGroupHead()) { dbg_artic = true; break; }
-		}
 	}
 
 	do {
 		add_unit(v);
 	} while ((v = v->Next()) != nullptr && v->IsArticGroupMember());
-
-	if (dbg_artic) R3RDbgCargoSummary(dbg_head, summary);
 }
 
 /**

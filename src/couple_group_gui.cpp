@@ -30,7 +30,6 @@
 #include "window_gui.h"
 #include "zoom_func.h"
 #include "core/geometry_func.hpp"
-#include "r3r_perf.h"
 #include "widgets/couple_group_widget.h"
 #include "table/strings.h"
 
@@ -216,11 +215,6 @@ public:
 		if (!Company::IsValidID(company)) company = _local_company;
 		this->company = company;
 
-		R3RDbgWrite("[R3R] CG-WIN open arg=%u arg_valid=%d company=%u company_valid=%d local=%u\n",
-				(unsigned)arg_company.base(), (int)Company::IsValidID(arg_company),
-				(unsigned)company.base(), (int)Company::IsValidID(company),
-				(unsigned)_local_company.base());
-
 		this->CreateNestedTree();
 		this->group_scroll = this->GetScrollbar(WID_CG_GROUPS_SCROLLBAR);
 		this->segment_scroll = this->GetScrollbar(WID_CG_SEGMENTS_SCROLLBAR);
@@ -237,11 +231,6 @@ public:
 		 * buttons) and cannot create anything which would show up afterwards. */
 		this->owner = this->company;
 		this->RebuildGroups();
-
-		R3RDbgWrite("[R3R] CG-INIT owner=%u owner_valid=%d company=%u company_valid=%d groups=%u\n",
-				(unsigned)this->owner.base(), (int)Company::IsValidID(this->owner),
-				(unsigned)this->company.base(), (int)Company::IsValidID(this->company),
-				(unsigned)this->groups.size());
 	}
 
 	/** Rebuild the left pane from the couple group pool, keeping the selection if possible. */
@@ -385,8 +374,6 @@ public:
 		static uint last_rbg_state = 0xFFFFFFFFu;
 		if (rbg_state != last_rbg_state) {
 			last_rbg_state = rbg_state;
-			R3RDbgWrite("[R3R] CG-RBG owner=%u company=%u iterated=%u visible=%u sel=%d\n",
-					(unsigned)this->owner.base(), (unsigned)this->company.base(), iterated, visible, this->selected_group);
 		}
 
 		this->RebuildSegments();
@@ -704,16 +691,6 @@ public:
 				((uint)(this->selected_group + 1) << 12) | ((uint)this->segments.size() << 20) | ((uint)allow_others << 30);
 		if (report != last_report) {
 			last_report = report;
-			const CoupleGroup *sel_cg = CoupleGroup::GetIfValid(this->GetSelectedGroup());
-			const NWidgetCore *add_btn = this->GetWidget<NWidgetCore>(WID_CG_ADD_SEGMENT);
-			R3RDbgWrite("[R3R] CG-PAINT owner=%u owner_valid=%d company=%u local=%u can_create=%d can_manage=%d groups=%u segments=%u sel=%d sel_cg=%d sel_cg_owner=%d add_disabled=%d lowered=%d\n",
-					(unsigned)this->owner.base(), (int)Company::IsValidID(this->owner),
-					(unsigned)this->company.base(), (unsigned)_local_company.base(),
-					(int)can_create, (int)can_manage, (unsigned)this->groups.size(), (unsigned)this->segments.size(),
-					this->selected_group, (int)(sel_cg != nullptr),
-					(int)(sel_cg != nullptr ? sel_cg->owner.base() : 0xFFFFu),
-					(int)(add_btn != nullptr && add_btn->IsDisabled()),
-					(int)this->IsWidgetLowered(WID_CG_ADD_SEGMENT));
 		}
 
 		this->DrawWidgets();
@@ -840,9 +817,6 @@ public:
 				 * be entered at all -- that was the "assign segment does nothing"
 				 * bug.  (第 145 轮: the flag moved from _thd to this->segment_picking,
 				 * see its declaration -- list clicks now also arm HT_DRAG.) */
-				R3RDbgWrite("[R3R] CG-CLICK-ADD manage=%d groups=%u sel=%d picking=%d\n",
-						(int)this->IsSelectedGroupManageable(), (unsigned)this->groups.size(),
-						this->selected_group, (int)this->segment_picking);
 				if (!this->IsSelectedGroupJoinable()) break;
 				if (this->segment_picking) {
 					/* Already picking for this window: cancel the mode. */
@@ -872,8 +846,6 @@ public:
 		 * "am I picking?" test (the engine lowers it before OnClick() and raises it
 		 * again when the click timeout expires), so test our own picking flag. */
 		if (!this->segment_picking) return false;
-
-		R3RDbgWrite("[R3R] CG-PICK veh=%d\n", (int)(v == nullptr ? -1 : (int)v->index.base()));
 
 		this->segment_picking = false;
 		this->RaiseWidget(WID_CG_ADD_SEGMENT);
@@ -1001,9 +973,7 @@ void ShowCoupleGroupWindow(Owner company)
 {
 	/* R3R: entry point probe -- written for every request (the depot button),
 	 * while CG-WIN above is only written when the window is actually built. */
-	R3RDbgWrite("[R3R] CG-SHOW req owner=%u valid=%d local=%u\n",
-			(unsigned)company.base(), (int)Company::IsValidID(company),
-			(unsigned)_local_company.base());
+	
 
 	/* R3R (KI-90): the window is a singleton (id 0), but it is *not*
 	 * interchangeable between companies -- it only ever lists the groups of one

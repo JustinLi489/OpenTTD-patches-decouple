@@ -17,7 +17,6 @@
 #include "group.h"
 #include "order_base.h"
 #include "tracerestrict.h"
-#include "r3r_perf.h"
 #include "core/pool_func.hpp"
 
 #include <string_view>
@@ -238,10 +237,7 @@ uint R3RSetCoupleGroupAllowOthers(CoupleGroupID group, bool allow_others)
 		other->parent = INVALID_COUPLE_GROUP;
 		detached++;
 	}
-	if (evicted != 0 || detached != 0) {
-		R3RDbgWrite("CGRP-CLOSE group=%u evicted=%u detached=%u\n",
-				(unsigned)group.base(), evicted, detached);
-	}
+	
 	return evicted;
 }
 
@@ -326,38 +322,6 @@ void R3RClearCoupleGroupsOfSegment(Train *v)
  * (`#define cdecl __cdecl`) turn it into the calling convention keyword and the
  * file stops compiling with C2059 __cdecl. `coupler_decl` / `target_decl` it is.
  */
-static void R3RCoupleGateProbe(const Train *coupler, const Train *target, bool coupler_decl,
-		bool target_decl, CoupleGroupMask cmask, CoupleGroupMask tmask, bool compatible)
-{
-	static uint32_t keys[64] = {};
-	static bool vals[64] = {};
-	static uint32_t used = 0;
-	const uint32_t max_entries = (uint32_t)(sizeof(keys) / sizeof(keys[0]));
-
-	const uint32_t key = (coupler->index.base() << 16) | (target->index.base() & 0xFFFF);
-	for (uint32_t i = 0; i < used; i++) {
-		if (keys[i] != key) continue;
-		if (vals[i] == compatible) return; // unchanged verdict: stay quiet
-		vals[i] = compatible;
-		R3RDbgWrite("CG-GATE compatible=%d coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X\n",
-				(int)compatible, (int)coupler->index.base(), (int)target->index.base(),
-				(int)coupler_decl, (int)target_decl, (unsigned)cmask, (unsigned)tmask);
-		return;
-	}
-	if (used < max_entries) {
-		keys[used] = key;
-		vals[used] = compatible;
-		used++;
-	} else {
-		/* R3R (第 224 轮 / KI-336): 表满即静默。闸门现在是热路径（每个候选、回溯的每一格
-		 * 都会问），原来的"表满后未知键每次都写一行"会在几秒内刷爆日志。 */
-		return;
-	}
-	R3RDbgWrite("CG-GATE compatible=%d coupler=%d target=%d cdecl=%d tdecl=%d cmask=0x%X tmask=0x%X\n",
-			(int)compatible, (int)coupler->index.base(), (int)target->index.base(),
-			(int)coupler_decl, (int)target_decl, (unsigned)cmask, (unsigned)tmask);
-}
-
 bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 {
 	if (coupler == nullptr || target == nullptr) return false;
@@ -505,8 +469,7 @@ bool R3RCoupleAllowedIgnoringPair(const Train *coupler, const Train *target)
 	}
 
 	const bool compatible = R3RCoupleGroupMasksCompatible(coupler_groups, target_groups);
-	R3RCoupleGateProbe(coupler, target, coupler_declared_temp, target_declared_temp,
-			coupler_groups, target_groups, compatible);
+	
 	return compatible;
 }
 
@@ -847,7 +810,6 @@ void AfterLoadCoupleGroups()
 	for (CoupleGroup *cg : CoupleGroup::Iterate()) {
 		if (cg->parent == INVALID_COUPLE_GROUP) continue;
 		if (!R3RCanCoupleGroupHaveParent(cg->index, cg->parent)) {
-			R3RDbgWrite("CGRP-PARENT-RESET g=%d bad=%d\n", (int)cg->index.base(), (int)cg->parent.base());
 			cg->parent = INVALID_COUPLE_GROUP;
 		}
 	}
@@ -896,7 +858,6 @@ void R3RNormaliseChainGroupsAfterLoad()
 {
 	uint chains = 0;
 	uint group_fixes = 0;
-	uint mask_fixes = 0;
 
 	for (Train *t : Train::Iterate()) {
 		if (t->Previous() != nullptr || !(t->IsFrontEngine() || t->IsFrontWagon())) continue;
@@ -908,16 +869,12 @@ void R3RNormaliseChainGroupsAfterLoad()
 				GroupID parked = s->group_id_backup;
 				/* 第 293 轮 / KI-464：DEFAULT_GROUP 副本不是"真分组"，丢弃它、保留段头活值。 */
 				if (parked != GroupID::Invalid() && !R3RIsParkedGroupUsable(parked)) {
-					R3RDbgWrite("GRP-DROP-DEFAULT-LOAD veh=%d bk=%u live=%u\n",
-							(int)s->index.base(), (uint)parked.base(), (uint)s->group_id.base());
 					s->group_id_backup = GroupID::Invalid();
 					parked = GroupID::Invalid();
 				}
 				if (parked != GroupID::Invalid()) {
 					if (R3RSetSegmentGroupID(s, parked) != 0) group_fixes++;
 					s->group_id_backup = GroupID::Invalid();
-					R3RDbgWrite("GRP-RESTORE-SEG-LOAD veh=%d group=%u\n",
-							(int)s->index.base(), (uint)parked.base());
 				} else {
 					/* GroupID::Invalid() 不是活值，统一归到"未分组"以免界面显示 65535。 */
 					const GroupID own = (s->group_id == GroupID::Invalid()) ? DEFAULT_GROUP : s->group_id;
@@ -941,13 +898,8 @@ void R3RNormaliseChainGroupsAfterLoad()
 			Vehicle *next = s->Next();
 			s = (next != nullptr) ? Train::From(next) : nullptr;
 		}
-		if (nseg > 1) {
-			R3RDbgWrite("CGRP-NORM-KEEP-LOAD head=%d nseg=%u union=%llu\n",
-					(int)t->index.base(), nseg, (unsigned long long)union_mask);
-		}
+		
 	}
-
-	R3RDbgWrite("GRP-NORM-LOAD-SUM chains=%u groupfix=%u maskfix=%u\n", chains, group_fixes, mask_fixes);
 
 	/* R3R (第 156 轮 / 落地清单 ⑦): the rows of the R3SG chunk are restored verbatim, so
 	 * a savegame written between two commit points can carry rows which no car claims
@@ -1339,8 +1291,6 @@ void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
 			GroupStatistics::CountVehicle(d, -1);
 			d->group_id = s->group_id;
 			GroupStatistics::CountVehicle(d, 1);
-			R3RDbgWrite("CLONE-TRAITS-GRP dst=%d from=%u to=%u\n",
-					(int)d->index.base(), (uint)from.base(), (uint)s->group_id.base());
 		} else {
 			d->group_id = s->group_id;
 		}
@@ -1408,9 +1358,7 @@ void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
 				 * hidden segment whose schedule sits in orders_backup would be
 				 * invisible there. One line per copied segment head makes the
 				 * round-227 fix verifiable (n must equal the source segment). */
-				R3RDbgWrite("CLONE-ORD dst=%d src=%d n=%u real=%d impl=%d borrowed=%d bk=%p\n",
-						(int)d->index.base(), (int)s->index.base(), (unsigned)src_own->GetNumOrders(),
-						(int)src_real, (int)src_impl, (int)s->r3r_orders_borrowed, (void *)d->orders_backup);
+				
 			}
 
 			/* The row is the formal home of a hidden segment's traits; the control
@@ -1430,8 +1378,6 @@ void R3RCopyClonedSegmentTraits(const Train *src_chain, Train *dst_chain)
 		s = s->GetNextVehicle();
 		d = d->GetNextVehicle();
 	}
-
-	R3RDbgWrite("CLONE-TRAITS dst=%d n=%u\n", (int)dst_chain->index.base(), n);
 }
 
 /**
@@ -1523,9 +1469,6 @@ static void R3RSegmentReconcileRows(const char *tag)
 	}
 
 	if (orphan == 0 && rebuilt == 0) return;
-
-	R3RDbgWrite("SEGROW-RECONCILE tag=%s rows=%u orphan=%u rebuilt=%u\n",
-			tag, (uint)claimed.size(), orphan, rebuilt);
 }
 
 std::vector<const Vehicle *> R3RSegmentHiddenHeads(const Vehicle *chain)

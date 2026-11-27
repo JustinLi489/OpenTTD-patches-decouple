@@ -65,7 +65,6 @@
 #include "vehicle_cmd.h"
 #include "road_layout_func.h"
 #include "script/api/script_event_types.hpp"
-#include "r3r_perf.h"
 
 #include "table/strings.h"
 #include "table/pricebase.h"
@@ -1566,10 +1565,7 @@ void CargoPayment::PayFinalDelivery(CargoType cargo, CargoPacket *cp, uint count
 		 * remainder on the chain front, and adding it here as well would create
 		 * the money twice. */
 		cp->RegisterDeferredCargoPayment(payee, this->front->type, profit);
-		if (R3RDbgOn()) {
-			R3RDbgWrite("R3R-PAY-FINAL front=%u front_owner=%d payee=%d profit=%lld count=%u\n",
-					this->front->index, (int)this->front->owner.base(), (int)payee.base(), (long long)profit, count);
-		}
+		
 	}
 	cp->PayDeferredPayments();
 
@@ -1602,10 +1598,7 @@ Money CargoPayment::PayTransfer(CargoType cargo, CargoPacket *cp, uint count, Ti
 	 * leg; on a single-company chain that is still the chain front's owner. */
 	const CompanyID payee = this->R3RGetPayeeCompany();
 	cp->RegisterDeferredCargoPayment(payee, this->front->type, profit);
-	if (payee != this->front->owner && R3RDbgOn()) {
-		R3RDbgWrite("R3R-PAY-TRANSFER front=%u front_owner=%d payee=%d profit=%lld count=%u\n",
-				this->front->index, (int)this->front->owner.base(), (int)payee.base(), (long long)profit, count);
-	}
+	
 
 	this->visual_transfer += profit; // accumulate transfer profits for whole vehicle
 	return profit; // account for the (virtual) profit already made for the cargo packet

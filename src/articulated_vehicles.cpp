@@ -20,7 +20,6 @@
 #include "newgrf.h"
 #include "newgrf_extension.h"
 #include "settings_type.h"
-#include "r3r_perf.h"
 #include <vector>
 
 #include "table/strings.h"
@@ -391,12 +390,6 @@ void CheckConsistencyOfArticulatedVehicle(const Vehicle *v)
 			if (GetNextArticulatedPart(i, head->engine_type) == EngineID::Invalid()) break;
 			r3r_pn++;
 		}
-		R3RDbgWrite("CONSIST-CHK veh=%u eng=%u n=%u pn=%u hit=%d more=%d ru=%08X pu=%08X ri=%08X pi=%08X dflt=%08X\n",
-				(uint)head->index.base(), (uint)head->engine_type.base(), r3r_n, r3r_pn,
-				r3r_hit ? 1 : 0, carries_more ? 1 : 0,
-				real_refit_union.base(), purchase_refit_union.base(),
-				real_refit_intersection.base(), purchase_refit_intersection.base(),
-				real_default_cargoes.base());
 	}
 
 	/* show a warning once for each GRF after each game load */
@@ -414,26 +407,15 @@ void CheckConsistencyOfArticulatedVehicle(const Vehicle *v)
 			if (GetNextArticulatedPart(i, head->engine_type) == EngineID::Invalid()) break;
 			purchase_parts++;
 		}
-		R3RDbgWrite("BUY-REFIT eng=%u veh=%u n=%u pn=%u pu=%08X pi=%08X ru=%08X ri=%08X more=%d dflt=%08X\n",
-				(uint)head->engine_type.base(), (uint)head->index.base(), n_parts, purchase_parts,
-				purchase_refit_union.base(), purchase_refit_intersection.base(),
-				real_refit_union.base(), real_refit_intersection.base(),
-				carries_more ? 1 : 0, real_default_cargoes.base());
 		/* 逐节对照：实车侧每条车的引擎/货种/容量/掩码，并把该货种在购买侧的默认容量
 		 * 一起打出来 —— carries_more 的真正成因就在 pcap==0 的那一节上。 */
 		uint part_no = 0;
 		for (const Vehicle *w = head; w != nullptr && part_no < MAX_ARTICULATED_PARTS;
 				w = (w->HasArticulatedPart() ? w->GetNextArticulatedPart() : nullptr), part_no++) {
-			const CargoType cargo = w->cargo_type;
-			R3RDbgWrite("BUY-REFIT-PART i=%u eng=%u cargo=%u cap=%u mask=%08X pcap=%u\n",
-					part_no, (uint)w->engine_type.base(), (uint)cargo, w->cargo_cap,
-					GetAvailableVehicleCargoTypes(w->engine_type, true).base(),
-					IsValidCargoType(cargo) ? purchase_default_capacity[cargo] : 0);
 		}
 		/* 购买侧的每一节引擎（front=nullptr 口径），用于和上面的 eng= 逐节对照。 */
-		R3RDbgWrite("BUY-REFIT-PP i=0 eng=%u\n", (uint)head->engine_type.base());
+		
 		for (uint i = 1; i < purchase_parts; i++) {
-			R3RDbgWrite("BUY-REFIT-PP i=%u eng=%u\n", i, (uint)GetNextArticulatedPart(i, head->engine_type).base());
 		}
 		ShowNewGrfVehicleError(engine->index, STR_NEWGRF_BUGGY, STR_NEWGRF_BUGGY_ARTICULATED_CARGO, GRFBug::VehRefit, false);
 	}

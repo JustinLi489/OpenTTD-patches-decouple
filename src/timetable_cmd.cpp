@@ -23,7 +23,6 @@
 #include "scope.h"
 #include "timetable_cmd.h"
 
-#include "r3r_perf.h"
 
 #include "widgets/vehicle_widget.h"
 
@@ -425,44 +424,6 @@ CommandCost CmdBulkChangeTimetable(DoCommandFlags flags, VehicleID veh, ModifyTi
 
 
 /**
- * R3R (KI-389): read-only probe for "the three timetable buttons do nothing".
- *
- * The timetable window leaves "automate" / "autofill" / "separation" enabled for own
- * vehicles, so a click which silently has no effect means the DoCommand below hit a
- * `return CMD_ERROR` guard. Printing who the window's vehicle actually is tells the
- * three candidate causes apart:
- *  - H-a: a car inside a segment (its GVSF_FRONT was cleared when it was absorbed),
- *  - H-b: the window was opened on a non-front car (`ShowTimetableWindow` keeps the
- *         clicked index as window number and never normalises to `First()`),
- *  - H-c: the control segment itself lost GVSF_FRONT at some commit point.
- * Logged unconditionally (subject to R3RDbgOn()), i.e. for successful clicks too, so
- * "no TT-CMD line at all" really means the command was never invoked.
- */
-static void R3RTimetableCmdProbe(const char *cmd, const Vehicle *v, VehicleID veh)
-{
-	if (!R3RDbgOn()) return;
-
-	if (v == nullptr) {
-		R3RDbgWrite("TT-CMD %s veh=%d found=0\n", cmd, (int)veh.base());
-		return;
-	}
-
-	bool front = false;
-	bool front_wagon = false;
-	if (v->type == VehicleType::Train) {
-		const Train *const t = Train::From(v);
-		front = t->IsFrontEngine();
-		front_wagon = t->IsFrontWagon();
-	}
-
-	R3RDbgWrite("TT-CMD %s veh=%d found=1 type=%d primary=%d front=%d frontwagon=%d orders=%p owner=%d first=%d segid=%u prio=%u borrowed=%d\n",
-			cmd, (int)veh.base(), (int)v->type, v->IsPrimaryVehicle() ? 1 : 0,
-			front ? 1 : 0, front_wagon ? 1 : 0, (const void *)v->GetEffectiveOrders(),
-			(int)v->owner.base(), (int)v->First()->index.base(), (unsigned)v->r3r_segment_id,
-			(unsigned)v->r3r_priority, v->r3r_orders_borrowed ? 1 : 0);
-}
-
-/**
  * Clear the lateness counter to make the vehicle on time.
  * @param flags Operation to perform.
  * @param veh Vehicle with the orders to change.
@@ -472,7 +433,7 @@ static void R3RTimetableCmdProbe(const char *cmd, const Vehicle *v, VehicleID ve
 CommandCost CmdSetVehicleOnTime(DoCommandFlags flags, VehicleID veh, bool apply_to_group)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	R3RTimetableCmdProbe("on-time", v, veh);
+	
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	/* A vehicle can't be late if its timetable hasn't started.
@@ -635,7 +596,7 @@ CommandCost CmdSetTimetableStart(DoCommandFlags flags, VehicleID veh, bool timet
 CommandCost CmdAutofillTimetable(DoCommandFlags flags, VehicleID veh, bool autofill, bool preserve_wait_time)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	R3RTimetableCmdProbe("autofill", v, veh);
+	
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle() || v->GetEffectiveOrders() == nullptr) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
@@ -684,7 +645,7 @@ CommandCost CmdAutofillTimetable(DoCommandFlags flags, VehicleID veh, bool autof
 CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool automate)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	R3RTimetableCmdProbe("automate", v, veh);
+	
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
@@ -725,7 +686,7 @@ CommandCost CmdAutomateTimetable(DoCommandFlags flags, VehicleID veh, bool autom
 CommandCost CmdTimetableSeparation(DoCommandFlags flags, VehicleID veh, bool separation)
 {
 	Vehicle *v = Vehicle::GetIfValid(veh);
-	R3RTimetableCmdProbe("separation", v, veh);
+	
 	if (v == nullptr || !IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) return CMD_ERROR;
 
 	CommandCost ret = CheckOwnership(v->owner);
@@ -1130,20 +1091,6 @@ void UpdateVehicleTimetable(Vehicle *v, bool travelling)
 		 * offending path can be found in R3R_debug.log via the TT-DESYNC lines.
 		 */
 		if (real_timetable_order != real_current_order) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "TT-DESYNC veh=%d trav=%d real=%d tt=%d impl=%d n=%d curType=%d realType=%d ttType=%d types=",
-						(int)v->index.base(), travelling ? 1 : 0, (int)v->cur_real_order_index, (int)v->cur_timetable_order_index,
-						(int)v->cur_implicit_order_index, (int)v->GetNumOrders(), (int)v->current_order.GetType(),
-						(int)(real_current_order != nullptr ? real_current_order->GetType() : 255),
-						(int)(real_timetable_order != nullptr ? real_timetable_order->GetType() : 255));
-				VehicleOrderID i = 0;
-				for (const Order *o : v->Orders()) {
-					fprintf(dbg, "%d%s", (int)o->GetType(), (++i < v->GetNumOrders()) ? "," : "");
-				}
-				fprintf(dbg, "\n");
-				fclose(dbg);
-			}
 			v->cur_timetable_order_index = v->cur_real_order_index;
 			real_timetable_order = real_current_order;
 		}

@@ -45,7 +45,6 @@
 #include "../rev.h"
 #include "../strings_func.h"
 #include "../company_func.h"
-#include "../r3r_perf.h"
 #include "../3rdparty/robin_hood/robin_hood.h"
 #include "table/strings.h"
 
@@ -788,11 +787,8 @@ static void loadUV(const SlxiSubChunkInfo &info, uint32_t length)
 			const SaveLoadVersion legacy_upstream_version = _sl_xv_upstream_version;
 			_sl_xv_upstream_version = (SaveLoadVersion)((uint)_sl_xv_upstream_version - SLV_R3R_LEGACY_SHIFT);
 			Debug(sl, 1, "Remapping legacy R3R upstream savegame version {} to {}", legacy_upstream_version, _sl_xv_upstream_version);
-			if (R3RDbgOn()) R3RDbgWrite("R3R-VER-REMAP upstream %u -> %u\n", (uint)legacy_upstream_version, (uint)_sl_xv_upstream_version);
-		} else if (R3RDbgOn()) {
-			/* No remap: either a current savegame or a legacy one whose flag got lost. */
-			R3RDbgWrite("R3R-VER-NOREMAP upstream=%u legacy_flag=%d\n", (uint)_sl_xv_upstream_version, _sl_r3r_legacy_numbering ? 1 : 0);
-		}
+			
+		} else 
 
 		if (_sl_xv_upstream_version > SL_UPSTREAM_VERSION) {
 			auto tmp_params = MakeParameters(_sl_xv_version_label.empty() ? STR_EMPTY : STR_GAME_SAVELOAD_FROM_VERSION, _sl_xv_version_label, "upstream savegame version", _sl_xv_upstream_version, SL_UPSTREAM_VERSION);

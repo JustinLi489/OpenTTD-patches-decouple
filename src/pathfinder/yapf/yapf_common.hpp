@@ -13,7 +13,6 @@
 #include "../../core/bitmath_func.hpp"
 #include "../../tile_type.h"
 #include "../../track_type.h"
-#include "../../r3r_perf.h"
 
 /** YAPF origin provider base class - used when origin is one tile / multiple trackdirs */
 template <class Types>
@@ -105,17 +104,6 @@ public:
 	/** Called when YAPF needs to place origin nodes into open list */
 	void PfSetStartupNodes()
 	{
-		if (this->origin_tile == TileXY(38, 35)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-STARTUP origin=%d,%d td=%d revTile=%d,%d revTd=%d\n",
-						(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
-						(int)this->origin_td,
-						(int)TileX(this->reverse_tile), (int)TileY(this->reverse_tile),
-						(int)this->reverse_td);
-				fclose(dbg);
-			}
-		}
 		if (this->origin_tile != INVALID_TILE && this->origin_td != INVALID_TRACKDIR) {
 			Node &n1 = Yapf().CreateNewNode();
 			n1.Set(nullptr, this->origin_tile, this->origin_td, false);

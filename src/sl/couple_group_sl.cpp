@@ -10,7 +10,6 @@
 #include "../stdafx.h"
 #include "../couple_group.h"
 
-#include "../r3r_perf.h"
 #include "../train.h"
 #include "../vehicle_base.h"
 
@@ -183,64 +182,23 @@ static void Load_R3VP()
 {
 	SaveLoadTableData slt = SlTableHeaderOrRiff(_r3r_park_desc);
 
-	/* R3R (第 191 轮 probe, read-only): 停放副本的读档留底，与 SEGSAVE-PARK 逐车比对。
-	 * 车号读档错（KI-293）如果出自"存档往返"，本行与 SEGSAVE-PARK 就会有差；
-	 * 若两者一致，则元凶在读档后的重建（SEGTR-SNAP tag=load 那一条）。 */
-	FILE *dbg = R3RDbgOn() ? fopen("R3R_debug.log", "a") : nullptr;
-
 	int index;
 	while ((index = SlIterateArray()) != -1) {
 		Vehicle *v = Vehicle::GetIfValid(index);
 		if (v == nullptr) continue;
 		SlObjectLoadFiltered(v, slt);
-		if (dbg != nullptr) {
-			fprintf(dbg, "SEGLOAD-PARK veh=%u unit=%u ubk=%u n=\"%s\" nbk=\"%s\" gid=%d gbk=%d seg=%u borrowed=%d prio=%u\n",
-					(unsigned)v->index.base(),
-					(unsigned)v->unitnumber,
-					(unsigned)v->unitnumber_backup,
-					v->name.empty() ? "" : v->name.c_str(),
-					v->name_backup.empty() ? "" : v->name_backup.c_str(),
-					(v->group_id == GroupID::Invalid()) ? -1 : (int)v->group_id.base(),
-					(v->group_id_backup == GroupID::Invalid()) ? -1 : (int)v->group_id_backup.base(),
-					(unsigned)v->r3r_segment_id,
-					v->r3r_orders_borrowed ? 1 : 0,
-					(unsigned)v->r3r_priority);
-		}
 	}
-	if (dbg != nullptr) fclose(dbg);
 }
 
 static void Save_R3VP()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_park_desc);
 
-	/* R3R (第 191 轮 probe, read-only): 存档侧留底。玩家 2026-10-01 报"耦合的列车存档再
-	 * 读档后车号错"，两个可能差了一个存档往返：(a) 号/名压根没写进档（R3VP 判定漏了某个
-	 * 字段），(b) 写了但读档重建时覆盖掉。SEGSAVE-PARK（写档时的停放副本）与读档期的
-	 * SEGTR-SNAP tag=load-raw（读回来的样子）逐车比对即可区分元凶。
-	 * 只打有停放态的车辆，与写出判据同源（R3RHasParkState），不会给正常档添噪声。 */
-	const bool dbg_on = R3RDbgOn();
-	FILE *dbg = dbg_on ? fopen("R3R_debug.log", "a") : nullptr;
-
 	for (Vehicle *v : Vehicle::Iterate()) {
 		if (!R3RHasParkState(v)) continue;
-		if (dbg != nullptr) {
-			fprintf(dbg, "SEGSAVE-PARK veh=%u unit=%u ubk=%u n=\"%s\" nbk=\"%s\" gid=%d gbk=%d seg=%u borrowed=%d prio=%u\n",
-					(unsigned)v->index.base(),
-					(unsigned)v->unitnumber,
-					(unsigned)v->unitnumber_backup,
-					v->name.empty() ? "" : v->name.c_str(),
-					v->name_backup.empty() ? "" : v->name_backup.c_str(),
-					(v->group_id == GroupID::Invalid()) ? -1 : (int)v->group_id.base(),
-					(v->group_id_backup == GroupID::Invalid()) ? -1 : (int)v->group_id_backup.base(),
-					(unsigned)v->r3r_segment_id,
-					v->r3r_orders_borrowed ? 1 : 0,
-					(unsigned)v->r3r_priority);
-		}
 		SlSetArrayIndex(v->index);
 		SlObjectSaveFiltered(v, slt);
 	}
-	if (dbg != nullptr) fclose(dbg);
 }
 
 static void Ptrs_R3VP()
@@ -309,28 +267,13 @@ static void Load_R3SG()
 {
 	SaveLoadTableData slt = SlTableHeaderOrRiff(_r3r_segment_desc);
 
-	/* R3R (第 191 轮 probe, read-only): 段行的读档留底，与 SEGSAVE-ROW（写档侧）成对
-	 * —— 两者不一致即"存档往返本身丢/改了数据"，两者一致而链上 SEGTR-SNAP 的 row
-	 * 不同即"读档重建把行覆盖了"（KI-294/295 的两种分叉）。 */
-	FILE *dbg = R3RDbgOn() ? fopen("R3R_debug.log", "a") : nullptr;
-
 	int index;
 	while ((index = SlIterateArray()) != -1) {
 		if (index <= 0 || index > R3R_SEGMENT_ID_MAX) continue;
 		R3RSegmentRecord *rec = R3RSegmentGetOrCreate(static_cast<uint16_t>(index));
 		if (rec == nullptr) continue;
 		SlObjectLoadFiltered(rec, slt);
-		if (dbg != nullptr) {
-			fprintf(dbg, "SEGLOAD-ROW id=%u u=%u n=\"%s\" g=%d borrowed=%d orders=%d\n",
-					(unsigned)index,
-					(unsigned)rec->unitnumber,
-					rec->name.empty() ? "" : rec->name.c_str(),
-					(rec->group_id == GroupID::Invalid()) ? -1 : (int)rec->group_id.base(),
-					rec->orders_borrowed ? 1 : 0,
-					(rec->orders != nullptr) ? 1 : 0);
-		}
 	}
-	if (dbg != nullptr) fclose(dbg);
 }
 
 /**
@@ -353,11 +296,6 @@ static void Save_R3SG()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_segment_desc);
 
-	/* R3R (第 191 轮 probe, read-only): 段行是号/名的正式宿主，写档时把每一行原样留底，
-	 * 与读档后的 SEGTR-SNAP `row u=/n=` 比对。name 走 SLE_SSTR（std::string），写空串是
-	 * 合法的，所以"行的名字丢了"只能由本行与读取侧两头对照才能定性（KI-294）。 */
-	FILE *dbg = R3RDbgOn() ? fopen("R3R_debug.log", "a") : nullptr;
-
 	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
 		R3RSegmentRecord *rec = R3RSegmentGet(static_cast<uint16_t>(id));
 		if (rec == nullptr) continue;
@@ -368,26 +306,11 @@ static void Save_R3SG()
 		 * and the next load aborts with "Referencing invalid OrderList". Drop it here;
 		 * the parked schedule of that row is unrecoverable either way. */
 		if (rec->orders != nullptr && !R3ROrderListIsLive(rec->orders)) {
-			if (dbg != nullptr) {
-				fprintf(dbg, "SEGSAVE-DROP-ORDERS id=%u use=%d u=%u borrowed=%d reason=dangling\n",
-						(unsigned)id, rec->in_use ? 1 : 0, (unsigned)rec->unitnumber,
-						rec->orders_borrowed ? 1 : 0);
-			}
 			rec->orders = nullptr;
-		}
-		if (dbg != nullptr) {
-			fprintf(dbg, "SEGSAVE-ROW id=%u use=%d u=%u n=\"%s\" g=%d borrowed=%d orders=%d\n",
-					(unsigned)id, rec->in_use ? 1 : 0,
-					(unsigned)rec->unitnumber,
-					rec->name.empty() ? "" : rec->name.c_str(),
-					(rec->group_id == GroupID::Invalid()) ? -1 : (int)rec->group_id.base(),
-					rec->orders_borrowed ? 1 : 0,
-					(rec->orders != nullptr) ? 1 : 0);
 		}
 		SlSetArrayIndex(static_cast<uint>(id));
 		SlObjectSaveFiltered(rec, slt);
 	}
-	if (dbg != nullptr) fclose(dbg);
 }
 
 static void Ptrs_R3SG()
@@ -403,22 +326,16 @@ static void Ptrs_R3SG()
 	 *
 	 * The value still holds the raw "index + 1" here (see ReferenceToInt()), so the
 	 * pool ID to validate is raw - 1. */
-	FILE *dbg = R3RDbgOn() ? fopen("R3R_debug.log", "a") : nullptr;
 
 	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
 		R3RSegmentRecord *rec = R3RSegmentGet(static_cast<uint16_t>(id));
 		if (rec == nullptr) continue;
 		const size_t raw = (size_t)rec->orders;
 		if (raw != 0 && !OrderList::IsValidID(raw - 1)) {
-			if (dbg != nullptr) {
-				fprintf(dbg, "R3SG-PTR-DROP id=%u raw=%u use=%d u=%u reason=invalid-orderlist\n",
-						(unsigned)id, (unsigned)raw, rec->in_use ? 1 : 0, (unsigned)rec->unitnumber);
-			}
 			rec->orders = nullptr;
 		}
 		SlObjectPtrOrNullFiltered(rec, slt);
 	}
-	if (dbg != nullptr) fclose(dbg);
 }
 
 extern const ChunkHandler couple_group_chunk_handlers[] = {

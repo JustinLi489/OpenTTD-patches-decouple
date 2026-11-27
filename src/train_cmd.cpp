@@ -12,7 +12,6 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
-#include "r3r_perf.h"
 #include "error.h"
 #include "articulated_vehicles.h"
 #include "command_func.h"
@@ -301,42 +300,6 @@ uint16_t GetTrainVehicleMaxSpeed(const Train *u, const RailVehicleInfo &rvi_u, c
 }
 
 /**
- * R3R (round 280, REG-279-M/N/O): speed-change attribution.
- *
- * The player reports two *hard* drops -- "0 in front of a signal" and "2 the
- * moment the nose touches the waypoint tile" -- but every standing probe in the
- * tree fires only on "nonzero -> zero" and writes through R3RDbgWrite(), which
- * the round-274 tag whitelist filters down to the RESV-, UNRES-, EXTEND- and
- * LOOP- families (see R3RDbgTagAllowed()). A count of zero proves nothing.
- *
- * These helpers remember the *last hard write* of cur_speed (tag + the values it
- * saw) for each vehicle, stamped with the tick of the write. TrainLocoHandler()
- * compares this tick's entry value with the previous tick's snapshot and writes
- * one "SPDD ... ctx=<tag> cage=<tick gap>" line. Round 281 (REG-280-A): the
- * record used to be one file-scope slot shared by every vehicle and never
- * stamped, so "ctx=waitcut from=235 to=0" could be arbitrarily old and matching
- * "cto == now" proved nothing (every hard write sets to = 0). The reader may now
- * only attribute a line when the record belongs to that vehicle and is at most
- * one tick old (cage 0 = written earlier in this tick, 1 = written in the tail
- * of the previous tick, i.e. after this probe ran); anything else prints
- * ctx=stale and must not be used for attribution. Read-only: nothing here
- * touches vehicle state. SPDD and STUCK use R3RFopenDbg() rather than
- * R3RDbgWrite() on purpose, so the tag whitelist cannot swallow them.
- */
-struct R3RSpdCtxRec {
-	const char *tag; ///< write point.
-	uint16_t from;   ///< speed before the write.
-	uint16_t to;     ///< speed after the write.
-	uint32_t tick;   ///< _tick_counter at the write.
-};
-static std::unordered_map<uint32_t, R3RSpdCtxRec> _r3r_spd_ctx_by_veh;
-
-static inline void R3RSpdCtx(const Train *v, const char *tag, uint16_t from, uint16_t to)
-{
-	if (!R3RDbgOn() || v == nullptr) return;
-	_r3r_spd_ctx_by_veh[v->index.base()] = R3RSpdCtxRec{tag, from, to, (uint32_t)_tick_counter};
-}
-
 /**
  * R3R (round 220, KI-331): does the leading end of a backwards-driving chain
  * really carry the driver?
@@ -562,21 +525,7 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 		 * "middle car of the livery-2 set turns livery-1". Only the interesting
 		 * rows are logged (first_engine set and different from this vehicle's own
 		 * engine), i.e. exactly the rows where an override/livery lookup is biased. */
-		if (R3RDbgBulkOn() && R3RDbgOn() && u->gcache.first_engine != EngineID::Invalid() && u->gcache.first_engine != u->engine_type) {
-			static unsigned r3r_segfe_lines = 0;
-			if (r3r_segfe_lines < 800) {
-				r3r_segfe_lines++;
-				FILE *r3r_dbg = R3RFopenDbg("a");
-				if (r3r_dbg != nullptr) {
-					fprintf(r3r_dbg, "SEGFE-VEH head=%d veh=%d eng=%d first=%d ovr=%d cargo=%u segf=%d segb=%d artgm=%d\n",
-							(int)this->index.base(), (int)u->index.base(), (int)u->engine_type.base(),
-							(int)u->gcache.first_engine.base(), u->tcache.cached_override != nullptr ? 1 : 0,
-							(uint)u->cargo_type, u->IsSegmentFront() ? 1 : 0, u->IsSegmentBack() ? 1 : 0,
-							u->IsArticGroupMember() ? 1 : 0);
-					fclose(r3r_dbg);
-				}
-			}
-		}
+		
 
 		/* Reset colour map */
 		u->colourmap = PAL_NONE;
@@ -614,40 +563,6 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 			}
 		}
 		uint16_t new_cap = e_u->DetermineCapacity(u);
-		/* R3R (第 468 轮, KI-661): read-only probe for the "0 capacity loco" defect.
-		 * The player's verdict is that this train must carry NOTHING (capacity 0),
-		 * while the chain reads 2 before the de-articulation and 1 after it. To pick
-		 * the right place for the clamp we need the *source* of each figure, so this
-		 * dumps, per vehicle of the consist: the callback result ("cb", what
-		 * DetermineCapacity() just returned), the value currently stored ("old"), the
-		 * refit capacity, the raw GRF property ("prop"), plus the identity bits that
-		 * decide which branch of the KI-641/KI-656 adjudication runs. Pure logging:
-		 * nothing below reads these values, and the whole block is behind R3RDbgOn()
-		 * so a release build with probes off pays nothing. Capped at 400 lines.
-		 *
-		 * The tag is "R3R-CAPCB", not "CAP-CB": R3RDbgWrite() runs every format
-		 * string through R3RDbgTagAllowed() (src\r3r_perf.h:322-405), a first-token
-		 * prefix whitelist whose only catch-all is the "R3R-" prefix. The first
-		 * version of this probe used "CAP-CB" and was therefore swallowed in
-		 * silence -- the 2026-11-19 re-run produced a log with the probe compiled
-		 * in (the literal is in the exe) and not a single line out. That is the
-		 * fifth time this trap fires, so: check a new tag against that predicate
-		 * before trusting a zero count. The same rename is applied to the round-458
-		 * "CAP-MEMBER-ZERO" line below, which was never visible for this reason
-		 * either -- "no CAP-MEMBER-ZERO in the log" up to now proved nothing. */
-		if (R3RDbgOn() && (u->IsArticGroupMember() || u->IsArticulatedPart())) {
-			static unsigned r3r_capcb_lines = 0;
-			if (r3r_capcb_lines < 400) {
-				r3r_capcb_lines++;
-				R3RDbgWrite("R3R-CAPCB head=%d veh=%d cb=%u old=%u rcap=%u prop=%u ct=%u eng=%d rvt=%d art=%d ah=%d am=%d\n",
-						(int)this->index.base(), (int)u->index.base(), (unsigned)new_cap,
-						(unsigned)u->cargo_cap, (unsigned)u->refit_cap,
-						(unsigned)RailVehInfo(u->engine_type)->capacity, (unsigned)u->cargo_type,
-						u->IsEngine() ? 1 : 0, (int)RailVehInfo(u->engine_type)->railveh_type,
-						u->IsArticulatedPart() ? 1 : 0, u->IsArticGroupHead() ? 1 : 0,
-						u->IsArticGroupMember() ? 1 : 0);
-			}
-		}
 		/* R3R (KI-641): a de-articulated group member keeps the capacity it had while
 		 * it was still the articulated parent. The NewGRF capacity callback sees the
 		 * role change and returns 0 for the former parent, which made the capacity
@@ -670,31 +585,7 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 			const Train *ghead = u->Previous();
 			while (ghead != nullptr && ghead->IsArticGroupMember() && !ghead->IsArticGroupHead()) ghead = ghead->Previous();
 			if (ghead != nullptr && ghead->IsArticGroupHead() && ghead->cargo_cap > 0) {
-				if (new_cap != 0 && u->cargo_cap > 0) {
-					R3RDbgWrite("R3R-CAPMEMBERZERO veh=%d head=%d cap=%u->0 cb=%u\n",
-							(int)u->index.base(), (int)ghead->index.base(),
-							(unsigned)u->cargo_cap, (unsigned)new_cap);
-				}
 				new_cap = 0;
-			} else if (new_cap == 0 && u->cargo_cap > 0) {
-				/* R3R (2026-11-19, KI-661): the KI-641 rescue that used to run here
-				 * (`new_cap = u->cargo_cap`) has been removed. The 2026-11-19 probe run
-				 * proved that DetermineCapacity() returns 0 for every member in this
-				 * state, so the non-zero figures on the capacity tab were nothing but
-				 * stale values the rescue kept recycling (2 before the de-articulation,
-				 * 1 after it) -- and the player's verdict is that this train carries
-				 * nothing at all. Keeping a figure the engine itself refuses to compute
-				 * also meant R3R disagreed with vanilla JGRPP, which shows 0 here.
-				 * If a NewGRF genuinely wants a member to carry cargo it must say so via
-				 * its capacity callback (a non-zero `new_cap`), which is written below
-				 * unchanged. Probe only: new_cap stays 0 either way. */
-				static unsigned r3r_capdrop_lines = 0;
-				if (R3RDbgOn() && r3r_capdrop_lines < 200) {
-					r3r_capdrop_lines++;
-					R3RDbgWrite("R3R-CAPDROP veh=%d head=%d cap=%u->0 cb=%u\n",
-							(int)u->index.base(), (int)this->index.base(),
-							(unsigned)u->cargo_cap, (unsigned)new_cap);
-				}
 			}
 		}
 		if (allowed_changes.Test(ConsistChangeFlag::Capacity)) {
@@ -736,28 +627,6 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	}
 	SetBit(last_vis_effect->vcache.cached_veh_flags, VCF_LAST_VISUAL_EFFECT);
 
-	if (r3r_ref_engine != this) {
-		/* Only reversed groups take a reference engine other than the chain head;
-		 * log once per (head, parent) pair so this cannot spam the debug log. */
-		static std::unordered_map<uint32_t, bool> _r3r_c2_ref_logged;
-		const uint32_t c2_key = (uint32_t)this->index.base() * 65536u + (uint32_t)r3r_ref_engine->index.base();
-		if (!_r3r_c2_ref_logged[c2_key]) {
-			_r3r_c2_ref_logged[c2_key] = true;
-			/* Tag renamed from "C2-REF" to "R3R-C2REF": R3RDbgTagAllowed() in
-			 * r3r_perf.h only lets a line through when its first token is a known
-			 * prefix or starts with "R3R-", so the old tag was silently swallowed
-			 * and "no C2-REF lines" proved nothing. */
-			R3RDbgWrite("R3R-C2REF head=%d ref=%d refEng=%d refType=%d powWag=%u n=%u db=%d headNm=%d refNm=%d\n",
-					(int)this->index.base(), (int)r3r_ref_engine->index.base(),
-					(int)r3r_ref_engine->engine_type.base(),
-					(int)RailVehInfo(r3r_ref_engine->engine_type)->railveh_type,
-					(unsigned)RailVehInfo(r3r_ref_engine->engine_type)->pow_wag_power,
-					(unsigned)this->gcache.cached_power, (int)driving_backwards,
-					R3REngineHasDisplayName(this->engine_type) ? 1 : 0,
-					R3REngineHasDisplayName(r3r_ref_engine->engine_type) ? 1 : 0);
-		}
-	}
-
 	/* store consist weight/max speed in cache */
 	this->vcache.cached_max_speed = max_speed;
 	this->tcache.cached_tflags |= (train_can_tilt ? TCF_TILT : TCF_NONE) | (speed_varies_by_railtype ? TCF_SPD_RAILTYPE : TCF_NONE);
@@ -765,18 +634,6 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	this->tcache.cached_max_curve_speed = this->GetCurveSpeedLimit();
 
 	if (driving_backwards && !R3RLeadingEndHasDrivingCab(this->Last())) {
-		/* R3R DEBUG: capture the exact state that sets the 32 km/h no-cab limit. */
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "NOCAB-SET this=%d db=%d last=%d lastSub=0x%02X lastEng=%d lastLead=%d leadCab=%d\n",
-						(int)this->index.base(), (int)driving_backwards,
-						(int)this->Last()->index.base(), (int)this->Last()->subtype,
-						(int)this->Last()->IsEngine(), (int)this->Last()->CanLeadTrain(),
-						(int)R3RLeadingEndHasDrivingCab(this->Last()));
-				fclose(dbg);
-			}
-		}
 		this->tcache.cached_tflags |= TCF_NO_DRIVING_CAB;
 	}
 
@@ -1732,95 +1589,6 @@ static void AdvanceLookAheadPosition(Train *v)
  * Calculates the maximum speed information of the vehicle under its current conditions.
  * @return Maximum speed information of the vehicle.
  */
-/**
- * R3R (第 319 轮, KI-499): 「拿到配对锁之前不许起步」的节流器。
- *
- * 本门理论上每次都能命中（锁没建立前每 tick 都成立），所以只允许每车每 512
- * tick 打一行，否则日志会被刷爆。释放方向不打日志 —— 「锁一建立就放行」的证据
- * 由 CPL-PAIRSCAN state=locked/steady 与随后的 actSpd>0 提供。
- */
-static std::unordered_map<uint32_t, uint32_t> _r3r_maxspd_hold_logged;
-
-static bool R3RDbgMaxSpdHold(const Train *t)
-{
-	auto it = _r3r_maxspd_hold_logged.find(t->index.base());
-	if (it != _r3r_maxspd_hold_logged.end() && (uint32_t)_tick_counter - it->second < 512) return false;
-	_r3r_maxspd_hold_logged[t->index.base()] = (uint32_t)_tick_counter;
-	return true;
-}
-
-/**
- * R3R (第 323 轮, 玩家要求): 「配对成功 → 耦合成功」区间的速度-距离曲线探针。
- *
- * 第 322 轮的 MAXSPD-BREAK 每车 512 tick 才一行（R3RDbgMaxSpdHold），而 30→5→0
- * 的整个接近段通常只有几十 tick，结构上必然落在两次采样的缝隙里 —— 这就是
- * 「两行读数都是 30、5 一次没抓到」的原因，不是 5 不存在。
- *
- * 本探针改成**状态触发**：只要 (cur_speed, gap) 这一对读数发生变化就写一行。
- * 匀速段不产生行，减速曲线的每个台阶都留痕。
- *
- * 区间判据（两条同时成立）：
- *   - current_order 是 OT_GOTO_COUPLE（区间从"前往挂接"开始）；
- *   - lookahead != nullptr（= 已通过 parked-no-pair 门、真的订到了路线）。
- * look=0 的那一段属于 :1643 的兜底 30，由既有 MAXSPD-BREAK(look=0) 认领；
- * 本探针不掺和，于是"两个 30"在日志里天然分开。
- *
- * 字段口径：
- *   strict = max_speed（刚出限速/曲线/开关那层）
- *   aend   = 叠加"到预订终点必须停住"(:1629, end_speed=0) 之后的 max_speed
- *   aitem  = 再叠加 lookahead items（站台/路点停车位、信号）之后的 max_speed
- *   adv    = advisory_max_speed（最终建议上限）
- *   gap    = reservation_end_position - current_position（刹车曲线里的 s）
- *   decel2 = stats.deceleration_x2（v² = decel2 * gap 里的 2a，可现场验算）
- * ⇒ aend 与 sqrt(decel2*gap) 对上，即证明 30/5 是刹车曲线；
- *   对不上再看 aitem（U-5）与 revd（ReversingDistanceTargetSpeed，:1615）。
- *
- * 每车每个 episode 最多 R3R_COUPLE_SPD_MAX_LINES 行，防病态刷屏。
- */
-static const uint R3R_COUPLE_SPD_MAX_LINES = 400;
-
-struct R3RCoupleSpdSample {
-	int spd;
-	int gap;
-};
-
-static std::unordered_map<uint32_t, R3RCoupleSpdSample> _r3r_couple_spd_last;
-static std::unordered_map<uint32_t, uint> _r3r_couple_spd_lines;
-
-static void R3RDbgCoupleSpdCurve(const Train *t, int strict, int adv, int after_end, int after_items, int decel2)
-{
-	if (!R3RDbgOn()) return;
-	if (t->lookahead == nullptr) return;
-	if (!t->current_order.IsType(OT_GOTO_COUPLE)) return;
-
-	const int gap = (int)(t->lookahead->reservation_end_position - t->lookahead->current_position);
-	const uint32_t key = t->index.base();
-	const int spd = (int)t->cur_speed;
-
-	auto last = _r3r_couple_spd_last.find(key);
-	if (last != _r3r_couple_spd_last.end() && last->second.spd == spd && last->second.gap == gap) return;
-
-	uint &lines = _r3r_couple_spd_lines[key];
-	if (lines >= R3R_COUPLE_SPD_MAX_LINES) return;
-	lines++;
-	_r3r_couple_spd_last[key] = R3RCoupleSpdSample{spd, gap};
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "CPLSPD veh=%d tick=%u tile=%d,%d spd=%d strict=%d aend=%d aitem=%d adv=%d gap=%d decel2=%d nocab=%d revd=%d spr=%d sig=%d ordmax=%d realbrk=%d db=%d depe=%d n=%u\n",
-			(int)t->index.base(), (uint32_t)_tick_counter, (int)TileX(t->tile), (int)TileY(t->tile),
-			spd, strict, after_end, after_items, adv, gap, decel2,
-			(t->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0,
-			(int)t->reverse_distance,
-			(int)t->speed_restriction, (int)t->signal_speed_restriction,
-			(int)t->current_order.GetMaxSpeed(),
-			t->UsingRealisticBraking() ? 1 : 0,
-			t->IsDrivingBackwards() ? 1 : 0,
-			t->lookahead->flags.Test(TrainReservationLookAheadFlag::DepotEnd) ? 1 : 0,
-			lines);
-	fclose(dbg);
-}
-
 Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) const
 {
 	int max_speed = _settings_game.vehicle.train_acceleration_model == AccelerationModel::Original ?
@@ -1841,14 +1609,6 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 			bool &logged = db ? db1_logged : db0_logged;
 			if (!logged) {
 				logged = true;
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "NOCAB-LIMIT this=%d db=%d spd=%d last=%d lastLead=%d order=%d\n",
-							(int)this->index.base(), (int)db, (int)this->cur_speed,
-							(int)this->Last()->index.base(), (int)this->Last()->CanLeadTrain(),
-							(int)this->current_order.GetType());
-					fclose(dbg);
-				}
 			}
 		}
 		constexpr int BACKWARDS_NO_CAB_SPEED_LIMIT = 32;
@@ -1856,11 +1616,6 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 	}
 
 	int advisory_max_speed = max_speed;
-
-	/* R3R (第 323 轮): CPLSPD 探针的中途快照，只在 realistic braking 块内赋值。 */
-	int r3r_probe_after_end = -1;
-	int r3r_probe_after_items = -1;
-	int r3r_probe_decel2 = -1;
 
 	if (_settings_game.vehicle.train_acceleration_model == AccelerationModel::Realistic && this->lookahead == nullptr) {
 		Train *v_platform = const_cast<Train *>(this->GetStationLoadingVehicle());
@@ -1935,7 +1690,6 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 				this->lookahead->zpos_refresh_remaining = this->GetZPosCacheUpdateInterval();
 			}
 			TrainDecelerationStats stats(this, this->lookahead->cached_zpos);
-			r3r_probe_decel2 = stats.deceleration_x2;
 			if (this->lookahead->flags.Test(TrainReservationLookAheadFlag::DepotEnd)) {
 				LimitSpeedFromLookAhead(max_speed, stats, this->lookahead->current_position, this->lookahead->reservation_end_position - TILE_SIZE,
 						_settings_game.vehicle.rail_depot_speed_limit, this->lookahead->reservation_end_z - stats.z_pos);
@@ -1944,7 +1698,6 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 						0, this->lookahead->reservation_end_z - stats.z_pos);
 			}
 			advisory_max_speed = std::min(advisory_max_speed, max_speed);
-			r3r_probe_after_end = max_speed;
 			VehicleOrderID current_order_index = this->cur_real_order_index;
 			const Order *order = &(this->current_order);
 			StationID last_station_visited = this->last_station_visited;
@@ -1954,13 +1707,12 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 			if (this->lookahead->flags.Test(TrainReservationLookAheadFlag::ApplyAdvisory)) {
 				max_speed = std::min(max_speed, advisory_max_speed);
 			}
-			r3r_probe_after_items = max_speed;
 		} else {
 			advisory_max_speed = std::min(advisory_max_speed, 30);
 		}
 	}
 
-	R3RDbgCoupleSpdCurve(this, max_speed, advisory_max_speed, r3r_probe_after_end, r3r_probe_after_items, r3r_probe_decel2);
+	
 
 	/* R3R (第 321 轮, KI-499): 「配对锁建立之前不许起步」——**这一层不承担**。
 	 *
@@ -1978,39 +1730,6 @@ Train::MaxSpeedInfo Train::GetCurrentMaxSpeedInfoInternal(bool update_state) con
 	 * 判据见 R3RShouldWaitForCouplePair()（= 配对锁本身，与 :14106-14108 同义）。
 	 */
 
-	/* R3R (第 322 轮): 只读分解探针 —— 挂车接近段"速度被卡在 5 和 30"的来源。
-	 *
-	 * 只对 GOTO_COUPLE 前车打，每车 512 tick 一行（复用 R3RDbgMaxSpdHold 节流），
-	 * 逐项列出所有可能压住 advisory_max_speed 的开关：
-	 *   look  = lookahead 是否存在（0 ⇒ 命中 :1643 的 30 兜底）
-	 *   nocab = TCF_NO_DRIVING_CAB（命中 ⇒ max_speed 被压到 32）
-	 *   revd  = reverse_distance（>=1 ⇒ 命中 :1615 的 ReversingDistanceTargetSpeed）
-	 *   revspd= 该函数当前返回值（AM_REALISTIC 非 realistic braking 时为 ((revd-1)*5)/2，
-	 *           revd=3 ⇒ 5、revd=13 ⇒ 30，正是现场两个读数）
-	 *   spr   = speed_restriction（tracerestrict 限速）
-	 *   sig   = signal_speed_restriction（信号速度适应）
-	 *   ordmax= 订单自带限速；realbrk=是否 realistic braking；db=是否倒车行驶
-	 */
-	if (R3RDbgOn() && this->IsFrontEngine() && this->current_order.IsType(OT_GOTO_COUPLE) && R3RDbgMaxSpdHold(this)) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "MAXSPD-BREAK veh=%d tile=%d,%d spd=%d strict=%d adv=%d look=%d lookend=%d nocab=%d revd=%d revspd=%d spr=%d sig=%d ordmax=%d realbrk=%d db=%d track=%d maxTrack=%d maxCurve=%d\n",
-					(int)this->index.base(), (int)TileX(this->tile), (int)TileY(this->tile),
-					(int)this->cur_speed, (int)max_speed, (int)advisory_max_speed,
-					(this->lookahead != nullptr) ? 1 : 0,
-					(this->lookahead != nullptr) ? (int)(this->lookahead->reservation_end_position - this->lookahead->current_position) : -1,
-					(this->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0,
-					(int)this->reverse_distance,
-					(this->reverse_distance >= 1) ? (int)ReversingDistanceTargetSpeed(this) : -1,
-					(int)this->speed_restriction, (int)this->signal_speed_restriction,
-					(int)this->current_order.GetMaxSpeed(),
-					this->UsingRealisticBraking() ? 1 : 0,
-					this->IsDrivingBackwards() ? 1 : 0,
-					(int)this->track,
-					(int)this->gcache.cached_max_track_speed, (int)this->tcache.cached_max_curve_speed);
-			fclose(dbg);
-		}
-	}
 
 	return { max_speed, advisory_max_speed };
 }
@@ -2433,25 +2152,6 @@ static CommandCost CmdBuildRailWagon(TileIndex tile, DoCommandFlags flags, const
 	return CommandCost();
 }
 
-/* R3R (KI-144 / KI-145 / KI-14): edge-triggered probes for the segment fixes.
- * Both call sites sit ahead of R3RDbgEdge() and of the R3RDbgEdgeTag enum (both
- * defined further down in this file), so the emitters are forward declared
- * here. In a probe-free build (R3R_PROBES=0) the macros expand to nothing, so
- * the calls and their arguments disappear entirely and the published exe stays
- * provably probe-free (release audit 2026-09-19). */
-#if R3R_PROBES
-static void R3RProbeNoAbsorbSeg(const Train *head);
-static void R3RProbeNdhSegKeep(const Train *front, const Train *other, bool moved);
-static void R3RProbeKi149Seam(const Train *v, bool at_front, const Train *waiting);
-#define R3R_PROBE_NOABSORB_SEG(head) R3RProbeNoAbsorbSeg(head)
-#define R3R_PROBE_NDH_SEG_KEEP(front, other, moved) R3RProbeNdhSegKeep(front, other, moved)
-#define R3R_PROBE_KI149_SEAM(v, at_front, waiting) R3RProbeKi149Seam(v, at_front, waiting)
-#else
-#define R3R_PROBE_NOABSORB_SEG(head) ((void)0)
-#define R3R_PROBE_NDH_SEG_KEEP(front, other, moved) ((void)0)
-#define R3R_PROBE_KI149_SEAM(v, at_front, waiting) ((void)0)
-#endif
-
 /**
  * R3R: does this chain already contain a segment (a SegmentFront marker)?
  * @param t Any vehicle of the chain.
@@ -2494,7 +2194,6 @@ void NormalizeTrainVehInDepot(const Train *u, bool include_front_wagon)
 	 * would end up inside the segment (between the segment's front marker and
 	 * its rear boundary) and could then no longer be moved on their own. */
 	if (R3RChainHasSegment(u)) {
-		R3R_PROBE_NOABSORB_SEG(u);
 		return;
 	}
 	std::vector<Train *> candidates;
@@ -2709,136 +2408,6 @@ static bool R3RChainHasRealArticPart(const Train *head)
 	return false;
 }
 
-/* R3R（一次性探针批次 / 第 205 轮，item 3「神秘跳命令」）：订单索引变更哨兵。
- *
- * 现象：某条链头的 cur_real_order_index 在**没有任何既有探针记录**的情况下从 0 变成 1，
- * 于是那条 GOTO_COUPLE 被静默跳过、列车改去跑后面的 GOTO_DEPOT。要区分三种可能——
- *   (a) R3R 自己的某个提交点（settle / 借用交接 / 车库编辑）在改；
- *   (b) 引擎侧（ProcessOrders / CmdSkipToOrder / CheckTrainStayInDepot）在改；
- *   (c) 只是进程静态态/上一次会话残留导致读档后索引与预期不一致——
- * 就必须在**决策点两侧成对**取快照。
- *
- * 本函数按 VehicleID 缓存上一次快照，只要 real / impl / tt / orders 指针 / 条数 /
- * 真铰接位 任一变化就写一行 ORD-IDX-WATCH。快照表刻意是进程静态且跨读档保留：
- * 第二次读档时上一次会话的残值会立刻把"读档后索引与上一次不同"显示出来
- * （`-1->` 前缀表示本次进程首次见到该车）。artic= 就是 R3RChainHasRealArticPart()
- * 的取值，因此本行同时回答"这条链到底算不算真铰接链"（第 180 轮的悬置项）。
- *
- * 纯只读：只读 real/impl/tt/orders/条数/artic，绝不改写任何字段。
- * @param t    要观察的列车（任意链上车辆，nullptr 安全）。
- * @param site 调用位置标签，用来在日志里给出"变更发生在哪两个站点之间"。
- * @param tag  可选补充标签（例如提交点名 couple / depot-edit），nullptr 打 '-'。
- */
-static void R3RWatchOrderIndex(const Train *t, const char *site, const char *tag = nullptr)
-{
-	/* R3R (第 209 轮 / KI-315): 探针关闭时立刻返回，别做记账。
-	 *
-	 * 本函数是唯一"先做真活、后调 R3RDbgWrite"的哨兵：R3R_PROBES=0 时
-	 * R3RDbgWrite(...) 展开成 ((void)0)（r3r_perf.h），日志与格式串会消失，
-	 * 但下面的静态表查找/插入与 R3RChainHasRealArticPart() 的全链扫描原本
-	 * 仍会执行；本函数有 26 个调用点，其中 10 个位于 TrainLocoHandler 每列车
-	 * 每 tick 的路径上、订单编辑命令另有 6 对。R3RDbgOn() 在 R3R_PROBES=0 时
-	 * 是常量 false（r3r_perf.h），故此门禁在发行版被折叠为 if (false) return
-	 * 并把整个函数体删掉，不产生任何指令；运行期 R3R_DBG=0（KI-26 的 A/B
-	 * 基准）同样受益。探针开启时本行恒为真，日志逐字不变。 */
-	if (!R3RDbgOn()) return;
-	if (t == nullptr) return;
-
-	struct R3RIdxSnap {
-		int real;
-		int impl;
-		int tt;
-		const OrderList *ol;
-		int count;
-		int artic;
-		bool valid;
-	};
-	/* R3R (第 206 轮修订): 快照按 (站点, 车号) 分桶，而不是只按车号。原实现
-	 * 所有站点共用一个桶 ⇒ A 站点打过一行后，B 站点看到相同的值就静默不打，
-	 * 于是"日志里没有 B 站点"无法区分 "B 站点没被执行" 与 "B 站点执行了但
-	 * 值没变"。分桶后每个站点各自有首次行 + 各自的边沿行。site 恒为字符串
-	 * 字面量（每个调用点地址固定），故直接用指针当键的高位。 */
-	static std::unordered_map<uint64_t, R3RIdxSnap> seen;
-
-	const uint64_t key = ((uint64_t)reinterpret_cast<uintptr_t>(site) << 32) | (uint64_t)t->index.base();
-	R3RIdxSnap &s = seen[key];
-	/* 修法 D: 打印的是这列车**实际在跑**的那张表，跟随态下它在跟随指针后面。 */
-	const OrderList *const ol = t->GetEffectiveOrders();
-	const int count = (ol != nullptr) ? (int)ol->GetNumOrders() : -1;
-	const int artic = R3RChainHasRealArticPart(t) ? 1 : 0;
-
-	if (s.valid && s.real == (int)t->cur_real_order_index &&
-			s.impl == (int)t->cur_implicit_order_index &&
-			s.tt == (int)t->cur_timetable_order_index &&
-			s.ol == ol && s.count == count && s.artic == artic) {
-		return;
-	}
-
-	/* R3R (第 297 轮 / KI-472 探针, 只读): 越界的显式标记。
-	 *
-	 * ORD-IDX-WATCH 会打出 impl= 与 n=，但要人工比对才看得出越界；而且上面那个
-	 * count 是"有效表本身的条数"（ol->GetNumOrders()），与断言用的
-	 * v->GetNumOrders() 不是同一个量（后者还含隐式订单）。这里用**断言同一把
-	 * 尺子**再判一次，越界就额外打一行，便于 `findstr ORDIDX-OOB` 直接捞到，
-	 * 并带上"这车此刻能不能动"的几个关键量。
-	 *
-	 * 玩家 2026-10-25 口径：只加探针、不加 clamp，该崩还是崩。 */
-	const int r3r_oob_limit = (int)t->GetNumOrders();
-	if (r3r_oob_limit > 0 && (int)t->cur_implicit_order_index >= r3r_oob_limit) {
-		R3RDbgWrite("ORDIDX-OOB site=%s tag=%s veh=%d impl=%d real=%d tt=%d num=%d eff=%d front=%d spd=%d parked=%d indepot=%d ticket=KI-472\n",
-				site, (tag != nullptr) ? tag : "-", (int)t->index.base(),
-				(int)t->cur_implicit_order_index, (int)t->cur_real_order_index,
-				(int)t->cur_timetable_order_index, r3r_oob_limit, count,
-				(int)t->IsFrontEngine(), (int)t->cur_speed, (int)t->r3r_parked,
-				(int)t->IsInDepot());
-	}
-
-	/* R3R (第 354 轮 V-1, 只读): the order index alone cannot tell whether a
-	 * 4->5 advance was a legitimate arrival or a stale-destination misfire. We
-	 * dump the order type the train is currently flying and the tile it believes
-	 * it is heading for, so that "real==4 but dest_tile==路点2" (G-4) becomes
-	 * directly readable on every site, del-implicit-in/out included. */
-	R3RDbgWrite("ORD-IDX-WATCH site=%s tag=%s veh=%d real=%d->%d impl=%d->%d tt=%d->%d n=%d->%d artic=%d->%d ord=%p->%p front=%d spd=%d parked=%d curType=%d dest=%u dtX=%d dtY=%d vtile=%d,%d\n",
-			site, (tag != nullptr) ? tag : "-", (int)t->index.base(),
-			s.valid ? s.real : -1, (int)t->cur_real_order_index,
-			s.valid ? s.impl : -1, (int)t->cur_implicit_order_index,
-			s.valid ? s.tt : -1, (int)t->cur_timetable_order_index,
-			s.valid ? s.count : -1, count,
-			s.valid ? s.artic : -1, artic,
-			(const void *)s.ol, (const void *)ol,
-			(int)t->IsFrontEngine(), (int)t->cur_speed, (int)t->r3r_parked,
-			(int)t->current_order.GetType(), (uint)t->dest_tile.base(),
-			(t->dest_tile != INVALID_TILE) ? (int)TileX(t->dest_tile) : -1,
-			(t->dest_tile != INVALID_TILE) ? (int)TileY(t->dest_tile) : -1,
-			(int)TileX(t->tile), (int)TileY(t->tile));
-
-	s.real = (int)t->cur_real_order_index;
-	s.impl = (int)t->cur_implicit_order_index;
-	s.tt = (int)t->cur_timetable_order_index;
-	s.ol = ol;
-	s.count = count;
-	s.artic = artic;
-	s.valid = true;
-}
-
-/**
- * R3R (第 206 轮探针, 只读): 非 static 薄包装，供 order_cmd.cpp 等别的 TU 打点。
- * 之所以在这里手写一个包装、而不把 R3RWatchOrderIndex 本身改成非 static 并在
- * 头文件里声明，是为了让本轮保持"只改 .cpp"——一旦碰 src\*.h，KI-183 的构建
- * 护栏会把全部 object 删掉、把增量构变成全量（约 700 步 / 半小时）。
- * @param t    要观察的列车（nullptr 安全）。
- * @param site 调用位置标签。
- * @param tag  可选补充标签，可为 nullptr。
- */
-void R3RWatchOrderIndexSite(const Train *t, const char *site, const char *tag)
-{
-	/* R3R (第 209 轮 / KI-315): 跨 TU 调用点（order_cmd.cpp 的 RAII 与 6 对命令层
-	 * 哨兵）无法内联，这里再挡一层 ⇒ 探针关闭时退化为一次普通函数调用 + 常量
-	 * false 判断，绝不进入下面的静态表记账与链扫描。 */
-	if (!R3RDbgOn()) return;
-	R3RWatchOrderIndex(t, site, tag);
-}
-
 /* R3R (第 180 轮 / 选项 C): defined in vehicle_cmd.cpp, right next to the
  * "upgrade to segment" command which is its other caller. Declared here by hand
  * instead of in vehicle_cmd.h so that this round stays a .cpp-only change and
@@ -2861,12 +2430,6 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
  * search throttle. Declared here by hand so this round stays a .cpp-only change
  * (no header, no KI-183 full rebuild). See the call site in ChooseTrainTrack(). */
 bool R3RCoupleSearchSkipped(const Train *v);
-
-/* R3R (第 272 轮, C-6): defined in pathfinder/yapf/yapf_rail.cpp. Tells the three
- * "no path found" situations apart: an empty reachable area (mask 0) versus candidates
- * that were explicitly refused by one of the four destination gates. Declared by hand
- * here for the same .cpp-only reason as above. */
-uint32_t R3RCoupleSearchRejectMask(const Train *v);
 
 /**
  * R3R (第 180 轮 / 选项 C): one-shot load-time migration of a legacy consist
@@ -2915,8 +2478,6 @@ static void R3RDearticulateLegacyArticSegment(Train *head)
 
 	DearticulateChainWithSnapshot(head);
 	head->ConsistChanged(CCF_SAVELOAD);
-	R3RDbgWrite("LEGACY-ARTIC-DEARTIC head=%d n=%u (load migration, round 180 option C)\n",
-			(int)head->index.base(), n);
 }
 
 /**
@@ -3033,12 +2594,8 @@ static void R3RNormaliseArticGroupBakes(Train *head)
 				q->max_speed_override = UINT16_MAX;
 			}
 			if (had_bake) {
-				R3RDbgWrite("ARTIC-BAKE-HEAL head=%d n=%u (stale bake on a genuine artic group cleared)\n",
-						(int)v->index.base(), n);
 				changed = true;
 			} else {
-				R3RDbgWrite("ARTIC-BAKE-SKIP head=%d n=%u reason=real-artic-parts\n",
-						(int)v->index.base(), n);
 			}
 			v = nxt;
 			continue;
@@ -3075,9 +2632,6 @@ static void R3RNormaliseArticGroupBakes(Train *head)
 			q->power_override = p_q;
 			q->max_speed_override = max_speed;
 		}
-
-		R3RDbgWrite("ARTIC-BAKE-NORMALISE head=%d n=%u w=%u p=%u spd=%u (overrides missing in savegame)\n",
-				(int)v->index.base(), n, total_weight, total_power, max_speed);
 		changed = true;
 		v = nxt;
 	}
@@ -3178,39 +2732,12 @@ bool R3RIsCoupleTarget(const Train *t)
  *
  * @param w Vehicle to check; anything but a WAIT_COUPLE holder is left alone.
  */
-/* R3R 探针（第 355 轮，只读诊断）：等待标记被清理的次数，按车辆累计。
- * 用途只有一个：被 SKIP-STOPPED 的 wclr 字段读取，用来区分
- *   wclr>0  ⇒ 该链的 WAIT_COUPLE 曾被这里清成 OT_NOTHING（先空后停）
- *   wclr=0  ⇒ 没被这里碰过（问题在停驶门本身，先停后空）
- * 不参与任何判定。 */
-static std::unordered_map<uint32_t, uint32_t> _r3r_waitclear_count;
-/* R3R 探针（第 355 轮）：某链连续被停驶门挡回的 tick 数（离开该分支即清零）。 */
-static std::unordered_map<uint32_t, uint32_t> _r3r_skipstop_ticks;
-
 static void R3RClearStaleWaitMarker(Train *w, const char *tag)
 {
 	if (w == nullptr || !w->current_order.IsType(OT_WAIT_COUPLE)) return;
 
-	/* 清理前抓一份读数：清理之后 current_order 已空，事后无法再回答"当时真实那条是什么"。 */
-	const Order *const r3r_real = (w->GetEffectiveOrders() != nullptr) ? w->GetOrder(w->cur_real_order_index) : nullptr;
-	const uint r3r_wclr = ++_r3r_waitclear_count[w->index.base()];
-
 	w->current_order.Free();
 	w->SetDestTile(INVALID_TILE);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "[R3R] CPL-WAITCLEAR veh=%d head=%d tile=%d,%d segFront=%d primary=%d tag=%s isHead=%d idx=%d real=%d nord=%d nth=%u\n",
-				(int)w->index.base(), (int)Train::From(w->First())->index.base(),
-				TileX(w->tile), TileY(w->tile),
-				(int)w->IsSegmentFront(), (int)w->IsPrimaryVehicle(),
-				tag, (w->First() == w) ? 1 : 0,
-				(int)w->cur_real_order_index,
-				(int)(r3r_real != nullptr ? r3r_real->GetType() : -1),
-				(int)(w->GetEffectiveOrders() != nullptr ? w->GetNumOrders() : -1),
-				r3r_wclr);
-		fclose(dbg);
-	}
 }
 
 /** R3R (KI-149): which end of a consist carries the seam a decouple left? */
@@ -3278,7 +2805,6 @@ static bool R3RWaitingCoupleAtEnd(const Train *v, bool at_front)
 			const int touch = (end->gcache.cached_veh_length + 1) / 2 + (w_end->gcache.cached_veh_length + 1) / 2;
 			if (dx * dx + dy * dy > (touch + 2) * (touch + 2)) continue;
 
-			R3R_PROBE_KI149_SEAM(v, at_front, w);
 			return true;
 		}
 	}
@@ -3427,9 +2953,6 @@ static void R3RRecordDecoupleSeam(const Train *kept, const Train *follower)
 	seam.seam_tile = seam_car->tile;
 	seam.tick = _tick_counter;
 	seam.reported = false;
-	R3RDbgWrite("DECOUPLE-INTERLOCK set head=%d follower=%d seam_car=%d tile=%d,%d\n",
-			(int)kept->index.base(), (int)follower->index.base(), (int)seam_car->index.base(),
-			TileX(seam_car->tile), TileY(seam_car->tile));
 }
 
 /**
@@ -3673,8 +3196,6 @@ static bool R3RDecoupleInterlockWait(Train *consist)
 	 * 撞毁这条唯一异常出口由 R3RPlatformClearForConsist 天然覆盖：它跳过撞毁车，
 	 * 前车一撞毁就不再算占用（详见该函数的说明）。 */
 	if (seam_car == nullptr) {
-		R3RDbgWrite("DECOUPLE-INTERLOCK clear head=%d follower=%d seam_car=%d dist=%u gone=1\n",
-				(int)seam.head.base(), (int)consist->index.base(), (int)seam.seam_car.base(), dist);
 		_r3r_decomp_seams.erase(it);
 		return false;
 	}
@@ -3720,9 +3241,6 @@ static bool R3RDecoupleInterlockWait(Train *consist)
 			 * 订不到就继续钉住，下一轮再试；不设超时（C-3）。 */
 			r3r_res = TryPathReserve(consist, false, false) ? 1 : 0;
 			if (r3r_res != 0) {
-				R3RDbgWrite("DECOUPLE-INTERLOCK release head=%d follower=%d seam_car=%d dist=%u age=%u left=%d res=1 reason=platform-clear\n",
-						(int)seam.head.base(), (int)consist->index.base(), (int)seam.seam_car.base(),
-						dist, (unsigned)age, leader_left ? 1 : 0);
 				_r3r_decomp_seams.erase(it);
 				return false;
 			}
@@ -3738,18 +3256,11 @@ static bool R3RDecoupleInterlockWait(Train *consist)
 		if (seam.hold_calls <= 1 || signature != seam.last_sig || age >= seam.last_log_age + 128) {
 			seam.last_sig = signature;
 			seam.last_log_age = age;
-			R3RDbgWrite("DECOUPLE-INTERLOCK hold head=%d follower=%d dist=%u age=%u left=%d res=%d n=%u reason=%s\n",
-					(int)seam.head.base(), (int)consist->index.base(), dist, (unsigned)age,
-					leader_left ? 1 : 0, r3r_res, (unsigned)seam.hold_calls, hold_reason);
 		}
 	}
 
 	if (!seam.reported) {
 		seam.reported = true;
-		R3RDbgWrite("DECOUPLE-INTERLOCK wait head=%d follower=%d seam=%d,%d seam_car=%d dist=%u age=%u left=%d\n",
-				(int)seam.head.base(), (int)consist->index.base(),
-				TileX(seam.seam_tile), TileY(seam.seam_tile), (int)seam.seam_car.base(), dist,
-				(unsigned)age, leader_left ? 1 : 0);
 	}
 	return true;
 }
@@ -4051,7 +3562,6 @@ static void NormaliseDualHeads(Train *t)
 				RemoveFromConsist(other);
 				InsertInConsist(t, other);
 			}
-			R3R_PROBE_NDH_SEG_KEEP(t, other, moved);
 			continue;
 		}
 
@@ -4127,21 +3637,6 @@ static CommandCost CheckNewTrain(Train *original_dst, Train *dst, Train *origina
  * out to be ValidateTrains() rejecting the attempted rearrangement, and the three
  * checks are indistinguishable from the log. Print exactly which chain, which part
  * and which callback/limit rejected it. Only the (rare) failure paths log. */
-static void R3RDumpAttachFail(Train *head, Train *part, int allowed_len, uint16_t callback, StringID error)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "ATTACH-FAIL head=%d head_et=%d head_eng=%d part=%d part_et=%d part_eng=%d cb=0x%X allowed=%d err=0x%X\n",
-			head != nullptr ? (int)head->index.base() : -1,
-			head != nullptr ? (int)head->engine_type.base() : -1,
-			head != nullptr ? (head->IsEngine() ? 1 : 0) : -1,
-			part != nullptr ? (int)part->index.base() : -1,
-			part != nullptr ? (int)part->engine_type.base() : -1,
-			part != nullptr ? (part->IsEngine() ? 1 : 0) : -1,
-			(unsigned)callback, allowed_len, (unsigned)error.base());
-	fclose(dbg);
-}
-
 /**
  * Check whether the train parts can be attached.
  * @param t the train to check
@@ -4166,7 +3661,7 @@ static CommandCost CheckTrainAttachment(Train *t)
 		}
 
 		if (allowed_len < 0) {
-			R3RDumpAttachFail(t, nullptr, allowed_len, 0, STR_ERROR_TRAIN_TOO_LONG);
+			
 			return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
 		}
 		return CommandCost();
@@ -4242,7 +3737,7 @@ static CommandCost CheckTrainAttachment(Train *t)
 				}
 
 				if (error != STR_NULL) {
-					R3RDumpAttachFail(head, t, allowed_len, callback, error);
+					
 					return CommandCost(error);
 				}
 			}
@@ -4255,7 +3750,7 @@ static CommandCost CheckTrainAttachment(Train *t)
 	}
 
 	if (allowed_len < 0) {
-		R3RDumpAttachFail(head, nullptr, allowed_len, 0, STR_ERROR_TRAIN_TOO_LONG);
+		
 		return CommandCost(STR_ERROR_TRAIN_TOO_LONG);
 	}
 	return CommandCost();
@@ -4273,26 +3768,16 @@ static CommandCost CheckTrainAttachment(Train *t)
  */
 static CommandCost ValidateTrains(Train *original_dst, Train *dst, Train *original_src, Train *src, bool check_limit)
 {
-	/* R3R (KI-215 decisive probe, 2026-09-30): a decouple that "did nothing" is
-	 * indistinguishable from "never reached" unless the failing stage is named.
-	 * Print which of the three checks rejected the rearrangement and with which
-	 * error StringID. Failures are rare, so this stays cheap. */
-	FILE *vdbg = R3RFopenDbg("a");
-	auto probe = [vdbg](const char *stage, const CommandCost &cc) {
-		if (vdbg == nullptr) return;
-		fprintf(vdbg, "VALIDATE-FAIL stage=%s err=0x%X\n", stage, (unsigned)cc.GetErrorMessage().base());
-	};
 	/* Check whether we may actually construct the trains. */
 	CommandCost ret = CheckTrainAttachment(src);
-	if (ret.Failed()) { probe("attach-src", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
+	if (ret.Failed()) return ret;
 	ret = CheckTrainAttachment(dst);
-	if (ret.Failed()) { probe("attach-dst", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
+	if (ret.Failed()) return ret;
 
 	/* Check whether we need to build a new train. */
-	if (!check_limit) { if (vdbg != nullptr) fclose(vdbg); return CommandCost(); }
+	if (!check_limit) return CommandCost();
 	ret = CheckNewTrain(original_dst, dst, original_src, src);
-	if (ret.Failed()) { probe("new-train", ret); if (vdbg != nullptr) fclose(vdbg); return ret; }
-	if (vdbg != nullptr) fclose(vdbg);
+	if (ret.Failed()) return ret;
 	return CommandCost();
 }
 
@@ -4310,6 +3795,7 @@ static CommandCost ValidateTrains(Train *original_dst, Train *dst, Train *origin
  * couple-priority helpers further down in this file. */
 static void R3RSyncChainAfterDepotEdit(Train *chain);
 static void R3RNormaliseChainGroups(Train *head);
+static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
 
 /* R3R diagnostic: the R3R code rewrites order indices by hand in a few places
  * (couple, decouple, schedule hand-over). Each of those blocks is supposed to
@@ -4318,19 +3804,6 @@ static void R3RNormaliseChainGroups(Train *head);
  * on the next station stop (see the TT-DESYNC log there). Call this right after
  * such a block: it writes one line per break, naming the block that caused it,
  * so the offending spot can be found from a single reproduction. */
-static void R3RCheckTtSync(const Vehicle *v, const char *tag)
-{
-	if (v == nullptr) return;
-	if (v->cur_timetable_order_index == INVALID_VEH_ORDER_ID) return;  /* not started yet */
-	if (v->cur_timetable_order_index == v->cur_real_order_index) return;  /* the invariant holds */
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "TT-CHK-BREAK %s veh=%d real=%d tt=%d impl=%d n=%d curType=%d\n",
-			tag, (int)v->index.base(), (int)v->cur_real_order_index, (int)v->cur_timetable_order_index,
-			(int)v->cur_implicit_order_index, (int)v->GetNumOrders(), (int)v->current_order.GetType());
-	fclose(dbg);
-}
-
 /* --- KI-629 (第 433 轮): statistics invariant guard ------------------------
  * 现场（第 433 轮）：机车寿命显示 "30 年 -> 0 年"，纯车底段寿命显示 0（= 上限）。
  * 已确认上游建造路径从不写 max_age（CmdBuildRailWagon 漏、AddArticulatedParts 清零、
@@ -4342,25 +3815,13 @@ static void R3RCheckTtSync(const Vehicle *v, const char *tag)
  *
  * 为什么快照而不是「只允许某几种变化」：ArrangeTrains 只搬运链序，从不该碰这四
  * 个字段；「不变」才是它该有的行为，所以任何漂移都是缺陷。
- * 标签前缀必须是 R3R-：裸 "STATS-" 不在 R3RDbgTagAllowed() 白名单里，会被静默丢弃
- * （第 274/296/370 轮已三次踩坑，0 条不等于没触发）。
- * 只读（除还原外）：只在探针开启时工作，probe-free 版行为与上游一致。 */
+ * 只读（除还原外）。 */
 struct R3RStatSnap {
 	int32_t age;
 	int32_t max_age;
 	uint16_t reliability;
 	uint16_t reliability_spd_dec;
 };
-
-static void R3RSnapshotChainStats(const Train *head, std::map<uint32_t, R3RStatSnap> &out)
-{
-	for (const Train *u = head; u != nullptr; ) {
-		out.emplace(u->index.base(), R3RStatSnap{ u->age.base(), u->max_age.base(),
-				u->reliability, u->reliability_spd_dec });
-		const Vehicle *next = u->Next();
-		u = (next != nullptr) ? Train::From(next) : nullptr;
-	}
-}
 
 static void R3RVerifyChainStats(const char *tag, Train *head_a, Train *head_b,
 		const std::map<uint32_t, R3RStatSnap> &before)
@@ -4374,12 +3835,6 @@ static void R3RVerifyChainStats(const char *tag, Train *head_a, Train *head_b,
 				if (u->age.base() != s.age || u->max_age.base() != s.max_age ||
 						u->reliability != s.reliability ||
 						u->reliability_spd_dec != s.reliability_spd_dec) {
-					R3RDbgWrite("R3R-STATS-DRIFT %s veh=%d age=%d->%d maxage=%d->%d rel=%u->%u dec=%u->%u eng=%u\n",
-							tag, (int)u->index.base(), (int)s.age, (int)u->age.base(),
-							(int)s.max_age, (int)u->max_age.base(),
-							(uint)s.reliability, (uint)u->reliability,
-							(uint)s.reliability_spd_dec, (uint)u->reliability_spd_dec,
-							(uint)u->engine_type.base());
 					u->age = CalTime::DateDelta(s.age);
 					u->max_age = CalTime::DateDelta(s.max_age);
 					u->reliability = s.reliability;
@@ -4395,22 +3850,7 @@ static void R3RVerifyChainStats(const char *tag, Train *head_a, Train *head_b,
 static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train *src, bool move_chain)
 {
 	std::map<uint32_t, R3RStatSnap> stat_before;
-	if (R3RDbgOn()) {
-		R3RSnapshotChainStats(*src_head, stat_before);
-		R3RSnapshotChainStats(*dst_head, stat_before);
-	}
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "ARRANGE-IN dh=%d dst=%d sh=%d src=%d mc=%d\n",
-				*dst_head != nullptr ? (int)(*dst_head)->index.base() : -1,
-				dst != nullptr ? (int)dst->index.base() : -1,
-				*src_head != nullptr ? (int)(*src_head)->index.base() : -1,
-				src != nullptr ? (int)src->index.base() : -1,
-				move_chain ? 1 : 0);
-			fclose(dbg);
-		}
-	}
+	
 
 	/* First determine the front of the two resulting trains */
 	if (*src_head == *dst_head) {
@@ -4438,24 +3878,12 @@ static void ArrangeTrains(Train **dst_head, Train *dst, Train **src_head, Train 
 	 * source train and *if* the destination is a not a new train add the chain
 	 * at the destination location. */
 	RemoveFromConsist(src, move_chain);
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) { fprintf(dbg, "ARRANGE-RFC-DONE\n"); fclose(dbg); }
-	}
 	if (*dst_head != src) InsertInConsist(dst, src);
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) { fprintf(dbg, "ARRANGE-IC-DONE\n"); fclose(dbg); }
-	}
 
 	/* Now normalise the dual heads, that is move the dual heads around in such
 	 * a way that the head and rear of a dual head are in the same train */
 	NormaliseDualHeads(*src_head);
 	NormaliseDualHeads(*dst_head);
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) { fprintf(dbg, "ARRANGE-NDH-DONE\n"); fclose(dbg); }
-	}
 
 	/* KI-629: 链序搬运不该碰任何一节车的统计量；变了就报告并还原。 */
 	if (!stat_before.empty()) R3RVerifyChainStats("arrange", *src_head, *dst_head, stat_before);
@@ -4623,10 +4051,8 @@ static void R3RReleaseParkedUnitNumber(Vehicle *v, const char *why)
 		Company::Get(v->owner)->freeunits[v->type].UseID(parked);
 		Company::Get(v->owner)->freeunits[v->type].ReleaseID(parked);
 		v->unitnumber_backup = 0;
-		R3RDbgWrite("UNIT-RELEASE veh=%d id=%u reason=%s\n", (int)v->index.base(), (unsigned)parked, why);
 	} else {
 		v->unitnumber_backup = 0;
-		R3RDbgWrite("UNIT-DROP veh=%d id=%u reason=%s-owned-elsewhere\n", (int)v->index.base(), (unsigned)parked, why);
 	}
 }
 
@@ -4661,7 +4087,6 @@ static void R3RParkTrainGroupID(Vehicle *v)
 	/* 未分组没有"可停放的归属"：停成 DEFAULT_GROUP 只会让归还侧误判，直接不记。 */
 	if (!R3RIsParkedGroupUsable(v->group_id)) return;
 	v->group_id_backup = v->group_id;
-	R3RDbgWrite("GRP-PARK veh=%d g=%u\n", (int)v->index.base(), (uint)v->group_id.base());
 }
 
 /** 见 R3RParkTrainGroupID()：段重新成为链头时，把自己借出的列车分组取回。 */
@@ -4680,7 +4105,6 @@ static void R3RRestoreTrainGroupID(Train *v)
 	/* 旧档/旧口径留下的 DEFAULT_GROUP 副本：它只表示"这一段本来就没有分组"，不能覆盖活字段上
 	 * 真实的分组，直接丢弃副本（KI-464）。 */
 	if (!R3RIsParkedGroupUsable(back)) {
-		R3RDbgWrite("GRP-DROP-DEFAULT veh=%d bk=%u live=%u\n", (int)v->index.base(), (uint)back.base(), (uint)v->group_id.base());
 		v->group_id_backup = GroupID::Invalid();
 		return;
 	}
@@ -4692,7 +4116,6 @@ static void R3RRestoreTrainGroupID(Train *v)
 	v->group_id = back;
 	GroupStatistics::CountVehicle(v, 1);
 	v->group_id_backup = GroupID::Invalid();
-	R3RDbgWrite("GRP-RESTORE veh=%d g=%u\n", (int)v->index.base(), (uint)back.base());
 }
 
 /** 见 R3RParkTrainGroupID()/R3RRestoreTrainName()：段重新成为链头时，把自己停放/借出的车号取回。
@@ -4716,8 +4139,7 @@ static void R3RRestoreUnitNumber(Train *head)
 		 * R3RBorrowControlTraitsLive() 会先让借用方脱下（那一刻本车已独占该号），再由它的
 		 * 号块把号还给本车；万一那条路没跑到，NormaliseTrainHead() 的兜底仍会发一个合法
 		 * 新号（备份留着占池位，宁可迟还，不可错丢）。 */
-		R3RDbgWrite("UNIT-RESTORE-DEFER veh=%d id=%u\n",
-				(int)head->index.base(), (unsigned)head->unitnumber_backup);
+		
 		return;
 	}
 
@@ -4728,7 +4150,6 @@ static void R3RRestoreUnitNumber(Train *head)
 	if (!HasBit(head->subtype, GVSF_VIRTUAL)) {
 		Company::Get(head->owner)->freeunits[head->type].UseID(restored);
 	}
-	R3RDbgWrite("UNIT-RESTORE veh=%d id=%u\n", (int)head->index.base(), (unsigned)restored);
 }
 
 static void NormaliseTrainHead(Train *head)
@@ -5028,26 +4449,6 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 				src_head->CopyVehicleConfigAndStatistics(src);
 			}
 			/* Remove stuff not valid anymore for non-front engines. */
-			if (src_head != src) {
-				/* R3R (KI-465 修法 D): 这里既不再把排程停进 orders_backup，也不再
-				 * DeleteVehicleOrders()。修法 D 下 src->orders 恒指向**它自己**的表
-				 * （借用只体现为跟随指针，已在上面摘掉），而引擎只执行链头
-				 * (IsFrontEngine()) 的排程 —— 中段挂着 orders 指针不会被跑。所以
-				 * "留着这张表、日后重新成为链头时接着跑"直接在 orders 上成立，
-				 * 不需要备份副本；反过来，把表搬进 orders_backup 并让 orders 变成
-				 * nullptr 正是 KI-465 崩溃的成因：活表失去持有者 ⇒ 存档按索引写出的
-				 * 表在指针修正阶段被判无效（"Referencing invalid OrderList"）。
-				 *
-				 * 共享表（原生 Ctrl 共享 / 读档补齐的那份）同理原样留在车上，既不
-				 * 进只有本车看得见的备份，也不做 RemoveFromShared()。若另一侧成员先
-				 * 被卖掉，KI-93 的 R3RFindOrderListReferrer() 会把订单表移交给仍持有
-				 * 它的车，不会悬垂。 */
-				R3RDbgWrite("DEPOT-KEEP veh=%d orders=%d share=%u follow=%d\n",
-						(int)src->index.base(),
-						(int)(src->orders != nullptr ? src->orders->GetNumOrders() : 0),
-						(unsigned)(src->orders != nullptr ? src->orders->GetNumVehicles() : 0),
-						(int)(src->r3r_follow_orders != nullptr ? src->r3r_follow_orders->GetNumOrders() : 0));
-			}
 			/* R3R (第 301 轮 / KI-475 P2 改口径): 车号冻结**只对"段"成立**。
 			 *
 			 * 玩家口径（2026-10-25 原话）：「3，4号车是按照耦合执行了号码冻结吗，
@@ -5070,10 +4471,8 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 					src->unitnumber_backup = src->unitnumber;
 				}
 				src->unitnumber = 0;
-				R3RDbgWrite("UNIT-PARK veh=%d bk=%u\n", (int)src->index.base(), (unsigned)src->unitnumber_backup);
 			} else {
 				if (src->unitnumber != 0) {
-					R3RDbgWrite("UNIT-RELEASE veh=%d id=%u reason=not-segment\n", (int)src->index.base(), (unsigned)src->unitnumber);
 					src->ReleaseUnitNumber();
 				}
 				R3RReleaseParkedUnitNumber(src, "not-segment");
@@ -5146,8 +4545,7 @@ CommandCost CmdMoveRailVehicle(DoCommandFlags flags, VehicleID src_veh, VehicleI
 				 * DearticulateChainWithSnapshot() first -- the depot drag has no
 				 * de-articulation step, so the block simply keeps its loose form and
 				 * stays out of the segment table. */
-				R3RDbgWrite("DEPOT-SEG-SKIP-REAL-ARTIC src=%d block_head=%d block_tail=%d -> ★/⊗ withheld (genuine articulated part)\n",
-						(int)src->index.base(), (int)original_src_head->index.base(), (int)moved_block_tail->index.base());
+				
 			} else {
 				src->SetSegmentFront();
 				moved_block_tail->SetSegmentBack();
@@ -5403,7 +4801,6 @@ static void MarkTrainAsStuck(Train *consist, bool waiting_restriction = false)
 		consist->wait_counter = 0;
 
 		/* Stop train */
-		R3RSpdCtx(consist, "stop-train", consist->cur_speed, 0);
 		consist->cur_speed = 0;
 		consist->subspeed = 0;
 		consist->SetLastSpeed();
@@ -5531,15 +4928,10 @@ static void ReverseTrainSwapVeh(Train *v, int l, int r)
 }
 
 /**
- * R3R (KI-334 probe): 定义在本文件后段(R3RDumpCoupleIdentity 之后)。物理翻
- * (ReverseTrainSwapVehicles)与逻辑翻(R3RReverseChainDirections)两处出口都要调，
- * 故在文件靠前处先声明。纯只读，R3R_PROBES=0 时 R3RDbgOn() 常量门直接折叠。
- */
-static void R3RDumpDualHeadPairs(const Train *chain, const char *tag);
-
-/**
- * Swap vehicles in chain starting from \a v, and reverse their direction.
- * @param v First vehicle in chain to change.
+ * Check if a level crossing tile has a train on it
+ * @param tile tile to test
+ * @return true if a train is on the crossing
+ * @pre tile is a level crossing
  */
 void ReverseTrainSwapVehicles(Train *v)
 {
@@ -5554,18 +4946,9 @@ void ReverseTrainSwapVehicles(Train *v)
 	for (Train *u = v; u != nullptr; u = u->Next()) {
 		UpdateStatusAfterSwap(u);
 	}
-	/* R3R (KI-334 probe): ReverseTrainSwapVeh 只换数据不重链，故 v 仍是链头，
-	 * 可以走完整个链。双头两半在这里被各自换到对面，本行看它们是否仍相邻、
-	 * 朝向是否仍一致(KI-334「挂接后机车错位」的物理解释候选)。 */
-	R3RDumpDualHeadPairs(v, "swapv-post");
 }
 
-/**
- * Check if a level crossing tile has a train on it
- * @param tile tile to test
- * @return true if a train is on the crossing
- * @pre tile is a level crossing
- */
+
 bool TrainOnCrossing(TileIndex tile)
 {
 	assert(IsLevelCrossingTile(tile));
@@ -5901,24 +5284,6 @@ static bool R3RConsumeForceReplan(const Train *consist)
  */
 static void ReverseTrainDirection(Train *consist)
 {
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "REVERSEDIR veh=%d tile=%d,%d dir=%d order=%d spd=%d nv=%d rev=%d stuck=%d db=%d\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)consist->direction, (int)consist->current_order.GetType(), (int)consist->cur_speed,
-					(int)CountVehiclesInChain(consist),
-					(int)consist->flags.Test(VehicleRailFlag::Reversing),
-					(int)consist->flags.Test(VehicleRailFlag::Stuck),
-					(int)consist->vehicle_flags.Test(VehicleFlag::DrivingBackwards));
-			for (const Train *w = consist; w != nullptr; w = w->Next()) {
-				fprintf(dbg, "  RF idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X\n",
-						(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-						(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track);
-			}
-			fclose(dbg);
-		}
-	}
 	R3RMarkChainJustReversed(consist);
 	/* R3R (答案本): 整列方向已反转，旧答案是一条单向序列，对新的 origin.trackdir 无意义。 */
 	R3RDropAnswerChain(consist, "reverse");
@@ -6036,20 +5401,6 @@ static void ReverseTrainDirection(Train *consist)
 		AdvanceWagonsAfterSwap(moving_front);
 	}
 
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "REVERSEDONE db=%d mvfront=%d\n",
-					(int)consist->vehicle_flags.Test(VehicleFlag::DrivingBackwards),
-					(int)consist->GetMovingFront()->index.base());
-			for (const Train *w = consist; w != nullptr; w = w->Next()) {
-				fprintf(dbg, "  RA idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X\n",
-						(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-						(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track);
-			}
-			fclose(dbg);
-		}
-	}
 
 	ClrBit(consist->vcache.cached_veh_flags, VCF_GV_ZERO_SLOPE_RESIST);
 
@@ -6299,7 +5650,6 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 				/* Chain position of the group, counted from the chain head. */
 				int start = 0;
 				for (const Train *w = front; w != old_head; w = w->Next()) start++;
-				const int end = start + (int)n_cars - 1;
 
 				/* ② 位置沿轨道轴镜像：新序第 i 位取旧序第 n-1-i 位的位置。
 				 * depot 行不读位置（备忘 §19.10），这一步纯粹为物理自洽。 */
@@ -6440,25 +5790,11 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 					if (w->flags.Test(VehicleRailFlag::Flipped)) n_flipped++;
 					/* 只读探针：让玩家/我们一眼看出"位置真的换了、包围盒跟着换了"。
 					 * bO=origin bE=extent bOf=offset（均为像素，相对 tile 原点）。 */
-					R3RDbgWrite("ARTIC-FLIP-CAR idx=%d x=%d y=%d len=%u flip=%d db=%d bO=(%d,%d) bE=(%d,%d) bOf=(%d,%d)\n",
-							(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-							(uint)w->gcache.cached_veh_length,
-							w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
-							w->IsDrivingBackwards() ? 1 : 0,
-							(int)w->bounds.origin.x, (int)w->bounds.origin.y,
-							(int)w->bounds.extent.x, (int)w->bounds.extent.y,
-							(int)w->bounds.offset.x, (int)w->bounds.offset.y);
+					
 				}
 
 				/* 名次/镜像/链序全变了，NewGRF 侧按名次缓存的图象必须整体作废。 */
 				new_head->InvalidateNewGRFCacheOfChain();
-
-				R3RDbgWrite("ARTIC-FLIP head=%d n=%u span=%d..%d primary=%d flipped=%u real=%d old=%d new=%d move=%d\n",
-						(int)front->index.base(), (uint)group.size(), start, end,
-						(int)front->IsPrimaryVehicle(), n_flipped,
-						had_real_artic ? 1 : 0,
-						(int)old_head->index.base(), (int)new_head->index.base(),
-						before == nullptr ? 1 : 0);
 			}
 
 			front->ConsistChanged(CCF_ARRANGE);
@@ -6509,7 +5845,6 @@ CommandCost CmdReverseTrainDirection(DoCommandFlags flags, VehicleID veh_id, boo
 			if (_settings_game.vehicle.train_acceleration_model != AccelerationModel::Original && v->cur_speed != 0) {
 				v->flags.Flip(VehicleRailFlag::Reversing);
 			} else {
-				R3RSpdCtx(v, "turn-around", v->cur_speed, 0);
 				v->cur_speed = 0;
 				v->SetLastSpeed();
 				HideFillingPercent(&v->fill_percent_te_id);
@@ -6795,30 +6130,6 @@ static Train *R3RGetControlSegment(Train *chain)
  * @param chain 链头（可为 nullptr）。
  * @param tag 提交点名（couple / decouple-v / decouple-u / depot-edit）。
  */
-static void R3RCheckControlSegment(Train *chain, const char *tag)
-{
-	if (chain == nullptr) return;
-	const std::vector<Train *> segs = R3RGetSegmentHeads(chain);
-	if (segs.size() < 2) return;
-
-	Train *const ctrl = R3RGetControlSegment(chain);
-	if (ctrl == nullptr) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	/* 第 159 轮 / q-0=贰乙: 控制段 = 命令所有者段（= r3r_priority 最小者），链头
-	 * 退化为它的**承载者**。甲口径那条"ctrl(链头所在段) vs owner(优先级最小者)"
-	 * 的对比在乙口径下恒等（ctrl 就是 owner），故这里只报告实际形态：
-	 * head_pri 最小 ⇒ 链头自己就是控制段（退化形态，borrowed 应为 0）；
-	 * borrowed=1 表示链头手上的表是借来的。多段链只在提交点各打一行。 */
-	fprintf(dbg, "INVAR-CTRL tag=%s head=%d nseg=%u ctrl=%d ctrl_pri=%u head_pri=%u borrowed=%d\n",
-			tag, (int)chain->index.base(), (unsigned)segs.size(),
-			(int)ctrl->index.base(), (unsigned)ctrl->r3r_priority,
-			(unsigned)chain->r3r_priority,
-			chain->r3r_orders_borrowed ? 1 : 0);
-	fclose(dbg);
-}
-
 /**
  * R3R (第 152 轮 / P3=B): is \a id currently held by a live car outside \a chain?
  *
@@ -6935,12 +6246,6 @@ static void R3RSyncSegmentIds(Train *chain, const char *tag)
 		}
 		if (!kept) R3RSegmentFree(old_ids[i]);
 	}
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "SEGID-SYNC tag=%s head=%d nseg=%u\n",
-			tag, (int)chain->index.base(), (unsigned)segs.size());
-	fclose(dbg);
 }
 
 /**
@@ -7025,24 +6330,12 @@ static void R3RResyncSegmentFronts(Train *chain, const char *tag)
 	if (!reported_once || fixed_total != reported_fixed) {
 		reported_once = true;
 		reported_fixed = fixed_total;
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "SEGFRONT-RESYNC-CHECK runs=%u fixed=%u\n",
-					(unsigned)checks, (unsigned)fixed_total);
-			fclose(dbg);
-		}
 	}
 
 	/* The same ID in two separate runs: report only (see the header comment). */
 	for (size_t i = 0; i < should_ids.size(); i++) {
 		for (size_t k = i + 1; k < should_ids.size(); k++) {
 			if (should_ids[i] != should_ids[k]) continue;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg == nullptr) return;
-			fprintf(dbg, "SEGFRONT-RESYNC-ANOM tag=%s head=%d seg=%u runs=%u\n",
-					tag, (int)chain->index.base(), (unsigned)should_ids[i],
-					(unsigned)should_ids.size());
-			fclose(dbg);
 			return;
 		}
 	}
@@ -7062,13 +6355,6 @@ static void R3RResyncSegmentFronts(Train *chain, const char *tag)
 		if (!w->IsSegmentFront()) { w->SetSegmentFront(); added++; }
 	}
 	fixed_total += (uint32_t)(added + dropped);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "SEGFRONT-RESYNC tag=%s head=%d nseg=%u added=%u dropped=%u\n",
-			tag, (int)chain->index.base(), (unsigned)(should.size() + 1),
-			(unsigned)added, (unsigned)dropped);
-	fclose(dbg);
 }
 
 /**
@@ -7132,11 +6418,7 @@ static void R3RBorrowControlTraits(Train *chain, const char *tag)
 	if (own_row->group_id != own_group_row) { own_row->group_id = own_group_row; changed = true; }
 	if (!own_name.empty() && !(own_row->name == own_name.c_str())) { own_row->name = own_name; changed = true; }
 
-	if (changed) {
-		R3RDbgWrite("CTRL-PARK tag=%s head=%d seg=%u unit=%u\n", tag,
-				(int)chain->index.base(), (unsigned)chain->r3r_segment_id,
-				(unsigned)own_row->unitnumber);
-	}
+	
 }
 
 /**
@@ -7209,14 +6491,6 @@ static void R3RSyncSegmentTraits(Train *chain, const char *tag)
 	if (!(traits->name == row->name.c_str())) { row->name = traits->name; changed = true; }
 
 	if (!changed) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "SEGTRAIT-SYNC tag=%s head=%d seg=%u unit=%u group=%d borrowed=%d ctrl=%d\n",
-			tag, (int)chain->index.base(), (unsigned)ctrl->r3r_segment_id,
-			(unsigned)traits->unitnumber, (int)ctrl_group.base(),
-			ctrl->r3r_orders_borrowed ? 1 : 0, (int)ctrl->index.base());
-	fclose(dbg);
 }
 
 /**
@@ -7276,13 +6550,6 @@ static void R3RRecoverSegmentTraits(Train *seg)
 	}
 
 	if (!moved) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "SEGTRAIT-RECOVER seg=%d unit=%u group=%d name=%d\n",
-			(int)seg->index.base(), (unsigned)seg->unitnumber_backup,
-			(int)seg->group_id_backup.base(), seg->name_backup.empty() ? 0 : 1);
-	fclose(dbg);
 }
 
 /**
@@ -7354,124 +6621,12 @@ static void R3RSyncHiddenSegmentTraits(Train *chain, const char *tag)
 		}
 
 		if (!changed) continue;
-
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg == nullptr) continue;
-		fprintf(dbg, "SEGTRAIT-SYNC-SEC tag=%s head=%d seg=%u unit=%u group=%d parkedname=%d\n",
-				tag, (int)chain->index.base(), (unsigned)seg->r3r_segment_id,
-				(unsigned)unit, (int)group.base(), have_parked_name ? 1 : 0);
-		fclose(dbg);
 	}
 }
 
 /* R3R (第 165 轮): the settle pass dumps the chain it just finished (segment IDs
  * and markers only become final there), so the geometry dumper — defined much
  * further down the file — must be declared before R3RSettleChainSegments(). */
-static void R3RDumpChainGeometry(const char *tag, const Train *head);
-
-/* R3R (第 170 轮, R170-B): the settle pass re-asserts the borrow layer (see the
- * body of R3RSettleChainSegments), so the live borrow — defined far below — has
- * to be declared here as well. */
-static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
-
-/**
- * R3R (第 165 轮 probe): is this chain worth a full post-settle geometry dump?
- *
- * Only multi-section or long chains can show the "section collapsed / cars
- * stacked" shapes this probe exists for; a single-section short train has
- * nothing to say. Keeps the log readable when a session couples a dozen trains.
- */
-static bool R3RSettleWorthDumping(const Train *chain)
-{
-	if (!R3RDbgOn()) return false;
-	int n = 0;
-	bool multi = false;
-	/* Literal bound: R3R_CHAIN_WALK_LIMIT is declared further down the file and
-	 * cannot be referenced from here. */
-	for (const Train *w = chain; w != nullptr && n < 512; w = w->Next(), n++) {
-		if (w != chain && w->IsSegmentFront()) multi = true;
-	}
-	return multi || n > 8;
-}
-
-/**
- * R3R (第 191 轮 probe, read-only): 把一条链里每个段的"号与名"在三个位置上摊平。
- *
- * 号/名有三个权威位置，读档族的三个症状（KI-293/294/295）全都出在"谁是权威"上：
- *
- *  - `live` = 段头车的活字段（#Vehicle::unitnumber / #Vehicle::name）。借用期它承载
- *    的是**控制段**那一套（第 159 轮 / q-0=贰乙），所以它本身不是本段的真身。
- *  - `bk`   = 同一辆车的停放副本（#Vehicle::unitnumber_backup / name_backup）。
- *    这一套才是**本段自己的**。
- *  - `row`  = 段行（#R3RSegmentRecord），第 152 轮定下的**正式宿主**，入 R3SG chunk。
- *
- * 判读口径（第 194 轮订正）：
- *  - "本段自己那一套" = 本段是承载者且未被借用时取 `live`，其余取 `bk`。
- *  - 健康态 = **每一段**的 `row == 本段自己那一套`；控制段同样如此 —— 它的行记的是
- *    它自己那一套，**不是**它的 `live`。
- *  - 借用态（`borrowed=1` 且控制段 != 链头）另加一条**跨车**不变式：
- *    链头（承载者）的 `live == 控制段的 bk`（链头手上那套正是命令所有者的）。
- *    此时控制段自己的 `live` 只是"上一次借入后剩下的残留"（现场常见 `u=0 n=""`），
- *    **故意不等于**它的 `row`，不能当坏账读。
- *  - 非借用态（控制段 == 链头）时 `live` 就是链头自己的，`bk` 应为空
- *    （`CTRL-UNBORROW` 已把它排空）；单段链不建行（`row none`）时界面直接读 `live`。
- *  - `bk n=""` 而 `row n!=""` ⇒ 停放副本丢了（KI-294 名称清空）。
- *  - 某段 `row n` 恰等于**另一段**的 `bk n` ⇒ 乱继承（KI-295）。
- *  - `row none/off` ⇒ 该段还没有自己的行（单段链是正常形态）。
- *  - 表头 `ctrl=` 的 `0` 有歧义：控制段是 0 号车、或压根没有控制段
- *    （`R3RGetControlSegment()` 返回 nullptr）都打 `0`；判定必须看下面每段的
- *    `ctrl=1` 落在哪一节 `front=` 上，不能只看表头。
- *
- * 提交点是封闭事件集（不是每帧），故无条件打；玩家 2026-10-01 的要求是
- * "每次列车进行 R3R 行为，就把有关段的编号和名称打印出来"。
- *
- * @param chain 链头；可为 nullptr。
- * @param tag   提交点名（couple / decouple-v / decouple-u / depot-edit / load / load-raw）。
- */
-static void R3RLogSegmentTraits(const Train *chain, const char *tag)
-{
-	if (!R3RDbgOn() || chain == nullptr) return;
-
-	/* R3RGetSegmentHeads()/R3RGetControlSegment() 收 Train*；本条只读，故此处转换。 */
-	Train *const head = const_cast<Train *>(chain);
-	const std::vector<Train *> segs = R3RGetSegmentHeads(head);
-	Train *const ctrl = R3RGetControlSegment(head);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-
-	fprintf(dbg, "SEGTR-SNAP tag=%s head=%u nseg=%u ctrl=%u borrowed=%d\n",
-			tag, (unsigned)chain->index.base(), (unsigned)segs.size(),
-			(ctrl != nullptr) ? (unsigned)ctrl->index.base() : 0u,
-			chain->r3r_orders_borrowed ? 1 : 0);
-
-	for (size_t i = 0; i < segs.size(); i++) {
-		const Train *const seg = segs[i];
-		const R3RSegmentRecord *const row = (seg->r3r_segment_id != R3R_SEGMENT_NONE)
-				? R3RSegmentGet(seg->r3r_segment_id) : nullptr;
-		fprintf(dbg, "SEGTR-SNAP   i=%u id=%u front=%u star=%d ctrl=%d"
-				" | live u=%u n=\"%s\" gid=%d"
-				" | bk u=%u n=\"%s\" gbk=%d"
-				" | row %s u=%u n=\"%s\" g=%d\n",
-				(unsigned)(i + 1),
-				(unsigned)((seg->r3r_segment_id != R3R_SEGMENT_NONE) ? seg->r3r_segment_id : 0),
-				(unsigned)seg->index.base(),
-				seg->IsSegmentFront() ? 1 : 0,
-				(seg == ctrl) ? 1 : 0,
-				(unsigned)seg->unitnumber,
-				seg->name.empty() ? "" : seg->name.c_str(),
-				(seg->group_id == GroupID::Invalid()) ? -1 : (int)seg->group_id.base(),
-				(unsigned)seg->unitnumber_backup,
-				seg->name_backup.empty() ? "" : seg->name_backup.c_str(),
-				(seg->group_id_backup == GroupID::Invalid()) ? -1 : (int)seg->group_id_backup.base(),
-				(row == nullptr) ? "none" : (row->in_use ? "use" : "off"),
-				(unsigned)((row != nullptr) ? row->unitnumber : 0),
-				(row != nullptr && !row->name.empty()) ? row->name.c_str() : "",
-				(row == nullptr || row->group_id == GroupID::Invalid()) ? -1 : (int)row->group_id.base());
-	}
-	fclose(dbg);
-}
-
 /**
  * Order list the segment owns itself, i.e. never the one it borrows while it
  * drives the control segment's schedule.
@@ -7561,13 +6716,9 @@ static bool R3RRefreshOrderBookmark(Train *v, const char *tag, bool only_unset =
 		if (r3r_cur != nullptr && r3r_cur->IsType(OT_WAIT_COUPLE)) return false;
 	}
 
-	const uint num = (uint)own->GetNumOrders();
 	if (v->orders_backup_real_index == INVALID_VEH_ORDER_ID) {
 		v->orders_backup_real_index = v->cur_real_order_index;
 		v->orders_backup_implicit_index = v->cur_implicit_order_index;
-		R3RDbgWrite("ORD-BORROW-PARK veh=%d bkr=%d bki=%d num=%u tag=%s\n",
-				(int)v->index.base(), (int)v->orders_backup_real_index,
-				(int)v->orders_backup_implicit_index, num, tag);
 		return true;
 	}
 	/* 第 384 轮（玩家拍板 D2）：only_unset 只剩"只补空"的兼容语义。所有调用点
@@ -7576,13 +6727,8 @@ static bool R3RRefreshOrderBookmark(Train *v, const char *tag, bool only_unset =
 	if (only_unset) return false;
 	if (v->orders_backup_real_index == v->cur_real_order_index &&
 			v->orders_backup_implicit_index == v->cur_implicit_order_index) return false;
-	const VehicleOrderID old_real = v->orders_backup_real_index;
-	const VehicleOrderID old_impl = v->orders_backup_implicit_index;
 	v->orders_backup_real_index = v->cur_real_order_index;
 	v->orders_backup_implicit_index = v->cur_implicit_order_index;
-	R3RDbgWrite("ORD-BORROW-REFRESH veh=%d bkr=%d->%d bki=%d->%d num=%u tag=%s\n",
-			(int)v->index.base(), (int)old_real, (int)v->orders_backup_real_index,
-			(int)old_impl, (int)v->orders_backup_implicit_index, num, tag);
 	return true;
 }
 
@@ -7614,11 +6760,7 @@ static void R3RBeginBorrow(Train *chain, OrderList *other, VehicleID owner, cons
 	 * 跟随指针 —— 调用者随后会把拥有权直搬。漏掉这一步会让 u 的进度在
 	 * DeleteVehicleOrders() 之后无从恢复。 */
 	if (other == nullptr) {
-		if (R3RParkOwnOrderProgress(chain)) {
-			R3RDbgWrite("ORD-BORROW-PARK veh=%d bkr=%d bki=%d tag=%s\n",
-					(int)chain->index.base(), (int)chain->orders_backup_real_index,
-					(int)chain->orders_backup_implicit_index, tag);
-		}
+		(void)(R3RParkOwnOrderProgress(chain));
 		return;
 	}
 	/* refresh 模式不做短路：R3RSyncDrivingOrders 每次切表都要刷新书签，
@@ -7627,12 +6769,8 @@ static void R3RBeginBorrow(Train *chain, OrderList *other, VehicleID owner, cons
 
 	if (refresh) {
 		R3RRefreshOrderBookmark(chain, tag);
-	} else if (R3RParkOwnOrderProgress(chain)) {
-		R3RDbgWrite("ORD-BORROW-PARK veh=%d bkr=%d bki=%d tag=%s\n",
-				(int)chain->index.base(), (int)chain->orders_backup_real_index,
-				(int)chain->orders_backup_implicit_index, tag);
 	}
-
+	(void)(R3RParkOwnOrderProgress(chain));
 	chain->r3r_follow_orders = other;
 	chain->r3r_follow_owner = owner;
 	chain->r3r_orders_borrowed = true;
@@ -7693,10 +6831,6 @@ static uint16_t R3RSkipCoupleAirRanges(Train *v)
 
 		const VehicleOrderID target = (VehicleOrderID)((end_idx + 1) % num);
 
-		R3RDbgWrite("COUPLE-AIR-SKIP veh=%d from=%u to=%u end=%u num=%u order=%u\n",
-				(int)v->index.base(), (unsigned)idx, (unsigned)target,
-				(unsigned)end_idx, (unsigned)num, (unsigned)v->current_order.GetType());
-
 		v->cur_real_order_index = target;
 		if (v->cur_implicit_order_index != INVALID_VEH_ORDER_ID &&
 				R3RIsCoupleAirOrder(orders, v->cur_implicit_order_index)) {
@@ -7748,7 +6882,7 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 {
 	/* R3R 探针（item 3）：提交点进出成对快照。本函数是"每次 R3R 行为"的收口处
 	 * （couple / decouple-v / decouple-u / depot-edit），最可疑的索引改写都在里面。 */
-	R3RWatchOrderIndex(chain, "settle-in", tag);
+	
 	/* R3R (KI-542, 第 379 轮；第 380 轮降级为"只补空、不覆盖")：本函数是所有提交点
 	 * 的收口，书签闸门就放这里，但**只允许补从没有过书签的车**。
 	 *
@@ -7781,10 +6915,7 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 	 * 把书签在一个 tick 内拉平，不需要本函数覆盖。 */
 	/* R3R (第 385 轮指纹探针)：这一行出现即证明运行的是"提交点只补空"版本的二进制；
 	 * 若日志里同 tag 后面仍出现 ORD-BORROW-REFRESH bkr=x->y，说明那条刷新不是本函数发的。 */
-	R3RDbgWrite("SETTLE-BKOU tag=%s head=%d bk=%d cur=%d\n", tag,
-			(chain != nullptr) ? (int)chain->index.base() : -1,
-			(chain != nullptr) ? (int)chain->orders_backup_real_index : -1,
-			(chain != nullptr) ? (int)chain->cur_real_order_index : -1);
+	
 	R3RRefreshOrderBookmarks(chain, nullptr, tag, /*only_unset=*/true);
 	R3RSyncSegmentIds(chain, tag);
 	R3RResyncSegmentFronts(chain, tag);
@@ -7820,14 +6951,7 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 	if (chain != nullptr) {
 		Train *const ctrl = R3RGetControlSegment(chain);
 		if (ctrl != nullptr && ctrl != chain) {
-			const UnitID unit_before = ctrl->unitnumber_backup;
-			const bool name_before = !ctrl->name_backup.empty();
 			R3RRecoverSegmentTraits(ctrl);
-			if (ctrl->unitnumber_backup != unit_before || (!name_before && !ctrl->name_backup.empty())) {
-				R3RDbgWrite("CTRL-RECOVER %s head=%d ctrl=%d unit=%u name=%d\n", tag,
-						(int)chain->index.base(), (int)ctrl->index.base(),
-						(unsigned)ctrl->unitnumber_backup, ctrl->name_backup.empty() ? 0 : 1);
-			}
 		}
 	}
 	/* R3R (第 170 轮 / R170-B): 提交点先补一次"活字段借用"，再收行。第 159 轮
@@ -7843,37 +6967,18 @@ static void R3RSettleChainSegments(Train *chain, const char *tag)
 	R3RBorrowControlTraits(chain, tag);
 	R3RSyncSegmentTraits(chain, tag);
 	R3RSyncHiddenSegmentTraits(chain, tag);
-	R3RCheckControlSegment(chain, tag);
+	
 	/* R3R (KI-541, 第 376 轮): 提交点也是空气区间的一道闸门。控制权刚回到某一段
 	 * 手上时，索引可能正落在区间里（玩家手写的占位命令），立刻跳过，界面与下一
 	 * tick 的执行都从 COUPLE_END 之后第一条命令开始。借用态（实际跑的是控制段
 	 * 的表）由 GetEffectiveOrders() 自动带入正确的表，不需要额外判断。 */
 	R3RSkipCoupleAirRanges(chain);
 
-	/* R3R (第 165 轮 probe, read-only): 上面这些步骤写完，段 ID / ★⊗ 标记 / 控制段
-	 * 才第一次是终值 —— 所有在此之前的 dump（GEO respace-after 等）打出来的
-	 * segid 都是 0（现场 5176 行），"这一段应该是一段还是六段"没法从日志判读。
-	 * 所以 settle 之后无条件补一条完整几何 —— 但要挡住两处噪声：(1) 读档会对
-	 * **每一列车** settle 一次（tag="load"），(2) 单段短链是绝大多数。只有
-	 * "多段链或长链"才打，一列车一行成本可忽略。 */
-	if (chain != nullptr && std::string_view(tag) != "load" && R3RSettleWorthDumping(chain)) {
-		/* The commit points are a closed set (see the @param above), so the label
-		 * is spelled out instead of building it with snprintf/seprintf. */
-		const std::string_view t(tag);
-		const char *label = (t == "couple")     ? "settle-couple" :
-		                    (t == "decouple-v") ? "settle-decouple-v" :
-		                    (t == "decouple-u") ? "settle-decouple-u" :
-		                    (t == "clone")      ? "settle-clone" :
-		                    (t == "depot-edit") ? "settle-depot-edit" : "settle-other";
-		R3RDumpChainGeometry(label, chain);
-	}
-
-	/* R3R (第 191 轮 probe, read-only): 玩家 2026-10-01 要求"每次列车进行 R3R 行为，
+		/* R3R (第 191 轮 probe, read-only): 玩家 2026-10-01 要求"每次列车进行 R3R 行为，
 	 * 就把有关段的编号和名称打印出来"。提交点是封闭事件集（couple / decouple-v /
 	 * decouple-u / depot-edit / load），不是每帧，故无条件打：SEGTR-SNAP 之后才是
 	 * 该次行为终值（上面的步骤全跑完），GEO 只对多段/长链打，本行对每次行为都给。 */
-	R3RLogSegmentTraits(chain, tag);
-	R3RWatchOrderIndex(chain, "settle-out", tag);
+	
 }
 
 /**
@@ -7928,20 +7033,13 @@ static void R3RPushProgressToOwner(Train *chain)
 			owner->cur_implicit_order_index == chain->cur_implicit_order_index) {
 		return;
 	}
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "ORD-PUSH head=%d owner=%d real=%d->%d\n",
-			(int)chain->index.base(), (int)owner->index.base(),
-			(int)owner->cur_real_order_index, (int)chain->cur_real_order_index);
-		fclose(dbg);
-	}
 	owner->cur_real_order_index = chain->cur_real_order_index;
 	owner->cur_implicit_order_index = chain->cur_implicit_order_index;
 	owner->cur_timetable_order_index = chain->cur_timetable_order_index;
 	/* R3R 探针（item 3）：这是唯一一处"把链头位置写回所有者"的地方，也是
 	 * KI-04 借用层最常见的"索引回灌"来源（冻结值被喂给下一个接手者）。 */
-	R3RWatchOrderIndex(chain, "ord-push");
-	R3RWatchOrderIndex(owner, "ord-push-owner");
+	
+	
 }
 
 /**
@@ -8060,19 +7158,8 @@ static void R3RReelectControlSegment(Train *chain, const char *tag)
 	Train *const holder = R3ROrderListHolderInChain(chain, ol);
 	if (holder == nullptr || holder == cur) return; /* 号码牌已指对，或表无主 */
 
-	const uint16_t old_pri = cur->r3r_priority;
 	holder->r3r_priority = 0;
 	R3RRenumberPriorities(chain);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "CTRL-REELECT tag=%s head=%d nseg=%u old=%d old_pri=%u new=%d new_pri=%u borrowed=%d\n",
-				tag, (int)chain->index.base(), (unsigned)segs.size(),
-				(int)cur->index.base(), (unsigned)old_pri,
-				(int)holder->index.base(), (unsigned)holder->r3r_priority,
-				(int)(chain->r3r_orders_borrowed ? 1 : 0));
-		fclose(dbg);
-	}
 }
 
 static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
@@ -8098,8 +7185,7 @@ static void R3RBorrowControlTraitsLive(Train *chain, const char *tag);
  * state at all, and there the relation is derived from the order pointers.
  *
  * @param chain Head of the consist.
- */
-void R3RRebuildCouplePriorities(Train *chain)
+ */void R3RRebuildCouplePriorities(Train *chain)
 {
 	if (chain == nullptr) return;
 
@@ -8115,7 +7201,7 @@ void R3RRebuildCouplePriorities(Train *chain)
 	 * "读档过程中已被改" 与 "读档之后（tick 之间）才被改" 分开：若
 	 * load-rebuild 就已经是 1，则写者在读档阶段；若这里是 0 而随后第一个
 	 * tick-in 才是 1，则写者在"读档结束到第一个 tick 之间"。 */
-	R3RWatchOrderIndex(chain, "load-rebuild");
+	
 
 	/* R3R (第 180 轮 / 选项 C): migrate a legacy "genuine articulated + ★/⊗"
 	 * consist before anything else looks at it. This runs at load only (this
@@ -8137,7 +7223,6 @@ void R3RRebuildCouplePriorities(Train *chain)
 	 * 都还是存档里读回来的原样（本函数随后才 R3RSettleChainSegments 重收），与
 	 * tag="load" 的那一条配对使用即可看出"读档过程本身有没有改坏号/名"：
 	 * load-raw 是文件里的样子，load 是重建后的样子。 */
-	R3RLogSegmentTraits(chain, "load-raw");
 
 	/* R3R (KI-169a): a loaded head which parked its own schedule is borrowing
 	 * whatever its orders pointer says. Dropping the park here is what made the
@@ -8336,8 +7421,6 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		 * 书签缺失或已越界（池表被删短/重建）则落 0 —— 宁可从头跑，不能留越界值。 */
 		{
 			const uint num = pool->GetNumOrders();
-			const VehicleOrderID real_old = chain->cur_real_order_index;
-			const VehicleOrderID impl_old = chain->cur_implicit_order_index;
 			VehicleOrderID real = chain->orders_backup_real_index;
 			VehicleOrderID impl = chain->orders_backup_implicit_index;
 			if (num == 0 || real == INVALID_VEH_ORDER_ID || real >= num) real = 0;
@@ -8345,18 +7428,11 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 			chain->cur_real_order_index = real;
 			chain->cur_implicit_order_index = impl;
 			chain->cur_timetable_order_index = real;
-			R3RDbgWrite("ORD-RETURN-TO-POOL-CLAMP veh=%d num=%u real=%d->%d impl=%d->%d bk=%d/%d\n",
-					(int)chain->index.base(), (unsigned)num,
-					(int)real_old, (int)real, (int)impl_old, (int)impl,
-					(int)chain->orders_backup_real_index, (int)chain->orders_backup_implicit_index);
 			chain->DeleteUnreachedImplicitOrders();
 		}
 		/* 驱动表换了（耦合方表 → 池表），订单窗口/车辆列表得跟着刷新 ——
 		 * 与下面常规归还路径同一口径（本函数末尾的 InvalidateVehicleOrder）。 */
 		InvalidateVehicleOrder(chain, 0);
-		R3RDbgWrite("ORD-RETURN-TO-POOL veh=%d pool=%u real=%d impl=%d\n",
-				(int)chain->index.base(), (unsigned)pool->index.base(),
-				(int)chain->cur_real_order_index, (int)chain->cur_implicit_order_index);
 		return true;
 	}
 	OrderList *const borrowed = was_follower ? chain->r3r_follow_orders : chain->orders;
@@ -8380,7 +7456,6 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		chain->RemoveFromShared();
 		chain->orders = nullptr;
 		left_shared_ring = true;
-		R3RDbgWrite("ORD-RETURN-SHARED veh=%d\n", (int)chain->index.base());
 	}
 	/* The parked schedule only exists when the borrow was started in this
 	 * session. After a load it is gone (see R3RRebuildCouplePriorities);
@@ -8420,19 +7495,9 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		 * 出是谁干的。七个借用入口现在都已按语义分类停位（首次借用停活索引、
 		 * 继承跟随保持 INVALID、读档只修判据、新建空表写 0），所以 num > 0 时
 		 * 读到 INVALID 属于异常，必须当场点名。 */
-		if (num > 0 && (own_real == INVALID_VEH_ORDER_ID || own_impl == INVALID_VEH_ORDER_ID)) {
-			R3RDbgWrite("ORD-RETURN-NOBK veh=%d num=%u real=%d impl=%d orphan=%d\n",
-					(int)chain->index.base(), (unsigned)num,
-					(int)own_real, (int)own_impl, orphan ? 1 : 0);
-		}
+		
 		if (num == 0 || own_real == INVALID_VEH_ORDER_ID || own_real >= num) own_real = 0;
 		if (num == 0 || own_impl == INVALID_VEH_ORDER_ID || own_impl >= num) own_impl = 0;
-		R3RDbgWrite("ORD-RETURN-OWN veh=%d num=%u real=%d->%d impl=%d->%d bk=%d/%d orphan=%d\n",
-				(int)chain->index.base(), (unsigned)num,
-				(int)chain->cur_real_order_index, (int)own_real,
-				(int)chain->cur_implicit_order_index, (int)own_impl,
-				(int)chain->orders_backup_real_index, (int)chain->orders_backup_implicit_index,
-				orphan ? 1 : 0);
 		chain->cur_real_order_index = own_real;
 		chain->cur_implicit_order_index = own_impl;
 		chain->cur_timetable_order_index = own_real;
@@ -8451,27 +7516,21 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 		 * 于是越界值一路带到 ProcessOrders 的
 		 * "cur_implicit_order_index < GetNumOrders()" 断言（崩溃现场 veh=3）。
 		 * 修法与上面 own 分支同构：按恢复出来那张表的实际条数归一化。 */
-		R3RWatchOrderIndex(chain, "backup-restore-in");
+		
 		chain->orders = chain->orders_backup;
 		{
 			const uint num = chain->orders->GetNumOrders();
 			VehicleOrderID real = chain->orders_backup_real_index;
 			VehicleOrderID impl = chain->orders_backup_implicit_index;
-			const VehicleOrderID real_old = real;
-			const VehicleOrderID impl_old = impl;
 			if (num == 0 || real == INVALID_VEH_ORDER_ID || real >= num) real = 0;
 			if (num == 0 || impl == INVALID_VEH_ORDER_ID || impl >= num) impl = 0;
-			if (real != real_old || impl != impl_old) {
-				R3RDbgWrite("ORD-RETURN-BK-CLAMP veh=%d num=%u real=%d->%d impl=%d->%d\n",
-						(int)chain->index.base(), (unsigned)num,
-						(int)real_old, (int)real, (int)impl_old, (int)impl);
-			}
+			
 			chain->cur_real_order_index = real;
 			chain->cur_implicit_order_index = impl;
 			chain->cur_timetable_order_index = real;
 		}
 		chain->DeleteUnreachedImplicitOrders();
-		R3RWatchOrderIndex(chain, "backup-restore-out");
+		
 	} else if (orphan) {
 		chain->orders = nullptr;
 	}
@@ -8480,7 +7539,7 @@ static bool R3RReturnBorrowedOrders(Train *chain, bool orphan)
 	chain->orders_backup_implicit_index = keep_bk_impl;
 	chain->r3r_orders_borrowed = false;
 	InvalidateVehicleOrder(chain, 0);
-	R3RCheckTtSync(chain, orphan ? "sync-return-orphan" : "sync-return-borrow");
+	
 	return true;
 }
 
@@ -8549,9 +7608,7 @@ static void TrainDispatchHandler(Train *v)
 	 * 表）时不再接管第二张池表 —— 否则 follow_orders 会被二次覆盖，挂起层与归还层
 	 * 就对不上了。等这一轮跑完、池表重新接回来再说。 */
 	if (v->r3r_pool_orders != nullptr) {
-		if (_r3r_dispatch_no_slot.insert(v->index.base()).second) {
-			R3RDbgWrite("DISP-POOL-BUSY veh=%d st=%d\n", (int)v->index.base(), (int)st_id.base());
-		}
+		(void)(_r3r_dispatch_no_slot.insert(v->index.base()).second);
 		return;
 	}
 
@@ -8580,11 +7637,7 @@ static void TrainDispatchHandler(Train *v)
 	if (picked < 0) {
 		/* 没得领：坑位已满，或本车性能不满足所有条目的分配规则（第 451 轮）。
 		 * 两种都按「原地等」处理。节流到每列车一次，避免每 tick 刷屏。 */
-		if (_r3r_dispatch_no_slot.insert(v->index.base()).second) {
-			R3RDbgWrite("DISP-POOL-WAIT veh=%d st=%d yard=%u count=%u\n",
-					(int)v->index.base(), (int)st_id.base(), (unsigned)yard,
-					(unsigned)st->R3RDispatchPoolCount(yard));
-		}
+		(void)(_r3r_dispatch_no_slot.insert(v->index.base()).second);
 		/* R3R (第 455 轮, KI-651): 池里一条调度命令都没有时，玩家看到的只是列车
 		 * 静默地原地反复尝试领取，毫无提示。这里给一次明确的弹框。
 		 * 玩家拍板 B-455-4：每列车只弹一次（同一列车之后不再刷屏）；
@@ -8594,18 +7647,10 @@ static void TrainDispatchHandler(Train *v)
 				_r3r_dispatch_empty_notified.insert(v->index.base()).second) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_R3R_DISPATCH_NO_SCHEDULE, v->index),
 					{}, WarningLevel::Warning);
-			R3RDbgWrite("DISP-POOL-EMPTY-NOTIFY veh=%d st=%d yard=%u\n",
-					(int)v->index.base(), (int)st_id.base(), (unsigned)yard);
 		}
 		return;
 	}
 	_r3r_dispatch_no_slot.erase(v->index.base());
-	/* 第 451 轮探针：领到哪一条、以及规则求值用的这四个实测值，
-	 * 便于复测时核对「为什么这列车领到了/没领到这张表」。 */
-	R3RDbgWrite("DISP-POOL-PICK veh=%d st=%d yard=%u idx=%d sched=%u spd=%u pow=%u te=%u rel=%u\n",
-			(int)v->index.base(), (int)st_id.base(), (unsigned)yard, picked, (unsigned)schedule,
-			(unsigned)claim_stats.max_speed, (unsigned)claim_stats.power,
-			(unsigned)claim_stats.max_te, (unsigned)claim_stats.reliability);
 
 	/* 表此刻必须真的可用（Pick 已校验，这里取指针）。 */
 	OrderList *const pool_orders = OrderList::GetIfValid(OrderListID(schedule));
@@ -8652,11 +7697,6 @@ static void TrainDispatchHandler(Train *v)
 	 * (the train keeps sitting there with the pool schedule already borrowed). */
 	const bool was_stopped = v->vehstatus.Test(VehState::Stopped);
 	if (was_stopped) v->vehstatus.Reset(VehState::Stopped);
-
-	R3RDbgWrite("DISP-POOL-BIND veh=%d host=%d st=%d yard=%u orders=%u bk=%d/%d unstop=%d\n",
-			(int)v->index.base(), (int)host.base(), (int)st_id.base(), (unsigned)yard,
-			(unsigned)pool_orders->GetNumOrders(), (int)v->orders_backup_real_index,
-			(int)v->orders_backup_implicit_index, (int)was_stopped);
 }
 
 /**
@@ -8705,10 +7745,6 @@ bool R3RReturnDispatchPool(Vehicle *veh)
 			if (st->R3RDispatchPoolRelease(pool_schedule)) break;
 		}
 	}
-
-	R3RDbgWrite("DISP-POOL-RETURN veh=%d host=%d num=%u real=%d tt=%d\n",
-			(int)v->index.base(), (int)host.base(), (unsigned)num,
-			(int)v->cur_real_order_index, (int)v->cur_timetable_order_index);
 	return true;
 }
 
@@ -8743,7 +7779,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	/* R3R (第 206 轮探针, 只读): 借用层的入口/出口。这是"没有任何提交点却静默改索引"
 	 * 的头号嫌疑：它专门把 owner 的冻结索引回灌给链头（见 KI-04 / KI-215b），
 	 * 而且读档 / 车库编辑 / 解挂三条边都会经过它。 */
-	R3RWatchOrderIndex(chain, "syncdriving-in", inherit_progress ? "inherit" : "keep");
+	
 
 	if (owner == chain) {
 		/* Head is the command owner: give the borrow back.
@@ -8754,7 +7790,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 		 * 段首 ⇒ 列车按第一条命令行驶（玩家实报：准备撞车）。
 		 * 在把该函数的落 0 分支改成"无书签就不动索引"之前，禁止扩大它的调用面。 */
 		R3RReturnBorrowedOrders(chain, false);
-		R3RWatchOrderIndex(chain, "syncdriving-out-owner");
+		
 		return;
 	}
 
@@ -8778,8 +7814,6 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 		OrderList *const driven = s->GetEffectiveOrders();
 		if (!s->r3r_orders_borrowed || driven == nullptr) continue;
 		if (R3ROrderListOwnedInChain(chain, driven)) continue;
-		R3RDbgWrite("ORD-RETURN-ORPHAN veh=%d head=%d owner=%d\n",
-				(int)s->index.base(), (int)chain->index.base(), (int)owner->index.base());
 		R3RReturnBorrowedOrders(s, true);
 	}
 
@@ -8798,7 +7832,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 		owner_implicit = owner->orders_backup_implicit_index;
 	}
 	if (owner_orders == nullptr) {
-		R3RWatchOrderIndex(chain, "syncdriving-out-nolist");
+		
 		return;  /* Nothing to drive yet. */
 	}
 	/* Parked without a recorded position: adopting it would corrupt the chain's
@@ -8811,16 +7845,9 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	 * 与 R3RReturnBorrowedOrders() 的两处 clamp 同构。 */
 	{
 		const uint owner_num = owner_orders->GetNumOrders();
-		const VehicleOrderID owner_real_old = owner_real;
-		const VehicleOrderID owner_impl_old = owner_implicit;
 		if (owner_num == 0 || owner_real == INVALID_VEH_ORDER_ID || owner_real >= owner_num) owner_real = 0;
 		if (owner_num == 0 || owner_implicit == INVALID_VEH_ORDER_ID || owner_implicit >= owner_num) owner_implicit = 0;
-		if (owner_real != owner_real_old || owner_implicit != owner_impl_old) {
-			R3RDbgWrite("ORD-SYNC-CLAMP veh=%d owner=%d num=%u real=%d->%d impl=%d->%d inherit=%d\n",
-					(int)chain->index.base(), (int)owner->index.base(), (unsigned)owner_num,
-					(int)owner_real_old, (int)owner_real, (int)owner_impl_old, (int)owner_implicit,
-					inherit_progress ? 1 : 0);
-		}
+		
 	}
 
 	if (chain->GetEffectiveOrders() == owner_orders) {
@@ -8832,7 +7859,7 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 			 * otherwise UpdateVehicleTimetable asserts on the next station stop. */
 			chain->cur_timetable_order_index = chain->cur_real_order_index;
 		}
-		R3RWatchOrderIndex(chain, "syncdriving-out-samelist");
+		
 		return;
 	}
 
@@ -8869,8 +7896,8 @@ static void R3RSyncDrivingOrders(Train *chain, bool inherit_progress)
 	chain->cur_timetable_order_index = chain->cur_real_order_index;
 	chain->DeleteUnreachedImplicitOrders();
 	InvalidateVehicleOrder(chain, 0);
-	R3RCheckTtSync(chain, "sync-borrow");
-	R3RWatchOrderIndex(chain, "syncdriving-out-adopted");
+	
+	
 }
 
 /**
@@ -8970,8 +7997,6 @@ static void R3RBorrowControlTraitsLive(Train *chain, const char *tag)
 			 * 绝不能"归还"——那会把这一段真正的分组冲成未分组。 */
 			if (!R3RIsParkedGroupUsable(chain->group_id_backup)) {
 				chain->group_id_backup = GroupID::Invalid();
-				R3RDbgWrite("GRP-DROP-DEFAULT tag=ctrl-unborrow veh=%d live=%u\n",
-						(int)chain->index.base(), (unsigned)chain->group_id.base());
 			} else {
 				const bool group_differs = chain->group_id != chain->group_id_backup;
 				R3RRestoreTrainGroupID(chain);
@@ -8979,13 +8004,7 @@ static void R3RBorrowControlTraitsLive(Train *chain, const char *tag)
 			}
 		}
 
-		if (unborrowed) {
-			R3RDbgWrite("CTRL-UNBORROW %s head=%d unit=%u own_bk=%u hasname=%d own_name=%d own_g=%d\n", tag,
-					(int)chain->index.base(), (unsigned)chain->unitnumber,
-					(unsigned)chain->unitnumber_backup, chain->name.empty() ? 0 : 1,
-					chain->name_backup.empty() ? 0 : 1,
-					(chain->group_id == GroupID::Invalid()) ? -1 : (int)chain->group_id.base());
-		}
+		
 		return;
 	}
 
@@ -9035,12 +8054,7 @@ static void R3RBorrowControlTraitsLive(Train *chain, const char *tag)
 		}
 	}
 
-	if (changed) {
-		R3RDbgWrite("DEPOT-XFER-ID %s head=%d ctrl=%d unit=%u own_bk=%u hasname=%d own_name=%d\n", tag,
-				(int)chain->index.base(), (int)ctrl->index.base(), (unsigned)chain->unitnumber,
-				(unsigned)chain->unitnumber_backup, chain->name.empty() ? 0 : 1,
-				chain->name_backup.empty() ? 0 : 1);
-	}
+	
 }
 
 /**
@@ -9066,7 +8080,7 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 
 	/* R3R 探针（item 3）：车库拖动提交点的入口快照。拖动是"读档后第一 tick 索引
 	 * 就已经是 1"的头号嫌疑：它整段跑在 tick 之外的命令执行期。 */
-	R3RWatchOrderIndex(chain, "depot-edit-in");
+	
 
 	R3RRenumberPriorities(chain);
 	/* R3R (第 196 轮 / 缺口 A): 压实老次序之后先重发号码牌 —— 车库拖动可能把持表
@@ -9118,13 +8132,13 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 			/* R3R (第 297 轮 / KI-472 探针, 只读): 第二条备份还原路径（车库拖动/
 			 * 解耦后取回"本车自己的"那份排程）。与 backup-restore-* 同族，
 			 * 同样是无界校验的直接赋值。 */
-			R3RWatchOrderIndex(chain, "backup-pickup-in");
+			
 			chain->orders = chain->orders_backup;
 			chain->cur_real_order_index = (chain->orders_backup_real_index != INVALID_VEH_ORDER_ID) ? chain->orders_backup_real_index : 0;
 			chain->cur_implicit_order_index = (chain->orders_backup_implicit_index != INVALID_VEH_ORDER_ID) ? chain->orders_backup_implicit_index : 0;
 			chain->cur_timetable_order_index = chain->cur_real_order_index;
 			chain->DeleteUnreachedImplicitOrders();
-			R3RWatchOrderIndex(chain, "backup-pickup-out");
+			
 			chain->orders_backup = nullptr;
 			chain->orders_backup_real_index = INVALID_VEH_ORDER_ID;
 			chain->orders_backup_implicit_index = INVALID_VEH_ORDER_ID;
@@ -9211,7 +8225,7 @@ static void R3RSyncChainAfterDepotEdit(Train *chain)
 	 * 拖动会拆链/并链，是"链头段与命令所有者分离"的第三个主现场。 */
 	R3RSettleChainSegments(chain, "depot-edit");
 	/* R3R 探针（item 3）：车库拖动提交点出口快照，与 depot-edit-in 成对。 */
-	R3RWatchOrderIndex(chain, "depot-edit-out");
+	
 }
 
 /**
@@ -9275,8 +8289,6 @@ static void R3RNormaliseChainGroups(Train *head)
 			/* R3R (第 293 轮 / KI-464): DEFAULT_GROUP 副本不是"真分组"（它只表示这一段本来
 			 * 就没有分组），归还它会把玩家后来给这一段设的分组冲掉 —— 丢弃副本、保留段头活值。 */
 			if (parked != GroupID::Invalid() && !R3RIsParkedGroupUsable(parked)) {
-				R3RDbgWrite("GRP-DROP-DEFAULT head=%d veh=%d bk=%u live=%u\n",
-						(int)front->index.base(), (int)t->index.base(), (uint)parked.base(), (uint)t->group_id.base());
 				t->group_id_backup = GroupID::Invalid();
 				parked = GroupID::Invalid();
 			}
@@ -9286,8 +8298,6 @@ static void R3RNormaliseChainGroups(Train *head)
 				const uint n = R3RSetSegmentGroupID(t, parked);
 				t->group_id_backup = GroupID::Invalid();
 				if (n != 0) changed_segs++;
-				R3RDbgWrite("GRP-RESTORE-SEG head=%d veh=%d group=%u n=%u\n",
-						(int)front->index.base(), (int)t->index.base(), (uint)parked.base(), n);
 			} else {
 				/* 段内各节本应同组；旧版本（第 292 轮之前）留下的存档可能被整链推平过，
 				 * 这里把本段补齐到段头自己的分组（只在本段范围内，不碰别的段）。
@@ -9299,9 +8309,7 @@ static void R3RNormaliseChainGroups(Train *head)
 		Vehicle *next = t->Next();
 		t = (next != nullptr) ? Train::From(next) : nullptr;
 	}
-	if (changed_segs != 0) {
-		R3RDbgWrite("GRP-NORM head=%d nseg=%u\n", (int)front->index.base(), changed_segs);
-	}
+	
 
 	/* 挂接分组（第 433 轮 / KI-627，玩家口径：**分组属于段**）：这里**不再**做全链并集广播。
 	 * 第 159 轮 / q-2=肆 曾是「取全链段头掩码的并集（OR）再广播回每个段头」，于是段 A(1+2) 与
@@ -9318,185 +8326,6 @@ static void R3RNormaliseChainGroups(Train *head)
 		Vehicle *next = t->Next();
 		t = (next != nullptr) ? Train::From(next) : nullptr;
 	}
-	R3RDbgWrite("CGRP-NORM-KEEP head=%d nseg=%u union=%llu\n", (int)front->index.base(), nseg,
-			(unsigned long long)union_mask);
-}
-
-/* --- KI-14 (1): edge-triggered debug output -------------------------------
- * The probes below (FOLDCHK / FOLDCHK-DIR, RESERVECONSIST, SKIP-STOPPED) all
- * sit on code that runs *every tick* while nothing changes: the fold-fix retry
- * loop (KI-06) re-runs up to three fold checks per tick, and a consist parked
- * on a platform re-reserves its tracks every tick (Train::ReserveTrackUnderConsist
- * is called from the R3R platform-waiter gate). Measured on net7probe.sav:
- * 28 838 lines / 2.1 MB of R3R_debug.log in 38 s, every line its own
- * fopen/fprintf/fclose. R3RDbgEdge() lets a call site emit its line only when
- * that probe's state is seen for the first time in the current window or when
- * it actually changes; repeats are counted and summarised once per window in
- * R3R_perf.log (dbgEdge / dbgEdgeSkip), so the flood disappears without losing
- * the diagnostic content. */
-enum R3RDbgEdgeTag : uint32_t {
-	R3REDGE_FOLDCHK = 0,
-	R3REDGE_FOLDCHK_DIR,
-	R3REDGE_RESERVECONSIST,
-	R3REDGE_SKIPSTOPPED,
-	R3REDGE_TTB,
-	R3REDGE_COUPLEFAIL, ///< TrainCoupleHandler: no coupling target found
-	R3REDGE_CPLS0,      ///< TrainLocoHandler: stopped-coupler check
-	R3REDGE_COUPLEGATE, ///< R3RCanCoupleNow: a candidate consist was rejected by the couple gate
-	R3REDGE_CPLGEO,      ///< GetCouplePosition: exact end-to-end hit (nominal geometry, no overlap)
-	R3REDGE_CPLHIT,      ///< CheckTrainCollision: touch/overlap test fired the couple (min_diff has -1)
-	R3REDGE_CPLGEOCOMMIT, ///< KI-106 fix 1: an exact hit was made while ROLLING (+ whether the merge committed)
-	R3REDGE_VEHTD,       ///< KI-108: GetVehicleTrackdir() had to coerce a direction/track mismatch
-	R3REDGE_NOABSORBSEG, ///< KI-144: a segment refused to absorb the free wagons standing in the depot
-	R3REDGE_NDHSEGKEEP,  ///< KI-145: a dual head inside a segment was kept adjacent to its partner
-	R3REDGE_KI149SEAM,   ///< KI-149: a decoupled part (WAIT_COUPLE) was found touching this train
-	R3REDGE_CPLPAIR,      ///< KI-182: a locomotive locked onto a waiting consist (the pair flag was set)
-	R3REDGE_CPLPAIRSTEAL, ///< KI-182: an *earlier* starter took a consist away from a later one
-	R3REDGE_OWNERMOVE,    ///< KI-187: a segment head handed its schedule/priority to the new head
-	R3REDGE_TRP,          ///< KI-199: a TryPathReserveWithResultFlags() attempt (result + order/destination context)
-	R3REDGE_SEAMFREE,     ///< KI-240: a touch/overlap on a decouple seam was released instead of crashing
-	R3REDGE_DECOUPLETRY,  ///< KI-215: TryTrainDecouple outcome (a DECOUPLE that looks like it did nothing)
-	R3REDGE_FOLDOVR,      ///< KI-265: the tight-splice direction OVERRIDE was itself overruled (fold verdict kept)
-	R3REDGE_CPLSUM,       ///< KI-265: the geometry summary written at *every* couple commit point
-	R3REDGE_TPRBLK,       ///< KI-330 (U-1): FollowTrainReservation() reported the consist as blocked by another train
-	R3REDGE_CPLOFFDEST,   ///< KI-330 (U-2): a GOTO_COUPLE loco with no candidate is *off* its order destination
-	R3REDGE_TPRWALK,      ///< KI-330 (U-1b): the block test did not fire -- which exit of the reservation core is taken
-	R3REDGE_TPREXEMPT,    ///< KI-330: the block test was waived at a decouple seam (same tile, standstill)
-	R3REDGE_TPRDIRBLK,    ///< KI-523: the same-tile seam waiver was withdrawn -- the other half lies ahead
-	R3REDGE_DUALHEAD,     ///< KI-334: a dual head pair's orientation/adjacency snapshot (flip/respace)
-	R3REDGE_DEPOTBLK,     ///< KI-336: the depot GOTO_COUPLE block's own verdict (the silent branch)
-	R3REDGE_CPLDEPOTSKIP, ///< KI-341: the depot touch-as-couple gate was skipped (moving chain not fully in depot)
-	R3REDGE_SPDDROP,      ///< KI-348: a train's cur_speed fell to zero (which commit point stopped it)
-	R3REDGE_LOCOMOVE,     ///< KI-348: a GOTO_COUPLE loco entered the *movement* branch (TrainController runs)
-	R3REDGE_REDSIG,       ///< KI-349: a train hit a red signal in TrainController (who owns the block behind it)
-	R3REDGE_WALKLOOP,     ///< KI-371: ExtendTrainReservation() walked a closed loop (its old one-lap bound is gone)
-	R3REDGE_RVCSTN,       ///< KI-429 (U-429-A): which booking a station/waypoint tile under a parked consist actually gets
-	R3REDGE_LINEND,       ///< KI-442 (REG-279-I): a train reached TrainApproachingLineEnd (line-end vs red-signal, spd clamp)
-	R3REDGE_PAIRSCAN,     ///< KI-477 (第 305 轮续): R3REnsureCouplePair() scan funnel (which gate ate the candidate)
-	R3REDGE_PAIRDROPS,    ///< KI-477 (第 305 轮续): a held pair lock stopped qualifying (why it was dropped)
-	R3REDGE_STOPGATE,     ///< KI-488 (R307-2): a station order was held back because the next order is GOTO_COUPLE
-	R3REDGE_TPRZERO,      ///< 第 336 轮: the early-exit was overruled because the reservation reached nowhere (zero usable path)
-	R3REDGE_RESVPROBE,    ///< 第 357 轮 (KI-533): a *whole* reservation attempt and the end it produced (R48-1..R48-3)
-	R3REDGE_JUNCCHOOSE,   ///< 第 357 轮 (KI-533): ChooseTrainTrack's per-tile verdict, tracked on *every* tile (R48-4)
-	R3REDGE_EXTGOALEXEMPT, ///< 第 406 轮 (REG-405-A): the choice refusal was waived -- the platform belongs to our locked couple partner
-	R3REDGE_EXTEXIT,      ///< REG-505-32-A: which *success* exit ExtendTrainReservation() took (choose/safe/eol)
-	R3REDGE_BRAKEHOLD,    ///< 第 523 轮续四 (KI-684): held-for-pair speed step under realistic braking (payload = cur_speed)
-	R3REDGE_COUNT,
-};
-
-struct R3RDbgEdgeState {
-	std::unordered_map<uint64_t, uint64_t> seen; ///< (tag << 56 | key) -> payload
-	uint64_t emitted[R3REDGE_COUNT];
-	uint64_t suppressed[R3REDGE_COUNT];
-
-	R3RDbgEdgeState() : emitted(), suppressed() {}
-};
-
-/* --- KI-14 (2): frame-budget breakdown for the train tick ------------------
- * PFE_GL_TRAINS reports ~135 ms/frame for the train tick while every R3R probe
- * on the couple/decouple path reports 0 -- so the cost sits on the plain tick
- * path. These per-frame counters split that path into named buckets so the
- * next 'fps' run says which bucket owns the 135 ms. All counters are static
- * to this TU on purpose: r3r_perf.h holds the shared ones, and touching a
- * header would force a full rebuild (KI-15). */
-static uint64_t r3r_loco_calls = 0, r3r_loco_ns = 0;   ///< TrainLocoHandler, both modes
-static uint64_t r3r_ch_calls = 0, r3r_ch_ns = 0;       ///< TrainCoupleHandler (called per movement step)
-static uint64_t r3r_plat_calls = 0, r3r_plat_ns = 0;   ///< R3R platform re-reservation gate
-static uint64_t r3r_resv_calls = 0, r3r_resv_ns = 0;   ///< Train::ReserveTrackUnderConsist
-static uint64_t r3r_edge_calls = 0, r3r_edge_ns = 0;   ///< R3RDbgEdge gate itself
-static uint64_t r3r_dump_ns = 0;                       ///< R3RPerfDumpAndReset itself
-static uint64_t r3r_ctrl_calls = 0, r3r_ctrl_ns = 0;   ///< TrainController (movement + path reservation)
-/* KI-574 (round 411): 'ctrl' is the whole TrainController() body, which mixes the
- * per-car physics step with the one path search the loco does when it crosses into
- * a new tile (ChooseTrainTrack() at the prev == nullptr branch). Those two have
- * completely different remedies -- a faster search versus a cheaper walk -- so
- * time the search separately. 'astar' is a SUBSET of 'ctrl': it is deliberately
- * not added to sub_ms (that would subtract it twice), it is only printed next to
- * 'ctrl' so the share is readable. */
-static uint64_t r3r_astar_calls = 0, r3r_astar_ns = 0; ///< ChooseTrainTrack, inside TrainController
-/* KI-574 (round 412): 'ctrl' measures the whole TrainController() body, which is 38% of
- * the frame but says nothing about *which* per-car step pays for it. These two split the
- * hot part of the per-vehicle loop, so the next rewrite can aim at a measured target:
- *   'vent' -- the VehicleEnterTile() call on the same-tile path (99.5% of iterations),
- *             i.e. candidate C-13.6;
- *   'wr'   -- the per-car position write (UpdateDeltaXY .. UpdateInclination), i.e. the
- *             exact block a 'derive x/y from the chain polyline' rewrite would replace.
- * Both are SUBSETS of 'ctrl' and are therefore only printed, never added to sub_ms. */
-static uint64_t r3r_vent_calls = 0, r3r_vent_ns = 0;   ///< VehicleEnterTile (same-tile path)
-static uint64_t r3r_wr_calls = 0, r3r_wr_ns = 0;       ///< per-car position write block
-/* KI-574 (round 413): the residual (55% of 'ctrl') still mixes several unrelated things.
- * These two name the only function-level items that could plausibly be the bulk of it:
- *   'gnvp' -- GetNewVehiclePos(), the one per-car function that runs every iteration;
- *   'lend' -- TrainCheckIfLineEnds() on the moving front, which may reserve a path.
- * Both are SUBSETS of 'ctrl' and are therefore only printed, never added to sub_ms. */
-static uint64_t r3r_gnvp_calls = 0, r3r_gnvp_ns = 0;   ///< GetNewVehiclePos
-static uint64_t r3r_lend_calls = 0, r3r_lend_ns = 0;   ///< TrainCheckIfLineEnds (inside ctrl)
-/* KI-574 (round 414): 'wr' is 1.60 us/car and is the only sized target left, but it packs
- * four unrelated jobs that can differ by an order of magnitude, so split it:
- *   'wrd' -- UpdateDeltaXY(): recomputes the sprite bounding box / x_offs / y_offs. A
- *            "derive x/y from the chain polyline" rewrite CANNOT replace this.
- *   'wru' -- the position commit itself (x_pos/y_pos = gp, UpdatePosition()). This is the
- *            one part a derived-position rewrite would actually replace.
- *   'wrs' -- the three bookkeeping calls (DecreaseReverseDistance, AdvanceLookAheadPosition,
- *            DecrementPendingSpeedRestrictions); never timed separately before.
- *   'wrz' -- UpdateInclination(): per-car Z / slope.
- * All four are SUBSETS of 'wr' (itself a subset of 'ctrl'), so they are only printed.
- * Note: 'wr' now carries 5 nested QPC reads (~0.2 us/car), so compare RATIOS to 'wr', not
- * the absolute value against round 413's reading. */
-static uint64_t r3r_wrd_calls = 0, r3r_wrd_ns = 0;     ///< UpdateDeltaXY (inside wr)
-static uint64_t r3r_wru_calls = 0, r3r_wru_ns = 0;     ///< x_pos/y_pos + UpdatePosition (inside wr)
-static uint64_t r3r_wrs_calls = 0, r3r_wrs_ns = 0;     ///< DecreaseReverseDistance + lookahead bookkeeping
-static uint64_t r3r_wrz_calls = 0, r3r_wrz_ns = 0;     ///< UpdateInclination (inside wr)
-static uint64_t r3r_coll_calls = 0, r3r_coll_ns = 0;   ///< CheckTrainCollision(moving_front)
-static uint64_t r3r_spd_calls = 0, r3r_spd_ns = 0;     ///< MaxSpeedInfo + UpdateSpeed (walks the consist)
-static uint64_t r3r_vp_calls = 0, r3r_vp_ns = 0;       ///< UpdateViewport loop (walks the consist)
-static uint64_t r3r_mov_iters = 0;                     ///< per-vehicle iterations of the TrainController loop
-/* KI-26 (step 2): the 09-14 Release run left 225 ms/s = 8.33 ms/frame inside
- * 'loco' with no bucket to its name. These wrap the handler's own passes: the
- * order machinery, the signal + path-reserve attempt, and the two per-consist
- * state passes. Whatever is left over (physics, station entry, reverse fallback,
- * TrainEnterStation) is printed as 'resid' so the split can be checked. */
-static uint64_t r3r_ord_calls = 0, r3r_ord_ns = 0;     ///< ProcessOrders + CheckReverseTrain, from TrainLocoHandler
-static uint64_t r3r_prv_calls = 0, r3r_prv_ns = 0;     ///< UpdateSignalsOnSegment + TryPathReserve, from TrainLocoHandler
-static uint64_t r3r_load_calls = 0, r3r_load_ns = 0;   ///< consist->HandleLoading
-static uint64_t r3r_dep_calls = 0, r3r_dep_ns = 0;     ///< CheckTrainStayInDepot
-/* KI-26 (step 2b, 09-14): the Release run still left 136 ms/s = 2.67 ms/frame in
- * 'resid'. These wrap the handler sections that had no bucket at all: the
- * DECOUPLE gate (the whole stopped-arrival block, incl. the DEPOT-ARR snapshot),
- * the waypoint reverse-on-arrival fallback, the stuck-train path, and the
- * 'Reversing' flag turn-around. 'cpl' and 'eg' are the pre-existing couple/edge
- * buckets, which also live inside the handler and were simply not subtracted.
- * ('wpr' is retained only for the PERF line; the reverse-on-arrival feature it
- * used to wrap was removed, so it now always reads 0.) */
-static uint64_t r3r_dec_calls = 0, r3r_dec_ns = 0;     ///< DECOUPLE gate (stopped-arrival block)
-static uint64_t r3r_wpr_calls = 0, r3r_wpr_ns = 0;     ///< retired: reverse-on-arrival fallback (always 0)
-static uint64_t r3r_stk_calls = 0, r3r_stk_ns = 0;     ///< stuck-train handling (path reserve retry)
-static uint64_t r3r_rev_calls = 0, r3r_rev_ns = 0;     ///< Reversing-flag turn-around (ReverseTrainDirection)
-/* KI-26 (step 3): the in-game "GL train ticks" figure, exposed by framerate_gui.cpp
- * so a Release run reports the same metric vanilla's 'framerates' output uses. */
-extern double R3RGetTrainsMs();
-
-/** RAII wall-clock accumulator for the KI-14 (2) probes. */
-struct R3RScopeTimer {
-	uint64_t *ns;    ///< accumulator for elapsed ns
-	uint64_t *calls; ///< optional call counter
-	uint64_t t0;
-	bool on;         ///< KI-26: R3RPerfOn() snapshot, so ctor/dtor agree
-
-	R3RScopeTimer(uint64_t *n, uint64_t *c = nullptr) : ns(n), calls(c), t0(0), on(R3RPerfOn())
-	{
-		if (!this->on) return;
-		this->t0 = R3RPerfNowNs();
-		if (this->calls != nullptr) (*this->calls)++;
-	}
-	~R3RScopeTimer() { if (this->on) *this->ns += R3RPerfNowNs() - this->t0; }
-};
-
-/** Process-wide edge state (single-threaded game logic). */
-static R3RDbgEdgeState &R3REdgeState()
-{
-	static R3RDbgEdgeState s;
-	return s;
 }
 
 /**
@@ -9531,9 +8360,6 @@ struct R3RPairVerdict {
 	uint64_t tick;     ///< 写入时的 _tick_counter
 };
 static std::unordered_map<uint32_t, R3RPairVerdict> _r3r_pair_verdict;
-
-/** R3R (第 318 轮, 修-3): 一条链一次 episode 只报一行 PAIR-INVARIANT-VIOLATION。 */
-static btree::btree_set<VehicleID> _r3r_pair_invariant_logged;
 
 /**
  * R3R (KI-182, player rule 2026-09-24): the tick on which a chain entered its
@@ -9609,302 +8435,6 @@ static bool R3RCouplePairOutranks(Train *challenger, Train *holder)
 	const uint64_t his = R3RCoupleEnterTick(holder);
 	if (mine == 0 || his == 0) return false;
 	return mine < his;
-}
-
-/**
- * Edge-triggered gate for a per-tick probe.
- * @param tag     probe id (R3RDbgEdgeTag).
- * @param key     identity of the logged object (vehicle, tile, ...); <= 56 bits.
- * @param payload the mutable part of the line -- a change forces a new line.
- * @return true when the caller should write its line now.
- */
-static bool R3RDbgEdge(uint32_t tag, uint64_t key, uint64_t payload)
-{
-	/* R3R (release audit 2026-09-19): this gate is reached once per vehicle per
-	 * tick from ReserveTrackUnderConsist() and once per collision pair per
-	 * movement step, and it used to do an unordered_map lookup (and, on a miss,
-	 * an insert) every time even with the probes off. With the log off nothing
-	 * can ever be emitted, so bail out first: with R3R_PROBES=0 R3RDbgOn() is a
-	 * constant, the whole body disappears, and callers collapse to their
-	 * non-logging branch. */
-	if (!R3RDbgOn()) return false;
-	R3RScopeTimer r3r_edge_timer(&r3r_edge_ns, &r3r_edge_calls);
-	R3RDbgEdgeState &s = R3REdgeState();
-	const uint64_t k = ((uint64_t)tag << 56) | (key & 0x00FFFFFFFFFFFFFFULL);
-	auto it = s.seen.find(k);
-	if (it != s.seen.end() && it->second == payload) {
-		s.suppressed[tag]++;
-		return false;
-	}
-	s.seen[k] = payload;
-	s.emitted[tag]++;
-	return true;
-}
-
-/**
- * R3R (KI-144 probe, forward declared near NormalizeTrainVehInDepot): the guard
- * "a segment never absorbs the free wagons of the depot" runs once per tick
- * while the segment stands in the depot, so the line is edge-triggered on
- * (segment head, number of free wagons on the tile) -- KI-14 口径, no flood.
- * @param head Any vehicle of the segment-bearing chain (the guard's argument).
- */
-static void R3RProbeNoAbsorbSeg(const Train *head)
-{
-	if (!R3RDbgOn()) return;
-	uint free_wagons = 0;
-	for (const Train *v = Train::From(GetFirstVehicleOnTile(head->tile, VehicleType::Train)); v != nullptr; v = v->HashTileNext()) {
-		if (v->IsFreeWagon() || v->IsFrontWagon()) free_wagons++;
-	}
-	const uint64_t n_key = (uint64_t)head->index.base();
-	if (R3RDbgEdge(R3REDGE_NOABSORBSEG, n_key, (uint64_t)free_wagons)) {
-		R3RDbgWrite("NOABSORB-SEG veh=%d n=%d len=%d\n", (int)head->index.base(), (int)free_wagons,
-				(int)CountVehiclesInChain(head));
-	}
-}
-
-/**
- * R3R (KI-145 probe, forward declared near NormalizeTrainVehInDepot): the
- * "both halves of a dual head stay adjacent inside a segment" branch. Edge-
- * triggered on the pair, with the payload telling whether the rear half had to
- * be moved back (which is also the case that pushes a sandwiched wagon out).
- * @param front The front half (the engine half).
- * @param other The rear half.
- * @param moved Whether the rear half actually had to be re-inserted.
- */
-static void R3RProbeNdhSegKeep(const Train *front, const Train *other, bool moved)
-{
-	if (!R3RDbgOn()) return;
-	const uint64_t n_key = ((uint64_t)front->index.base() << 32) ^ (uint64_t)other->index.base();
-	if (R3RDbgEdge(R3REDGE_NDHSEGKEEP, n_key, moved ? 1ULL : 0ULL)) {
-		R3RDbgWrite("NDH-SEG-KEEP front=%d rear=%d moved=%d\n",
-				(int)front->index.base(), (int)other->index.base(), moved ? 1 : 0);
-	}
-}
-
-/**
- * R3R (KI-149): a consist waiting to be coupled is standing touching this train,
- * i.e. a decouple seam runs over one of our ends and that direction is blocked
- * for us. Edge-triggered: the state holds for as long as both parts stand next
- * to each other, which is exactly the situation a probe per tick would flood.
- * @param v Train that has the seam (any member of the chain).
- * @param at_front The waiting consist touches our nose (else our tail).
- * @param waiting The waiting consist touching us.
- */
-static void R3RProbeKi149Seam(const Train *v, bool at_front, const Train *waiting)
-{
-	if (!R3RDbgOn()) return;
-	const uint64_t key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)waiting->index.base();
-	if (R3RDbgEdge(R3REDGE_KI149SEAM, key, at_front ? 1ULL : 0ULL)) {
-		R3RDbgWrite("KI149-SEAM veh=%d seam=%s other=%d tile=%d,%d\n", (int)v->index.base(),
-				at_front ? "front" : "back", (int)waiting->index.base(), TileX(v->tile), TileY(v->tile));
-	}
-}
-
-/** Stable hash of a probe's tag string, so different tags never share an edge key. */
-static uint64_t R3RDbgTagHash(const char *tag)
-{
-	uint64_t h = 1469598103934665603ULL; /* FNV-1a offset basis */
-	for (const char *c = tag; *c != '\0'; c++) h = (h ^ (uint64_t)(uint8_t)*c) * 1099511628211ULL;
-	return h & 0xFFFFFFFFULL;
-}
-
-/** Emitted/suppressed totals of the current window (for the PERF line). */
-static void R3RDbgEdgeTotals(uint64_t &emitted, uint64_t &suppressed)
-{
-	R3RDbgEdgeState &s = R3REdgeState();
-	emitted = 0;
-	suppressed = 0;
-	for (uint i = 0; i < R3REDGE_COUNT; i++) {
-		emitted += s.emitted[i];
-		suppressed += s.suppressed[i];
-	}
-}
-
-/** Start a new edge-trigger window: a repeating site logs at most once per window. */
-static void R3RDbgEdgeReset()
-{
-	R3RDbgEdgeState &s = R3REdgeState();
-	s.seen.clear();
-	for (uint i = 0; i < R3REDGE_COUNT; i++) {
-		s.emitted[i] = 0;
-		s.suppressed[i] = 0;
-	}
-}
-
-/**
- * R3R perf probe (KI-14): world snapshot + one aggregate line to R3R_perf.log
- * per 128 rendered frames, then reset the counters.
- *
- * All rates are per *second*, derived from the window length, so a line reads
- * like "... dbgWrite=812.4/s 1263ms/s 3.71MB/s ..." -- i.e. the R3R debug log
- * alone consumed 1263 ms of CPU per second of wall clock. That is the smoking
- * gun for the fold-fix retry loop (KI-06) writing to disk every tick.
- */
-void R3RPerfDumpAndReset()
-{
-	/* R3R (release audit 2026-09-19): guard here as well as at the frame tick,
-	 * because the body is expensive for a "switched off" probe -- a full
-	 * Train::Iterate() world scan, an fopen/ftell/fclose of R3R_debug.log and
-	 * the fopen/fprintf/fclose of R3R_perf.log (which also creates a stray log
-	 * file next to a published exe). With R3R_PROBES=0 R3RPerfOn() is a
-	 * constant false, so MSVC keeps only the `ret`. */
-	if (!R3RPerfOn()) return;
-
-	/* Measures the world snapshot + log accounting below (not the fprintf
-	 * itself, which runs after this value is read). */
-	R3RScopeTimer r3r_dump_timer(&r3r_dump_ns);
-	R3RPerfCounters &p = R3RP();
-
-	/* World snapshot: chain count/length and how many segments this mod splits
-	 * them into -- the O(n^2) suspects scale with these. */
-	uint64_t chains = 0, vehs = 0, max_chain = 0, segs = 0, artics = 0, wait_couple = 0;
-	for (const Train *t : Train::Iterate()) {
-		vehs++;
-		if (t->IsArticulatedPart()) artics++;
-		if (t->IsSegmentFront()) segs++;
-		if (t->current_order.IsType(OT_WAIT_COUPLE)) wait_couple++;
-		if (t->Previous() == nullptr) {
-			chains++;
-			uint64_t n = 0;
-			for (const Train *w = t; w != nullptr; w = w->Next()) n++;
-			if (n > max_chain) max_chain = n;
-		}
-	}
-
-	/* Growth of R3R_debug.log since the previous dump. */
-	static long long last_size = 0;
-	long long size = 0;
-	FILE *lf = fopen("R3R_debug.log", "rb");
-	if (lf != nullptr) {
-		if (fseek(lf, 0, SEEK_END) == 0) size = ftell(lf);
-		fclose(lf);
-	}
-
-	const double win_ms = (double)p.frame_ms_sum;
-	const double per_s = (win_ms > 0.0) ? 1000.0 / win_ms : 0.0;  /* ns counter -> per second */
-	const double ms_per_s = per_s / 1e6;                          /* ns counter -> ms per second */
-	const double fps = (p.frames > 0 && win_ms > 0.0) ? 1000.0 * (double)p.frames / win_ms : 0.0;
-
-	/* KI-14 (1): how much the edge-trigger gate swallowed this window. */
-	uint64_t edge_written = 0, edge_skipped = 0;
-	R3RDbgEdgeTotals(edge_written, edge_skipped);
-
-	FILE *f = fopen("R3R_perf.log", "a");
-	if (f != nullptr) {
-		fprintf(f, "PERF frames=%llu fps=%.1f frameMs avg=%.1f max=%llu | "
-				"tryCouple=%.1f/s %.0fms/s | foldCheck=%.1f/s %.0fms/s | dumpChain=%.1f/s dumpIdent=%.1f/s | "
-				"dbgWrite=%.1f/s %.0fms/s %.2fMB/s | posHelper=%.1f/s steps=%.0f/s maxSteps=%llu %.0fms/s | "
-				"dbgEdge=%.1f/s skipped=%.0f/s | "
-				"chains=%llu vehs=%llu maxChain=%llu segs=%llu artic=%llu waitCouple=%llu\n",
-				(unsigned long long)p.frames, fps,
-				(double)p.frame_ms_sum / (double)(p.frames != 0 ? p.frames : 1), (unsigned long long)p.frame_ms_max,
-				(double)p.try_couple * per_s, (double)p.try_couple_ns * ms_per_s,
-				(double)p.fold_check * per_s, (double)p.fold_check_ns * ms_per_s,
-				(double)p.dump_chain * per_s, (double)p.dump_ident * per_s,
-				(double)p.dbg_writes * per_s, (double)p.dbg_ns * ms_per_s,
-				(double)(size - last_size) * per_s / (1024.0 * 1024.0),
-				(double)p.pos_helper * per_s, (double)p.pos_steps * per_s, (unsigned long long)p.pos_max,
-				(double)p.pos_ns * ms_per_s,
-				(double)edge_written * per_s, (double)edge_skipped * per_s,
-				(unsigned long long)chains, (unsigned long long)vehs, (unsigned long long)max_chain,
-				(unsigned long long)segs, (unsigned long long)artics, (unsigned long long)wait_couple);
-
-		/* KI-14 (2): where the train-tick milliseconds actually go. 'loco' is the
-		 * whole TrainLocoHandler body (both modes) and should track PFE_GL_TRAINS;
-		 * plat/resv/edgeGate/coupleH are the R3R additions that sit inside it,
-		 * while ctrl/coll/spd/vp are the *native* per-tick passes -- movement,
-		 * collision scan, the consist-wide speed computation and the per-vehicle
-		 * viewport refresh -- which an R3R-merged mega-chain multiplies. */
-		/* KI-26 (step 2): what the named sub-buckets of 'loco' add up to, and the
-		 * residue they leave. 'resv' is left out on purpose: it is the inner loop
-		 * of 'plat', so counting both would subtract it twice (same for 'coll',
-		 * which sits inside 'ctrl'). 'ctrl' also runs from the reversal helpers
-		 * outside the handler, so 'sub' can slightly overshoot -- read resid as an
-		 * upper bound of the still-unexplained part.
-		 *
-		 * KI-26 (step 2b, 09-14): 'coupleH', 'edgeGate', 'dec', 'wpr', 'stk' and
-		 * 'rev' also run inside the handler and were simply missing from the sum.
-		 * 'nl' (non-loco) is the part of the trains tick that is not the handler at
-		 * all, i.e. PFE_GL_TRAINS minus 'loco' -- the remainder of the 11.47ms. */
-		const double sub_ms = (double)(r3r_ctrl_ns + r3r_spd_ns + r3r_vp_ns + r3r_plat_ns +
-				r3r_ord_ns + r3r_prv_ns + r3r_load_ns + r3r_dep_ns +
-				r3r_ch_ns + r3r_edge_ns + r3r_dec_ns + r3r_wpr_ns + r3r_stk_ns + r3r_rev_ns) * ms_per_s;
-		const double resid_ms = (double)r3r_loco_ns * ms_per_s - sub_ms;
-		const double nl_ms = R3RGetTrainsMs() * fps - (double)r3r_loco_ns * ms_per_s;
-		fprintf(f, "PERF-TICK loco=%.1f/s %.0fms/s | coupleH=%.1f/s %.0fms/s | plat=%.1f/s %.0fms/s | "
-				"resv=%.1f/s %.0fms/s | edgeGate=%.1f/s %.0fms/s | "
-				"ctrl=%.1f/s %.0fms/s | astar=%.1f/s %.0fms/s | "
-				"vent=%.1f/s %.0fms/s | wr=%.1f/s %.0fms/s | "
-				"gnvp=%.1f/s %.0fms/s | lend=%.1f/s %.0fms/s | "
-				"wrd=%.1f/s %.0fms/s | wru=%.1f/s %.0fms/s | wrs=%.1f/s %.0fms/s | wrz=%.1f/s %.0fms/s | "
-				"coll=%.1f/s %.0fms/s | spd=%.1f/s %.0fms/s | "
-				"vp=%.1f/s %.0fms/s | dump=%.0fms/s | mov=%.1f/s | "
-				"ord=%.1f/s %.0fms/s | prv=%.1f/s %.0fms/s | load=%.1f/s %.0fms/s | dep=%.1f/s %.0fms/s | "
-				"dec=%.1f/s %.0fms/s | wpr=%.1f/s %.0fms/s | stk=%.1f/s %.0fms/s | rev=%.1f/s %.0fms/s | "
-				"sub=%.0fms/s resid=%.0fms/s | nl=%.0fms/s glTrains=%.2fms\n",
-				(double)r3r_loco_calls * per_s, (double)r3r_loco_ns * ms_per_s,
-				(double)r3r_ch_calls * per_s, (double)r3r_ch_ns * ms_per_s,
-				(double)r3r_plat_calls * per_s, (double)r3r_plat_ns * ms_per_s,
-				(double)r3r_resv_calls * per_s, (double)r3r_resv_ns * ms_per_s,
-				(double)r3r_edge_calls * per_s, (double)r3r_edge_ns * ms_per_s,
-				(double)r3r_ctrl_calls * per_s, (double)r3r_ctrl_ns * ms_per_s,
-				(double)r3r_astar_calls * per_s, (double)r3r_astar_ns * ms_per_s,
-				(double)r3r_vent_calls * per_s, (double)r3r_vent_ns * ms_per_s,
-				(double)r3r_wr_calls * per_s, (double)r3r_wr_ns * ms_per_s,
-				(double)r3r_gnvp_calls * per_s, (double)r3r_gnvp_ns * ms_per_s,
-				(double)r3r_lend_calls * per_s, (double)r3r_lend_ns * ms_per_s,
-				(double)r3r_wrd_calls * per_s, (double)r3r_wrd_ns * ms_per_s,
-				(double)r3r_wru_calls * per_s, (double)r3r_wru_ns * ms_per_s,
-				(double)r3r_wrs_calls * per_s, (double)r3r_wrs_ns * ms_per_s,
-				(double)r3r_wrz_calls * per_s, (double)r3r_wrz_ns * ms_per_s,
-				(double)r3r_coll_calls * per_s, (double)r3r_coll_ns * ms_per_s,
-				(double)r3r_spd_calls * per_s, (double)r3r_spd_ns * ms_per_s,
-				(double)r3r_vp_calls * per_s, (double)r3r_vp_ns * ms_per_s,
-				(double)r3r_dump_ns * ms_per_s,
-				(double)r3r_mov_iters * per_s,
-				(double)r3r_ord_calls * per_s, (double)r3r_ord_ns * ms_per_s,
-				(double)r3r_prv_calls * per_s, (double)r3r_prv_ns * ms_per_s,
-				(double)r3r_load_calls * per_s, (double)r3r_load_ns * ms_per_s,
-				(double)r3r_dep_calls * per_s, (double)r3r_dep_ns * ms_per_s,
-				(double)r3r_dec_calls * per_s, (double)r3r_dec_ns * ms_per_s,
-				(double)r3r_wpr_calls * per_s, (double)r3r_wpr_ns * ms_per_s,
-				(double)r3r_stk_calls * per_s, (double)r3r_stk_ns * ms_per_s,
-				(double)r3r_rev_calls * per_s, (double)r3r_rev_ns * ms_per_s,
-				sub_ms, resid_ms, nl_ms, R3RGetTrainsMs());
-		fclose(f);
-	}
-	last_size = size;
-
-	R3RDbgEdgeReset();
-	p = R3RPerfCounters();
-	r3r_loco_calls = r3r_loco_ns = 0;
-	r3r_ch_calls = r3r_ch_ns = 0;
-	r3r_plat_calls = r3r_plat_ns = 0;
-	r3r_resv_calls = r3r_resv_ns = 0;
-	r3r_edge_calls = r3r_edge_ns = 0;
-	r3r_ctrl_calls = r3r_ctrl_ns = 0;
-	r3r_astar_calls = r3r_astar_ns = 0;
-	r3r_vent_calls = r3r_vent_ns = 0;
-	r3r_wr_calls = r3r_wr_ns = 0;
-	r3r_gnvp_calls = r3r_gnvp_ns = 0;
-	r3r_lend_calls = r3r_lend_ns = 0;
-	r3r_wrd_calls = r3r_wrd_ns = 0;
-	r3r_wru_calls = r3r_wru_ns = 0;
-	r3r_wrs_calls = r3r_wrs_ns = 0;
-	r3r_wrz_calls = r3r_wrz_ns = 0;
-	r3r_coll_calls = r3r_coll_ns = 0;
-	r3r_spd_calls = r3r_spd_ns = 0;
-	r3r_vp_calls = r3r_vp_ns = 0;
-	r3r_dump_ns = 0;
-	r3r_mov_iters = 0;
-	r3r_ord_calls = r3r_ord_ns = 0;
-	r3r_prv_calls = r3r_prv_ns = 0;
-	r3r_load_calls = r3r_load_ns = 0;
-	r3r_dep_calls = r3r_dep_ns = 0;
-	r3r_dec_calls = r3r_dec_ns = 0;
-	r3r_wpr_calls = r3r_wpr_ns = 0;
-	r3r_stk_calls = r3r_stk_ns = 0;
-	r3r_rev_calls = r3r_rev_ns = 0;
 }
 
 /**
@@ -9988,7 +8518,6 @@ static bool TryTrainDecouple(Train *v, Train *u)
 	 * otherwise indistinguishable from "the attempt silently failed" -- the
 	 * DECOUPLE-JUMP / DECOUPLE-DONE lines only appear when this returns true.
 	 * Log the outcome (and the ValidateTrains error) once per distinct state. */
-	const uint64_t td_try_key = ((uint64_t)v->index.base() << 16) | (uint64_t)u->index.base();
 	TrainList original_src;
 	MakeTrainBackup(original_src, v);
 	Train *first_param = nullptr;
@@ -10013,20 +8542,7 @@ static bool TryTrainDecouple(Train *v, Train *u)
 	_current_company = old_company;
 
 	bool ok = !ret.Failed();
-	if (R3RDbgEdge(R3REDGE_DECOUPLETRY, td_try_key,
-			(uint64_t)(ok ? 1u : 0u) | ((uint64_t)ret.GetErrorMessage().base() << 1))) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "TDTRY ok=%d v=%d u=%d err=0x%X v_head=%d u_head=%d borrowed=%d u_eng=%d v_eng=%d u_next=%d\n",
-					(int)ok, (int)((td_try_key >> 16) & 0xFFFF), (int)(td_try_key & 0xFFFF),
-					(unsigned)ret.GetErrorMessage().base(),
-					(int)v->index.base(), (int)u->index.base(),
-					(int)(v->r3r_orders_borrowed ? 1 : 0),
-					(int)(u->IsEngine() ? 1 : 0), (int)(v->IsEngine() ? 1 : 0),
-					u->Next() != nullptr ? (int)u->Next()->index.base() : -1);
-			fclose(dbg);
-		}
-	}
+	
 	u->ConsistChanged(CCF_ARRANGE);
 	v->ConsistChanged(CCF_ARRANGE);
 	if (!ok) {
@@ -10107,14 +8623,6 @@ static void R3RSettleLoadingBeforeChainEdit(Train *chain, const char *site)
 			v->vehicle_flags.Reset(VehicleFlag::LoadingFinished);
 			v->vehicle_flags.Reset(VehicleFlag::CargoUnloading);
 			v->load_unload_ticks = 0;
-		}
-
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "SETTLE-LOAD site=%s veh=%d co=%d tx=%d ty=%d\n",
-					site, (int)v->index.base(), (int)v->current_order.GetType(),
-					TileX(v->tile), TileY(v->tile));
-			fclose(dbg);
 		}
 	}
 }
@@ -10263,10 +8771,6 @@ static int R3RNormaliseMixedChainDrivingBackwards(Train *head, const char *tag)
 	 * couple clean-up does after clearing a stale driving-backwards state. This is
 	 * what recomputes TCF_NO_DRIVING_CAB from Last()->CanLeadTrain(). */
 	head->ConsistChanged(CCF_TRACK);
-
-	R3RDbgWrite("[R3R] DB-NORMALISE %s head=%d headDB=%d cleared=%d set=%d n=%d nocab=%d\n",
-			tag, (int)head->index.base(), (int)head_db, cleared, set, visited,
-			(int)((head->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0));
 	return cleared + set;
 }
 
@@ -10295,31 +8799,6 @@ static int R3RNormaliseMixedChainDrivingBackwards(Train *head, const char *tag)
  * @param tag  Probe label.
  * @param head First vehicle of the chain to dump.
  */
-static void R3RDumpChainGeometry(const char *tag, const Train *head)
-{
-	if (!R3RDbgOn() || head == nullptr) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-
-	int n = 0;
-	for (const Train *w = head; w != nullptr && n < R3R_CHAIN_WALK_LIMIT; w = w->Next(), n++) {
-		const Train *nx = w->Next();
-		const int dist = (nx == nullptr) ? -1 : std::max(std::abs((int)w->x_pos - (int)nx->x_pos), std::abs((int)w->y_pos - (int)nx->y_pos));
-		const int nom = (nx == nullptr) ? -1 : w->CalcNextVehicleOffset();
-		fprintf(dbg, "GEO %s n=%d veh=%d tile=%d,%d x=%d y=%d dir=%d db=%d artic=%d starF=%d starB=%d segid=%d clen=%d dist=%d nom=%d\n",
-				tag, n, (int)w->index.base(), (int)TileX(w->tile), (int)TileY(w->tile),
-				(int)w->x_pos, (int)w->y_pos, (int)w->direction,
-				w->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0,
-				w->IsArticulatedPart() ? 1 : 0,
-				w->IsSegmentFront() ? 1 : 0, w->IsSegmentBack() ? 1 : 0,
-				(int)w->r3r_segment_id, (int)w->gcache.cached_veh_length, dist, nom);
-	}
-	fprintf(dbg, "GEO-END %s head=%d n=%d capped=%d\n",
-			tag, (int)head->index.base(), n, (n >= R3R_CHAIN_WALK_LIMIT) ? 1 : 0);
-	fclose(dbg);
-}
-
 /**
  * R3R (第 165 轮 probe, KI-253 §5.1): one car as it was *before* a respace pass.
  *
@@ -10335,31 +8814,6 @@ struct R3RGeoPoint { const Train *veh; int tx; int ty; int x; int y; };
  * be diffed car by car (the old before-snapshot only had veh/x/y, i.e. no
  * dist/nom/clen/artic/segid to compare against).
  */
-static void R3RDumpChainGeometrySnapshot(const char *tag, const std::vector<R3RGeoPoint> &snap)
-{
-	if (!R3RDbgBulkOn() || !R3RDbgOn() || snap.empty()) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	for (size_t i = 0; i < snap.size(); i++) {
-		const Train *w = snap[i].veh;
-		if (w == nullptr) continue;
-		const R3RGeoPoint *nx = (i + 1 < snap.size()) ? &snap[i + 1] : nullptr;
-		const int dist = (nx == nullptr) ? -1 : std::max(std::abs(snap[i].x - nx->x), std::abs(snap[i].y - nx->y));
-		const int nom = (nx == nullptr) ? -1 : w->CalcNextVehicleOffset();
-		fprintf(dbg, "GEO %s n=%d veh=%d tile=%d,%d x=%d y=%d dir=%d db=%d artic=%d starF=%d starB=%d segid=%d clen=%d dist=%d nom=%d\n",
-				tag, (int)i, (int)w->index.base(), snap[i].tx, snap[i].ty,
-				snap[i].x, snap[i].y, (int)w->direction,
-				w->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0,
-				w->IsArticulatedPart() ? 1 : 0,
-				w->IsSegmentFront() ? 1 : 0, w->IsSegmentBack() ? 1 : 0,
-				(int)w->r3r_segment_id, (int)w->gcache.cached_veh_length, dist, nom);
-	}
-	fprintf(dbg, "GEO-END %s head=%d n=%d capped=%d\n",
-			tag, (int)snap[0].veh->index.base(), (int)snap.size(), 0);
-	fclose(dbg);
-}
-
 /**
  * R3R (KI-134): pull a freshly edited chain geometrically tight.
  *
@@ -10422,12 +8876,7 @@ static int R3RRespaceChainAfterEdit(Train *head, const char *tag)
 	 * clen/artic/segid) can be read from the live vehicle when the dump is
 	 * written, and "before" and "after" come out in one identical format. */
 	std::vector<R3RGeoPoint> geo_before;
-	if (R3RDbgOn()) {
-		int k = 0;
-		for (const Train *w = head; w != nullptr && k < R3R_CHAIN_WALK_LIMIT; w = w->Next(), k++) {
-			geo_before.push_back({ w, (int)TileX(w->tile), (int)TileY(w->tile), (int)w->x_pos, (int)w->y_pos });
-		}
-	}
+	
 
 	int moved = 0;
 	int stretched = 0;
@@ -10437,8 +8886,6 @@ static int R3RRespaceChainAfterEdit(Train *head, const char *tag)
 	 * travelled in this call (the number the player perceives as "the train was
 	 * moved"), so the log can prove position invariance of a logical flip. */
 	int skipped = 0;
-	const int front_x0 = (int)front->x_pos;
-	const int front_y0 = (int)front->y_pos;
 	int passes = 0;
 	int visited = 0;
 	bool walk_capped = false;
@@ -10540,39 +8987,19 @@ static int R3RRespaceChainAfterEdit(Train *head, const char *tag)
 		if (moved + stretched == done_before) break;
 	}
 
-	if (moved != 0 || stretched != 0 || unfixed != 0 || walk_capped || skipped != 0) {
-		/* R3R (KI-253 probe): the pre-tightening snapshot and the current state,
-		 * so the log reader can see exactly which cars were stacked or split.
-		 * R3R (第 165 轮, §5.1): both ends carry the same fields now, so the two
-		 * dumps can be diffed car by car instead of only by pixel. */
-		R3RDumpChainGeometrySnapshot("respace-before", geo_before);
-		R3RDumpChainGeometry("respace-after", head);
-	}
 	/* R3R (第 165 轮, §5.1): the summary is printed on *every* commit, even when
 	 * nothing moved — otherwise "no RESPACE-AFTER-EDIT in the log" cannot be told
 	 * apart from "the pass never ran" (KI-253 retest kept asking that). */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			const int front_shift = std::max(std::abs((int)front->x_pos - front_x0), std::abs((int)front->y_pos - front_y0));
-			fprintf(dbg, "[R3R] RESPACE-AFTER-EDIT %s head=%d px=%d stretch=%d unfixed=%d skip=%d front=%d passes=%d visited=%d capped=%d\n",
-					tag, (int)head->index.base(), moved, stretched, unfixed, skipped, front_shift, passes, visited, walk_capped ? 1 : 0);
-			fclose(dbg);
-		}
-	}
 	/* R3R (第 173 轮, KI-265 探针): unfixed>0 是"结构性坏链"的签名 —— 这一遍扫完
 	 * 仍有接缝满足不了"实际间距 == 名义间距"，而且 respace 主动跳过了它（超界被
 	 * skip，见 R170-A），也就是工具自己承认修不动。2026-09-30 现场 3747 行
 	 * `RESPACE-AFTER-EDIT couple head=48 ... unfixed=1` 就紧跟在那次穿模提交之后。
 	 * 单独打一行是为了便于 grep / 计数，不必在 summary 的其它计数里翻。只读。 */
-	if (unfixed != 0) {
-		R3RDbgWrite("RESPACE-BADCHAIN %s head=%d unfixed=%d skip=%d stretch=%d px=%d visited=%d capped=%d\n",
-				tag, (int)head->index.base(), unfixed, skipped, stretched, moved, visited, walk_capped ? 1 : 0);
-	}
+	
 	/* R3R (KI-334 probe): 提交点的最终几何 —— 双头两半是否仍相邻、朝向是否一致、
 	 * 中间有没有被 respace 的逐节平移插进别的车。R170-A 起 respace 有了 8px 误差
 	 * 上界并会 skip 超界的对，本探针正好能把「两半被分开」与「两半被拉长」区分开。 */
-	R3RDumpDualHeadPairs(head, "respace-post");
+	
 	return moved + stretched;
 }
 
@@ -10718,10 +9145,6 @@ static void R3RAdvanceAfterDecouple(Train *half, OrderList *driving_orders, Vehi
 
 /* R3R (KI-205): defined next to Couple(); used by DecoupleTrain() as well. */
 static uint R3RReleaseChainReservations(const Train *head, const char *why);
-
-/* R3R (2026-10-26, 玩家要求): 配对锁探针，定义在 R3REnsureCouplePair() 之前，
- * 但 DecoupleTrain()/Couple() 在本文件更早处就要用到，故先声明。 */
-static void R3RDbgPairEvent(const char *what, const char *why, const Train *a, const Train *b);
 
 /**
  * Decouple the rear part of the train as specified by the DECOUPLE order.
@@ -10954,7 +9377,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * its own parked schedule back); a half which keeps driving the consist's
 		 * own list lands on decouple_idx + 1 instead. */
 		R3RAdvanceAfterDecouple(v, driving_orders, decouple_idx);
-		R3RCheckTtSync(v, "decouple-v");
+		
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads whatever
 		 * R3RAdvanceAfterDecouple() left the index on — the restored
@@ -11025,11 +9448,6 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 				InsertOrder(u, std::move(wc), 0);
 				wait_idx = 0;
 			} else {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "DECOUPLE-NO-ORDERTABLE veh=%d (orderlist pool full)\n", (int)u->index.base());
-					fclose(dbg);
-				}
 			}
 		}
 		if (wait_idx != INVALID_VEH_ORDER_ID) {
@@ -11046,60 +9464,12 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * 解挂是"谁继承哪张排程"的另一个主现场。 */
 		R3RSettleChainSegments(v, "decouple-v");
 		R3RSettleChainSegments(u, "decouple-u");
-		R3RCheckTtSync(u, "decouple-u");
+		
 		/* R3R: clear the stale current order (the DECOUPLE that was just
 		 * executed) so the next ProcessOrders tick loads the WAIT_COUPLE
 		 * order — otherwise the train would sit idle forever. */
 		u->current_order.Free();
 		u->SetDestTile(INVALID_TILE);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				/* R3R (KI-215c probe, 2026-09-26)：让"解挂时列车多跳了一个命令"的
-				 * 报告可以直接判读 —— fire_real = 刚跑完的那条(列车停在其终点的站)，
-				 * dec_idx = 真正触发解挂的 DECOUPLE，wait_idx = 解出方被钉住的
-				 * WAIT_COUPLE。step = wait_idx - dec_idx(按 u 的表取模，-1 表示没钉)，
-				 * 后随 4 行 JUMP-ORD 列出 dec_idx..dec_idx+3 上到底是什么类型，于是
-				 * "跳了几格、跳过去的那条是什么"一次日志即可核对，不必再复跑。 */
-				/* 修法 D: 判"有没有表"必须看有效表，否则跟随者会打出 n_u=0 的假象。 */
-				if (u->GetEffectiveOrders() != nullptr) {
-					const VehicleOrderID n_jump = u->GetNumOrders();
-					const int jump_step = (wait_idx == INVALID_VEH_ORDER_ID || n_jump == 0)
-							? -1
-							: (int)((wait_idx + n_jump - decouple_idx) % n_jump);
-					fprintf(dbg, "DECOUPLE-JUMP fire_real=%d dec_idx=%d wait_idx=%d step=%d v=%d u=%d n_u=%d\n",
-						(int)fire_real, (int)decouple_idx, (int)wait_idx, jump_step,
-						(int)v->index.base(), (int)u->index.base(), (int)n_jump);
-					for (VehicleOrderID k = 0; k < 4 && n_jump > 0; ++k) {
-						const VehicleOrderID i = (decouple_idx + k) % n_jump;
-						const Order *jo = u->GetOrder(i);
-						fprintf(dbg, "  JUMP-ORD %d type=%d\n", (int)i, (int)(jo ? jo->GetType() : -1));
-					}
-				} else {
-					fprintf(dbg, "DECOUPLE-JUMP fire_real=%d dec_idx=%d wait_idx=%d step=-1 v=%d u=%d n_u=0\n",
-						(int)fire_real, (int)decouple_idx, (int)wait_idx,
-						(int)v->index.base(), (int)u->index.base());
-				}
-				/* R3R (2026-09-27): 两半各自推进后的落点。新规则下 wait_idx 只在
-				 * "解出方本来没有排程"那一支才有值（step=0）；正常情况下两半都由
-				 * R3RAdvanceAfterDecouple() 落位，直接看 v_real / u_real。 */
-				fprintf(dbg, "DECOUPLE-ADV dec_idx=%d v_real=%d u_real=%d\n",
-					(int)decouple_idx, (int)v->cur_real_order_index, (int)u->cur_real_order_index);
-				/* R3R (第 201 轮 / KI-305): the "DECOUPLE-ODOF" probe was removed
-				 * together with the strategy parser it reported on
-				 * (R3RApplyDecoupleOrdersStrategy, see above). */
-				fprintf(dbg, "DECOUPLE-DONE u=%d co=%d real=%d tx=%d ty=%d x=%d y=%d\n",
-					(int)u->index.base(), (int)R3RIsCarOnlyFormation(u),
-					(int)u->cur_real_order_index, (int)TileX(u->tile), (int)TileY(u->tile), (int)u->x_pos, (int)u->y_pos);
-				if (u->GetEffectiveOrders() != nullptr) {
-					for (VehicleOrderID i = 0; i < u->GetNumOrders(); ++i) {
-						const Order *o = u->GetOrder(i);
-						fprintf(dbg, "  U-ORD %d type=%d\n", (int)i, (int)(o ? o->GetType() : -1));
-					}
-				}
-				fclose(dbg);
-			}
-		}
 		/* Restore the unit numbers: the decoupled part keeps its own number (the
 		 * locomotive currently holds it), the locomotive gets its own back. */
 		/* R3R (第 195 轮 / KI-299b): 归还块的门禁必须用**同步之后**的借用态。
@@ -11157,15 +9527,6 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			 * 把号留给对方、自己清回"没有号"（可逆、号池登记不动）。 */
 			v->unitnumber = 0;
 			v->unitnumber_backup = 0;
-			R3RDbgWrite("UNIT-RESTORE veh=%d side=head-cleared id=%u\n",
-					(int)v->index.base(), (unsigned)u->unitnumber);
-		} else if (head_borrows_now) {
-			/* R3R (第 195 轮 / KI-299b): 借用态 ⇒ 号不归还（理由见本块开头）。
-			 * 解出的那半的号不归这里管：它由 settle 里 R3RBorrowControlTraitsLive()
-			 * 的 ctrl == chain 分支（CTRL-UNBORROW）取回自己的号，照旧执行。 */
-			R3RDbgWrite("UNIT-RESTORE-SKIP-BORROW veh=%d u=%d borrowed=1 unit=%u own_bk=%u\n",
-					(int)v->index.base(), (int)u->index.base(),
-					(unsigned)v->unitnumber, (unsigned)v->unitnumber_backup);
 		}
 		/* R3R (第 160 轮 / KI-261): 车名的归还，与上面车号的归还同构。
 		 *
@@ -11183,13 +9544,10 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			 * 的说明）—— 借用态下链头的活名就是控制段那一套，凭 name_backup 非空
 			 * 再"还"一次等于用另一套凭证推翻 settle 刚做完的 (c)。现场签名就是
 			 * `NAME-RESTORE veh=27 side=head`（1726）。u 侧的名取回在上一行，照旧。 */
-			R3RDbgWrite("NAME-RESTORE-SKIP-BORROW veh=%d u=%d borrowed=1 hasname=%d own_name=%d\n",
-					(int)v->index.base(), (int)u->index.base(),
-					v->name.empty() ? 0 : 1, v->name_backup.empty() ? 0 : 1);
+			
 		} else if (!v->name_backup.empty()) {
 			v->name = v->name_backup;
 			v->name_backup.clear();
-			R3RDbgWrite("NAME-RESTORE veh=%d side=head\n", (int)v->index.base());
 		} else if (!u->name.empty() && std::string_view(v->name) == std::string_view(u->name)) {
 			/* R3R (第 181 轮 / KI-277)：「链头本来就没有名字」的借用没法靠停放副本
 			 * 认出来 —— 当时无值可停，name_backup 空着，归还块整支被跳过，链头
@@ -11197,15 +9555,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 			 * Couple() 现在不再清空 u->name，因此"活字段仍等于等待方自己的名字"
 			 * 就是这次借用的凭据，把借来的显示名清回"没有名字"（可逆、不丢数据）。 */
 			v->name.clear();
-			R3RDbgWrite("NAME-RESTORE veh=%d side=head-cleared\n", (int)v->index.base());
 		}
-	} else if (!v->name.empty() && !u->name.empty() && std::string_view(v->name) == std::string_view(u->name)) {
-		/* R3R (第 185 轮 / KI-280)：「没有借用排程」的解挂会把上面整支归还块跳过。
-		 * 若链头此刻的活名字正好等于等待方的名字，说明名侧的借用与
-		 * r3r_orders_borrowed 脱了钩，归还端因此从不执行（现场日志里连续两次解挂都
-		 * 不见 NAME-RESTORE 的另一种解释）。本条只留痕、不改任何行为。 */
-		R3RDbgWrite("NAME-RESTORE-SKIP veh=%d u=%d borrowed=0 head_name_matches_u=1\n",
-				(int)v->index.base(), (int)u->index.base());
 	}
 	/* R3R（2026-09-22，第 292 轮 / KI-463 改口径 C-3）：解挂时两半各自收敛自己的
 	 * 「列车分组」与「挂接分组」，见 R3RNormaliseChainGroups()。分组属于段，所以收敛
@@ -11254,12 +9604,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 		 * only one the player could hit without ever running the depot "upgrade to
 		 * segment" command: couple it once, decouple it once, and the released
 		 * bottom keeps the segment identity -- welded, ★ and all. */
-		if (R3RChainHasRealArticPart(u)) {
-			R3RDbgWrite("DECOUPLE-SEG-SKIP-REAL-ARTIC veh=%d -> ★ withheld (genuine articulated part)\n",
-					(int)u->index.base());
-		} else {
-			u->SetSegmentFront();
-		}
+		if (!R3RChainHasRealArticPart(u)) u->SetSegmentFront();
 	}
 
 	/* R3R (KI-205): the split is committed, so neither half will ever drive the
@@ -11316,18 +9661,6 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * decouple" could not be told apart from "the ability was never granted
 	 * here". One line per half, per decouple -- mirrors the coupling probe at
 	 * the Couple() commit point (search R3R-RES-ONCE grant). */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "R3R-RES-ONCE grant head=%d side=v force_proceed=%d tile=%d,%d stale=%d\n",
-					(int)v->index.base(), (int)v->force_proceed,
-					(int)TileX(v->tile), (int)TileY(v->tile), (int)v_had_stale);
-			fprintf(dbg, "R3R-RES-ONCE grant head=%d side=u force_proceed=%d tile=%d,%d stale=%d\n",
-					(int)u->index.base(), (int)u->force_proceed,
-					(int)TileX(u->tile), (int)TileY(u->tile), (int)u_had_stale);
-			fclose(dbg);
-		}
-	}
 
 	/* R3R: after the split both newly-independent parts must refresh their
 	 * images once, otherwise they keep sprites/caches that still reflect the
@@ -11349,7 +9682,7 @@ static Train *DecoupleTrain(Train *v, bool allow_in_depot = false)
 	 * one -- is dropped here. A part which does keep a GOTO_COUPLE order simply
 	 * re-locks on the next tick (TrainLocoHandler). The priority stamp is reset
 	 * with it: a split ends the couple run which was in progress. */
-	R3RDbgPairEvent("CPL-PAIRUNLOCK", "decouple", v, u);
+	
 	R3RUnpairCoupleTargets(v);
 	R3RUnpairCoupleTargets(u);
 	_r3r_couple_enter_tick.erase(v->index.base());
@@ -11411,9 +9744,7 @@ static int R3RCheckChainFold(Train *head, const char *tag)
 	 * couple attempt, i.e. once per tick while the fold-fix retry loop never
 	 * converges (KI-06). The scan itself is cheap; the per-call
 	 * fopen/fprintf/fclose of the whole chain is gone (edge-triggered below). */
-	R3RPerfCounters &r3rp = R3RP();
-	if (R3RPerfOn()) r3rp.fold_check++;
-	R3RPerfTimer r3r_fold_timer(&r3rp.fold_check_ns);
+	
 
 	int worst_gap = 0;
 	int nom_wa = 0;
@@ -11452,26 +9783,6 @@ static int R3RCheckChainFold(Train *head, const char *tag)
 			nom_sel = nom;
 		}
 	}
-	/* KI-14 (1): edge-triggered. The fold-fix retry loop (KI-06) calls this up
-	 * to three times per tick and rebuilds the merged chain for every attempt,
-	 * so key on the current head and the tag and only re-log when the outcome
-	 * (worst gap / folding pair) actually changes. */
-	const uint64_t fold_key = ((uint64_t)head->index.base() << 32) ^ R3RDbgTagHash(tag);
-	if (!R3RDbgEdge(R3REDGE_FOLDCHK, fold_key, ((uint64_t)worst_gap << 1) | (wa != nullptr ? 1 : 0))) return worst_gap;
-
-	R3RDbgWrite("FOLDCHK %s n=%d worst_gap=%d", tag, CountVehiclesInChain(head), worst_gap);
-	if (wa != nullptr) {
-		R3RDbgWrite(" A idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X db=%d B idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X exp=%d nom=%d nom0=%d nom1=%d dist=%d",
-				(int)wa->index.base(), (int)wa->x_pos, (int)wa->y_pos,
-				(int)TileX(wa->tile), (int)TileY(wa->tile), (int)wa->direction, (uint)wa->track,
-				wa->IsDrivingBackwards() ? 1 : 0,
-				(int)wb->index.base(), (int)wb->x_pos, (int)wb->y_pos,
-				(int)TileX(wb->tile), (int)TileY(wb->tile), (int)wb->direction, (uint)wb->track,
-				(int)(wa->gcache.cached_veh_length + wb->gcache.cached_veh_length) / 2,
-				nom_sel, nom_wa, nom_wb,
-				std::max(std::abs(wa->x_pos - wb->x_pos), std::abs(wa->y_pos - wb->y_pos)));
-	}
-	R3RDbgWrite("\n");
 	return worst_gap;
 }
 
@@ -11614,17 +9925,6 @@ static bool R3RCheckChainFoldedDirection(const Train *head, const char *tag,
 		 * 供提交前闸门与 OVERRIDE 前提判断折叠落在哪个接缝上。 */
 		if (out_a != nullptr) *out_a = wa;
 		if (out_b != nullptr) *out_b = wb;
-		/* KI-14 (1): edge-triggered -- same per-tick retry loop as FOLDCHK. */
-		const uint64_t dir_key = ((uint64_t)head->index.base() << 32) ^ R3RDbgTagHash(tag);
-		if (R3RDbgEdge(R3REDGE_FOLDCHK_DIR, dir_key, ((uint64_t)worst_dot << 1) | (wa != nullptr ? 1 : 0))) {
-			R3RDbgWrite("FOLDCHK-DIR %s dot=%d", tag, worst_dot);
-			if (wa != nullptr) {
-				R3RDbgWrite(" A idx=%d x=%d y=%d dir=%d trk=0x%X B idx=%d x=%d y=%d dir=%d trk=0x%X",
-						(int)wa->index.base(), (int)wa->x_pos, (int)wa->y_pos, (int)wa->direction, (uint)wa->track,
-						(int)wb->index.base(), (int)wb->x_pos, (int)wb->y_pos, (int)wb->direction, (uint)wb->track);
-			}
-			R3RDbgWrite("\n");
-		}
 		return true;
 	}
 	return false;
@@ -11700,7 +10000,7 @@ static void R3RReverseChainDirections(Train *chain)
 	}
 	/* R3R (KI-334 probe): 逐节取反之后，双头两半的 direction 是否仍一致、
 	 * 是否仍相邻 —— 这是本函数唯一"会破坏双头刚性"的地方。 */
-	R3RDumpDualHeadPairs(chain, "rev-dir-post");
+	
 }
 
 /** R3R: 一条链上的段边界快照:★ 段首车与段右边界标记车(段尾)。 */
@@ -11793,13 +10093,6 @@ static void R3RMoveSegmentOwner(Train *from, Train *to)
 
 	/* 只有"旧段头确实带着责任"时才值得落一行,并且走边沿闸门(KI-14 口径):
 	 * 挂车死循环下每 tick 都会翻转+回滚,直写会刷屏。 */
-	const bool from_carries = from->orders != nullptr || from->orders_backup != nullptr ||
-			from->r3r_follow_orders != nullptr ||
-			from->r3r_orders_borrowed || from->r3r_priority != to->r3r_priority;
-	const uint64_t owner_payload = ((uint64_t)from->r3r_priority << 40) ^
-			((uint64_t)(from->GetEffectiveOrders() != nullptr ? from->GetEffectiveOrders()->GetNumOrders() : 0) << 8) ^
-			(uint64_t)(from->orders_backup != nullptr ? 1 : 0) ^
-			(uint64_t)(from->r3r_orders_borrowed ? 2 : 0);
 
 	/* 排程所有权(route A 借用制:主人保留自己的指针,链头只借用)。 */
 	std::swap(to->orders, from->orders);
@@ -11835,12 +10128,7 @@ static void R3RMoveSegmentOwner(Train *from, Train *to)
 	std::swap(to->name_backup, from->name_backup);
 	std::swap(to->group_id_backup, from->group_id_backup);
 
-	if (from_carries && R3RDbgEdge(R3REDGE_OWNERMOVE, from->index.base(), owner_payload)) {
-		R3RDbgWrite("OWNER-MOVE from=%d to=%d orders=%d prio=%u borrowed=%d\n",
-				(int)from->index.base(), (int)to->index.base(),
-				(int)(to->GetEffectiveOrders() != nullptr ? to->GetEffectiveOrders()->GetNumOrders() : 0),
-				(unsigned)to->r3r_priority, (int)to->r3r_orders_borrowed);
-	}
+	
 }
 
 /**
@@ -11905,181 +10193,11 @@ static void R3RUndoLogicalFlip(Train *chain, const R3RSegBoundaries &old_bounds,
  * neither a single front engine nor a set of free wagons -- which is what a
  * wagon left behind by a chain edit looks like. Read-only, changes nothing.
  */
-void R3RStrandCensus()
-{
-	static uint32_t r3r_census_seq = 0;
-	r3r_census_seq++;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-
-	fprintf(dbg, "=== CENSUS seq=%u ===\n", (unsigned)r3r_census_seq);
-	for (const Vehicle *v : Vehicle::Iterate()) {
-		if (v->type != VehicleType::Train) continue;
-		if (v->Previous() != nullptr) continue;
-
-		uint n = 0, nfe = 0, nfw = 0, nseg = 0;
-		const Owner head_owner = v->owner;
-		bool multi_owner = false;
-		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
-			const Train *wt = Train::From(w);
-			n++;
-			if (wt->IsFrontEngine()) nfe++;
-			if (wt->IsFreeWagon()) nfw++;
-			if (wt->IsSegmentFront()) nseg++;
-			if (w->owner != head_owner) multi_owner = true;
-		}
-
-		fprintf(dbg, "CENSUS-CHAIN head=%d own=%d n=%u FE=%u FW=%u SEGF=%u multiown=%d ord=%d tile=%d,%d dir=%d xy=%d,%d:",
-				(int)v->index.base(), (int)head_owner.base(), n, nfe, nfw, nseg,
-				(int)multi_owner, (int)(v->GetEffectiveOrders() != nullptr), TileX(v->tile), TileY(v->tile),
-				(int)v->direction, v->x_pos, v->y_pos);
-		for (const Vehicle *w = v; w != nullptr; w = w->Next()) {
-			const Train *wt = Train::From(w);
-			fprintf(dbg, " %d[ow%d t%d,%d d%d m%d %s %s %s %s]",
-					(int)w->index.base(), (int)w->owner.base(), TileX(w->tile), TileY(w->tile),
-					(int)w->direction, (int)wt->GetMovingDirection(),
-					wt->IsFrontEngine() ? "FE" : "--",
-					wt->IsFreeWagon() ? "FW" : "--",
-					wt->IsSegmentFront() ? "SF" : "--",
-					(w == v && wt->IsStoppedInDepot()) ? "DP" : "--");
-		}
-		fprintf(dbg, "\n");
-
-		if (nfe != 1) {
-			fprintf(dbg, "CENSUS-ANOMALY head=%d n=%u FE=%u FW=%u SEGF=%u (chain head is not exactly one front engine)\n",
-					(int)v->index.base(), n, nfe, nfw, nseg);
-		}
-	}
-	/* R3R (TEMPORARY DIAGNOSTIC): couple-gate probe. Prints the couple group
-	 * table plus, for every ordered pair of chain heads, the verdict of the
-	 * couple gate and the depot GOTO_COUPLE preconditions, so a coupling which
-	 * never happens can be attributed to a specific condition. Read-only. */
-	if (r3r_census_seq <= 8) {
-		for (const CoupleGroup *cg : CoupleGroup::Iterate()) {
-			fprintf(dbg, "CGPROBE-GROUP id=%d own=%d flags=%02X open=%d name=%s\n",
-					(int)cg->index.base(), (int)cg->owner.base(), (unsigned)cg->flags,
-					(int)cg->AllowsOthers(), cg->name.c_str());
-		}
-		std::vector<const Train *> heads;
-		for (const Vehicle *v : Vehicle::Iterate()) {
-			if (v->type != VehicleType::Train || v->Previous() != nullptr) continue;
-			heads.push_back(Train::From(v));
-		}
-		for (const Train *a : heads) {
-			for (const Train *b : heads) {
-				if (a == b) continue;
-				const bool a_target_depot = a->current_order.IsType(OT_GOTO_COUPLE) &&
-						a->current_order.GetCoupleIsDepot() && IsRailDepotTile(a->tile) &&
-						a->current_order.GetDestination().ToDepotID() == GetDepotIndex(a->tile);
-				/* 修法 D: 探针要反映"在跑的那张表"里的当前命令,跟随者自己的表可能是空的。 */
-				const Order *ra = (a->GetEffectiveOrders() != nullptr) ? a->GetOrder(a->cur_real_order_index) : nullptr;
-				const Order *rb = (b->GetEffectiveOrders() != nullptr) ? b->GetOrder(b->cur_real_order_index) : nullptr;
-				fprintf(dbg, "CGPROBE-PAIR a=%d b=%d ownA=%d ownB=%d gA=%llX gB=%llX allowed=%d"
-						" aStopped=%d aSpd=%u aCo=%d aReal=%d aTargetDepot=%d"
-						" bCo=%d bReal=%d bSegF=%d bDepot=%d\n",
-						(int)a->index.base(), (int)b->index.base(), (int)a->owner.base(), (int)b->owner.base(),
-						(unsigned long long)R3RGetCoupleGroupsOfSegment(a),
-						(unsigned long long)R3RGetCoupleGroupsOfSegment(b),
-						(int)R3RCoupleAllowed(a, b),
-						(int)a->vehstatus.Test(VehState::Stopped), (unsigned)a->cur_speed,
-						(int)a->current_order.GetType(), (int)(ra != nullptr ? ra->GetType() : -1),
-						(int)a_target_depot,
-						(int)b->current_order.GetType(), (int)(rb != nullptr ? rb->GetType() : -1),
-						(int)b->IsSegmentFront(), (int)b->IsStoppedInDepot());
-			}
-		}
-	}
-
-	fprintf(dbg, "=== CENSUS-END ===\n");
-	fclose(dbg);
-}
-
 /** Debug dump of a train chain structure for hang diagnosis. */
-static void R3RDumpChainDbg(const Train *head, const char *tag)
-{
-	/* R3R (第 386 轮 / 探针分离): 与 R3RWatchOrderIndex 同款门禁。
-	 * 本函数"先做真活、后开日志"：探针关闭时原来仍会记账 + 构造计时器 + 走一遍
-	 * R3RFopenDbg（发布版里现在直接 nullptr），全链遍历才被挡住。首行返回让
-	 * R3R_PROBES=0 时整个函数体被折叠为空。 */
-	if (!R3RDbgOn()) return;
-	/* R3R perf probe (KI-14). */
-	R3RPerfCounters &r3rp = R3RP();
-	if (R3RPerfOn()) r3rp.dump_chain++;
-	R3RPerfTimer r3r_dump_timer(&r3rp.dump_chain_ns);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	if (head == nullptr) {
-		fprintf(dbg, "DUMP %s head=NULL\n", tag);
-		fclose(dbg);
-		return;
-	}
-	fprintf(dbg, "DUMP %s head=%d", tag, (int)head->index.base());
-	int i = 0;
-	for (const Train *w = head; w != nullptr; w = w->Next()) {
-		fprintf(dbg, " [%d p=%d n=%d f=%d l=%d]",
-			(int)w->index.base(),
-			w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
-			w->Next() != nullptr ? (int)w->Next()->index.base() : -1,
-			w->First() != nullptr ? (int)w->First()->index.base() : -1,
-			w->Last() != nullptr ? (int)w->Last()->index.base() : -1);
-		if (++i > 60) break;
-	}
-	fprintf(dbg, "%s\n", i > 60 ? " CYCLE-OVERFLOW" : " END");
-	fclose(dbg);
-}
-
 /** R3R debug: dump per-vehicle identity (subtype bits + group-role flags) of a
  *  fold-fix participant chain. Distinguishes real articulated parts (subtype
  *  artic bit) from de-articulated groups (ArticGroupHead/Member railflags,
  *  artic bit cleared by the segment upgrade). */
-static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
-{
-	/* R3R (第 386 轮 / 探针分离): 门禁同 R3RDumpChainDbg。 */
-	if (!R3RDbgOn()) return;
-	/* R3R perf probe (KI-14). */
-	R3RPerfCounters &r3rp = R3RP();
-	if (R3RPerfOn()) r3rp.dump_ident++;
-	R3RPerfTimer r3r_ident_timer(&r3rp.dump_ident_ns);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "IDENT %s head=%d\n", tag, head != nullptr ? (int)head->index.base() : -1);
-	if (head != nullptr) {
-		int i = 0;
-		for (const Train *w = head; w != nullptr; w = w->Next()) {
-			fprintf(dbg, "  %s veh=%d p=%d n=%d subtype=0x%02x(front=%d eng=%d wagon=%d freeW=%d artic=%d) AH=%d AM=%d SF=%d dir=%d flip=%d db=%d x=%d y=%d engType=%d mh=%d rdh=%d omp=%d\n",
-				tag,
-				(int)w->index.base(),
-				w->Previous() != nullptr ? (int)w->Previous()->index.base() : -1,
-				w->Next() != nullptr ? (int)w->Next()->index.base() : -1,
-				w->subtype,
-				HasBit(w->subtype, GVSF_FRONT) ? 1 : 0,
-				HasBit(w->subtype, GVSF_ENGINE) ? 1 : 0,
-				HasBit(w->subtype, GVSF_WAGON) ? 1 : 0,
-				HasBit(w->subtype, GVSF_FREE_WAGON) ? 1 : 0,
-				HasBit(w->subtype, GVSF_ARTICULATED_PART) ? 1 : 0,
-				w->flags.Test(VehicleRailFlag::ArticGroupHead) ? 1 : 0,
-				w->flags.Test(VehicleRailFlag::ArticGroupMember) ? 1 : 0,
-				w->IsSegmentFront() ? 1 : 0,
-				(int)w->direction,
-				w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
-				w->IsDrivingBackwards() ? 1 : 0,
-				(int)w->x_pos, (int)w->y_pos, (int)w->engine_type.base(),
-				/* R3R (KI-334 probe): the dual head relation itself. FOLD-V/FOLD-U
-				 * already print both halves' dir/flip/engType, but nothing in the
-				 * log used to say *which* cars form a rigid dual head pair. */
-				w->IsMultiheaded() ? 1 : 0,
-				w->IsDualHeadRear() ? 1 : 0,
-				w->other_multiheaded_part != nullptr ? (int)w->other_multiheaded_part->index.base() : -1);
-			if (++i > 60) break;
-		}
-	}
-	fprintf(dbg, "IDENT-END %s\n", tag);
-	fclose(dbg);
-}
-
 /**
  * R3R (KI-334 probe, 只读): 把一条链上的每个「双头机车对」当成一对来 dump。
  *
@@ -12099,72 +10217,6 @@ static void R3RDumpCoupleIdentity(const Train *head, const char *tag)
  * @param chain 链上任意一节(通常传链头)。
  * @param tag   探针标签，"rev-dir-post"/"respace"…(参与边沿键，互不抑制)。
  */
-static void R3RDumpDualHeadPairs(const Train *chain, const char *tag)
-{
-	if (!R3RDbgOn() || chain == nullptr) return;
-
-	int pos = 0;
-	for (const Train *w = chain; w != nullptr && pos < R3R_CHAIN_WALK_LIMIT; w = w->Next(), pos++) {
-		/* 每对只从「引擎那一半」打一行；正常双头恰好一个引擎半边。 */
-		if (!w->IsMultiheaded() || !w->IsEngine()) continue;
-		const Train *const other = w->other_multiheaded_part;
-		if (other == nullptr) {
-			const uint64_t okey = (R3RDbgTagHash(tag) << 32) ^ ((uint64_t)w->index.base() << 16);
-			if (R3RDbgEdge(R3REDGE_DUALHEAD, okey, 0xFFFFFFFFULL)) {
-				R3RDbgWrite("DUALHEAD %s front=%d orphan=1 (no other_multiheaded_part) pos=%d\n",
-						tag, (int)w->index.base(), pos);
-			}
-			continue;
-		}
-
-		/* 两半之间夹了几节(0=紧贴)，以及中间是否夹了段头 ★。 */
-		int sep = -1;           /* -1 = 伙伴不在此半前方的链序里(异常) */
-		bool star_between = false;
-		if (w->Next() == other) {
-			sep = 0;
-		} else if (w->Previous() == other) {
-			sep = 0;
-		} else {
-			int d = 0;
-			for (const Train *b = w->Next(); b != nullptr && d < 64; b = b->Next(), d++) {
-				if (b == other) { sep = d; break; }
-				if (b->IsSegmentFront()) star_between = true;
-			}
-			if (sep < 0) star_between = false;
-		}
-		const int opos = (sep < 0) ? -1
-				: (w->Next() == other) ? pos + 1
-				: (w->Previous() == other) ? pos - 1
-				: pos + 1 + sep;
-		const bool adjacent = (sep == 0);
-
-		const int dir_f = (int)w->direction;
-		const int dir_r = (int)other->direction;
-		const int flip_f = w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0;
-		const int flip_r = other->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0;
-		const int db_f = w->IsDrivingBackwards() ? 1 : 0;
-		const int db_r = other->IsDrivingBackwards() ? 1 : 0;
-		const int seg_f = w->IsSegmentFront() ? 1 : 0;
-		const int seg_r = other->IsSegmentFront() ? 1 : 0;
-
-		const uint64_t key = (R3RDbgTagHash(tag) << 32) ^
-				((uint64_t)w->index.base() << 16) ^ (uint64_t)other->index.base();
-		const uint64_t payload =
-				((uint64_t)(dir_f & 7) << 22) | ((uint64_t)flip_f << 21) | ((uint64_t)db_f << 20) | ((uint64_t)seg_f << 19) |
-				((uint64_t)(dir_r & 7) << 16) | ((uint64_t)flip_r << 15) | ((uint64_t)db_r << 14) | ((uint64_t)seg_r << 13) |
-				((uint64_t)(star_between ? 1 : 0) << 12) |
-				(uint64_t)((sep + 1) & 0xFF); /* sep=-1 -> 0, 0 -> 1, … */
-		if (R3RDbgEdge(R3REDGE_DUALHEAD, key, payload)) {
-			R3RDbgWrite("DUALHEAD %s front=%d pos=%d dir=%d flip=%d db=%d engType=%d segF=%d | rear=%d pos=%d dir=%d flip=%d db=%d engType=%d segF=%d | sep=%d adj=%d star=%d | px=%d,%d / %d,%d\n",
-					tag,
-					(int)w->index.base(), pos, dir_f, flip_f, db_f, (int)w->engine_type.base(), seg_f,
-					(int)other->index.base(), opos, dir_r, flip_r, db_r, (int)other->engine_type.base(), seg_r,
-					sep, adjacent ? 1 : 0, star_between ? 1 : 0,
-					(int)w->x_pos, (int)w->y_pos, (int)other->x_pos, (int)other->y_pos);
-		}
-	}
-}
-
 /** R3R: 以遍历为准重建链上所有车辆的 first/last 缓存。
  *  背景: RestoreTrainBackup 用 SetNext 重链时,若原链被逻辑反转(段序
  *  旋转过),SetNext 的 last 更新沿 this->first 遍历,可能把链尾车辆的
@@ -12260,8 +10312,6 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 	 * GRF 回调拥有,翻它会让段边界/包围盒与父车脱钩。返回原链头 = "翻转未发生",
 	 * 调用方在门外已否决整块折叠修正,故此处只可能被将来新增的调用方命中。 */
 	if (R3RChainHasRealArticPart(chain)) {
-		R3RDbgWrite("FLIP-REFUSE-REAL-ARTIC head=%d whole=%d -> chain left untouched\n",
-				(int)chain->index.base(), whole_chain_invert ? 1 : 0);
 		return chain;
 	}
 
@@ -12340,13 +10390,6 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 	 * 第一段(段序也随之颠倒 ⇒ 等价于整链逐车倒置,artic 块整块不动)。
 	 * SetNext 双向维护 next/previous/first/last,会自动切断重链过程中遇到的
 	 * 陈旧链接,无需先手工断链。 */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "FLIP-STEP2-DONE nseg=%d whole=%d\n", (int)segs.size(), whole_chain_invert ? 1 : 0);
-			fclose(dbg);
-		}
-	}
 	Train *prev = nullptr;
 	Train *new_head = nullptr;
 	for (size_t si = 0; si < segs.size(); si++) {
@@ -12366,10 +10409,6 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 	}
 	/* 防御性清掉可能残留的陈旧 next。 */
 	prev->SetNext(nullptr);
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) { fprintf(dbg, "FLIP-STEP3-DONE\n"); fclose(dbg); }
-	}
 
 	/* 4. 段标记迁移:段内反转后每组的新段首 = 旧组尾块之首车。 */
 	for (R3RSegGroup &s : segs) {
@@ -12436,14 +10475,10 @@ static Train *R3RFlipChainBySegments(Train *chain, R3RSegBoundaries *owner_moves
 	 * + 镜像后的名次"重新取数,而不是沿用翻链前的缓存值。 */
 	new_head->InvalidateNewGRFCacheOfChain();
 
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) { fprintf(dbg, "FLIP-DONE head=%d nseg=%d whole=%d\n", (int)new_head->index.base(), (int)segs.size(), whole_chain_invert ? 1 : 0); fclose(dbg); }
-	}
 	/* R3R (KI-253 probe): the flip only rewrites direction / chain order / ★ and
 	 * never touches positions, so dump where every car sits on the way out -- this
 	 * is the state a following RESPACE dump has to be compared against. */
-	R3RDumpChainGeometry("flip-done", new_head);
+	
 	return new_head;
 }
 
@@ -12661,9 +10696,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 {
 	/* R3R perf probe (KI-14): a converging couple calls this once; a fold-fix
 	 * retry loop calls it every tick (KI-06). */
-	R3RPerfCounters &r3rp = R3RP();
-	if (R3RPerfOn()) r3rp.try_couple++;
-	R3RPerfTimer r3r_couple_timer(&r3rp.try_couple_ns);
+	
 
 	/* R3R: refuse invalid input. Both chains must be intact (each argument must
 	 * be its own chain head); otherwise ArrangeTrains would merge corrupted
@@ -12690,9 +10723,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	 * 直接 return false 即可，不需要回滚。机车侧(v)同样拒绝：R3R 的段机制无法安全
 	 * 处理真 artic part 的位置/包围盒（见 R170-A），铰接机车本就不该做 R3R 挂车。 */
 	if (R3RChainHasRealArticPart(v) || R3RChainHasRealArticPart(u)) {
-		R3RDbgWrite("CPL-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d -> coupling refused (genuine articulated part present)\n",
-				(int)v->index.base(), (int)u->index.base(),
-				R3RChainHasRealArticPart(v) ? 1 : 0, R3RChainHasRealArticPart(u) ? 1 : 0);
 		return false;
 	}
 
@@ -12740,9 +10770,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		const bool dir_fold = R3RCheckChainFoldedDirection(head, tag, out_a, out_b);
 		if (out_dir != nullptr) *out_dir = dir_fold;
 		if (dir_fold) return true;
-		if (worst_gap > 8) {
-			R3RDbgWrite("FOLDCHK-ACCEPT %s worst_gap=%d residual gap (chain still closing up), not a fold\n", tag, worst_gap);
-		}
+		
 		return false;
 	};
 
@@ -12781,10 +10809,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		const int expected = (splice_prev->gcache.cached_veh_length + splice_head->gcache.cached_veh_length) / 2;
 		const int dist = std::max(std::abs(splice_prev->x_pos - splice_head->x_pos), std::abs(splice_prev->y_pos - splice_head->y_pos));
 		if (std::abs(dist - expected) <= 8) return false;
-		R3RDbgWrite("SPLICE-GAP-REJECT %s prev=%d x=%d y=%d head=%d x=%d y=%d exp=%d dist=%d\n",
-				tag, (int)splice_prev->index.base(), (int)splice_prev->x_pos, (int)splice_prev->y_pos,
-				(int)splice_head->index.base(), (int)splice_head->x_pos, (int)splice_head->y_pos,
-				expected, dist);
 		return true;
 	};
 	/* R3R (2026-09-27, KI-214): 拼接端点一致性 —— 候选1 固定把翻好的 u 接到 v 的
@@ -12802,10 +10826,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		const int d_used = std::max(std::abs(splice_prev->x_pos - splice_head->x_pos), std::abs(splice_prev->y_pos - splice_head->y_pos));
 		const int d_other = std::max(std::abs(other_end->x_pos - splice_head->x_pos), std::abs(other_end->y_pos - splice_head->y_pos));
 		if (d_other <= expected + 4 && d_used > d_other + 4) {
-			R3RDbgWrite("SPLICE-WRONG-END %s used=%d x=%d d=%d other=%d x=%d d=%d head=%d x=%d exp=%d\n",
-					tag, (int)splice_prev->index.base(), (int)splice_prev->x_pos, d_used,
-					(int)other_end->index.base(), (int)other_end->x_pos, d_other,
-					(int)splice_head->index.base(), (int)splice_head->x_pos, expected);
 			return true;
 		}
 		return false;
@@ -12869,22 +10889,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 	const bool override_candidate = (direct_folded && direct_dir_fold && !direct_splice &&
 			direct_gap >= 0 && direct_gap <= 2);
 	if (override_candidate && !fold_pair_on_splice && !fold_pair_dir_mixed) {
-		R3RDbgWrite("FOLDCHK-DIR-OVERRIDE worst_gap=%d tight direct splice, fold verdict ignored\n", direct_gap);
 		direct_folded = false;
-	} else if (override_candidate && direct_fold_a != nullptr && direct_fold_b != nullptr) {
-		/* KI-265 复测判据:折叠结论被保留 ⇒ 继续走折叠修正分支(含真 artic
-		 * 拒绝门禁),不再提交病链。节流:同一对折叠车只写一次。 */
-		const uint64_t ovr_key = ((uint64_t)direct_fold_a->index.base() << 32) ^
-				(uint64_t)direct_fold_b->index.base();
-		const uint64_t ovr_payload = ((uint64_t)direct_gap << 2) |
-				((uint64_t)(fold_pair_on_splice ? 1 : 0) << 1) |
-				(uint64_t)(fold_pair_dir_mixed ? 1 : 0);
-		if (R3RDbgEdge(R3REDGE_FOLDOVR, ovr_key, ovr_payload)) {
-			R3RDbgWrite("FOLDCHK-DIR-OVERRIDE-SKIP worst_gap=%d on_splice=%d dir_mixed=%d dirA=%d dirB=%d A=%d B=%d -> fold verdict kept\n",
-					direct_gap, fold_pair_on_splice ? 1 : 0, fold_pair_dir_mixed ? 1 : 0,
-					(int)direct_fold_a->direction, (int)direct_fold_b->direction,
-					(int)direct_fold_a->index.base(), (int)direct_fold_b->index.base());
-		}
 	}
 
 	if (direct_folded || direct_splice) {
@@ -12926,15 +10931,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		R3RRefreshChainCaches(u);
 		u_old_bounds = R3RCaptureSegBoundaries(u);
 		u_old_roles = R3RCaptureArticRoles(u);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) { fprintf(dbg, "FOLD-CATCHUP START\n"); fclose(dbg); }
-		}
 		/* R3R identity probe: dump both participants' per-vehicle identity so the
 		 * fold-fix scenario can be classified (real artic bits vs de-articulated
 		 * group roles). */
-		R3RDumpCoupleIdentity(v, "FOLD-V");
-		R3RDumpCoupleIdentity(u, "FOLD-U");
+		
+		
 
 		/* R3R (2026-09-30, R170-A 双管齐下之二): 禁止对含真 artic 的链做逻辑翻。
 		 *
@@ -12949,8 +10950,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		 * 本 tick 不挂车。状态已在上面被 RestoreTrainBackup 还原,放弃无需额外
 		 * 回滚,但缓存/链统计必须刷新后再交还给世界。 */
 		if (R3RChainHasRealArticPart(v) || R3RChainHasRealArticPart(u)) {
-			const bool v_real = R3RChainHasRealArticPart(v);
-			const bool u_real = R3RChainHasRealArticPart(u);
 			R3RRefreshChainCaches(v);
 			R3RRefreshChainCaches(u);
 			v->ConsistChanged(CCF_ARRANGE);
@@ -12961,12 +10960,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			 * gap 逐次变小,就说明重试循环还在把几何顶向 OVERRIDE 的触发条件,下一轮
 			 * 才好在拒绝分支里下刹车(本轮只取证,不动运动/位置)。
 			 * —— 第 174 轮复测已确认 spd=21~23 且 gap 单调变小,据此在下方下刹车。 */
-			R3RDbgWrite("FOLDCHK-REFUSE-REAL-ARTIC v=%d u=%d v_real=%d u_real=%d gap=%d pair=(%d,%d) spd=%d db=%d -> rolled back, no logical flip this tick\n",
-					(int)v->index.base(), (int)u->index.base(), v_real ? 1 : 0, u_real ? 1 : 0,
-					direct_gap,
-					(direct_fold_a != nullptr) ? (int)direct_fold_a->index.base() : -1,
-					(direct_fold_b != nullptr) ? (int)direct_fold_b->index.base() : -1,
-					(int)v->cur_speed, (int)(v->IsDrivingBackwards() ? 1 : 0));
+			
 
 			/* R3R (第 174 轮, KI-265「治前因」): 拒绝挂车必须同时让机车真正停下来。
 			 *
@@ -12986,14 +10980,9 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			 * 带 overlap=1),所以刹车不会把机车停在够不着的地方 —— 它本来就已够着。
 			 * 注意 cur_speed 只对前部机车主控有效,故刹车对象取 v->First()。 */
 			Train *const v_front = v->First();
-			const int v_spd_before = (int)v_front->cur_speed;
-			R3RSpdCtx(v_front, "foldchk-refuse-brake", (uint16_t)v_spd_before, 0);
 			v_front->cur_speed = 0;
 			v_front->subspeed = 0;
 			v_front->progress = 0;
-			R3RDbgWrite("FOLDCHK-REFUSE-BRAKE v=%d front=%d spd_before=%d spd_after=%d db=%d\n",
-					(int)v->index.base(), (int)v_front->index.base(), v_spd_before,
-					(int)v_front->cur_speed, (int)(v_front->IsDrivingBackwards() ? 1 : 0));
 			return false;
 		}
 
@@ -13015,10 +11004,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		 * 行为一致)。 */
 
 		/* 候选1:只逻辑翻 u(u 反)。 */
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) { fprintf(dbg, "A2-FLIP-U\n"); fclose(dbg); }
-		}
 		/* 用户拍板 A(2026-09-25): 翻 u 走**整链倒置**(段序随整链颠倒)——
 		 * 位置不动的就地反转下,"整链头尾对调"与"段序颠倒"是同一件事,段序保持
 		 * 版本只能把链头搬到原链头段内(多段链时正好接不上物理相邻对,见函数头
@@ -13026,15 +11011,11 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		Train *u_flip_head = R3RFlipChainBySegments(u, &u_old_bounds, true);
 		u_flipped = true;
 		u_merged_head = u_flip_head;
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) { fprintf(dbg, "A2-FLIP-DONE merged_head=%d\n", (int)u_flip_head->index.base()); fclose(dbg); }
-		}
 
 		u_head = u_flip_head;
 		v_last = R3RTrainTail(v);
-		R3RDumpChainDbg(v, "A2-ARR-BEFORE-V");
-		R3RDumpChainDbg(u_flip_head, "A2-ARR-BEFORE-U");
+		
+		
 		ArrangeTrains(&v, v_last, &u_head, u_flip_head, true);
 		if (ChainFolded(v, "COUPLE-FLIP-U") || SpliceFolded(v_last, "COUPLE-FLIP-U") ||
 				WrongSpliceEnd(v, v_last, "COUPLE-FLIP-U")) {
@@ -13045,25 +11026,13 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			u_flipped = false;
 			R3RRefreshChainCaches(v);
 			R3RRefreshChainCaches(u);
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) { fprintf(dbg, "A2-ROLLBACK-DONE\n"); fclose(dbg); }
-			}
 
 			/* 候选2:只逻辑翻 v(u 保持原样)。机车停在车底头端但尾巴背向
 			 * 车底(单侧朝向错误)时,单翻 v 即可让机车尾贴上 u_head。 */
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) { fprintf(dbg, "A3-FLIP-V-ONLY\n"); fclose(dbg); }
-			}
 			v_old_bounds = R3RCaptureSegBoundaries(v);
 			v_old_roles = R3RCaptureArticRoles(v);
 			Train *v_flip_head = R3RFlipChainBySegments(v, &v_old_bounds);
 			v_flipped = true;
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) { fprintf(dbg, "A3-FLIPV-DONE head=%d\n", (int)v_flip_head->index.base()); fclose(dbg); }
-			}
 			/* R3R (P1, KI-06 fix 2026-09-15): 候选3(双翻)改为"可达且被实测判定"。
 			 * 逻辑翻 v 使链头离开原机车对象时,仅当新链头仍是引擎(真引擎列车翻后
 			 * 新链头 = 原链尾引擎,primary 身份随成功提交迁往新链头)才接受;v 拖着
@@ -13083,7 +11052,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				R3RRefreshChainCaches(u);
 				v->ConsistChanged(CCF_ARRANGE);
 				u->ConsistChanged(CCF_ARRANGE);
-				R3RDbgWrite("FOLDCHK-SKIP COUPLE-FLIP-V v_head_not_engine head=%d -> fall through to candidate 3\n", (int)v_flip_head->index.base());
 				try_candidate3 = true;
 			} else {
 				/* 接受翻 v:v 链真头可能已离开 v 对象(多节真引擎),把合并链当前
@@ -13092,8 +11060,8 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				u_merged_head = u;
 				u_head = u;
 				v_last = R3RTrainTail(v);
-				R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
-				R3RDumpChainDbg(u, "A3-ARR-BEFORE-U");
+				
+				
 				ArrangeTrains(&head, v_last, &u_head, u, true);
 				if (ChainFolded(head, "COUPLE-FLIP-V") || SpliceFolded(v_last, "COUPLE-FLIP-V")) {
 					/* 候选2 失败:撤销只翻 v(逻辑翻回原状)。 */
@@ -13103,10 +11071,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					v_flipped = false;
 					R3RRefreshChainCaches(v);
 					R3RRefreshChainCaches(u);
-					{
-						FILE *dbg = R3RFopenDbg("a");
-						if (dbg != nullptr) { fprintf(dbg, "A3-ROLLBACK-DONE\n"); fclose(dbg); }
-					}
 					try_candidate3 = true;
 				}
 			}
@@ -13115,10 +11079,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				/* 候选3:双翻 —— 机车与车底都处于错误朝向。机车逻辑反转 +
 				 * 车组逻辑反转后两链同向,原"机车鼻顶车组尾"的相邻点恰好
 				 * 变成"机车链尾顶车组链头",一次即可拼成。 */
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-FLIPV\n"); fclose(dbg); }
-				}
 				v_old_bounds = R3RCaptureSegBoundaries(v);
 				head = R3RFlipChainBySegments(v, &v_old_bounds);
 				v_flipped = true;
@@ -13126,10 +11086,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				u_flip_head = R3RFlipChainBySegments(u, &u_old_bounds, true);
 				u_flipped = true;
 				u_merged_head = u_flip_head;
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) { fprintf(dbg, "A3-BOTH-FLIP-DONE merged_head=%d\n", (int)u_flip_head->index.base()); fclose(dbg); }
-				}
 				if (head != v && !head->IsEngine()) {
 					/* 候选3 的结构守卫(与候选2 同一判据):双翻同样让链头离开原机车
 					 * 对象,不可接受 —— 完整回滚两条链并放弃本次折叠修正(下 tick
@@ -13144,19 +11100,14 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 					R3RRefreshChainCaches(u);
 					v->ConsistChanged(CCF_ARRANGE);
 					u->ConsistChanged(CCF_ARRANGE);
-					R3RDbgWrite("FOLDCHK-SKIP COUPLE-FLIP-BOTH v_head_not_engine head=%d -> give up this tick\n", (int)head->index.base());
 					return false;
 				}
 
 				u_head = u_flip_head;
 				v_last = R3RTrainTail(v);
-				R3RDumpChainDbg(v, "A3-ARR-BEFORE-V");
-				R3RDumpChainDbg(u_flip_head, "A3-ARR-BEFORE-U");
+				
+				
 				ArrangeTrains(&head, v_last, &u_head, u_flip_head, true);
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) { fprintf(dbg, "A3-ARRANGE-DONE\n"); fclose(dbg); }
-				}
 				if (ChainFolded(head, "COUPLE-FLIP-BOTH")) {
 					/* 彻底失败:把两条链都翻回原状再报错(下次触发会重头试)。 */
 					RestoreTrainBackup(original_src);
@@ -13179,9 +11130,7 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 				 * hard veto (a genuine fold must not be committed); only the
 				 * splice-gap preference is relaxed here, and it says so in the
 				 * log so a broken merged chain is traceable. */
-				if (SpliceFolded(v_last, "COUPLE-FLIP-BOTH")) {
-					R3RDbgWrite("SPLICE-GAP-LAST-RESORT COUPLE-FLIP-BOTH accepted anyway (no candidate has an adjacent splice)\n");
-				}
+				(void)(SpliceFolded(v_last, "COUPLE-FLIP-BOTH"));
 			}
 		}
 	}
@@ -13202,41 +11151,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 		const Train *gate_b = nullptr;
 		const bool gate_folded = R3RCheckChainFoldedDirection(head, "COUPLE-PREFLIGHT", &gate_a, &gate_b);
 
-		/* R3R (第 173 轮, KI-265 探针): 到达提交点时无条件留一行几何摘要。
-		 * 折叠判据只在"判为折叠"时才打 FOLDCHK-DIR，而它受 R3RDbgEdge 的 128 帧
-		 * 窗口节流 ⇒ "日志里没有 FOLDCHK-DIR"既可能是没折叠、也可能是被节流，
-		 * 复测时无法区分。这一行按 (v,u,gap,dirA,dirB) 几何签名节流（每个不同的
-		 * 几何只写一行），于是每次重试都留下一条可核对的现场：拼接对是谁、两车
-		 * 朝向如何、判据是否成立、机车当时的速度。只读，不参与任何判据。 */
-		{
-			const Train *const sp_a = v_last;
-			const Train *const sp_b = (sp_a != nullptr) ? sp_a->Next() : nullptr;
-			const uint32_t pf_gap = (direct_gap < 0) ? 0xFFu : (uint32_t)direct_gap;
-			const uint32_t pf_dira = (gate_a != nullptr) ? (uint32_t)gate_a->direction : 0xFu;
-			const uint32_t pf_dirb = (gate_b != nullptr) ? (uint32_t)gate_b->direction : 0xFu;
-			const bool pf_mixed = (gate_a != nullptr && gate_b != nullptr &&
-					gate_a->direction != gate_b->direction);
-			const uint64_t pf_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
-			const uint64_t pf_payload = ((uint64_t)pf_gap << 40) | ((uint64_t)pf_dira << 36) |
-					((uint64_t)pf_dirb << 32) | ((uint64_t)(gate_folded ? 1u : 0u) << 1) |
-					(uint64_t)(pf_mixed ? 1u : 0u);
-			if (R3RDbgEdge(R3REDGE_CPLSUM, pf_key, pf_payload)) {
-				R3RDbgWrite("COUPLE-PREFLIGHT head=%d last=%d fold=%d dirfold=%d gap=%d pair=(%d dir=%d, %d dir=%d) mixed=%d onsplice=%d splice=(%d dir=%d, %d dir=%d) spd=%d db=%d\n",
-						(int)head->index.base(),
-						(sp_a != nullptr) ? (int)sp_a->index.base() : -1,
-						(int)(gate_folded ? 1 : 0), (int)(direct_dir_fold ? 1 : 0), direct_gap,
-						(gate_a != nullptr) ? (int)gate_a->index.base() : -1, (int)pf_dira,
-						(gate_b != nullptr) ? (int)gate_b->index.base() : -1, (int)pf_dirb,
-						(int)(pf_mixed ? 1 : 0),
-						(gate_a != nullptr && gate_a == v_last) ? 1 : 0,
-						(sp_a != nullptr) ? (int)sp_a->index.base() : -1,
-						(sp_a != nullptr) ? (int)sp_a->direction : -1,
-						(sp_b != nullptr) ? (int)sp_b->index.base() : -1,
-						(sp_b != nullptr) ? (int)sp_b->direction : -1,
-						(int)v->cur_speed, (int)(v->IsDrivingBackwards() ? 1 : 0));
-			}
-		}
-
 		if (gate_folded && gate_a != nullptr && gate_b != nullptr && gate_a == v_last &&
 				gate_a->direction != gate_b->direction) {
 			RestoreTrainBackup(original_src);
@@ -13247,9 +11161,6 @@ static bool TryTrainCouple(Train *&v, Train *u, Train *&merged_first)
 			R3RRefreshChainCaches(u);
 			v->ConsistChanged(CCF_ARRANGE);
 			u->ConsistChanged(CCF_ARRANGE);
-			R3RDbgWrite("COUPLE-REFUSE-STILL-FOLDED head=%d a=%d dirA=%d b=%d dirB=%d -> rolled back, no merge this tick\n",
-					(int)head->index.base(), (int)gate_a->index.base(), (int)gate_a->direction,
-					(int)gate_b->index.base(), (int)gate_b->direction);
 			return false;
 		}
 	}
@@ -13426,14 +11337,6 @@ static void R3RNormaliseDepotMergeDirection(Train *v)
 	const bool tail_leads = exit_offset(v->Last()) > exit_offset(v);
 	v->vehicle_flags.Set(VehicleFlag::DrivingBackwards, tail_leads);
 	v->ConsistChanged(CCF_ARRANGE);
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "[R3R] DEPOT-MERGE-DIR head=%d tail=%d tail_leads=%d head_off=%d tail_off=%d\n",
-				(int)v->index.base(), (int)v->Last()->index.base(), (int)tail_leads,
-				(int)exit_offset(v), (int)exit_offset(v->Last()));
-		fclose(dbg);
-	}
 }
 
 /**
@@ -13657,9 +11560,6 @@ static uint R3RReleaseChainReservations(const Train *head, const char *why)
 
 				SetRailStationReservation(rec.tile, false);
 				freed++;
-				R3RDbgWrite("RESV-GHOST %s veh=%d tile=%d,%d track=whole kind=%s\n",
-						why, (int)chain_head->index.base(), (int)TileX(rec.tile), (int)TileY(rec.tile),
-						IsRailWaypointTile(rec.tile) ? "waypoint" : "station");
 				continue;
 			}
 
@@ -13668,18 +11568,12 @@ static uint R3RReleaseChainReservations(const Train *head, const char *why)
 
 			UnreserveRailTrack(rec.tile, rec.track);
 			freed++;
-			R3RDbgWrite("RESV-GHOST %s veh=%d tile=%d,%d track=%u\n",
-					why, (int)chain_head->index.base(), (int)TileX(rec.tile), (int)TileY(rec.tile), (uint)rec.track);
 		}
 	}
 
 	/* Always log the summary when there was anything to look at: "cand" and
 	 * "freed" must be equal, and the pair is what tells a future round whether a
 	 * path was still being cut. */
-	if (!doomed.empty()) {
-		R3RDbgWrite("RESV-GHOST-SUMMARY %s veh=%d cand=%u freed=%u\n",
-				why, (int)chain_head->index.base(), (unsigned)doomed.size(), freed);
-	}
 	return freed;
 }
 
@@ -13754,7 +11648,7 @@ static void Couple(Train *v, Train *u)
 	 * side is cleared through the *original* locomotive's id: a fold-fix flip
 	 * may have migrated the identity (and thus the object `v` points at) onto a
 	 * new head, while the recorded id still resolves to the merged chain. */
-	R3RDbgPairEvent("CPL-PAIRUNLOCK", "coupled", Train::GetIfValid(couple_loco_id), u);
+	
 	R3RUnpairCoupleTargets(Train::GetIfValid(couple_loco_id));
 	R3RUnpairCoupleTargets(u);
 	_r3r_pair_scan_tick.erase(couple_loco_id.base());
@@ -13841,16 +11735,6 @@ static void Couple(Train *v, Train *u)
 			const int seam_abs = (seam_delta < 0) ? -seam_delta : seam_delta;
 			const int seam_circ = (seam_abs > 4) ? 8 - seam_abs : seam_abs;
 			if (seam_circ == 2) {
-				/* 直角(90°)拼缝 = 事故。两车在这之前已完成物理拼接(ArrangeTrains)，这里立即
-				 * 按撞毁处理，不再走下面的排程交接：车已毁，orders 交接没有意义。 */
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] COUPLE-SEAM-CRASH circ=2 a=%d dirA=%d b=%d dirB=%d tile=%u\n",
-							(int)seam_prev->index.base(), (int)seam_prev->direction,
-							(int)merged_first->index.base(), (int)merged_first->direction,
-							(unsigned)v->tile.base());
-					fclose(dbg);
-				}
 				if (!v->vehstatus.Test(VehState::Crashed)) {
 					const uint num_victims = TrainCrashed(v);
 					if (v->owner == _local_company) {
@@ -13860,13 +11744,6 @@ static void Couple(Train *v, Train *u)
 				return;
 			}
 			if (seam_circ >= 3) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] COUPLE-SEAM-FLIP circ=%d a=%d dirA=%d b=%d dirB=%d\n",
-							seam_circ, (int)seam_prev->index.base(), (int)seam_prev->direction,
-							(int)merged_first->index.base(), (int)merged_first->direction);
-					fclose(dbg);
-				}
 				R3RReverseChainDirections(merged_first);
 			}
 		}
@@ -13983,17 +11860,7 @@ static void Couple(Train *v, Train *u)
 	 * left untouched pending the owner's decision; this line only makes the
 	 * cross-company case visible so the report can be tied to a real coupling.
 	 * Read-only, one line per cross-company coupling. */
-	if (couple_owner->owner != v->owner) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "COUPLE-XCOMPANY head=%d head_own=%d owner=%d owner_own=%d owner_ords=%d head_ords=%d borrows=%d\n",
-					(int)v->index.base(), (int)v->owner.base(),
-					(int)couple_owner->index.base(), (int)couple_owner->owner.base(),
-					(int)couple_owner->GetNumOrders(), (int)v->GetNumOrders(),
-					(int)(couple_owner->GetEffectiveOrders() != nullptr));
-			fclose(dbg);
-		}
-	}
+	
 
 	/* R3R (KI-187): 交接判据必须问"命令主人有没有表",而不是"挂车前的车组链头
 	 * (u) 有没有表" —— 折叠修正可能已把 u 的段身份(含排程)搬到段内另一辆车,
@@ -14019,19 +11886,6 @@ static void Couple(Train *v, Train *u)
 		 * （必须原样留着，解挂时归还）；借用已结束 ⇒ backup 是过期副本（照 KI-147
 		 * 还给号池）。v->r3r_orders_borrowed 在 :10180 会被置真，那时就分不清了。 */
 		const bool was_borrowing = v->r3r_orders_borrowed;
-		if (v->IsR3RFollower()) {
-			/* KI-215 判据：第二次及以后的耦合必须出现这一行（第二次耦合不再
-			 * 更换自己那张表），且 cur_real 是本车自己那张表里的位置。 */
-			R3RDbgWrite("ORD-XFER keep veh=%d owner=%d cur_real=%d parked_real=%d own_shared=%d own_first=%d owner_shared=%d\n",
-					(int)v->index.base(), (int)couple_owner->index.base(),
-					(int)v->cur_real_order_index, (int)v->orders_backup_real_index,
-					/* R3R (第 296 轮, KI-470): the second coupling of a chain that sits on a
-					 * native shared schedule is exactly the case where "own list" and "list we
-					 * actually run" can diverge. own_first names the other member of the ring. */
-					(int)v->IsOrderListShared(),
-					(int)(v->FirstShared() != nullptr ? v->FirstShared()->index.base() : -1),
-					(int)(couple_owner->GetEffectiveOrders() != nullptr && couple_owner->GetEffectiveOrders()->IsShared()));
-		}
 		/* R3R (KI-542 修法甲/第 378-379 轮): 链上每一个"把自己那张表让出去"的段，
 		 * 都在这里按此刻的真实进度重写书签（书签不过期）。下面那个
 		 * R3RParkOwnOrderProgress(v) 只覆盖链头（机车），被动跟走的车底段从来没人停
@@ -14066,8 +11920,6 @@ static void Couple(Train *v, Train *u)
 		 * 已存在挂起层时不再覆盖（与 R3RReturnBorrowedOrders() 的恢复分支一一对应）。 */
 		if (v->r3r_follow_pool && v->r3r_follow_orders != nullptr && v->r3r_pool_orders == nullptr) {
 			v->r3r_pool_orders = v->r3r_follow_orders;
-			R3RDbgWrite("ORD-BORROW-STACK veh=%d pool=%u tag=couple\n",
-					(int)v->index.base(), (unsigned)v->r3r_pool_orders->index.base());
 		}
 		/* R3R (第 383 轮 / D2): 停位与接管跟随指针绑成一次调用。 */
 		R3RBeginBorrow(v, couple_owner->GetEffectiveOrders(), couple_owner->index, "couple");
@@ -14146,10 +11998,7 @@ static void Couple(Train *v, Train *u)
 			/* R3R (第 185 轮 / KI-280): borrowed=采样到的"耦合前 v 就在借用中"，
 			 * own=停放后 v 是否真有一件"自己的名字"（0 且 borrowed=1 表示这次正确地
 			 * 没有把借名停成原名；旧 exe 在这种情况下会错停成 1）。 */
-			R3RDbgWrite("NAME-XFER head=%d u=%d head_own=%d got_u=%d keep_u=%d borrowed=%d own=%d\n",
-					(int)v->index.base(), (int)u->index.base(),
-					(int)head_had_own, (int)!v->name.empty(), (int)!u->name.empty(),
-					(int)was_borrowing, (int)!v->name_backup.empty());
+			
 		}
 		/* Inherit the consist's schedule position from the vehicle that was
 		 * waiting to be coupled. The WAIT_COUPLE order currently being fulfilled
@@ -14216,127 +12065,12 @@ static void Couple(Train *v, Train *u)
 		const Train *const r3r_land_plat = v->GetStationLoadingVehicle();
 		const bool r3r_at_legal_spot = IsRailDepotTile(v->tile) ||
 				(r3r_land_plat != nullptr && IsTileType(r3r_land_plat->tile, TileType::Station));
-		const uint decouple_skip = (r3r_landed_on_decouple && !r3r_at_legal_spot)
-				? R3RSkipUnfireableDecoupleOrder(v) : 0;
-		if (decouple_skip > 0) {
-			const Order *const skipped_to = v->GetNumOrders() > 0 ? v->GetOrder(v->cur_real_order_index) : nullptr;
-			R3RDbgWrite("COUPLE-SKIP-DECOUPLE head=%d stepped=%u real=%d type=%d\n",
-					(int)v->index.base(), decouple_skip, (int)v->cur_real_order_index,
-					skipped_to != nullptr ? (int)skipped_to->GetType() : -1);
-		}
-		R3RCheckTtSync(v, "couple-waitcouple");
+		if (r3r_landed_on_decouple && !r3r_at_legal_spot) R3RSkipUnfireableDecoupleOrder(v);
+
 		/* Keep the timetable index in sync (IncrementRealOrderIndex does not
 		 * update it; a mismatch crashes UpdateVehicleTimetable on station leave:
 		 * "real_timetable_order == real_current_order"). */
 		v->cur_timetable_order_index = v->cur_real_order_index;
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				const Order *co = (v->GetNumOrders() > 0) ? v->GetOrder(v->cur_real_order_index) : nullptr;
-				fprintf(dbg, "COUPLE-OK loco=%d rear=%d consist=%d co=%d real=%d type=%d tx=%d ty=%d x=%d y=%d\n",
-					(int)v->index.base(), (int)(v->Last()->index.base()),
-					(int)u->index.base(), (int)R3RIsCarOnlyFormation(u),
-					(int)v->cur_real_order_index, (int)(co ? co->GetType() : -1),
-					(int)TileX(v->tile), (int)TileY(v->tile), (int)v->x_pos, (int)v->y_pos);
-				for (const Train *w = v; w != nullptr; w = w->Next()) {
-					/* R3R 1px probe: gap = actual centre distance - nominal
-					 * (len_a + len_b)/2. Negative => the two boxes overlap. */
-					const Train *nxt = w->Next();
-					/* R3R (KI-214 probe fix, 2026-09-27): nominal is the engine's
-					 * CalcNextVehicleOffset() (for odd lengths the leading vehicle
-					 * rounds up), not the (la + lb) / 2 average -- the average
-					 * reported gap=0 even for a real 1px overlap. nom0/nom1 print
-					 * both rounding hypotheses for the record. */
-					int gap = 0;
-					int nom = 0;
-					int nom0 = 0;
-					int nom1 = 0;
-					if (nxt != nullptr) {
-						const int la = w->gcache.cached_veh_length;
-						const int lb = nxt->gcache.cached_veh_length;
-						nom0 = la / 2 + (lb + 1) / 2;
-						nom1 = lb / 2 + (la + 1) / 2;
-						const Train *const self = w->IsDrivingBackwards() ? nxt : w;
-						nom = self->CalcNextVehicleOffset();
-						gap = std::max(std::abs((int)w->x_pos - (int)nxt->x_pos), std::abs((int)w->y_pos - (int)nxt->y_pos)) - nom;
-					}
-					/* R3R (KI-214 probe, 2026-09-26)：玩家反复报的"图像偏移"无法只靠
-					 * x/y/gap 判定 —— 那些只证明【物理间隔】在容差内(1px 重合都可能
-					 * 参数合格)，完全不代表【画出来的盒子】和车一致。这里补上
-					 * Train::UpdateDeltaXY() 由 direction/Flipped 推出的渲染包围盒
-					 * (origin/extent/offset) 与它据以推导的那对方向量，于是"盒子不再
-					 * 对齐车身"可以直接读出来。与本节其余 dump 同一频度(每次耦合一次)，
-					 * 不经 R3RDbgEdge，不会被 128 帧窗口抑制。 */
-					fprintf(dbg, "  CPL idx=%d x=%d y=%d tile=%d,%d dir=%d flip=%d db=%d trk=0x%X len=%d gap=%d nom=%d nom0=%d nom1=%d bO=%d,%d bE=%d,%d bF=%d,%d\n",
-							(int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-							(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction,
-							w->flags.Test(VehicleRailFlag::Flipped) ? 1 : 0,
-							w->IsDrivingBackwards() ? 1 : 0,
-							(uint)w->track,
-							(int)w->gcache.cached_veh_length, gap, nom, nom0, nom1,
-							(int)w->bounds.origin.x, (int)w->bounds.origin.y,
-							(int)w->bounds.extent.x, (int)w->bounds.extent.y,
-							(int)w->bounds.offset.x, (int)w->bounds.offset.y);
-				}
-				fclose(dbg);
-			}
-		}
-	}
-
-	/* R3R (第 173 轮, KI-265 探针, 只读): 提交之后的"事后校验"。
-	 * 提交前闸门只看【这一次的拼接对】，这里在【最终整链】上再跑一次方向判据：
-	 * 若为真，说明"绝不提交折叠链"这条不变式还有一条没被闸门覆盖的侧门，必须
-	 * 拿日志来定位。刻意只写日志、**不撤销提交** —— 提交之后回滚要连排程交接、
-	 * 索引继承、窗口失效一起还原，风险远大于收益；真正的拦截在 try 阶段完成。
-	 * 每次成功挂车写一行（不是每 tick），不会被 128 帧窗口抑制。 */
-	{
-		const Train *po_a = nullptr;
-		const Train *po_b = nullptr;
-		const Train *const post_head = v->First();
-		const bool post_folded = R3RCheckChainFoldedDirection(post_head, "COUPLE-POSTFOLD", &po_a, &po_b);
-		R3RDbgWrite("COUPLE-POSTFOLD head=%d folded=%d a=(%d dir=%d y=%d) b=(%d dir=%d y=%d) mixed=%d%s\n",
-				(int)post_head->index.base(), (int)(post_folded ? 1 : 0),
-				(po_a != nullptr) ? (int)po_a->index.base() : -1,
-				(po_a != nullptr) ? (int)po_a->direction : -1,
-				(po_a != nullptr) ? (int)po_a->y_pos : -1,
-				(po_b != nullptr) ? (int)po_b->index.base() : -1,
-				(po_b != nullptr) ? (int)po_b->direction : -1,
-				(po_b != nullptr) ? (int)po_b->y_pos : -1,
-				(int)((po_a != nullptr && po_b != nullptr && po_a->direction != po_b->direction) ? 1 : 0),
-				post_folded ? " INVARIANT-BROKEN-report-this" : "");
-	}
-
-	/* R3R (KI-128 probe): snapshot the order list right after the hand-over so a
-	 * report of "a mystery order appeared after coupling / the train crawls out
-	 * of the station" can be traced to the exact inherited order. One header line
-	 * plus one line per order, per coupling -- not per tick. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "ORD-AFTER-COUPLE head=%d n=%d real=%d impl=%d tt=%d co=%d dest=%u borrowed=%d owner=%d u_has_orders=%d own_shared=%d own_first=%d u_shared=%d u_follow=%d\n",
-					(int)v->index.base(), (int)v->GetNumOrders(),
-					(int)v->cur_real_order_index, (int)v->cur_implicit_order_index,
-					(int)v->cur_timetable_order_index, (int)v->current_order.GetType(),
-					(unsigned)v->dest_tile.base(), (int)v->r3r_orders_borrowed,
-					(int)couple_owner->index.base(), (int)(u->GetEffectiveOrders() != nullptr),
-					/* R3R (第 296 轮, KI-470): a merged chain whose own list is still
-					 * registered in a native shared ring means the "who runs what" answer
-					 * changes under our feet -- the round-296 evidence had two sets of
-					 * three trains on shared schedules. own_shared = v's list is shared,
-					 * own_first = that ring's first vehicle (i.e. who else reads it),
-					 * u_shared / u_follow = the coupled-in side's list state. */
-					(int)v->IsOrderListShared(),
-					(int)(v->FirstShared() != nullptr ? v->FirstShared()->index.base() : -1),
-					(int)u->IsOrderListShared(),
-					(int)u->IsR3RFollower());
-			for (uint i = 0; i < v->GetNumOrders(); i++) {
-				const Order *o = v->GetOrder(i);
-				if (o == nullptr) continue;
-				fprintf(dbg, "  ORD idx=%u type=%d dest=%u\n",
-						(uint)i, (int)o->GetType(), (unsigned)o->GetDestination().value);
-			}
-			fclose(dbg);
-		}
 	}
 
 	/* R3R (KI-179): grant the merged train the one-shot "independent reservation"
@@ -14347,14 +12081,6 @@ static void Couple(Train *v, Train *u)
 	 * first successful reservation and kept while no reservation can be made (the
 	 * train then takes the ordinary "waiting for free track" punishment). */
 	v->SetForceReserveOnce();
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "R3R-RES-ONCE grant head=%d force_proceed=%d tile=%d,%d\n",
-					(int)v->index.base(), (int)v->force_proceed, (int)TileX(v->tile), (int)TileY(v->tile));
-			fclose(dbg);
-		}
-	}
 
 	/* R3R (KI-199): "couple, then reserve". The hand-over right above discarded the
 	 * current order and left loading the new one to the *next* ProcessOrders() run --
@@ -14366,39 +12092,6 @@ static void Couple(Train *v, Train *u)
 	 * ProcessOrders() has put the inherited travel order (and with it dest_tile) in
 	 * place. */
 	if (v->IsFrontEngine()) _r3r_couple_autoreserve.insert(v->index);
-
-	/* R3R (KI-131 probe): report the merged chain's aggregate attributes and, per
-	 * segment head, the values that segment reports. Train::ConsistChanged()
-	 * stores the *consist-wide* totals in the gcache of every vehicle, so any
-	 * code (or UI panel / GRF) which sums gcache over the segment heads of a
-	 * multi-segment chain reports exactly n_segments times the real value -- the
-	 * "every attribute is three times too big" report for a three-segment chain.
-	 * The per-segment lines make that visible: when all of them carry the same
-	 * power/weight/length as the head, the totals are chain-wide and summing them
-	 * multiplies. Read-only, one header plus one line per segment, per coupling. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			uint n = 0, nseg = 0, nfe = 0;
-			for (const Train *w = v; w != nullptr; w = w->Next()) {
-				n++;
-				if (w->IsSegmentFront()) nseg++;
-				if (w->IsFrontEngine()) nfe++;
-			}
-			fprintf(dbg, "CHAIN-ATTRS head=%d n=%u FE=%u SEG=%u pow=%lld wt=%lld len=%d spd=%d\n",
-					(int)v->index.base(), n, nfe, nseg,
-					(long long)v->gcache.cached_power, (long long)v->gcache.cached_weight,
-					(int)v->gcache.cached_total_length, (int)v->GetDisplayMaxSpeed());
-			for (const Train *w = v; w != nullptr; w = w->Next()) {
-				if (w != v && !w->IsSegmentFront()) continue;
-				fprintf(dbg, "  SEG idx=%d pow=%lld wt=%lld len=%d spd=%d\n",
-						(int)w->index.base(), (long long)w->gcache.cached_power,
-						(long long)w->gcache.cached_weight,
-						(int)w->gcache.cached_total_length, (int)w->GetDisplayMaxSpeed());
-			}
-			fclose(dbg);
-		}
-	}
 
 	/* The formation front (zero-power locomotive identity) becomes a normal wagon again.
 	 * R3R: remember that the coupled-on chain carried a formation identity BEFORE the
@@ -14434,7 +12127,6 @@ static void Couple(Train *v, Train *u)
 		 * Vehicle::R3RUnitNumberOwnedByOther()）。旧代码在这里 ReleaseID 把号直接
 		 * 还回公司池，等于把编号让给了别的列车。 */
 		if (u->unitnumber_backup == 0) u->unitnumber_backup = u->unitnumber;
-		R3RDbgWrite("UNIT-FREEZE id=%u head_id=%u\n", u->unitnumber, v->unitnumber);
 	}
 	u->unitnumber = 0;
 	GroupStatistics::CountVehicle(u, -1);
@@ -14486,14 +12178,6 @@ static void Couple(Train *v, Train *u)
 	 * （IncrementImplicitOrderIndex/ProcessOrders 在上方），所以这里打点日志供现场
 	 * 核对：临时分组不进入合并后的链，整链的挂接分组由上一步 R3RNormaliseChainGroups()
 	 * 按**全链段头掩码的并集**广播下去（第 159 轮 / q-2=肆，不再是覆盖控制段）。 */
-	if (coupler_used_fake_group != INVALID_COUPLE_GROUP) {
-		const char *fake_name = R3RGetCoupleGroupName(coupler_used_fake_group);
-		R3RDbgWrite("CGRP-FAKE-DESTROY head=%d loco=%d group=%d name=%s mask=0x%llx\n",
-				(int)v->index.base(), (int)couple_loco_id.base(), (int)coupler_used_fake_group.base(),
-				fake_name != nullptr ? fake_name : "-",
-				(unsigned long long)R3RGetCoupleGroupsOfSegment(v));
-	}
-
 	InvalidateWindowClassesData(WindowClass::TrainList, 0);
 
 	/* R3R (KI-150/153): an in-depot couple absorbed a chain into this one, so the
@@ -14522,16 +12206,6 @@ static void Couple(Train *v, Train *u)
 	/* R3R DEBUG probe: report whether the coupled-on chain carried the stale
 	 * backing-up state and whether a no-cab speed flag was lingering. */
 	if (v->vehicle_flags.Test(VehicleFlag::DrivingBackwards) && !IsRailDepotTile(v->tile)) {
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "DB-CLEAR head=%d staleNocab=%d last=%d lastLead=%d\n",
-						(int)v->index.base(),
-						(int)((v->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0),
-						(int)v->Last()->index.base(), (int)v->Last()->CanLeadTrain());
-				fclose(dbg);
-			}
-		}
 		for (Train *u = v; u != nullptr; u = u->Next()) {
 			u->vehicle_flags.Reset(VehicleFlag::DrivingBackwards);
 
@@ -14583,18 +12257,6 @@ static void Couple(Train *v, Train *u)
 	 * log showed (len=0 pow=0 wt=0). Report the same aggregate once more here, at
 	 * the very end of the commit point, so "probe ran too early" and "the caches
 	 * really are empty" can be told apart. Read-only. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "CHAIN-ATTRS2 couple head=%d len=%d pow=%lld wt=%lld spd=%d nocab=%d db=%d\n",
-					(int)v->index.base(), (int)v->gcache.cached_total_length,
-					(long long)v->gcache.cached_power, (long long)v->gcache.cached_weight,
-					(int)v->GetDisplayMaxSpeed(),
-					(int)((v->tcache.cached_tflags & TCF_NO_DRIVING_CAB) ? 1 : 0),
-					v->vehicle_flags.Test(VehicleFlag::DrivingBackwards) ? 1 : 0);
-			fclose(dbg);
-		}
-	}
 
 	/* R3R: force an immediate visual refresh of the whole merged chain, so the
 	 * consist (which just became ordinary wagons again) repaints right away
@@ -14704,35 +12366,6 @@ static bool R3RCanCoupleNow(const Train *coupler, const Train *target, const cha
 	}
 
 	if (why != nullptr) *why = reason;
-	/* KI-14: edge-triggered -- this gate is re-evaluated every tick while a
-	 * locomotive sits next to a candidate it is not allowed to couple onto. */
-	const uint64_t g_key = ((uint64_t)coupler->index.base() << 32) ^ (uint64_t)target->index.base();
-	/* R3R (第 296 轮, KI-470): the order-list identity is part of the reject state.
-	 * A pair sitting on native shared schedules can flip between "same list" and
-	 * "two lists" without the reason changing, so encode it or the edge gate hides
-	 * the very transition we are looking for. */
-	const int g_t_shared = (int)target->IsOrderListShared();
-	const int g_t_follow = (int)target->IsR3RFollower();
-	const int g_a_follow = (int)coupler->IsR3RFollower();
-	const int g_a_shared = (int)coupler->IsOrderListShared();
-	const uint64_t g_payload = R3RDbgTagHash(reason) ^
-			(R3RDbgTagHash(site != nullptr ? site : "-") << 24) ^
-			((uint64_t)g_t_shared << 40) ^ ((uint64_t)g_t_follow << 41) ^
-			((uint64_t)g_a_follow << 42) ^ ((uint64_t)g_a_shared << 43);
-	if (R3RDbgEdge(R3REDGE_COUPLEGATE, g_key, g_payload)) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "[R3R] CPL-GATE reject=%s site=%s act=%d tgt=%d aOrd=%d tOrd=%d aStop=%d tStop=%d grp=%d tOwn=%d tShared=%d tFollow=%d aFollow=%d aShared=%d\n",
-					reason, site != nullptr ? site : "-",
-					(int)coupler->index.base(), (int)target->index.base(),
-					(int)coupler->current_order.GetType(), (int)target->current_order.GetType(),
-					(int)coupler->vehstatus.Test(VehState::Stopped),
-					(int)target->vehstatus.Test(VehState::Stopped),
-					(int)R3RCoupleAllowed(coupler, target),
-					(int)(target->orders != nullptr), g_t_shared, g_t_follow, g_a_follow, g_a_shared);
-			fclose(dbg);
-		}
-	}
 	return false;
 }
 
@@ -14754,38 +12387,7 @@ static bool R3RCanCoupleNow(const Train *coupler, const Train *target, const cha
  * （r3r_couple_requester），65535 = 无。Stopd = VehState::Stopped（停驶/停运旗标，
  * **不是**"站台停稳"，站台停稳看 Spd=0 + Ord=17）。
  */
-static void R3RDbgPairSide(FILE *dbg, const char *tag, const Train *v)
-{
-	if (v == nullptr) {
-		fprintf(dbg, " %s=none", tag);
-		return;
-	}
-	const Train *head = Train::From(v->First());
-	fprintf(dbg, " %s=%d %sHead=%d %sTile=%d,%d %sSpd=%d %sOrd=%d %sStopd=%d %sFront=%d %sLen=%u %sPairT=%d %sPairR=%d",
-			tag, (int)v->index.base(),
-			tag, (int)head->index.base(),
-			tag, (int)TileX(v->tile), (int)TileY(v->tile),
-			tag, (int)v->cur_speed,
-			tag, (int)v->current_order.GetType(),
-			tag, v->vehstatus.Test(VehState::Stopped) ? 1 : 0,
-			tag, v->IsFrontEngine() ? 1 : 0,
-			tag, (uint)v->gcache.cached_total_length,
-			tag, (int)v->r3r_couple_target.base(),
-			tag, (int)v->r3r_couple_requester.base());
-}
-
 /** One CPL-PAIRLOCK / CPL-PAIRUNLOCK row: both sides of the lock. */
-static void R3RDbgPairEvent(const char *what, const char *why, const Train *a, const Train *b)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "[R3R] %s tick=%u why=%s", what, (uint)_tick_counter, why);
-	R3RDbgPairSide(dbg, "act", a);
-	R3RDbgPairSide(dbg, "tgt", b);
-	fprintf(dbg, "\n");
-	fclose(dbg);
-}
-
 /**
  * R3R (第 318 轮, 修-3, 玩家拍板「修法三，加日志，也可以」): 硬规则护栏。
  *
@@ -14803,20 +12405,6 @@ static void R3RDbgPairEvent(const char *what, const char *why, const Train *a, c
  * @param candidates How many acceptable candidates the last real scan saw.
  * @param verdict    -1 = no cached verdict at all, 0 = "no candidate", 1 = "has one".
  */
-static void R3RDbgPairInvariantViolation(const Train *consist, uint candidates, int verdict)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "[R3R] PAIR-INVARIANT-VIOLATION tick=%u veh=%d tile=%d,%d spd=%d cand=%u"
-			" verdict=%d lock=0 real=%d ord=%d\n",
-			(uint)_tick_counter, (int)consist->index.base(),
-			(int)TileX(consist->tile), (int)TileY(consist->tile),
-			(int)consist->cur_speed, candidates, verdict,
-			(int)consist->cur_real_order_index,
-			(int)consist->current_order.GetType());
-	fclose(dbg);
-}
-
 /** Upper bound for the per-couple dump of order tables (a consist schedule can be
  *  arbitrarily long; 40 lines is already far more than any diagnostic needs). */
 static const uint R3R_PLAN_DUMP_MAX = 40;
@@ -14850,69 +12438,8 @@ static const uint R3R_PLAN_DUMP_MAX = 40;
  * Only called from the CPL-PAIRLOCK site (a low-frequency event: four rows in the
  * whole round-312 log), so a full table dump costs nothing in steady state.
  */
-static void R3RDbgPairPlans(const char *what, const Train *a, const Train *b)
-{
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-
-	const Train *const sides[2] = { a, b };
-	const char *const tags[2] = { "act", "tgt" };
-	for (uint s = 0; s < 2; s++) {
-		const Train *const v = sides[s];
-		if (v == nullptr) continue;
-
-		const uint n = (uint)v->GetNumOrders();
-		fprintf(dbg, "[R3R] %s tick=%u side=%s veh=%d head=%d caronly=%d n=%u real=%d impl=%d tt=%d co=%d dest=%u borrowed=%d follow=%d followOwn=%d ownShared=%d firstShared=%d bak=%d bakReal=%d\n",
-				what, (uint)_tick_counter, tags[s], (int)v->index.base(),
-				(int)v->First()->index.base(), R3RIsCarOnlyFormation(v) ? 1 : 0,
-				n, (int)v->cur_real_order_index,
-				(int)v->cur_implicit_order_index, (int)v->cur_timetable_order_index,
-				(int)v->current_order.GetType(), (unsigned)v->current_order.GetDestination().value,
-				v->r3r_orders_borrowed ? 1 : 0,
-				v->r3r_follow_orders != nullptr ? 1 : 0,
-				(v->r3r_follow_owner == VehicleID::Invalid()) ? -1 : (int)v->r3r_follow_owner.base(),
-				v->IsOrderListShared() ? 1 : 0,
-				(v->FirstShared() != nullptr) ? (int)v->FirstShared()->index.base() : -1,
-				v->orders_backup != nullptr ? 1 : 0,
-				(v->orders_backup_real_index == INVALID_VEH_ORDER_ID) ? -1 : (int)v->orders_backup_real_index);
-
-		const uint cap = (n < R3R_PLAN_DUMP_MAX) ? n : R3R_PLAN_DUMP_MAX;
-		for (uint i = 0; i < cap; i++) {
-			const Order *const o = v->GetOrder(i);
-			if (o == nullptr) continue;
-			fprintf(dbg, "  %sORD idx=%u type=%d dest=%u\n",
-					tags[s], (uint)i, (int)o->GetType(), (unsigned)o->GetDestination().value);
-		}
-		if (n > cap) fprintf(dbg, "  %sORD capped=1 shown=%u of=%u\n", tags[s], cap, n);
-	}
-	fclose(dbg);
-}
-
 /** Every R3R_PAIRMAP_TICKS ticks: dump every live pair lock, so the question
  *  "which consist is locked to which locomotive right now" is always answerable. */
-static void R3RDbgPairMap()
-{
-	static const uint64_t R3R_PAIRMAP_TICKS = 256;
-	static uint64_t last = 0;
-	if (last != 0 && _tick_counter - last < R3R_PAIRMAP_TICKS) return;
-	last = _tick_counter;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	uint n = 0;
-	for (Train *t : Train::Iterate()) {
-		if (t->First() != t) continue;
-		if (t->r3r_couple_target == VehicleID::Invalid() && t->r3r_couple_requester == VehicleID::Invalid()) continue;
-		fprintf(dbg, "[R3R] CPL-PAIRMAP tick=%u role=%s", (uint)_tick_counter,
-				t->r3r_couple_target != VehicleID::Invalid() ? "requester" : "target");
-		R3RDbgPairSide(dbg, "v", t);
-		fprintf(dbg, "\n");
-		++n;
-	}
-	if (n == 0) fprintf(dbg, "[R3R] CPL-PAIRMAP tick=%u locks=0\n", (uint)_tick_counter);
-	fclose(dbg);
-}
-
 /**
  * R3R (KI-182): keep the couple target lock -- "已有耦合目标" -- of a locomotive
  * which is executing a GOTO_COUPLE order up to date.
@@ -14942,7 +12469,7 @@ static void R3REnsureCouplePair(Train *v)
 	if (coupler == nullptr) return;
 
 	/* R3R (2026-10-26): periodic whole-pool dump of every live pair lock. */
-	R3RDbgPairMap();
+	
 
 	/* Not executing a GOTO_COUPLE order any more. What that means depends on
 	 * which half of the lock this chain holds (round 312).
@@ -14965,9 +12492,6 @@ static void R3REnsureCouplePair(Train *v)
 	 * back). A live lock belongs to the requester and only it may drop it. */
 	if (!coupler->current_order.IsType(OT_GOTO_COUPLE)) {
 		if (coupler->r3r_couple_target != VehicleID::Invalid()) {
-			/* R3R (2026-10-26 probe): this silent drop was invisible before. */
-			Train *const r3r_stale = R3RGetCouplePairPartner(coupler);
-			if (r3r_stale != nullptr) R3RDbgPairEvent("CPL-PAIRUNLOCK", "order-changed", coupler, r3r_stale);
 			R3RUnpairCoupleTargets(coupler);
 		} else if (coupler->r3r_couple_requester != VehicleID::Invalid() &&
 				R3RGetCouplePairPartner(coupler) == nullptr) {
@@ -14975,18 +12499,14 @@ static void R3REnsureCouplePair(Train *v)
 			 * already meaningless. Clear ours without touching anything else --
 			 * R3RHasCouplePair() would otherwise keep advertising this consist
 			 * as taken for ever. */
-			R3RDbgPairEvent("CPL-PAIRUNLOCK", "target-dangling", coupler, nullptr);
+			
 			coupler->r3r_couple_requester = VehicleID::Invalid();
 		}
 		_r3r_pair_scan_tick.erase(coupler->index.base());
 		_r3r_couple_enter_tick.erase(coupler->index.base());
 		/* 第 318 轮: 订单已不是 GOTO_COUPLE，扫描结论与护栏节流都必须随之失效。 */
 		_r3r_pair_verdict.erase(coupler->index.base());
-		/* 第 323 轮: CPLSPD 曲线探针的上一读数/行数计数一并清掉，避免槽位复用后跨车。 */
-		_r3r_couple_spd_last.erase(coupler->index.base());
-		_r3r_couple_spd_lines.erase(coupler->index.base());
-		_r3r_pair_invariant_logged.erase(coupler->index);
-		return;
+			return;
 	}
 
 	/* R3R (KI-182, player rule 2026-09-24): stamp the tick this chain entered the
@@ -15011,52 +12531,6 @@ static void R3REnsureCouplePair(Train *v)
 	 * near* = 距 coupler 最近的被拒候选快照。
 	 *
 	 * 只读：只有本函数内的局部计数器与日志，不写任何车辆/订单/预留状态。 */
-	const bool r3r_ps = R3RDbgOn();
-	const int r3r_ps_act = (int)coupler->index.base();
-	uint r3r_s_chain = 0, r3r_s_pool = 0, r3r_s_target = 0, r3r_s_stop = 0;
-	uint r3r_s_dest = 0, r3r_s_lock = 0, r3r_s_ign = 0, r3r_s_ignd = 0;
-	const Train *r3r_near = nullptr;
-	uint r3r_near_dist = 0;
-	const char *r3r_near_why = "none";
-	auto r3r_near_note = [&](const Train *t, const char *why) {
-		if (!r3r_ps || t == nullptr) return;
-		const uint d = DistanceManhattan(coupler->tile, t->tile);
-		if (r3r_near == nullptr || d < r3r_near_dist) {
-			r3r_near = t;
-			r3r_near_dist = d;
-			r3r_near_why = why;
-		}
-	};
-	auto r3r_ps_report = [&](const char *state, const Train *best, uint best_dist, int paired, int wait) {
-		if (!r3r_ps) return;
-		const uint64_t key = ((uint64_t)coupler->index.base() << 20) ^ (uint64_t)R3RDbgTagHash(state);
-		/* R3R 探针（第 355 轮）：wait 原先参与去重，但它每 tick 都在变 ⇒ 去重恒不命中，
-		 * 于是同一个 (state, best, bestDist) 被反复打印（现场 1392 行 / 550 KB）。
-		 * 去掉后同一形态只留一行；wait 仍然照常打印在正文里，不丢信息。 */
-		const uint64_t payload = (uint64_t)(best != nullptr ? best->index.base() : 0xFFFF)
-				| ((uint64_t)std::min<uint>(best_dist, 0xFFFFu) << 20);
-		if (!R3RDbgEdge(R3REDGE_PAIRSCAN, key, payload)) return;
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg == nullptr) return;
-		fprintf(dbg, "[R3R] CPL-PAIRSCAN tick=%u act=%d state=%s ord=%d destStn=%d"
-				" actTile=%d,%d actSpd=%d pool=%u s_chain=%u s_target=%u s_stop=%u"
-				" s_dest=%u s_lock=%u s_ign=%u s_ignd=%u best=%d bestDist=%u paired=%d wait=%d"
-				" near=%d nearDist=%u nearWhy=%s nearTile=%d,%d nearOrd=%d nearStop=%d\n",
-				(uint)_tick_counter, r3r_ps_act, state,
-				(int)coupler->current_order.GetType(),
-				(int)coupler->current_order.GetDestination().ToStationID().base(),
-				TileX(coupler->tile), TileY(coupler->tile), (int)coupler->cur_speed,
-				r3r_s_pool, r3r_s_chain, r3r_s_target, r3r_s_stop,
-				r3r_s_dest, r3r_s_lock, r3r_s_ign, r3r_s_ignd,
-				best != nullptr ? (int)best->index.base() : -1, best_dist, paired, wait,
-				r3r_near != nullptr ? (int)r3r_near->index.base() : -1, r3r_near_dist, r3r_near_why,
-				r3r_near != nullptr ? (int)TileX(r3r_near->tile) : -1,
-				r3r_near != nullptr ? (int)TileY(r3r_near->tile) : -1,
-				r3r_near != nullptr ? (int)r3r_near->current_order.GetType() : -1,
-				(r3r_near != nullptr && r3r_near->vehstatus.Test(VehState::Stopped)) ? 1 : 0);
-		fclose(dbg);
-	};
-
 	/* Still locked onto a consist which still qualifies: nothing to do. This is
 	 * the steady state, so it must stay cheap -- no pool walk at all. */
 	Train *partner = R3RGetCouplePairPartner(coupler);
@@ -15066,7 +12540,6 @@ static void R3REnsureCouplePair(Train *v)
 	if (partner != nullptr && partner->First() != coupler->First() && R3RIsCoupleTarget(partner) &&
 			!partner->vehstatus.Test(VehState::Stopped) &&
 			R3RCoupleAllowedIgnoringPair(coupler, partner)) {
-		r3r_ps_report("steady", partner, DistanceManhattan(coupler->tile, partner->tile), -1, -1);
 		_r3r_pair_scan_tick.erase(coupler->index.base());
 		/* 第 318 轮: 结论缓存与扫描状态同步——持有效锁 ⇒ "有候选"。 */
 		_r3r_pair_verdict[coupler->index.base()] = R3RPairVerdict{ true, 1, (uint64_t)_tick_counter };
@@ -15074,31 +12547,7 @@ static void R3REnsureCouplePair(Train *v)
 	}
 	if (partner != nullptr) {
 		/* KI-477 探针：锁被丢掉的原因（必须在 R3RUnpairCoupleTargets() 之前读）。 */
-		if (r3r_ps) {
-			const char *why = "same-head";
-			if (partner->First() != coupler->First()) {
-				if (!R3RIsCoupleTarget(partner)) why = "not-target";
-				else if (partner->vehstatus.Test(VehState::Stopped)) why = "stopped";
-				else if (!R3RCoupleAllowedIgnoringPair(coupler, partner))
-					why = R3RCoupleTargetAtOrderStation(coupler, partner) ? "group" : "dest-station";
-				else why = "unknown";
-			}
-			const uint64_t d_key = ((uint64_t)coupler->index.base() << 20) ^ (uint64_t)partner->index.base();
-			if (R3RDbgEdge(R3REDGE_PAIRDROPS, d_key, R3RDbgTagHash(why))) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] CPL-PAIRDROPS tick=%u act=%d tgt=%d why=%s tgtOrd=%d"
-							" tgtTile=%d,%d tgtStop=%d tgtSpd=%d\n",
-							(uint)_tick_counter, r3r_ps_act, (int)partner->index.base(), why,
-							(int)partner->current_order.GetType(),
-							TileX(partner->tile), TileY(partner->tile),
-							partner->vehstatus.Test(VehState::Stopped) ? 1 : 0,
-							(int)partner->cur_speed);
-					fclose(dbg);
-				}
-			}
-		}
-		R3RUnpairCoupleTargets(coupler);
+R3RUnpairCoupleTargets(coupler);
 	}
 
 	/* (Re)select the nearest waiting consist which satisfies every ordinary
@@ -15111,8 +12560,6 @@ static void R3REnsureCouplePair(Train *v)
 	if (scan_it != _r3r_pair_scan_tick.end() && _tick_counter - scan_it->second < R3R_PAIR_RESCAN_TICKS) {
 		/* KI-477 探针：退避期也要留痕——"没有日志"与"没有扫描"必须可区分。
 		 * 现场 tick 2890→2906 只有 16 tick，最多两次扫描机会，退避足以吃掉整段窗口。 */
-		r3r_ps_report("backoff", nullptr, 0, 0,
-				(int)(R3R_PAIR_RESCAN_TICKS - (_tick_counter - scan_it->second)));
 		/* 第 318 轮, 玩家拍板「按上一帧走」: 退避期**故意不写** _r3r_pair_verdict。
 		 * 这是迟滞的实现点——`parked-no-pair` 门在退避窗口里沿用上一次真正扫完的
 		 * 结论，结论不会因为"这一 tick 没扫"而翻转，于是不会出现 0/27/30 那种
@@ -15137,12 +12584,10 @@ static void R3REnsureCouplePair(Train *v)
 		if (t->First() != t || t->First() == coupler->First()) {
 			/* R3R 探针（第 355 轮）：这里是"只读扫描"里唯一的写状态点，务必标出来源。 */
 			R3RClearStaleWaitMarker(t, "scan");
-			++r3r_s_chain;
 			continue;
 		}
-		++r3r_s_pool;
-		if (!R3RIsCoupleTarget(t)) { ++r3r_s_target; r3r_near_note(t, "not-target"); continue; }
-		if (t->vehstatus.Test(VehState::Stopped)) { ++r3r_s_stop; r3r_near_note(t, "stopped"); continue; }
+		if (!R3RIsCoupleTarget(t)) { continue; }
+		if (t->vehstatus.Test(VehState::Stopped)) { continue; }
 		/* R3R (KI-319, round 212): the destination rule is applied *here*, before
 		 * the pair-lock report, and not only by R3RCoupleAllowedIgnoringPair()
 		 * further down. A candidate parked at another station -- or at a station
@@ -15152,32 +12597,18 @@ static void R3REnsureCouplePair(Train *v)
 		 * Round 210 read exactly that as contention (CPL-PAIR-STEAL every 8 ticks,
 		 * §八.2) while the truth was "there is nothing here to couple onto". The
 		 * accepted set is unchanged: this only stops the lie. */
-		if (!R3RCoupleTargetAtOrderStation(coupler, t)) { ++r3r_s_dest; r3r_near_note(t, "dest-station"); continue; }
+		if (!R3RCoupleTargetAtOrderStation(coupler, t)) { continue; }
 		/* Somebody else already locked this consist: first come, first served.
 		 * "First" is the tick the order was entered, not the tick this scan ran,
 		 * so a locomotive which is already on its way to a consist is only
 		 * displaced by one which started its couple earlier. */
 		Train *locker = R3RGetCouplePairPartner(t);
 		if (locker != nullptr) {
-			if (!R3RCouplePairOutranks(coupler, locker)) { ++r3r_s_lock; r3r_near_note(t, "locked"); continue; }
-			const uint64_t s_key = ((uint64_t)coupler->index.base() << 32) ^ (uint64_t)t->index.base();
-			if (R3RDbgEdge(R3REDGE_CPLPAIRSTEAL, s_key, (uint64_t)locker->index.base())) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] CPL-PAIR-STEAL act=%d tgt=%d from=%d myEnter=%llu hisEnter=%llu\n",
-							(int)coupler->index.base(), (int)t->index.base(), (int)locker->index.base(),
-							(unsigned long long)R3RCoupleEnterTick(coupler),
-							(unsigned long long)R3RCoupleEnterTick(locker));
-					fclose(dbg);
-				}
-			}
+			if (!R3RCouplePairOutranks(coupler, locker)) { continue; }
 		}
 		if (!R3RCoupleAllowedIgnoringPair(coupler, t)) {
-			++r3r_s_ign;
 			const bool r3r_dest_ok = R3RCoupleTargetAtOrderStation(coupler, t);
-			if (!r3r_dest_ok) ++r3r_s_ignd;
-			r3r_near_note(t, r3r_dest_ok ? "group" : "dest-station");
-			continue;
+			if (!r3r_dest_ok) continue;
 		}
 
 		const uint dist = DistanceManhattan(coupler->tile, t->tile);
@@ -15188,7 +12619,6 @@ static void R3REnsureCouplePair(Train *v)
 	}
 
 	if (best == nullptr) {
-		r3r_ps_report("none", nullptr, 0, 0, (int)R3R_PAIR_RESCAN_TICKS);
 		_r3r_pair_scan_tick[coupler->index.base()] = _tick_counter;
 		/* 第 318 轮: 真扫过了，确实没人 ⇒ 门必须拒绝订路（"没有配对锁就禁止滑行"）。 */
 		_r3r_pair_verdict[coupler->index.base()] = R3RPairVerdict{ false, 0, (uint64_t)_tick_counter };
@@ -15199,7 +12629,6 @@ static void R3REnsureCouplePair(Train *v)
 		 * sides to their chain heads and refuses a common head). Do not report a lock
 		 * which was never taken -- that lie is what made the KI-188 log read as a
 		 * self-lock -- and retry after the ordinary rescan delay. */
-		r3r_ps_report("refused", best, best_dist, 0, (int)R3R_PAIR_RESCAN_TICKS);
 		_r3r_pair_scan_tick[coupler->index.base()] = _tick_counter;
 		/* 第 318 轮: 有候选但配对层拒绝（归一化到同一链头等）⇒ 拿不到锁。
 		 * 玩家规则是"先有配对再起动"，拿不到锁就走等于滑到目的地干等，
@@ -15207,11 +12636,9 @@ static void R3REnsureCouplePair(Train *v)
 		_r3r_pair_verdict[coupler->index.base()] = R3RPairVerdict{ false, 1, (uint64_t)_tick_counter };
 		return;
 	}
-	r3r_ps_report("locked", best, best_dist, 1, 0);
 	_r3r_pair_scan_tick.erase(coupler->index.base());
 	/* 第 318 轮: 锁已建立 ⇒ 门放行；顺便清掉护栏节流，下一次违规才能再报一行。 */
 	_r3r_pair_verdict[coupler->index.base()] = R3RPairVerdict{ true, 1, (uint64_t)_tick_counter };
-	_r3r_pair_invariant_logged.erase(coupler->index);
 
 	/* R3R (2026-10-26, 玩家硬要求「第 5 步：必须先有配对再起动」): 配对一建立，
 	 * 就在这里替这台车订一次路线。
@@ -15231,26 +12658,11 @@ static void R3REnsureCouplePair(Train *v)
 
 	/* R3R (2026-10-26 probe): the moment the lock is actually taken -- both sides,
 	 * their speed/order/stopped flags and their raw lock bits, unthrottled. */
-	R3RDbgPairEvent("CPL-PAIRLOCK", "scan", coupler, best);
+	
 	/* R3R (第 313 轮): the lock row alone cannot say what either side is going to do
 	 * next; dump both effective schedules on the very tick the lock is taken. */
-	R3RDbgPairPlans("CPL-PLAN", coupler, best);
+	
 
-	const uint64_t g_key = ((uint64_t)coupler->index.base() << 32) ^ (uint64_t)best->index.base();
-	if (R3RDbgEdge(R3REDGE_CPLPAIR, g_key, (uint64_t)best_dist)) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			/* R3R (第 255 轮, P0)：补 tick=。没有它，日志里相邻两行 CPL-PAIR 到底
-			 * 隔了 1 个 tick 还是 2000 个 tick 只能靠上下文猜，而"挂车要等多久"本身
-			 * 就是本轮要测的量（T_tick = 从订单开始运行到 COUPLE-OK 的 tick 数）。 */
-			fprintf(dbg, "[R3R] CPL-PAIR tick=%u act=%d tgt=%d dist=%u actTile=%d,%d tgtTile=%d,%d\n",
-					(uint)_tick_counter,
-					(int)coupler->index.base(), (int)best->index.base(), best_dist,
-					TileX(coupler->tile), TileY(coupler->tile),
-					TileX(best->tile), TileY(best->tile));
-			fclose(dbg);
-		}
-	}
 }
 
 /**
@@ -15471,11 +12883,7 @@ int R3RShouldCutCoupleAtWaitPoint(const Train *v, uint32_t *wait_wp)
 		bs.overshoot = false;
 	} else if (bs.seen_on_wp && !bs.overshoot) {
 		bs.overshoot = true;
-		if (R3RDbgOn()) {
-			R3RDbgWrite("WBAR-OVERSHOOT veh=%d wp=%u tile=%d,%d spd=%d order=%d\n",
-					v->index.base(), (unsigned int)wait_dest.base() + 1,
-					(int)TileX(v->tile), (int)TileY(v->tile), v->cur_speed, (int)order_index);
-		}
+		
 	}
 	if (bs.overshoot) return 0;
 
@@ -15534,48 +12942,9 @@ int R3RShouldCutCoupleAtWaitPoint(const Train *v, uint32_t *wait_wp)
 	 * 配对对象 24 的 tile(265,234) 若不是车站格，则 aOnStn 恒为 0、pair_ready
 	 * 恒为 false，机车会被永久拦在栅栏格上（wait_cut 恒为 2），表现为
 	 * "锁有、车底在、就是不动"。签名变化才写，零行为改动。 */
-	if (R3RDbgOn()) {
-		static std::map<uint32_t, uint64_t> r3r_wbar_state_seen;
-		const uint64_t wbar_sig =
-				(uint64_t)(a != nullptr ? a->index.base() : 0xFFFFu)
-				| ((uint64_t)(a != nullptr && a->cur_speed == 0 ? 1 : 0) << 20)
-				| ((uint64_t)(a != nullptr && a->vehstatus.Test(VehState::Stopped) ? 1 : 0) << 21)
-				| ((uint64_t)(a != nullptr && IsRailStationTile(a->tile) ? 1 : 0) << 22)
-				| ((uint64_t)(a != nullptr && R3RIsCoupleTarget(a) ? 1 : 0) << 23)
-				| ((uint64_t)(pair_ready ? 1 : 0) << 24)
-				| ((uint64_t)(front_on_wp ? 1 : 0) << 25)
-				| ((uint64_t)(v->cur_speed == 0 ? 1 : 0) << 26)
-				| ((uint64_t)(bs.overshoot ? 1 : 0) << 27);
-		uint64_t &wbar_seen = r3r_wbar_state_seen[v->index.base()];
-		if (wbar_seen != wbar_sig) {
-			wbar_seen = wbar_sig;
-			R3RDbgWrite("WBAR-STATE veh=%d a=%d pair=%d aSpd=%d aStopped=%d aOnStn=%d aIsTgt=%d aStn=%d vSpd=%d onwp=%d over=%d\n",
-					v->index.base(), a != nullptr ? (int)a->index.base() : -1, pair_ready ? 1 : 0,
-					a != nullptr ? (int)a->cur_speed : -1,
-					(a != nullptr && a->vehstatus.Test(VehState::Stopped)) ? 1 : 0,
-					(a != nullptr && IsRailStationTile(a->tile)) ? 1 : 0,
-					(a != nullptr && R3RIsCoupleTarget(a)) ? 1 : 0,
-					(a != nullptr && IsRailStationTile(a->tile)) ? (int)GetStationIndex(a->tile).base() : 65535,
-					(int)v->cur_speed, front_on_wp ? 1 : 0, bs.overshoot ? 1 : 0);
-		}
-	}
+	
 
 	if (pair_ready) {
-		/* R3R (第 278 轮, D-4): 放行必须留痕，且不受"运动前端是否到过路点"限制。
-		 * 旧版门禁是 `bs.seen_on_wp`，于是"车头还在路点前一格就被放行"这一整类
-		 * 现场没有任何日志（本轮日志里 `CPL-WAITCUT state=0` 前后找不到任何
-		 * WBAR-*，无法判断是放行还是压根没进判据）。改为每道墙第一次放行必打一行。 */
-		if (!bs.released && R3RDbgOn()) {
-			bs.released = true;
-			const Train *mf = v->GetMovingFront();
-			R3RDbgWrite("WBAR-RELEASE veh=%d wp=%u onwp=%d seen=%d tile=%d,%d spd=%d mf=%d,%d pair=%d\n",
-					v->index.base(), (unsigned int)wait_dest.base() + 1,
-					(front_on_wp ? 1 : 0), (bs.seen_on_wp ? 1 : 0),
-					(int)TileX(v->tile), (int)TileY(v->tile), v->cur_speed,
-					mf != nullptr ? (int)TileX(mf->tile) : -1,
-					mf != nullptr ? (int)TileY(mf->tile) : -1,
-					a != nullptr ? (int)a->index.base() : -1);
-		}
 		return 0;
 	}
 
@@ -15654,23 +13023,6 @@ static Train *GetCouplePosition(Train *v, bool &reverse)
 	uint8_t u_length = z->gcache.cached_veh_length;
 
 	if (diff == ((v_length + 1) / 2 + (u_length + 1) / 2)) {
-		/* R3R 1px probe: this is the *exact* end-to-end path -- the loco stopped
-		 * on the nominal pixel, so the coupled chain has no pixel overlap. Logged
-		 * once per (loco, consist, lengths) so it does not flood the file. */
-		const uint64_t g_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
-		const uint64_t g_payload = ((uint64_t)v_length << 32) ^ (uint64_t)u_length ^ ((uint64_t)(reverse ? 1u : 0u) << 16);
-		if (R3RDbgEdge(R3REDGE_CPLGEO, g_key, g_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "[R3R] CPL-GEO site=%s v=%d vn=%d vlen=%d u=%d z=%d ulen=%d rev=%d dx=%d dy=%d diff=%d need=%d spd=%d db=%d\n",
-						"geo", (int)v->index.base(), (int)v_near->index.base(), (int)v_length,
-						(int)u->index.base(), (int)z->index.base(),
-						(int)u_length, (int)reverse, x_diff, y_diff, diff,
-						(int)((v_length + 1) / 2 + (u_length + 1) / 2),
-						(int)v->cur_speed, (int)v->IsDrivingBackwards());
-				fclose(dbg);
-			}
-		}
 		return u;
 	}
 
@@ -15857,7 +13209,6 @@ static bool R3RCoupleOrderDestinationReached(const Train *v)
  */
 static bool TrainCoupleHandler(Train *v)
 {
-	R3RScopeTimer r3r_ch_timer(&r3r_ch_ns, &r3r_ch_calls);
 	if (!v->current_order.IsType(OT_GOTO_COUPLE)) {
 		/* R3R: no longer executing a GOTO_COUPLE order (player skipped it / the
 		 * schedule moved on) — any couple-failure news throttle episode is over;
@@ -16040,31 +13391,6 @@ static bool TrainCoupleHandler(Train *v)
 		 * swung its rear onto the freshly decoupled consist 8 px away. Cleared as
 		 * soon as a candidate shows up or the order changes. */
 		_r3r_couple_no_target[v->index] = 1;
-		/* KI-14 (2): edge-triggered. This branch is reached on every tick (and on
-		 * every movement step, see the loop at the end of TrainLocoHandler) while
-		 * a GOTO_COUPLE loco has no reachable target, so the two raw
-		 * fopen/fprintf/fclose blocks below used to run continuously and dominate
-		 * the train tick. Compute the failure signature first and only touch the
-		 * log when it changes (a stuck loco logs once per perf window). */
-		const uint64_t cf_key = R3RDbgTagHash("COUPLE-FAIL") | ((uint64_t)v->index.base() << 32);
-		const uint64_t cf_payload = ((uint64_t)v->tile.base() << 32) ^
-				((uint64_t)v->current_order.GetType() << 48);
-		if (R3RDbgEdge(R3REDGE_COUPLEFAIL, cf_key, cf_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "COUPLE-FAIL loco=%d order=%d tx=%d ty=%d x=%d y=%d\n",
-					(int)v->index.base(), (int)v->current_order.GetType(),
-					(int)TileX(v->tile), (int)TileY(v->tile), (int)v->x_pos, (int)v->y_pos);
-				/* 修法 D: 跟随态的机车自己的表可能是空的，打印它实际在跑的那张。 */
-				if (v->GetEffectiveOrders() != nullptr) {
-					for (VehicleOrderID i = 0; i < v->GetNumOrders(); ++i) {
-						const Order *o = v->GetOrder(i);
-						fprintf(dbg, "  LOCO-ORD %d type=%d\n", (int)i, (int)(o ? o->GetType() : -1));
-					}
-				}
-				fclose(dbg);
-			}
-		}
 
 		/* R3R (KI-193 revised, round 112): standstill on the GOTO_COUPLE destination with
 		 * nothing to couple onto -- WAIT IN PLACE. The order is deliberately NOT advanced
@@ -16078,18 +13404,6 @@ static bool TrainCoupleHandler(Train *v)
 			 * would block the next, legitimate coupling target that shows up later. */
 			R3RUnpairCoupleTargets(v);
 
-			const VehicleOrderID r3r_num_orders = v->GetNumOrders();
-			const VehicleOrderID r3r_next = (r3r_num_orders > 0)
-					? (VehicleOrderID)((v->cur_real_order_index + 1) % r3r_num_orders)
-					: INVALID_VEH_ORDER_ID;
-
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "COUPLE-DEST-EMPTY loco=%d tile=%d,%d real=%d num=%d next=%d (waiting in place, order kept)\n",
-						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-						(int)v->cur_real_order_index, (int)r3r_num_orders, (int)r3r_next);
-				fclose(dbg);
-			}
 			return false;
 		} else {
 			/* R3R (第 246 轮 / 第 6 项): nothing to reset here any more; the wait gate
@@ -16106,27 +13420,7 @@ static bool TrainCoupleHandler(Train *v)
 			 * stuck self-heal depends on, so this branch deliberately keeps running. Log the
 			 * order destination once per (vehicle, tile) so an unreachable destination
 			 * can be told apart from a missing coupling target. */
-			const Order &r3r_co = v->current_order;
-			const uint64_t off_key = ((uint64_t)v->index.base() << 32) | (uint64_t)v->tile.base();
-			const uint64_t off_payload = (uint64_t)r3r_co.GetDestination().ToDepotID().base() |
-					((uint64_t)(r3r_co.GetCoupleIsDepot() ? 1 : 0) << 16) |
-					((uint64_t)v->dest_tile.base() << 24);
-			if (R3RDbgEdge(R3REDGE_CPLOFFDEST, off_key, off_payload)) {
-				const Train *r3r_mf = v->GetMovingFront();
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "COUPLE-WAIT-OFFDEST veh=%u tile=%u,%u mf=%u,%u real=%d isDepot=%d destDepot=%u destStn=%u destTile=%u onDepotTile=%d onStnTile=%d\n",
-							v->index.base(), (uint)TileX(v->tile), (uint)TileY(v->tile),
-							r3r_mf != nullptr ? (uint)TileX(r3r_mf->tile) : 65535u, r3r_mf != nullptr ? (uint)TileY(r3r_mf->tile) : 65535u,
-							(int)v->cur_real_order_index, r3r_co.GetCoupleIsDepot() ? 1 : 0,
-							r3r_co.GetCoupleIsDepot() ? (uint)r3r_co.GetDestination().ToDepotID().base() : 0u,
-							r3r_co.GetCoupleIsDepot() ? 0u : (uint)r3r_co.GetDestination().ToStationID().base(),
-							v->dest_tile.base(),
-							(r3r_mf != nullptr && IsRailDepotTile(r3r_mf->tile)) ? 1 : 0,
-							(r3r_mf != nullptr && HasStationTileRail(r3r_mf->tile)) ? 1 : 0);
-					fclose(dbg);
-				}
-			}
+			
 		}
 		return false;
 	}
@@ -16143,32 +13437,7 @@ static bool TrainCoupleHandler(Train *v)
 	 * (1 km/h zero-power locomotive) a score of -20, which is always below the
 	 * minimum of 0, so coupling was always rejected. Re-enable once the scoring
 	 * rules are reworked (e.g. exempt consists from speed matching). */
-	//if (EvaluateCoupleScore(u) < _couple_min_score) {
-	//	/* Stop behind the candidate and wait; do not couple onto a low-scoring consist. */
-	//	v->cur_speed = 0;
-	//	return false;
-	//}
-
 	Couple(v, u);
-	if (r3r_rolling) {
-		/* R3R (KI-106 fix 1) probe: the couple was triggered from the movement loop
-		 * (spd != 0) instead of from standstill. merged tells whether the merge
-		 * actually committed -- a fold-fix rollback leaves the two chains apart and
-		 * the loco is stopped on the exact pixel, retrying from standstill. */
-		const uint64_t gm_key = ((uint64_t)v->index.base() << 32) ^ (uint64_t)u->index.base();
-		const uint64_t gm_payload = (uint64_t)v->tile.base();
-		if (R3RDbgEdge(R3REDGE_CPLGEOCOMMIT, gm_key, gm_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "[R3R] CPL-GEO-DONE v=%d u=%d merged=%d spd=%d x=%d y=%d\n",
-						(int)v->index.base(), (int)u->index.base(),
-						(int)(u->First() == v->First()),
-						(int)v->cur_speed, (int)v->x_pos, (int)v->y_pos);
-				fclose(dbg);
-			}
-		}
-	}
-
 	/* R3R (KI-193 fallback, round 114): a rendezvous which cannot be committed.
 	 * Reaching this point means a qualifying waiting consist was found right here
 	 * (R3RCanCoupleNow() passed) and Couple() ran -- this is NOT the "no consist wants
@@ -16194,15 +13463,6 @@ static bool TrainCoupleHandler(Train *v)
 			ep.failures = 0;
 		}
 		++ep.failures;
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "COUPLE-COMMIT-FAIL loco=%d cand=%d tile=%d,%d real=%d tries=%u\n",
-						(int)v->index.base(), (int)u->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-						(int)v->cur_real_order_index, (unsigned)ep.failures);
-				fclose(dbg);
-			}
-		}
 
 		if (ep.failures >= R3R_COUPLE_COMMIT_FAIL_LIMIT) {
 			_r3r_couple_commit_fail.erase(v->index);
@@ -16214,19 +13474,10 @@ static bool TrainCoupleHandler(Train *v)
 					? (VehicleOrderID)((v->cur_real_order_index + 1) % r3r_num_orders)
 					: INVALID_VEH_ORDER_ID;
 
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "COUPLE-SKIP-COMMIT-FAIL loco=%d cand=%d tile=%d,%d real=%d num=%d next=%d\n",
-							(int)v->index.base(), (int)u->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-							(int)v->cur_real_order_index, (int)r3r_num_orders, (int)r3r_next);
-					fclose(dbg);
-				}
-			}
 
 			if (r3r_next != INVALID_VEH_ORDER_ID) {
 				/* R3R (第 206 轮探针, 只读): 这是本文件里另一条"自动跳命令"路径。 */
-				R3RWatchOrderIndex(v, "commitfail-skip-in");
+				
 				/* Same bookkeeping as CmdSkipToOrder(): leave any loading/waiting state,
 				 * reset the beyond-platform-end marks, select the next order and discard
 				 * the stale current order so the ordinary ProcessOrders() of the next
@@ -16243,7 +13494,7 @@ static bool TrainCoupleHandler(Train *v)
 				v->ResetDepotUnbunching();
 				InvalidateVehicleOrder(v, 0);
 				v->StopSeparation();
-				R3RWatchOrderIndex(v, "commitfail-skip-out");
+				
 			}
 			return false;
 		}
@@ -16479,9 +13730,6 @@ static bool R3RCouplePartialReserved(const Train *v, TileIndex mf_tile, TileInde
 	}
 	if (!it->second.logged) {
 		it->second.logged = true;
-		R3RDbgWrite("DEPOT-EXIT-SELF-PARTIAL veh=%d mf=%d,%d next=%d,%d why=cpl-partial-res\n",
-				(int)v->index.base(), (int)TileX(mf_tile), (int)TileY(mf_tile),
-				(int)TileX(next_tile), (int)TileY(next_tile));
 	}
 	return true;
 }
@@ -16524,41 +13772,6 @@ static bool R3RDepotSelfReleased(const Train *v)
  */
 static bool CheckTrainStayInDepot(Train *v)
 {
-	/* R3R (第 206 轮探针, 只读): 库内列车本 tick 的入口基线。若 54 号链在
-	 * TrainLocoHandler 里被 Stopped 早退挡住，本函数根本不会跑 ⇒ "这里没有
-	 * 行"本身就说明该链走的不是这条路径。 */
-	R3RWatchOrderIndex(v, "depotstay-in");
-
-	/* R3R (第 394 轮, KI-561 只读探针): 库内列车"本 tick 拒绝放行"的出口编号。
-	 *
-	 * KI-561 现场：机车 + 车底都已完整进库、订单配对条件满足，却整列车一格都不动。
-	 * 静态代码能给出的三个嫌疑（都在这一个函数里，且都表现为"原地不动"）：
-	 *   11 = exit-blocked        -> seg_state==Full 或 HasDepotReservation()，库格上残留预留
-	 *   12 = no-path             -> TryPathReserve() 恒失败，被 MarkTrainAsStuck 钉住
-	 *    2 = no-power            -> cached_power==0 且非纯车底，被自动 Stop（与 KI-566 同源）
-	 * 三者无法从代码再收窄（取决于现场状态），故每个出口都留痕。
-	 * 同一列车同一出口只在**变化**时写一行，避免每 tick 刷屏。 */
-	static std::unordered_map<uint32_t, uint32_t> _r3r_depot_stay_tag;
-	auto r3r_depot_stay = [v](uint32_t tag, int seg = -1) -> bool {
-		if (R3RDbgOn()) {
-			/* R3R (第 397 轮, REG-397-A): exit=11 有两个 disjunct（seg_state==Full
-			 * 与库格预留），只打 resv= 分不清。把 seg 编进边沿 key 一起打出来。 */
-			const uint32_t key = tag * 16u + (uint32_t)(seg + 2);
-			uint32_t &last = _r3r_depot_stay_tag[v->index.base()];
-			if (last != key) {
-				last = key;
-				R3RDbgWrite("DEPOT-STAY veh=%d exit=%u power=%d speed=%d order=%d wait=%u resv=%d track=%d fully=%d stuck=%d seg=%d\n",
-						(int)v->index.base(), (unsigned)tag,
-						(int)v->gcache.cached_power, (int)v->cur_speed,
-						(int)v->current_order.GetType(), (unsigned)v->wait_counter,
-						IsRailDepotTile(v->tile) ? (int)HasDepotReservation(v->tile) : -1,
-						(int)v->track, (int)R3RChainFullyInDepot(v),
-						(int)v->flags.Test(VehicleRailFlag::Stuck), seg);
-			}
-		}
-		return true;
-	};
-
 	/* R3R: a GOTO_COUPLE locomotive stays inside its target depot ONLY when it
 	 * has actually reached that depot (GOTO_COUPLE has no arrival handling so
 	 * without this it would drive right back out). A locomotive that is merely
@@ -16581,7 +13794,7 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->current_order.IsType(OT_GOTO_COUPLE) && v->current_order.GetCoupleIsDepot() &&
 			IsRailDepotTile(v->tile) &&
 			v->current_order.GetDestination().ToDepotID() == GetDepotIndex(v->tile) &&
-			R3RChainFullyInDepot(v)) return r3r_depot_stay(1);
+			R3RChainFullyInDepot(v)) return true;
 
 	/* bail out if not all wagons are in the same depot or not in a depot at all */
 	for (const Train *u = v; u != nullptr; u = u->Next()) {
@@ -16595,30 +13808,30 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->gcache.cached_power == 0 && !R3RIsCarOnlyFormation(v)) {
 		v->vehstatus.Set(VehState::Stopped);
 		SetWindowDirty(WindowClass::VehicleDepot, v->tile.base());
-		return r3r_depot_stay(2);
+		return true;
 	}
 
 	if (v->current_order.IsWaitTimetabled()) {
 		v->HandleWaiting(false, true);
 	}
 	if (v->current_order.IsType(OT_WAITING)) {
-		return r3r_depot_stay(3);
+		return true;
 	}
 
 	/* R3R: a WAIT_COUPLE order parks the train in place (it declares "wait here
 	 * to be coupled"), like a normal wait order. Without this the consist would
 	 * keep creeping along (it has a minimal power to avoid the auto-stop check). */
 	if (v->current_order.IsType(OT_WAIT_COUPLE)) {
-		return r3r_depot_stay(4);
+		return true;
 	}
 
 	/* Check if we should wait here for unbunching. */
-	if (v->IsWaitingForUnbunching()) return r3r_depot_stay(5);
+	if (v->IsWaitingForUnbunching()) return true;
 
 	if (v->reverse_distance > 0) {
 		v->reverse_distance--;
 		if (v->reverse_distance == 0) SetWindowWidgetDirty(WindowClass::VehicleView, v->index, WID_VV_START_STOP);
-		return r3r_depot_stay(6);
+		return true;
 	}
 
 	SigSegState seg_state;
@@ -16627,7 +13840,7 @@ static bool CheckTrainStayInDepot(Train *v)
 	if (v->force_proceed == TFP_NONE) {
 		/* force proceed was not pressed */
 		if (++v->wait_counter < 37) {
-			return r3r_depot_stay(7);
+			return true;
 		}
 
 		v->wait_counter = 0;
@@ -16639,20 +13852,7 @@ static bool CheckTrainStayInDepot(Train *v)
 		 * R3RDepotSelfReleased() 的说明与 R3R_depot_selfrelease_round397_memo.md。 */
 		const bool depot_reserved = HasDepotReservation(v->tile);
 		const bool self_released = depot_reserved && R3RDepotSelfReleased(v);
-		if (self_released && R3RDbgOn()) {
-			static std::unordered_map<uint32_t, uint32_t> _r3r_self_release_logged;
-			uint32_t &last = _r3r_self_release_logged[v->index.base()];
-			if (last == 0 || (uint32_t)_tick_counter - last >= R3R_DEPOT_SELF_RELEASE_TICKS) {
-				last = (uint32_t)_tick_counter;
-				const Train *const r3r_owner = GetTrainForWholeTileReservation(v->tile);
-				R3RDbgWrite("DEPOT-SELF-RELEASE veh=%d tile=%d,%d wait=%u order=%d owner=%d booked=%d seg=%d\n",
-						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-						(unsigned)v->wait_counter, (int)v->current_order.GetType(),
-						r3r_owner == nullptr ? -1 : (int)r3r_owner->First()->index.base(),
-						(int)_r3r_depot_self_release.count(v->First()->index.base()),
-						(int)seg_state);
-			}
-		}
+		
 		if (seg_state == SigSegState::Full || (depot_reserved && !self_released)) {
 			/* Full and no PBS signal in block or depot reserved, can't exit. */
 			exit_blocked = true;
@@ -16663,10 +13863,10 @@ static bool CheckTrainStayInDepot(Train *v)
 
 	/* We are leaving a depot, but have to go to the exact same one; re-enter. */
 	if (v->current_order.IsType(OT_GOTO_DEPOT) && v->tile == v->dest_tile) {
-		if (exit_blocked) return r3r_depot_stay(9);
+		if (exit_blocked) return true;
 		/* Service when depot has no reservation. */
 		if (!HasDepotReservation(v->tile)) VehicleEnterDepot(v);
-		return r3r_depot_stay(10);
+		return true;
 	}
 
 	if (_settings_game.vehicle.drive_through_train_depot) {
@@ -16728,19 +13928,19 @@ static bool CheckTrainStayInDepot(Train *v)
 
 			InvalidateWindowData(WindowClass::VehicleDepot, depot_tile.base());
 			InvalidateWindowData(WindowClass::VehicleDepot, behind_depot_tile.base());
-			return r3r_depot_stay(8);
+			return true;
 		}
 	}
 
 	/* R3R (第 397 轮, REG-397-A): 把 seg_state 一起打出来，才能分清 exit=11 到底是
 	 * "库外信号段占满(Full)"还是"库格预留"在拦 —— 两者的修法完全不同。 */
-	if (exit_blocked) return r3r_depot_stay(11, (int)seg_state);
+	if (exit_blocked) return true;
 
 	/* Only leave when we can reserve a path to our destination. */
 	if (seg_state == SigSegState::Path && !TryPathReserve(v) && v->force_proceed == TFP_NONE) {
 		/* No path and no force proceed. */
 		MarkTrainAsStuck(v);
-		return r3r_depot_stay(12);
+		return true;
 	}
 
 	SetDepotReservation(v->tile, true);
@@ -16758,7 +13958,6 @@ static bool CheckTrainStayInDepot(Train *v)
 
 	moving_front->vehstatus.Reset(VehState::Hidden);
 	moving_front->UpdateIsDrawn();
-	R3RSpdCtx(v, "leave-depot", v->cur_speed, 0);
 	v->cur_speed = 0;
 
 	moving_front->UpdateViewport(true, true);
@@ -16918,11 +14117,7 @@ static void ClearPathReservation(const Train *v, TileIndex tile, Trackdir track_
 		const TrackBits tbits = v->track & TRACK_BIT_MASK;
 		if (tbits == TRACK_BIT_NONE) return;
 		track_dir = TrackToTrackdir(FindFirstTrack(tbits));
-		if (R3RDbgEdge(R3REDGE_VEHTD, (uint64_t)v->index.base(), ((uint64_t)v->tile.base() << 32) | ((uint64_t)(uint)v->track << 16) | (uint64_t)(uint)track_dir)) {
-			R3RDbgWrite("VEHTD-CLEARRES veh=%d tile=%d,%d trk=0x%X td=%d\n",
-					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-					(uint)v->track, (int)track_dir);
-		}
+		
 	}
 
 	if (IsTileType(tile, TileType::TunnelBridge)) {
@@ -17117,17 +14312,6 @@ void FreeTrainTrackReservation(Train *consist, TileIndex origin, Trackdir orig_t
 				if (HasReservedTracks(tile, TrackToTrackBits(r3r_track))) {
 					const Train *r3r_owner = GetTrainForReservation(tile, r3r_track);
 					r3r_owned = (r3r_owner == nullptr || r3r_owner == consist->First());
-					if (!r3r_owned && R3RDbgOn()) {
-						/* 边沿触发：同一 (清位者, 格) 只记一次，避免 KI-478 那种日志洪水。 */
-						static std::map<uint64_t, uint8_t> r3r_foreign_skip_seen;
-						const uint64_t fs_key = ((uint64_t)consist->index.base() << 40) | (uint64_t)tile.base();
-						if (r3r_foreign_skip_seen.find(fs_key) == r3r_foreign_skip_seen.end()) {
-							r3r_foreign_skip_seen[fs_key] = 1;
-							R3RDbgWrite("RESV-FOREIGN-SKIP veh=%d tile=%d,%d td=%d track=%d owner=%u\n",
-									consist->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
-									(int)r3r_track, r3r_owner->index.base());
-						}
-					}
 				}
 			}
 			if (r3r_owned) ClearPathReservation(consist, tile, td);
@@ -17255,13 +14439,6 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			if (static_cast<uint32_t>(_tick_counter - it->second.tick) < R3R_LOOP_MEMO_TICKS) {
 				if (new_tracks != nullptr) *new_tracks = it->second.new_tracks;
 				if (enterdir != nullptr) *enterdir = it->second.enterdir;
-				const uint64_t r3r_memo_edge = R3RDbgTagHash("LOOP-MEMO") | ((uint64_t)v->index.base() << 32);
-				if (R3RDbgEdge(R3REDGE_WALKLOOP, r3r_memo_edge, (uint64_t)_tick_counter)) {
-					R3RDbgWrite("LOOP-MEMO veh=%u origin=%d,%d/%d tile=%d,%d/%d age=%u\n",
-							(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-							(int)TileX(it->second.tile), (int)TileY(it->second.tile), (int)it->second.td,
-							(unsigned)(_tick_counter - it->second.tick));
-				}
 				return PBSTileInfo(it->second.tile, it->second.td, false);
 			}
 			_r3r_loop_memo.erase(it);
@@ -17348,13 +14525,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 				!(IsRailStationTile(ft.new_tile) && GetStationIndex(ft.new_tile) == r3r_stn_bound_id)) {
 			if (new_tracks != nullptr) *new_tracks = TrackdirBitsToTrackBits(ft.new_td_bits);
 			if (enterdir != nullptr) *enterdir = ft.exitdir;
-			if (R3RDbgEdge(R3REDGE_EXTEXIT,
-					((uint64_t)v->index.base() << 40) | ((uint64_t)ft.new_tile.base() << 8) | 3, 3)) {
-				R3RDbgWrite("RESV-EXT-STNEDGE veh=%u origin=%d,%d/%d stn=%u edge=%d,%d td=%d nextbits=0x%X steps=%u spd=%u\n",
-						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-						(uint)r3r_stn_bound_id.base(), (int)TileX(ft.new_tile), (int)TileY(ft.new_tile), (int)ft.old_td,
-						(uint)ft.new_td_bits, (unsigned)r3r_walk_steps, (uint)v->cur_speed);
-			}
+			
 			return PBSTileInfo(ft.new_tile, ft.old_td, false);
 		}
 
@@ -17433,22 +14604,12 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 					}
 				}
 				if (r3r_goal_pair != nullptr) {
-					if (R3RDbgEdge(R3REDGE_EXTGOALEXEMPT,
-							((uint64_t)r3r_own_key << 32) | (uint64_t)ft.new_tile.base(),
-							(uint64_t)r3r_goal_pair->index.base())) {
-						R3RDbgWrite("EXTEND-GOAL-EXEMPT veh=%u tile=%d,%d pair=%u whole=%d track=%d need=0x%X resv=0x%X\n",
-								(uint)r3r_own_key, (int)TileX(ft.new_tile), (int)TileY(ft.new_tile),
-								(uint)r3r_goal_pair->index.base(), r3r_backout_owner_whole ? 1 : 0,
-								r3r_backout_owner_track, r3r_backout_need_bits, r3r_backout_resv_bits);
-					}
+					
 					/* The tile is our pair partner's own platform: treat it as an ordinary
 					 * choice and let the pathfinder lay down the rest of the path. */
 				} else if (r3r_blame_track != INVALID_TRACK && r3r_backout_ledger == (int)r3r_own_key &&
 						R3RReleaseReservationChecked(r3r_own_key, ft.new_tile, r3r_blame_track, "stale-own-bit") &&
 						!HasReservedTracks(ft.new_tile, TrackdirBitsToTrackBits(TrackdirReachesTrackdirs(ft.old_td)))) {
-					R3RDbgWrite("STALE-OWN-BIT veh=%u tile=%d,%d track=%d led=%d cleared=1\n",
-							(uint)r3r_own_key, (int)TileX(ft.new_tile), (int)TileY(ft.new_tile),
-							(int)r3r_blame_track, r3r_backout_ledger);
 					/* The bit is gone: the tile is free again, so treat it as an ordinary
 					 * choice and let the pathfinder lay down the rest of the path. */
 				} else {
@@ -17467,13 +14628,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			/* R3R (REG-505-32-A): the three *success* exits of this walk had no log at all, so
 			 * "the reservation stopped early" could not be told apart from "it backed out".
 			 * Read-only: nothing below this line changes any decision (no break, no booking). */
-			if (R3RDbgEdge(R3REDGE_EXTEXIT,
-					((uint64_t)v->index.base() << 40) | ((uint64_t)ft.new_tile.base() << 8) | 1, 1)) {
-				R3RDbgWrite("RESV-EXT-EXIT veh=%u kind=choose origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u\n",
-						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-						(int)TileX(ft.new_tile), (int)TileY(ft.new_tile), (int)ft.old_td,
-						(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps);
-			}
+			
 			return PBSTileInfo(ft.new_tile, ft.old_td, false);
 		}
 
@@ -17493,13 +14648,6 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			_r3r_loop_memo[r3r_memo_key] = R3RLoopMemo{tile, ft.old_td,
 					new_tracks != nullptr ? *new_tracks : TRACK_BIT_NONE,
 					enterdir != nullptr ? *enterdir : DiagDirection::Invalid, (uint32_t)_tick_counter};
-			const uint64_t r3r_loop_key = R3RDbgTagHash("LOOP-CLOSED") | ((uint64_t)v->index.base() << 32);
-			if (R3RDbgEdge(R3REDGE_WALKLOOP, r3r_loop_key, ((uint64_t)tile.base() << 8) | (uint32_t)cur_td)) {
-				R3RDbgWrite("LOOP-CLOSED veh=%u origin=%d,%d/%d tile=%d,%d/%d steps=%u track=%d\n",
-						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-						(int)TileX(tile), (int)TileY(tile), (int)cur_td, (unsigned)r3r_walk_steps,
-						(int)TrackdirToTrack(cur_td));
-			}
 			/* Same (tile, trackdir) convention as the choice branch above. */
 			return PBSTileInfo(tile, ft.old_td, false);
 		}
@@ -17515,13 +14663,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 			if (!(wp_free && TryReserveRailTrackdir(v, tile, cur_td))) { r3r_backout_reason = wp_free ? "safe-reserve-fail" : "safe-not-free"; break; }
 			/* Safe position is all good, path valid and okay. */
 			/* R3R (REG-505-32-A): safe-waiting-position success exit, see the choice exit above. */
-			if (R3RDbgEdge(R3REDGE_EXTEXIT,
-					((uint64_t)v->index.base() << 40) | ((uint64_t)tile.base() << 8) | 2, 2)) {
-				R3RDbgWrite("RESV-EXT-EXIT veh=%u kind=safe origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u\n",
-						(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-						(int)TileX(tile), (int)TileY(tile), (int)cur_td,
-						(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps);
-			}
+			
 			restricted_signal_state.TraceRestrictExecuteResEndSlot(v);
 			return PBSTileInfo(tile, cur_td, true);
 		}
@@ -17563,14 +14705,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 	if (ft.err == CFollowTrackRail::ErrorCode::Owner || ft.err == CFollowTrackRail::ErrorCode::NoWay) {
 		/* End of line, path valid and okay. */
 		/* R3R (REG-505-32-A): end-of-line success exit, see the choice exit above. */
-		if (R3RDbgEdge(R3REDGE_EXTEXIT,
-				((uint64_t)v->index.base() << 40) | ((uint64_t)ft.old_tile.base() << 8) | 3, 3)) {
-			R3RDbgWrite("EXT-EXIT veh=%u kind=eol origin=%d,%d/%d tile=%d,%d td=%d nextbits=0x%X stn=%d skip=%u steps=%u err=%d\n",
-					(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-					(int)TileX(ft.old_tile), (int)TileY(ft.old_tile), (int)ft.old_td,
-					(uint)ft.new_td_bits, ft.is_station ? 1 : 0, (uint)ft.tiles_skipped, (unsigned)r3r_walk_steps,
-					(int)ft.err);
-		}
+		
 		return PBSTileInfo(ft.old_tile, ft.old_td, true);
 	}
 
@@ -17599,24 +14734,7 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 	 * (veh, next tile, reason, owner): the first four rounds of a key print in full,
 	 * then one line per 256. n= is appended at the very end -- the old fields and
 	 * their order are byte-for-byte unchanged. */
-	if (R3RDbgOn()) {
-		static std::unordered_map<uint64_t, uint32_t> r3r_backout_count;
-		const uint64_t count_key = (static_cast<uint64_t>(v->index.base()) << 40) ^
-				(static_cast<uint64_t>(ft.new_tile.base()) << 8) ^
-				static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r3r_backout_reason) & 0xFF) ^
-				(static_cast<uint64_t>(r3r_backout_owner != nullptr ? r3r_backout_owner->index.base() : 0xFFFFFu) << 24);
-		uint32_t &backout_n = r3r_backout_count[count_key];
-		backout_n++;
-		if (backout_n <= 4 || backout_n % 256 == 0) {
-			R3RDbgWrite("EXTEND-BACKOUT veh=%u origin=%d,%d/%d stop=%d,%d/%d next=%d,%d reason=%s err=%d owner=%d whole=%d track=%d need=0x%X resv=0x%X led=%d n=%u\n",
-					(uint)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir,
-					(int)TileX(ft.old_tile), (int)TileY(ft.old_tile), (int)ft.old_td,
-					(int)TileX(ft.new_tile), (int)TileY(ft.new_tile), r3r_backout_reason, (int)ft.err,
-					r3r_backout_owner != nullptr ? (int)r3r_backout_owner->index.base() : -1,
-					r3r_backout_owner_whole ? 1 : 0, r3r_backout_owner_track,
-					r3r_backout_need_bits, r3r_backout_resv_bits, r3r_backout_ledger, backout_n);
-		}
-	}
+	
 	tile = origin.tile;
 	cur_td = origin.trackdir;
 	TileIndex stopped = ft.old_tile;
@@ -17629,21 +14747,8 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 	 * their bits once the loop is done: a head that is still booked at that point is an
 	 * orphan this back-out cannot lift, which is exactly the ①a "reservation outside
 	 * the path" shape, and it explains why SET-BRIDGE outnumbers CLEAR-BRIDGE. */
-	static const uint32_t R3R_BACKOUT_SKIP_MAX = 8;
-	struct R3RSkippedHead { TileIndex tile; uint32_t skipped; };
-	R3RSkippedHead r3r_skipped[R3R_BACKOUT_SKIP_MAX];
-	uint32_t r3r_skipped_n = 0;
-	/* Guarded: a failing extension is retried every tick (the 405-round case), so the
-	 * bookkeeping must vanish with the probes off instead of running per tick. */
-	const bool r3r_skip_trace = R3RDbgOn();
 	while (tile != stopped || cur_td != stopped_td) {
 		if (!ft.Follow(tile, cur_td)) break;
-
-		if (r3r_skip_trace && ft.tiles_skipped != 0 && r3r_skipped_n < R3R_BACKOUT_SKIP_MAX) {
-			r3r_skipped[r3r_skipped_n].tile = ft.old_tile;
-			r3r_skipped[r3r_skipped_n].skipped = (uint32_t)ft.tiles_skipped;
-			r3r_skipped_n++;
-		}
 
 		if (ft.tiles_skipped == 0 && Rail90DegTurnDisallowedTilesFromTrackdir(ft.old_tile, ft.new_tile, ft.old_td, _settings_game.pf.forbid_90_deg)) {
 			ft.new_td_bits &= ~TrackdirCrossesTrackdirs(ft.old_td);
@@ -17655,13 +14760,6 @@ static PBSTileInfo ExtendTrainReservation(const Train *v, const PBSTileInfo &ori
 		cur_td = FindFirstTrackdir(ft.new_td_bits);
 
 		UnreserveRailTrackdir(tile, cur_td);
-	}
-
-	for (uint32_t i = 0; i < r3r_skipped_n; i++) {
-		R3RDbgWrite("EXTEND-BACKOUT-SKIP veh=%u tile=%d,%d skipped=%u resvAfter=0x%X\n",
-				(uint)v->index.base(),
-				(int)TileX(r3r_skipped[i].tile), (int)TileY(r3r_skipped[i].tile),
-				r3r_skipped[i].skipped, (unsigned)GetReservedTrackbits(r3r_skipped[i].tile));
 	}
 
 	if (temporary_slot_state.IsActive()) temporary_slot_state.PopFromChangeStackRevertTemporaryChanges(v->index);
@@ -17840,11 +14938,7 @@ public:
 			 * 无条件推进（车头一进站台格就把目标改成等待车底，列车还在滑行就
 			 * 被引去挂车），这里只保留停止点标记、不推进。 */
 			if (R3RStationOrderHoldsForCouple(v)) {
-				if (R3RDbgEdge(R3REDGE_STOPGATE, ((uint64_t)v->index.base() << 16) ^ (uint64_t)v->cur_real_order_index, 0)) {
-					R3RDbgWrite("ORD-STOPGATE veh=%d site=loading order=%d real=%d num=%d spd=%d tile=%d,%d\n",
-							(int)v->index.base(), (int)v->current_order.GetType(), (int)v->cur_real_order_index,
-							(int)v->GetNumOrders(), (int)v->cur_speed, TileX(v->tile), TileY(v->tile));
-				}
+				
 				return;
 			}
 			this->SwitchToNextOrder(true);
@@ -17886,11 +14980,7 @@ public:
 			/* R3R (R307-2, 第 307 轮): 同 loading 分支。站台格判据在车头刚进格
 			 * 那一 tick 就成立，若下一条是 GOTO_COUPLE，此处也必须等停稳。 */
 			if (R3RStationOrderHoldsForCouple(v)) {
-				if (R3RDbgEdge(R3REDGE_STOPGATE, ((uint64_t)v->index.base() << 16) ^ (uint64_t)v->cur_real_order_index, 1)) {
-					R3RDbgWrite("ORD-STOPGATE veh=%d site=platform order=%d real=%d num=%d spd=%d tile=%d,%d\n",
-							(int)v->index.base(), (int)v->current_order.GetType(), (int)v->cur_real_order_index,
-							(int)v->GetNumOrders(), (int)v->cur_speed, TileX(v->tile), TileY(v->tile));
-				}
+				
 				return;
 			}
 			this->SwitchToNextOrder(true);
@@ -18162,13 +15252,6 @@ struct R3RLongReserveDepthGuard {
 					res_end = _r3r_lr_trace_train->lookahead->reservation_end_position;
 					cur = _r3r_lr_trace_train->lookahead->current_position;
 				}
-				R3RDbgWrite("LR-TRACE veh=%d depth=%u tile=%d,%d td=%d res_end=%d cur=%d le=%d reason=%u nodes=%u\n",
-						(_r3r_lr_trace_train != nullptr) ? (int)_r3r_lr_trace_train->index.base() : -1,
-						(unsigned)_r3r_lr_trace_max_depth,
-						(int)TileX(_r3r_lr_trace_max_tile), (int)TileY(_r3r_lr_trace_max_tile),
-						(int)_r3r_lr_trace_max_td, res_end, cur,
-						_r3r_le_lookahead_end, (unsigned)_r3r_le_reason,
-						(unsigned)_r3r_long_reserve_nodes);
 			}
 			_r3r_lr_trace_max_depth = 0;
 			_r3r_lr_trace_max_tile = INVALID_TILE;
@@ -18205,10 +15288,6 @@ static void TryLongReserveChooseTrainTrack(Train *v, TileIndex tile, Trackdir td
 		static uint32_t last_budget_tick = 0;
 		if (last_budget_tick == 0 || (uint32_t)_tick_counter - last_budget_tick >= 64) {
 			last_budget_tick = (uint32_t)_tick_counter;
-			R3RDbgWrite("LR-BUDGET veh=%d tile=%d,%d td=%d depth=%u nodes=%u limit=%u\n",
-					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
-					(unsigned)_r3r_long_reserve_depth, (unsigned)_r3r_long_reserve_nodes,
-					(unsigned)R3R_LONG_RESERVE_MAX_NODES);
 		}
 		return;
 	}
@@ -18219,9 +15298,6 @@ static void TryLongReserveChooseTrainTrack(Train *v, TileIndex tile, Trackdir td
 		static uint32_t last_cap_tick = 0;
 		if (last_cap_tick == 0 || (uint32_t)_tick_counter - last_cap_tick >= 64) {
 			last_cap_tick = (uint32_t)_tick_counter;
-			R3RDbgWrite("LR-DEPTH-CAP veh=%d tile=%d,%d td=%d depth=%u limit=%u\n",
-					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
-					(unsigned)_r3r_long_reserve_depth, (unsigned)R3R_LONG_RESERVE_MAX_DEPTH);
 		}
 		return;
 	}
@@ -18231,9 +15307,6 @@ static void TryLongReserveChooseTrainTrack(Train *v, TileIndex tile, Trackdir td
 		static uint32_t last_cycle_tick = 0;
 		if (last_cycle_tick == 0 || (uint32_t)_tick_counter - last_cycle_tick >= 64) {
 			last_cycle_tick = (uint32_t)_tick_counter;
-			R3RDbgWrite("LR-CYCLE veh=%d tile=%d,%d td=%d depth=%u\n",
-					(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)td,
-					(unsigned)_r3r_long_reserve_depth);
 		}
 		return;
 	}
@@ -18374,89 +15447,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 
 	ChooseTrainTrackResultFlags result_flags = CTTRF_NONE;
 
-	/* R3R (第 329 轮 E1d, KI-504): 唯一出口探针。第 329 轮 E1c 试图用 RESV-SPLIT-PASS 证明
-	 * "早退分支给出了 TRACK_X"，但现场 reserved=0x0 ⇒ 早退根本不触发，判据无从判别。
-	 * 这条 lambda 让每条 return 都自报 why（early / yapf / fallback），从而把
-	 * "谁给出了这根轨" 与 "v->track 最终写了什么"（见 TRKSET）分离开。
-	 * 只在挂接单 + 该格 >=2 根轨时打（岔道格），签名去重，零行为改动。 */
-	auto r3r_chosen_ret = [&](Track ret_track, ChooseTrainTrackResultFlags ret_flags, const char *why) -> ChooseTrainTrackResult {
-		if (R3RDbgOn() && consist->current_order.IsType(OT_GOTO_COUPLE) && KillFirstBit(tracks) != TRACK_BIT_NONE) {
-			const TrackBits r3r_now = (TrackBits)(GetReservedTrackbits(tile) & DiagdirReachesTracks(enterdir));
-			const uint32_t r3r_ret_bits = (ret_track == INVALID_TRACK) ? 0xFFu : (uint32_t)TrackToTrackBits(ret_track);
-			static std::map<uint32_t, uint64_t> r3r_crtr_seen;
-			const uint64_t crtr_sig = ((uint64_t)r3r_ret_bits << 56)
-					| ((uint64_t)(uint32_t)r3r_now << 32)
-					| ((uint64_t)(uint32_t)enterdir << 24)
-					| ((uint64_t)(uint32_t)tracks << 8);
-			uint64_t &crtr_prev = r3r_crtr_seen[consist->index.base()];
-			if (crtr_prev != crtr_sig) {
-				crtr_prev = crtr_sig;
-				R3RDbgWrite("CPL-RET veh=%d tick=%u tile=%d,%d enterdir=%d tracks=0x%X res=0x%X ret=0x%X why=%s spd=%d real=%d\n",
-						consist->index.base(), (uint)_tick_counter, (int)TileX(tile), (int)TileY(tile), (int)enterdir,
-						(uint)tracks, (uint)r3r_now, (uint)r3r_ret_bits, why,
-						(int)consist->cur_speed, (int)consist->cur_real_order_index);
-			}
-		}
-
-		/* R3R (第 357 轮, KI-533 / R48-4): 逐格道岔裁决台账,**不**限定挂接单、也
-		 * **不**限定多轨格 —— 玩家主诉的第四环是"最后在第三个道岔拐错方向",而
-		 * 现有的 CPL-RET 只覆盖"挂接单 + 该格 >=2 根轨",一旦那次选择的判据落在这
-		 * 个交集之外就完全看不见。这里把每一次 ChooseTrainTrack 的出口都记下来:
-		 *   tracks = 本格对该入方向可用的轨集合（道岔的全部选项）
-		 *   res    = 记账前本格已被订下的轨（谁被占住了）
-		 *   ret    = 本次实际给出的轨（0xFF = 没给出）
-		 * 签名去重（同车同几何只一行），零行为改动。
-		 * IsPlainRailTile 守卫是硬要求:GetReservedTrackbits() 内部对非平原轨会
-		 * 断言（rail_map.h 的 dbg_assert_tile(IsPlainRailTile())），探针不得制造
-		 * 新的崩溃面（第 110 轮附记 7b 的教训）。 */
-		if (R3RDbgOn()) {
-			const TrackBits r3r_jc_res = IsPlainRailTile(tile) ? GetReservedTrackbits(tile) : TRACK_BIT_NONE;
-			const TrackBits r3r_jc_now = (TrackBits)(r3r_jc_res & DiagdirReachesTracks(enterdir));
-			const uint32_t r3r_jc_ret = (ret_track == INVALID_TRACK) ? 0xFFu : (uint32_t)TrackToTrackBits(ret_track);
-			static std::map<uint32_t, uint64_t> r3r_jc_seen;
-			const uint64_t jc_sig = ((uint64_t)r3r_jc_ret << 56)
-					| ((uint64_t)(uint32_t)r3r_jc_now << 40)
-					| ((uint64_t)(uint32_t)enterdir << 32)
-					| ((uint64_t)(uint32_t)tracks << 16)
-					| (uint64_t)((uint)consist->current_order.GetType() & 0xFF);
-			uint64_t &jc_prev = r3r_jc_seen[consist->index.base()];
-			if (jc_prev != jc_sig) {
-				jc_prev = jc_sig;
-				R3RDbgWrite("JUNC-CHOOSE veh=%d tick=%u tile=%d,%d enterdir=%d tracks=0x%X res=0x%X ret=0x%X why=%s order=%d spd=%d real=%d db=%d\n",
-						consist->index.base(), (uint)_tick_counter, (int)TileX(tile), (int)TileY(tile), (int)enterdir,
-						(uint)tracks, (uint)r3r_jc_now, (uint)r3r_jc_ret, why,
-						(int)consist->current_order.GetType(), (int)consist->cur_speed,
-						(int)consist->cur_real_order_index,
-						(int)(consist->IsDrivingBackwards() ? 1 : 0));
-			}
-		}
-		return { ret_track, ret_flags };
-	};
-
-	/* R3R (第 289 轮, 只读取证): 这一处是新的头号嫌疑 —— 若 new_tile 上已经有我们自己的
-	 * 预留，函数在此"啥也不做"直接返回，result_flags 不含 CTTRF_RESERVATION_MADE，
-	 * 于是 TryPathReserveCore 判 ok=0 res=0，而 DoTrainCouplePathfind() 永远不会被调用
-	 * （日志表现为 RESV-EXT-DEST 零命中 + CPL-ENTRY 消失）。签名去重，零行为改动。
-	 * 标签必须带 RESV- 前缀：R3RDbgTagAllowed() 只放行 RESV-/UNRES-/EXTEND-/LOOP-/R3R-RES-，
-	 * 原先的 "EXT-PRE" 会被静默丢弃（第 289 轮日志假阴性根因）。 */
-	if (R3RDbgOn() && consist->current_order.IsType(OT_GOTO_COUPLE)) {
-		const TrackBits r3r_res_now = (TrackBits)GetReservedTrackbits(tile);
-		static std::map<uint32_t, uint64_t> r3r_ext_pre_seen;
-		const uint64_t ep_sig = ((uint64_t)(uint32_t)r3r_res_now << 32)
-				| ((uint64_t)(uint32_t)tracks << 20)
-				| ((uint64_t)(uint32_t)enterdir << 16);
-		uint64_t &ep_seen = r3r_ext_pre_seen[consist->index.base()];
-		if (ep_seen != ep_sig) {
-			ep_seen = ep_sig;
-			R3RDbgWrite("RESV-EXT-PRE veh=%d tile=%d,%d enterdir=%d tracks=0x%X reserved=0x%X doRes=%d real=%d spd=%d\n",
-					consist->index.base(),
-					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-					(uint)tracks, (uint)r3r_res_now,
-					do_track_reservation ? 1 : 0,
-					(int)consist->cur_real_order_index, (int)consist->cur_speed);
-		}
-	}
-	/* Don't use tracks here as the setting to forbid 90 deg turns might have been switched between reservation and now. */
+/* Don't use tracks here as the setting to forbid 90 deg turns might have been switched between reservation and now. */
 	TrackBits res_tracks = (TrackBits)(GetReservedTrackbits(tile) & DiagdirReachesTracks(enterdir));
 	/* R3R (第 289 轮续五, KI-457): 停住的挂接机车不许吃这条"已有预留就早退"的捷径。
 	 *
@@ -18496,21 +15487,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	const bool r3r_couple_split_res = consist->current_order.IsType(OT_GOTO_COUPLE) &&
 			!consist->current_order.GetCoupleIsDepot() &&
 			KillFirstBit(res_tracks) != TRACK_BIT_NONE;
-	if (R3RDbgOn() && r3r_couple_split_res) {
-		static std::map<uint32_t, uint64_t> r3r_split_pass_seen;
-		const uint64_t sp_sig = ((uint64_t)(uint32_t)res_tracks << 32)
-				| ((uint64_t)(uint32_t)tile.base() << 8)
-				| ((uint64_t)(uint32_t)(consist->cur_speed & 0xFF));
-		uint64_t &sp_seen = r3r_split_pass_seen[consist->index.base()];
-		if (sp_seen != sp_sig) {
-			sp_seen = sp_sig;
-			R3RDbgWrite("RESV-SPLIT-PASS veh=%d tile=%d,%d enterdir=%d res=0x%X tracks=0x%X spd=%d real=%d\n",
-					consist->index.base(),
-					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-					(uint)res_tracks, (uint)tracks,
-					(int)consist->cur_speed, (int)consist->cur_real_order_index);
-		}
-	}
+	
 	/* R3R (第 343 轮, memo §24.16 修法 1 / memo §25): early-haverserved 的语义是「下一格已经有
 	 * **我的**预留，直接开进去就行」（第 289 轮续五注释），但它的判据 res_tracks 来自
 	 * GetReservedTrackbits(tile) —— 该格上**任何人都有的**预留。于是别人的一格预留就能让挂接
@@ -18548,21 +15525,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		}
 		r3r_couple_foreign_res = !owned;
 	}
-	if (R3RDbgOn() && r3r_couple_foreign_res) {
-		static std::map<uint32_t, uint64_t> r3r_foreign_res_seen;
-		const uint64_t fr_sig = ((uint64_t)(uint32_t)res_tracks << 32)
-				| ((uint64_t)(uint32_t)tile.base() << 8)
-				| ((uint64_t)(uint32_t)(consist->cur_speed & 0xFF));
-		uint64_t &fr_seen = r3r_foreign_res_seen[consist->index.base()];
-		if (fr_seen != fr_sig) {
-			fr_seen = fr_sig;
-			R3RDbgWrite("RESV-FOREIGN-RES veh=%d tile=%d,%d enterdir=%d res=0x%X tracks=0x%X spd=%d real=%d\n",
-					consist->index.base(),
-					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-					(uint)res_tracks, (uint)tracks,
-					(int)consist->cur_speed, (int)consist->cur_real_order_index);
-		}
-	}
+	
 	/* R3R (第 338 轮, KI-359 修法 P1): early-haverserved 还漏了一条前提 —— 「本车手上已有前瞻」。
 	 *
 	 * 该出口的意图是「下一格已经有我的预留，直接开进去就行」，但它 return 时既不置
@@ -18582,49 +15545,16 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 	 */
 	const bool r3r_couple_no_lookahead = consist->current_order.IsType(OT_GOTO_COUPLE) &&
 			!consist->current_order.GetCoupleIsDepot() && consist->lookahead == nullptr;
-	if (R3RDbgOn() && r3r_couple_no_lookahead && res_tracks != TRACK_BIT_NONE) {
-		static std::map<uint32_t, uint64_t> r3r_nolook_pass_seen;
-		const uint64_t nl_sig = ((uint64_t)(uint32_t)res_tracks << 32)
-				| ((uint64_t)(uint32_t)tile.base() << 8)
-				| ((uint64_t)(uint32_t)(consist->cur_speed & 0xFF));
-		uint64_t &nl_seen = r3r_nolook_pass_seen[consist->index.base()];
-		if (nl_seen != nl_sig) {
-			nl_seen = nl_sig;
-			R3RDbgWrite("RESV-NOLOOK-PASS veh=%d tile=%d,%d enterdir=%d res=0x%X tracks=0x%X spd=%d real=%d\n",
-					consist->index.base(),
-					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-					(uint)res_tracks, (uint)tracks,
-					(int)consist->cur_speed, (int)consist->cur_real_order_index);
-		}
-	}
+	
 	/* R3R (第 505 轮续, REG-505-32-C): `early-haverserved` 这条 return 此前一个字都不打，
 	 * 是最大的探针盲区（详见 R3R_couple_resv_unsafe_turnout_20261124_memo.md §32.10）。
 	 * 它排在下面 if (do_track_reservation) 之前，一旦命中就不调 ExtendTrainReservation()、
 	 * 也不调 yapf，日志里于是只剩 RP cur= 而 EXT-* 全 0。这里在判定前补一条签名去重探针，
 	 * 只读：四个豁免的取值直接说明是哪一条把"必须重算路径"的要求放过去了。
 	 * key=veh，签名含 res/tile/spd/look，同一形态只打一次，不刷屏。 */
-	if (R3RDbgOn()) {
-		static std::map<uint32_t, uint64_t> r3r_haveres_seen;
-		const uint64_t hr_sig = ((uint64_t)(uint32_t)res_tracks << 40)
-				| ((uint64_t)(uint32_t)tile.base() << 12)
-				| ((uint64_t)(consist->cur_speed & 0xFF) << 2)
-				| ((uint64_t)(consist->lookahead != nullptr ? 1 : 0));
-		uint64_t &hr_seen = r3r_haveres_seen[consist->index.base()];
-		if (hr_seen != hr_sig) {
-			hr_seen = hr_sig;
-			R3RDbgWrite("RESV-HAVERES veh=%d tile=%d,%d enterdir=%d res=0x%X tracks=0x%X spd=%d real=%d order=%d stuckretry=%d split=%d foreign=%d nolook=%d look=%d\n",
-					consist->index.base(),
-					(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-					(uint)res_tracks, (uint)tracks,
-					(int)consist->cur_speed, (int)consist->cur_real_order_index,
-					(int)consist->current_order.GetType(),
-					r3r_couple_stuck_retry ? 1 : 0, r3r_couple_split_res ? 1 : 0,
-					r3r_couple_foreign_res ? 1 : 0, r3r_couple_no_lookahead ? 1 : 0,
-					consist->lookahead != nullptr ? 1 : 0);
-		}
-	}
+	
 	/* Do we have a suitable reserved track? */
-	if (res_tracks != TRACK_BIT_NONE && !r3r_couple_stuck_retry && !r3r_couple_split_res && !r3r_couple_foreign_res && !r3r_couple_no_lookahead) return r3r_chosen_ret(FindFirstTrack(res_tracks), result_flags, "early-haverserved");
+	if (res_tracks != TRACK_BIT_NONE && !r3r_couple_stuck_retry && !r3r_couple_split_res && !r3r_couple_foreign_res && !r3r_couple_no_lookahead) return { FindFirstTrack(res_tracks), result_flags };
 
 	bool mark_stuck = (flags & CTTF_MARK_STUCK);
 
@@ -18648,13 +15578,12 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 					}
 					if (out.flags & (TRPRF_WAIT_AT_PBS | TRPRF_REVERSE_AT)) {
 						if (mark_stuck) MarkTrainAsStuck(consist, true);
-						return r3r_chosen_ret(track, result_flags, "single-restrict-wait");
+						return { track, result_flags };
 					}
 				}
 			}
 			/* R3R (第 306 轮, 只读取证): 先记下"这次调用原本有没有订路资格"
 			 * （下面 :16550 会被信号分支强行改成 true）。 */
-			const bool r3r_sigpass_dores_in = do_track_reservation;
 
 			consist->flags.Reset(VehicleRailFlag::WaitingRestriction);
 
@@ -18672,40 +15601,13 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			 *
 			 * ownRes: 0=该格该轨无主(没人订) 1=本车 2=别的车。
 			 * 按 (veh, tile) 逐格去重，值变了才打一行，不会刷屏。 */
-			if (R3RDbgOn()) {
-				/* R3R (第 306 轮, KI-484): `GetTrainForReservation()` 的第一行是
-				 *   assert_msg_tile(HasReservedTracks(tile, TrackToTrackBits(track)), ...);
-				 * 而这里**恰恰**是"灯已变绿、预留还没订"的瞬间（§14.3），灯格常常
-				 * 没有该轨预留 ⇒ 直接问会 abort（现场：pbs.cpp:1961 断言崩溃）。
-				 * 先自证前置条件；无预留即 reserved=0 / ownRes=0，不必再走归属回溯。 */
-				const bool r3r_sig_reserved = HasReservedTracks(tile, TrackToTrackBits(track));
-				const Train *const r3r_sig_owner = r3r_sig_reserved ? GetTrainForReservation(tile, track) : nullptr;
-				const uint64_t r3r_sig_key = ((uint64_t)(uint32_t)consist->index.base() << 32)
-						| (uint64_t)(uint32_t)tile.base();
-				const uint64_t r3r_sig_val = ((uint64_t)(r3r_sigpass_dores_in ? 1 : 0) << 32)
-						| ((uint64_t)(uint32_t)track << 16)
-						| ((uint64_t)(r3r_sig_reserved ? 1 : 0) << 2)
-						| (uint64_t)(r3r_sig_owner == nullptr ? 0 : (r3r_sig_owner == consist ? 1 : 2));
-				static std::map<uint64_t, uint64_t> r3r_sigpass_seen;
-				uint64_t &r3r_sig_seen = r3r_sigpass_seen[r3r_sig_key];
-				if (r3r_sig_seen != r3r_sig_val) {
-					r3r_sig_seen = r3r_sig_val;
-					R3RDbgWrite("RESV-SIGPASS veh=%d tile=%d,%d track=%d dir=%d doResIn=%d spd=%d reserved=%d ownRes=%d coType=%d real=%d db=%d\n",
-							consist->index.base(),
-							(int)TileX(tile), (int)TileY(tile), (int)track, (int)enterdir,
-							r3r_sigpass_dores_in ? 1 : 0, (int)consist->cur_speed,
-							r3r_sig_reserved ? 1 : 0,
-							r3r_sig_owner == nullptr ? 0 : (r3r_sig_owner == consist ? 1 : 2),
-							(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-							consist->IsDrivingBackwards() ? 1 : 0);
-				}
-			}
+			
 			if (_extra_aspects > 0) {
 				SetSignalAspect(tile, track, 0);
 				UpdateAspectDeferredWithVehicleRail(consist, tile, changed_signal);
 			}
 		} else if (!do_track_reservation) {
-			return r3r_chosen_ret(track, result_flags, "single-track-nores");
+			return { track, result_flags };
 		}
 		best_track = track;
 	}
@@ -18737,24 +15639,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			/* R3R (第 289 轮, 只读取证): 这一条出口是"机车一步不动"的嫌疑真凶 —— 它
 			 * 早于 16151 的 DoTrainCouplePathfind()，所以日志里既没有 CPL-ENTRY 也没有
 			 * CPL-SKIP，只有 TryPathReserveCore 汇总的 ok=0 res=0。签名去重，零行为改动。 */
-			if (R3RDbgOn() && consist->current_order.IsType(OT_GOTO_COUPLE)) {
-				static std::map<uint32_t, uint64_t> r3r_ext_bad_seen;
-				const uint64_t eb_sig = ((uint64_t)(uint32_t)origin.tile.base() << 32)
-						| ((uint64_t)(uint32_t)consist->cur_real_order_index << 24)
-						| ((uint64_t)(uint32_t)tracks << 8)
-						| ((uint64_t)(origin.okay ? 1 : 0) << 20);
-				uint64_t &eb_seen = r3r_ext_bad_seen[consist->index.base()];
-				if (eb_seen != eb_sig) {
-					eb_seen = eb_sig;
-					R3RDbgWrite("RESV-EXT-DEST veh=%d bad=1 tile=%d,%d origin=%d,%d otd=%d ookay=%d new=%d,%d exit=%d tracks=0x%X real=%d spd=%d\n",
-							consist->index.base(),
-							(int)TileX(consist->tile), (int)TileY(consist->tile),
-							(int)TileX(origin.tile), (int)TileY(origin.tile),
-							(int)origin.trackdir, origin.okay ? 1 : 0,
-							(int)TileX(tile), (int)TileY(tile), (int)enterdir,
-							(uint)tracks, (int)consist->cur_real_order_index, (int)consist->cur_speed);
-				}
-			}
+			
 			/* R3R (第 289 轮续五, KI-457): 停住的挂接机车也不许吃这条"预留失败"早退。
 			 *
 			 * 本条出口排在 16194 的挂接分支之前，而挂接寻路存在的**唯一理由**就是
@@ -18772,7 +15657,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				/* Reservation failed? */
 				if (mark_stuck) MarkTrainAsStuck(consist);
 				if (changed_signal != INVALID_TRACKDIR) SetSignalStateByTrackdir(tile, changed_signal, SignalState::Red);
-				return r3r_chosen_ret(FindFirstTrack(tracks), result_flags, "resfail-extend");
+				return { FindFirstTrack(tracks), result_flags };
 			}
 		}
 		if (res_dest.okay) {
@@ -18788,26 +15673,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 
 			/* R3R (第 289 轮, 只读取证): 走到这里的挂接机车说明预留"成功但不长"，与上面
 			 * EXT-DEST bad=1 成对读，用来解释同一起点跨 tick 结果翻转 (REG-289-D)。 */
-			if (R3RDbgOn() && consist->current_order.IsType(OT_GOTO_COUPLE)) {
-				static std::map<uint32_t, uint64_t> r3r_ext_ok_seen;
-				const uint64_t eo_sig = ((uint64_t)(uint32_t)res_dest.tile.base() << 32)
-						| ((uint64_t)(uint32_t)consist->cur_real_order_index << 24)
-						| ((uint64_t)(uint32_t)tracks << 8)
-						| ((uint64_t)(res_dest.okay ? 1 : 0) << 20)
-						| ((uint64_t)(long_reserve ? 1 : 0) << 21);
-				uint64_t &eo_seen = r3r_ext_ok_seen[consist->index.base()];
-				if (eo_seen != eo_sig) {
-					eo_seen = eo_sig;
-					R3RDbgWrite("RESV-EXT-DEST veh=%d bad=0 origin=%d,%d otd=%d ookay=%d dest=%d,%d dtd=%d dokay=%d lr=%d tracks=0x%X real=%d spd=%d\n",
-							consist->index.base(),
-							(int)TileX(origin.tile), (int)TileY(origin.tile),
-							(int)origin.trackdir, origin.okay ? 1 : 0,
-							(int)TileX(res_dest.tile), (int)TileY(res_dest.tile),
-							(int)res_dest.trackdir, res_dest.okay ? 1 : 0,
-							(int)long_reserve, (uint)tracks,
-							(int)consist->cur_real_order_index, (int)consist->cur_speed);
-				}
-			}
+			
 			if (!long_reserve) {
 				/* Got a valid reservation that ends at a safe target, quick exit. */
 				result_flags |= CTTRF_RESERVATION_MADE;
@@ -18817,7 +15683,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 					TryReserveRailTrack(moving_front->tile, TrackdirToTrack(moving_front->GetVehicleTrackdir()));
 				}
 				if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) FillTrainReservationLookAhead(consist);
-				return r3r_chosen_ret(best_track, result_flags, "res-ok-brief");
+				return { best_track, result_flags };
 			}
 		}
 
@@ -18870,14 +15736,6 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		TileIndex &r3r_cd_seen = _r3r_couple_depot_news[consist->index];
 		if (r3r_cd_seen != consist->dest_tile) {
 			r3r_cd_seen = consist->dest_tile;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "COUPLE-DEPOT-DIRECT veh=%d tile=%d,%d dest=%d,%d\n",
-						(int)consist->index.base(),
-						(int)TileX(consist->tile), (int)TileY(consist->tile),
-						(int)TileX(consist->dest_tile), (int)TileY(consist->dest_tile));
-				fclose(dbg);
-			}
 		}
 	}
 
@@ -18931,47 +15789,9 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			const Track r3r_pf_track = DoTrainPathfind(consist, tile, enterdir, tracks, r3r_pf_found, do_track_reservation, &r3r_pf_dest, &r3r_pf_final);
 			if (r3r_pf_found && r3r_pf_track != INVALID_TRACK) {
 				path_found = r3r_pf_track;
-				if (R3RDbgOn()) {
-					static std::map<uint32_t, uint32_t> r3r_cpl_pf_fb_seen;
-					const uint32_t fb_sig = (uint32_t)r3r_pf_track | ((uint32_t)tracks << 8) | ((uint32_t)tile.base() << 16);
-					uint32_t &fb_seen = r3r_cpl_pf_fb_seen[consist->index.base()];
-					if (fb_seen != fb_sig) {
-						fb_seen = fb_sig;
-						R3RDbgWrite("CPL-PF-FALLBACK veh=%d tile=%d,%d ret=0x%X tracks=0x%X dest=%d,%d final=%d,%d\n",
-								consist->index.base(), (int)TileX(tile), (int)TileY(tile),
-								(unsigned)r3r_pf_track, (unsigned)tracks,
-								r3r_pf_dest.tile != INVALID_TILE ? (int)TileX(r3r_pf_dest.tile) : -1,
-								r3r_pf_dest.tile != INVALID_TILE ? (int)TileY(r3r_pf_dest.tile) : -1,
-								r3r_pf_final != INVALID_TILE ? (int)TileX(r3r_pf_final) : -1,
-								r3r_pf_final != INVALID_TILE ? (int)TileY(r3r_pf_final) : -1);
-					}
-				}
-			}
-		} else if (path_found == INVALID_TRACK
-				&& R3RCouplePathBlockedByThirdParty()
-				&& consist->current_order.IsType(OT_GOTO_COUPLE)) {
-			/* R3R (第 346 轮续, KI-516): 挂接路径已经算出来了，只是回溯的安全位判据被
-			 * 第三方车（现场 veh=54 过路车，ord=6 正在开走）否决。玩家 2026-10-28 原话：
-			 * 「它自己的路径被挡住了那就等待啊，等到路径被放出来啊」。
-			 *
-			 * ⇒ **不降级**到普通寻路。降级会把目标换成被车底自己占着的 dest_tile=(12,15)，
-			 * 普通寻路永远到不了它，只能订到相邻股道的 (5,14) —— 那正是玩家看到的
-			 * "走错股道"（y=14 与车底所在的 y=15 平行）。这里就地停住，下一 tick 由
-			 * r3r_couple_stuck_retry 重算同一场景的完整挂接路径；障碍离开后回到 found=1，
-			 * 沿原股道撞上车底完成耦合（撞上即耦合）。 */
-			if (R3RDbgOn()) {
-				static std::map<uint32_t, uint32_t> r3r_cpl_blocked_seen;
-				const uint32_t blocked_sig = (uint32_t)consist->tile.base();
-				uint32_t &blocked_seen = r3r_cpl_blocked_seen[consist->index.base()];
-				if (blocked_seen != blocked_sig) {
-					blocked_seen = blocked_sig;
-					R3RDbgWrite("CPL-BLOCKED-WAIT veh=%d tile=%d,%d dest=%d,%d\n",
-							consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-							consist->dest_tile != INVALID_TILE ? (int)TileX(consist->dest_tile) : -1,
-							consist->dest_tile != INVALID_TILE ? (int)TileY(consist->dest_tile) : -1);
-				}
 			}
 		}
+
 		/* R3R (第 335 轮, 修 train_cmd.cpp:20024 断言): 采纳条件必须与调用方
 		 * 20024 的断言判据同构 —— chosen_track & (bits | GetReservedTrackbits(new_tile))。
 		 *
@@ -18998,25 +15818,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			if (HasTrack(r3r_accept_bits, path_found)) {
 				best_track = path_found;
 			} else {
-				/* R3R (第 335 轮, 只读口径): 跨格答案被拒多少次、拒的是什么。
-				 * 标签必须落在 R3RDbgTagAllowed() 的 RESV-/UNRES-/EXTEND-/LOOP-/
-				 * R3R-RES- 白名单内，否则会被静默丢弃。签名去重，零行为改动。 */
-				if (R3RDbgOn()) {
-					static std::map<uint32_t, uint64_t> r3r_cpl_xtile_seen;
-					const uint64_t xt_sig = ((uint64_t)(uint32_t)path_found << 48)
-							| ((uint64_t)(uint32_t)tracks << 32)
-							| ((uint64_t)(uint32_t)GetReservedTrackbits(tile) << 16)
-							| (uint64_t)(uint32_t)consist->tile.base();
-					uint64_t &xt_seen = r3r_cpl_xtile_seen[consist->index.base()];
-					if (xt_seen != xt_sig) {
-						xt_seen = xt_sig;
-						R3RDbgWrite("RESV-CPL-XTILE veh=%d tile=%d,%d tracks=0x%X resv=0x%X ret=0x%X accept=0x%X\n",
-								consist->index.base(), (int)TileX(tile), (int)TileY(tile),
-								(unsigned)tracks, (unsigned)GetReservedTrackbits(tile),
-								(unsigned)path_found, (unsigned)r3r_accept_bits);
-					}
-				}
-				const Track r3r_same_tile = FindFirstTrack(tracks);
+const Track r3r_same_tile = FindFirstTrack(tracks);
 				best_track = (r3r_same_tile != INVALID_TRACK) ? r3r_same_tile : best_track;
 			}
 		}
@@ -19046,7 +15848,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			 * 节流跳过没有改变任何地图状态，所以保持现状：不撤销预留、不标 stuck、
 			 * 不改 best_track（此时它仍是 FindFirstTrack(tracks)，与下面的失败返回一致），
 			 * 下一 tick 节流窗口一过，正常的 search 会自己把结果定下来。 */
-			if (keep_track != INVALID_TRACK && R3RCoupleSearchSkipped(consist)) return r3r_chosen_ret(keep_track, result_flags, "cpl-search-skip");
+			if (keep_track != INVALID_TRACK && R3RCoupleSearchSkipped(consist)) return { keep_track, result_flags };
 
 			/* R3R (第 271 轮): 车还在动的时候，也不许拿"没找到可挂车底"当理由拆预留。
 			 *
@@ -19123,21 +15925,8 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				const Train *const r3r_own_front = consist->GetMovingFront();
 				const PBSTileInfo own_resv = FollowTrainReservation(consist, nullptr, FollowTrainReservationFlag::IgnoreLookahead);
 				const bool has_own_resv = r3r_own_front != nullptr && own_resv.tile != r3r_own_front->tile;
-				if (has_own_resv) return r3r_chosen_ret(keep_track, result_flags, "cpl-moving-keep");
+				if (has_own_resv) return { keep_track, result_flags };
 
-				/* 同一失败签名只报一次，避免每 tick 刷屏。 */
-				static std::map<uint32_t, int> r3r_noownresv_seen;
-				int &seen = r3r_noownresv_seen[consist->index.base()];
-				if (seen != (int)keep_track) {
-					seen = (int)keep_track;
-					R3RDbgWrite("CPL-NOOWNRESV veh=%d tile=%d,%d spd=%d real=%d order=%d keep=%d front=%d,%d end=%d,%d reason=no-own-reservation\n",
-							consist->index.base(), TileX(consist->tile), TileY(consist->tile),
-							consist->cur_speed, (int)consist->cur_real_order_index,
-							(int)consist->current_order.GetType(), (int)keep_track,
-							r3r_own_front != nullptr ? (int)TileX(r3r_own_front->tile) : -1,
-							r3r_own_front != nullptr ? (int)TileY(r3r_own_front->tile) : -1,
-							(int)TileX(own_resv.tile), (int)TileY(own_resv.tile));
-				}
 				/* 不依赖调用方传进来的 mark_stuck：这里明确是「车在动、却无路可走」，
 				 * 必须停住。MarkTrainAsStuck 幂等，下面 KI-316 再调一次无副作用；
 				 * 掉头风险由 KI-289 的 R3R_COUPLE_WAIT_HEAL_LIMIT 抑制。 */
@@ -19177,36 +15966,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 			if (mark_stuck) MarkTrainAsStuck(consist);
 
-			if (!pair_ready) {
-				/* 未就绪：TrainCoupleHandler 的 COUPLE-FAIL / COUPLE-DEST-EMPTY 心跳只说明
-				 * "没挂上"，不说明卡在哪一层；这里补一条 500 tick 相位心跳，回答"是没配对
-				 * 还是没路线"（C-6 拆分的就是这一点）。 */
-				if (((_tick_counter + consist->index.base()) % 500) == 0) {
-					R3RDbgWrite("CPL-NOTREADY veh=%d tile=%d,%d real=%d spd=%d stuck=%d\n",
-							consist->index.base(), TileX(consist->tile), TileY(consist->tile),
-							(int)consist->cur_real_order_index, consist->cur_speed,
-							consist->flags.Test(VehicleRailFlag::Stuck) ? 1 : 0);
-				}
-			} else if (R3RCoupleSearchRejectMask(consist) != 0) {
-				/* 真失败：同一失败签名只报一次（签名 = rej mask），避免每 tick 刷屏。 */
-				static std::map<int, uint32_t> r3r_couple_pathbug_mask;
-				const uint32_t rej = R3RCoupleSearchRejectMask(consist);
-				uint32_t &seen = r3r_couple_pathbug_mask[(int)consist->index.base()];
-				if (seen != rej) {
-					seen = rej;
-					const TileIndex dest = consist->dest_tile;
-					const uint dist = (dest != INVALID_TILE)
-							? (uint)std::max(std::abs((int)TileX(dest) - (int)TileX(consist->tile)),
-									std::abs((int)TileY(dest) - (int)TileY(consist->tile)))
-							: 0;
-					const Train *const partner = R3RGetCouplePairPartner(consist);
-					R3RDbgWrite("CPL-PATHBUG veh=%d alock=%d found=0 rej=0x%X dest=%d,%d dist=%u spd=%d\n",
-							consist->index.base(), (partner != nullptr) ? (int)partner->index.base() : -1,
-							rej, (dest != INVALID_TILE) ? (int)TileX(dest) : 0, (dest != INVALID_TILE) ? (int)TileY(dest) : 0,
-							dist, consist->cur_speed);
-				}
-			}
-			return r3r_chosen_ret(FindFirstTrack(tracks), result_flags, "cpl-fail");
+			return { FindFirstTrack(tracks), result_flags };
 		}
 		result_flags |= CTTRF_RESERVATION_MADE;
 	}
@@ -19250,33 +16010,16 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			const Train *const r3r_nr_front = consist->GetMovingFront();
 			const PBSTileInfo r3r_nr_own = FollowTrainReservation(consist, nullptr, FollowTrainReservationFlag::IgnoreLookahead);
 			if (r3r_nr_front == nullptr || r3r_nr_own.tile == r3r_nr_front->tile) {
-				if (R3RDbgOn()) {
-					static std::map<uint32_t, uint32_t> r3r_nores_blocked_seen;
-					const uint32_t nr_sig = (uint32_t)consist->tile.base()
-							^ ((uint32_t)(uint8_t)consist->cur_real_order_index << 24)
-							^ (consist->cur_speed != 0 ? 0x80000000u : 0);
-					uint32_t &nr_seen = r3r_nores_blocked_seen[consist->index.base()];
-					if (nr_seen != nr_sig) {
-						nr_seen = nr_sig;
-						R3RDbgWrite("CPL-NORES-BLOCK veh=%d tile=%d,%d real=%d spd=%d stuck=%d front=%d,%d end=%d,%d best=0x%X\n",
-								consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-								(int)consist->cur_real_order_index, consist->cur_speed,
-								consist->flags.Test(VehicleRailFlag::Stuck) ? 1 : 0,
-								r3r_nr_front != nullptr ? (int)TileX(r3r_nr_front->tile) : -1,
-								r3r_nr_front != nullptr ? (int)TileY(r3r_nr_front->tile) : -1,
-								(int)TileX(r3r_nr_own.tile), (int)TileY(r3r_nr_own.tile),
-								(best_track == INVALID_TRACK) ? 0xFFu : (uint)TrackToTrackBits(best_track));
-					}
-				}
+				
 				FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 				if (changed_signal != INVALID_TRACKDIR) MarkSingleSignalDirty(tile, changed_signal);
 				/* 在动的必须当场停住；已经停着的车只在调用方要求时才标卡住，
 				 * 免得把"正常等车底"刷成界面红（KI-445 的原生刹车口径不变）。 */
 				if (consist->cur_speed != 0 || mark_stuck) MarkTrainAsStuck(consist);
-				return r3r_chosen_ret(FindFirstTrack(tracks), result_flags, "nores-couple-blocked");
+				return { FindFirstTrack(tracks), result_flags };
 			}
 		}
-		return r3r_chosen_ret(best_track, result_flags, "nores-final");
+		return { best_track, result_flags };
 	}
 
 	/* A path was found, but could not be reserved. */
@@ -19301,13 +16044,9 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			extern bool R3RTakeSelfLock(VehicleID veh, TileIndex *tile);
 			TileIndex r3r_selflock_tile = INVALID_TILE;
 			if (R3RTakeSelfLock(consist->index, &r3r_selflock_tile)) {
-				R3RDbgWrite("CPL-SELFLOCK veh=%d pos=%d,%d locked=%d,%d why=self-cross-unreachable spd=%d real=%d\n",
-						consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-						(int)TileX(r3r_selflock_tile), (int)TileY(r3r_selflock_tile),
-						(int)consist->cur_speed, (int)consist->cur_real_order_index);
 				FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 				if (mark_stuck) MarkTrainAsStuck(consist);
-				return r3r_chosen_ret(best_track, result_flags, "selflock-unreachable");
+				return { best_track, result_flags };
 			}
 			if (_settings_game.vehicle.train_braking_model == TBM_REALISTIC) {
 				/* R3R: the couple pathfinder does reserve the path up to the waiting
@@ -19331,11 +16070,11 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 				* 回溯撞上等待车底造成的误判，CPL-RES-OK booked=3 才是真正的订主=本车）。记一笔，
 				* 让下一次出库尝试认得出"库口那格是我自己的"。 */
 				R3RMarkCouplePartialReserve(consist);
-				return r3r_chosen_ret(best_track, result_flags, "cpl-partial-res");
+				return { best_track, result_flags };
 		}
 		if (mark_stuck) MarkTrainAsStuck(consist);
 		FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
-		return r3r_chosen_ret(best_track, result_flags, "resfail-notokay");
+		return { best_track, result_flags };
 	}
 
 	/* No possible reservation target found, we are probably lost. */
@@ -19357,7 +16096,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 			FreeTrainTrackReservation(consist, origin.tile, origin.trackdir);
 			if (mark_stuck) MarkTrainAsStuck(consist);
 		}
-		return r3r_chosen_ret(best_track, result_flags, "lost");
+		return { best_track, result_flags };
 	}
 
 	result_flags |= CTTRF_RESERVATION_MADE;
@@ -19423,12 +16162,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		 * will later re-issue a second reservation starting from that junction,
 		 * and the second pathfinder picks the exit on its own (G-5). tcount>=2
 		 * marks a junction tile; safe=0 is the invariant violation itself. */
-		R3RDbgWrite("RESV-UNSAFE-TAIL veh=%d real=%d type=%d tile=%d,%d td=%d tcount=%d safe=0 vtile=%d,%d spd=%d ext=0\n",
-				(int)consist->index.base(), (int)consist->cur_real_order_index,
-				(int)consist->current_order.GetType(),
-				(int)TileX(res_dest.tile), (int)TileY(res_dest.tile), (int)res_dest.trackdir,
-				(IsPlainRailTile(res_dest.tile) ? (int)CountBits((uint)GetTrackBits(res_dest.tile)) : -2),
-				(int)TileX(consist->tile), (int)TileY(consist->tile), (int)consist->cur_speed);
+		
 		r3r_unsafe_tail = true;
 		/* No order or no safe position found, try any position. */
 		if (!TryReserveSafeTrack(consist, res_dest.tile, res_dest.trackdir, true)) {
@@ -19449,14 +16183,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		 * the reservation legally terminated on a junction). Comparing vtile of
 		 * this line with the next RESV-TERM of the same vehicle shows whether the
 		 * second reservation started from that junction. */
-		R3RDbgWrite("RESV-TERM veh=%d real=%d type=%d tile=%d,%d td=%d tcount=%d safe=%d tail=%d spd=%d vtile=%d,%d\n",
-				(int)consist->index.base(), (int)consist->cur_real_order_index,
-				(int)consist->current_order.GetType(),
-				(int)TileX(res_dest.tile), (int)TileY(res_dest.tile), (int)res_dest.trackdir,
-				(IsPlainRailTile(res_dest.tile) ? (int)CountBits((uint)GetTrackBits(res_dest.tile)) : -2),
-				(int)IsSafeWaitingPosition(consist, res_dest.tile, res_dest.trackdir, true, _settings_game.pf.forbid_90_deg),
-				(int)r3r_unsafe_tail, (int)consist->cur_speed,
-				(int)TileX(consist->tile), (int)TileY(consist->tile));
+		
 		if (temporary_slot_state.IsActive()) temporary_slot_state.PopFromChangeStackApplyTemporaryChanges(consist);
 		if (consist->current_order.IsBaseStationOrder() && HasStationTileRail(res_dest.tile) && consist->current_order.GetDestination() == GetStationIndex(res_dest.tile)) {
 			if (consist->current_order.ShouldStopAtStation(consist, consist->current_order.GetDestination().ToStationID(), consist->current_order.IsType(OT_GOTO_WAYPOINT))) {
@@ -19483,10 +16210,6 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 					static uint32_t last_noprog_tick = 0;
 					if (last_noprog_tick == 0 || (uint32_t)_tick_counter - last_noprog_tick >= 64) {
 						last_noprog_tick = (uint32_t)_tick_counter;
-						R3RDbgWrite("LR-NO-PROGRESS veh=%d tile=%d,%d td=%d end=%d prev=%d depth=%u\n",
-								(int)consist->index.base(), (int)TileX(res_dest.tile), (int)TileY(res_dest.tile), (int)res_dest.trackdir,
-								(int)consist->lookahead->reservation_end_position, (int)prev_res_end,
-								(unsigned)_r3r_long_reserve_depth);
 					}
 				}
 			}
@@ -19512,7 +16235,7 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
 		SetWindowWidgetDirty(WindowClass::VehicleView, consist->index, WID_VV_START_STOP);
 	}
 
-	return r3r_chosen_ret(best_track, result_flags, "final");
+	return { best_track, result_flags };
 }
 
 /* R3R (KI-199 probe): one line per *distinct* reservation attempt, so "coupling never
@@ -19524,31 +16247,6 @@ static ChooseTrainTrackResult ChooseTrainTrack(Train *consist, const TileIndex t
  * logged, because that is the window the player is looking at. lookahead= tells the two
  * very different cases apart: extending an existing reservation (lookahead!=null)
  * versus asking for a brand new one after the coupling invalidated both halves. */
-static void R3RLogReserveAttempt(Train *consist, bool mark_as_stuck, bool first_tile_okay, TryPathReserveResultFlags res)
-{
-	if (!R3RDbgOn() || consist == nullptr) return;
-
-	const bool one_shot = consist->HasForceReserveOnce();
-	const uint64_t payload = (uint64_t)(uint8_t)res
-			| ((uint64_t)(uint32_t)consist->current_order.GetType() << 8)
-			| ((uint64_t)(uint32_t)consist->dest_tile.base() << 16)
-			| ((uint64_t)(consist->cur_speed != 0 ? 1 : 0) << 48);
-	if (!one_shot && !R3RDbgEdge(R3REDGE_TRP, (uint64_t)consist->index.base(), payload)) return;
-
-	Train *mf = consist->GetMovingFront();
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "TRP veh=%d mf=%d,%d real=%d type=%d dest=%u spd=%d fp=%d look=%d one=%d mstuck=%d fto=%d => ok=%d res=%d\n",
-				(int)consist->index.base(), (int)TileX(mf->tile), (int)TileY(mf->tile),
-				(int)consist->cur_real_order_index, (int)consist->current_order.GetType(),
-				(unsigned)consist->dest_tile.base(), (int)consist->cur_speed, (int)consist->force_proceed,
-				consist->lookahead != nullptr ? 1 : 0, one_shot ? 1 : 0,
-				mark_as_stuck ? 1 : 0, first_tile_okay ? 1 : 0,
-				(res & TPRRF_RESERVATION_OK) ? 1 : 0, (int)(uint8_t)res);
-		fclose(dbg);
-	}
-}
-
 static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark_as_stuck, bool first_tile_okay);
 
 /**
@@ -19701,8 +16399,6 @@ static bool R3RIsParkedWaiting(Train *consist, const char **reason)
 		const bool r3r_verdict_fresh = r3r_verdict_it != _r3r_pair_verdict.end() &&
 				(_tick_counter - r3r_verdict_it->second.tick) <= R3R_PAIR_VERDICT_MAX_AGE;
 		const bool r3r_has_pair_target = r3r_verdict_fresh && r3r_verdict_it->second.has_candidate;
-		const uint r3r_pair_cands = r3r_verdict_fresh ? r3r_verdict_it->second.candidates : 0;
-		const int r3r_verdict = !r3r_verdict_fresh ? -1 : (r3r_has_pair_target ? 1 : 0);
 
 		if (!r3r_has_pair_target) {
 			*reason = "parked-no-pair";
@@ -19710,12 +16406,7 @@ static bool R3RIsParkedWaiting(Train *consist, const char **reason)
 			/* 修-3（只读护栏）：这条硬规则被违反的现场必须自己在日志里留一行。
 			 * 按车一次 episode 只报一行；拿到候选（locked 分支的 erase）或订单结束
 			 * 才会重新武装。 */
-			if (consist->cur_speed != 0 &&
-					_r3r_pair_invariant_logged.insert(consist->index).second) {
-				R3RDbgPairInvariantViolation(consist, r3r_pair_cands, r3r_verdict);
-			}
-
-			/* 修-2（玩家拍板）：既已禁止订路，就不能留着旧 lookahead 让移动分支
+/* 修-2（玩家拍板）：既已禁止订路，就不能留着旧 lookahead 让移动分支
 			 * 继续"扩展既有预留"——那是绕过本门的后门。
 			 *
 			 * 只 reset lookahead，**不写 cur_speed**：lookahead 一清，
@@ -19726,20 +16417,11 @@ static bool R3RIsParkedWaiting(Train *consist, const char **reason)
 			 * 依赖的 ReserveTrackUnderConsist()（KI-208 / C4-3 的边界）。 */
 			if (consist->lookahead != nullptr) {
 				consist->lookahead.reset();
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] RESV-NOBOOK-LOOKAHEAD tick=%u veh=%d tile=%d,%d spd=%d reason=%s\n",
-							(uint)_tick_counter, (int)consist->index.base(),
-							(int)TileX(consist->tile), (int)TileY(consist->tile),
-							(int)consist->cur_speed, *reason);
-					fclose(dbg);
-				}
 			}
 			return true;
 		}
 
 		/* 有候选（缓存判定）：解除护栏节流，让下一次真正违规还能报一行。 */
-		_r3r_pair_invariant_logged.erase(consist->index);
 	}
 
 	/* R3R (第 306 轮, KI-481): 库内**已经配对成功**的挂接机车同样不许再订路线。
@@ -19908,34 +16590,7 @@ TryPathReserveResultFlags TryPathReserveWithResultFlags(Train *consist, bool mar
 	 *     （R48-3 的判据，不需要再猜）。
 	 * 纯读，零行为改动；放在 KI-208 早退门之前，所以"被门拒掉的尝试"也会留痕。 */
 	const TileIndex r3r_resv_prev_end = (consist->lookahead != nullptr) ? consist->lookahead->reservation_end_tile : INVALID_TILE;
-	const int r3r_resv_prev_end_pos = (consist->lookahead != nullptr) ? (int)consist->lookahead->reservation_end_position : -1;
-	if (R3RDbgOn()) {
-		const Train *const r3r_rb_mf = consist->GetMovingFront();
-		const uint64_t r3r_rb_pay = (uint64_t)consist->tile.base()
-				| ((uint64_t)(uint16_t)r3r_rb_mf->GetVehicleTrackdir() << 24)
-				| ((uint64_t)((uint)consist->current_order.GetType() & 0xFF) << 32)
-				| ((uint64_t)(consist->lookahead != nullptr ? 1u : 0u) << 40)
-				| ((uint64_t)(consist->cur_speed != 0 ? 1u : 0u) << 41);
-		const uint64_t r3r_rb_key = R3RDbgTagHash("RESV-BEGIN") | ((uint64_t)consist->index.base() << 32);
-		if (R3RDbgEdge(R3REDGE_RESVPROBE, r3r_rb_key, r3r_rb_pay)) {
-			FILE *const r3r_rb = R3RFopenDbg("a");
-			if (r3r_rb != nullptr) {
-				fprintf(r3r_rb, "RESV-BEGIN veh=%d tick=%u tile=%d,%d mf=%d,%d td=%d spd=%d real=%d order=%d one=%d look=%d prevEnd=%d,%d prevEndPos=%d\n",
-						(int)consist->index.base(), (uint)_tick_counter,
-						(int)TileX(consist->tile), (int)TileY(consist->tile),
-						(int)TileX(r3r_rb_mf->tile), (int)TileY(r3r_rb_mf->tile),
-						(int)r3r_rb_mf->GetVehicleTrackdir(),
-						(int)consist->cur_speed, (int)consist->cur_real_order_index,
-						(int)consist->current_order.GetType(),
-						(int)(consist->HasForceReserveOnce() ? 1 : 0),
-						(int)(consist->lookahead != nullptr ? 1 : 0),
-						IsValidTile(r3r_resv_prev_end) ? (int)TileX(r3r_resv_prev_end) : -1,
-						IsValidTile(r3r_resv_prev_end) ? (int)TileY(r3r_resv_prev_end) : -1,
-						r3r_resv_prev_end_pos);
-				fclose(r3r_rb);
-			}
-		}
-	}
+	
 
 	/* R3R (KI-208): a consist parked on a platform waiting to be coupled must
 	 * never book a route in the first place -- refusing the booking is what
@@ -19978,13 +16633,8 @@ TryPathReserveResultFlags TryPathReserveWithResultFlags(Train *consist, bool mar
 	 * active side (GOTO_COUPLE already at its destination with no pair lock). */
 	const char *r3r_nobook_reason = nullptr;
 	if (R3RIsParkedWaiting(consist, &r3r_nobook_reason)) {
-		R3RLogReserveAttempt(consist, mark_as_stuck, first_tile_okay, TPRRF_NONE);
-		if (_r3r_waiter_nobook_logged.insert(consist->index).second) {
-			R3RDbgWrite("RESV-NOBOOK veh=%d tile=%d,%d order=%d caronly=%d reason=%s\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)consist->current_order.GetType(), (int)R3RIsCarOnlyFormation(consist),
-					r3r_nobook_reason);
-		}
+		
+		(void)(_r3r_waiter_nobook_logged.insert(consist->index).second);
 		return TPRRF_NONE;
 	}
 
@@ -20011,16 +16661,7 @@ TryPathReserveResultFlags TryPathReserveWithResultFlags(Train *consist, bool mar
 	 * 和其它门一样，只拒绝路线：既有预留、脚下保护、配对扫描、挂接几何命中全部
 	 * 不动；配对锁一建立判据即失效，车立刻正常开过去粘贴。 */
 	if (R3RShouldActAsWaitingForCouple(consist)) {
-		R3RLogReserveAttempt(consist, mark_as_stuck, first_tile_okay, TPRRF_NONE);
-		if (((_tick_counter + consist->index.base()) % 500) == 0) {
-			const Train *mf = consist->GetMovingFront();
-			R3RDbgWrite("CPL-WAIT-NOBOOK veh=%d tile=%d,%d real=%d mf=%d,%d spd=%d\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)consist->cur_real_order_index,
-					mf != nullptr ? (int)TileX(mf->tile) : -1,
-					mf != nullptr ? (int)TileY(mf->tile) : -1,
-					consist->cur_speed);
-		}
+		
 		return TPRRF_NONE;
 	}
 	/* R3R (C4-3, round 272): a chain held on a pass-through waiting waypoint must not
@@ -20034,17 +16675,12 @@ TryPathReserveResultFlags TryPathReserveWithResultFlags(Train *consist, bool mar
 	 * and TrainCoupleHandler() are untouched, so the pairing layer keeps working and the
 	 * chain starts rolling as soon as R3RShouldHoldForCouple() turns false. */
 	if (R3RShouldHoldForCouple(consist)) {
-		R3RLogReserveAttempt(consist, mark_as_stuck, first_tile_okay, TPRRF_NONE);
-		if (((_tick_counter + consist->index.base()) % 500) == 0) {
-			R3RDbgWrite("CPL-HOLD-NOBOOK veh=%d tile=%d,%d real=%d\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)consist->cur_real_order_index);
-		}
+		
 		return TPRRF_NONE;
 	}
 
 	const TryPathReserveResultFlags r3r_res = R3RTryPathReserveCore(consist, mark_as_stuck, first_tile_okay);
-	R3RLogReserveAttempt(consist, mark_as_stuck, first_tile_okay, r3r_res);
+	
 	return r3r_res;
 }
 
@@ -20099,13 +16735,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 			consist->current_order.GetType() != OT_LOADING &&
 			!IsRailDepotTile(consist->tile) && !(consist->track & TRACK_BIT_DEPOT)) {
 		consist->SetForceReserveOnce();
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "R3R-RES-ONCE grant head=%d why=turn force_proceed=%d tile=%d,%d\n",
-					(int)consist->index.base(), (int)consist->force_proceed,
-					(int)TileX(consist->tile), (int)TileY(consist->tile));
-			fclose(dbg);
-		}
 	}
 
 	/* R3R (第 347 轮, C-8 / KI-517): 玩家 2026-10-28 拍板「选C8」——**彻底不动，直到
@@ -20135,22 +16764,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	const bool r3r_one_shot_blocked = consist->HasForceReserveOnce() &&
 			consist->current_order.IsType(OT_GOTO_COUPLE) &&
 			R3RCouplePathBlockedByThirdParty();
-	if (r3r_one_shot_blocked) {
-		/* 按 (车号, tile) 节流：车彻底不动时只留一行，正好作为"位置不再变化"的证据。 */
-		static std::unordered_map<uint32_t, uint32_t> r3r_oneshot_hold_state;
-		const uint32_t r3r_hold_key = consist->index.base();
-		const uint32_t r3r_hold_tile = (uint32_t)consist->tile.base();
-		auto r3r_hold_it = r3r_oneshot_hold_state.find(r3r_hold_key);
-		if (r3r_hold_it == r3r_oneshot_hold_state.end() || r3r_hold_it->second != r3r_hold_tile) {
-			r3r_oneshot_hold_state[r3r_hold_key] = r3r_hold_tile;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "R3R-RES-ONCE hold head=%d tile=%d,%d why=couple-path-blocked\n",
-						(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile));
-				fclose(dbg);
-			}
-		}
-	}
 
 	/* R3R (KI-179): the one-shot "independent reservation" ability granted when a
 	 * coupling completes (VehicleRailFlag::ForceReserveOnce). The two halves were
@@ -20171,14 +16784,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		{
 			if (!this->armed) return;
 			if (this->reserved) {
-				/* R3R probe: the ability has been spent (recorded once per grant). */
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "R3R-RES-ONCE used head=%d force_proceed=%d tile=%d,%d\n",
-							(int)this->consist->index.base(), (int)this->consist->force_proceed,
-							(int)TileX(this->consist->tile), (int)TileY(this->consist->tile));
-					fclose(dbg);
-				}
 				this->consist->ClearForceReserveOnce();
 			} else {
 				/* Nothing could be reserved: keep the ability for the next attempt. */
@@ -20203,13 +16808,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 			if (this->reserved && this->saved_force_proceed == TFP_NONE && this->consist->force_proceed == TFP_SIGNAL) {
 				this->consist->force_proceed = TFP_NONE;
 				InvalidateWindowData(WindowClass::VehicleView, this->consist->index);
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "R3R-RES-ONCE clear head=%d tile=%d,%d\n",
-							(int)this->consist->index.base(),
-							(int)TileX(this->consist->tile), (int)TileY(this->consist->tile));
-					fclose(dbg);
-				}
 			}
 		}
 	} r3r_one_shot{consist, consist->HasForceReserveOnce() && !r3r_one_shot_blocked, consist->force_proceed};
@@ -20267,21 +16865,7 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		const DiagDirection r3r_depot_dir = GetRailDepotDirection(moving_front->tile);
 		const TileIndex r3r_next_tile = TileAddByDiagDir(moving_front->tile, r3r_depot_dir);
 		const bool r3r_next_resv = HasReservedTracks(r3r_next_tile, DiagdirReachesTracks(r3r_depot_dir));
-		if (R3RDbgOn() && (r3r_depot_resv || r3r_next_resv)) {
-			const Train *const r3r_next_owner = r3r_next_resv ? GetTrainForWholeTileReservation(r3r_next_tile) : nullptr;
-			const Train *const r3r_mf_owner = r3r_depot_resv ? GetTrainForWholeTileReservation(moving_front->tile) : nullptr;
-			R3RDbgWrite("DEPOT-EXIT-GATE veh=%d tick=%u mf=%d,%d next=%d,%d dir=%d depotResv=%d selfRel=%d mfOwner=%d nextResv=%d nextOwner=%d nextMf=%d,%d stuck=%d\n",
-					(int)consist->index.base(), (uint)_tick_counter,
-					(int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
-					(int)TileX(r3r_next_tile), (int)TileY(r3r_next_tile), (int)r3r_depot_dir,
-					(int)r3r_depot_resv, (int)r3r_self_rel,
-					r3r_mf_owner == nullptr ? -1 : (int)r3r_mf_owner->First()->index.base(),
-					(int)r3r_next_resv,
-					r3r_next_owner == nullptr ? -1 : (int)r3r_next_owner->First()->index.base(),
-					r3r_next_owner == nullptr ? -1 : (int)TileX(r3r_next_owner->tile),
-					r3r_next_owner == nullptr ? -1 : (int)TileY(r3r_next_owner->tile),
-					(int)consist->flags.Test(VehicleRailFlag::Stuck));
-		}
+		
 		if (r3r_depot_resv && !r3r_self_rel) {
 			if (mark_as_stuck) MarkTrainAsStuck(consist);
 			return TPRRF_NONE;
@@ -20368,35 +16952,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	 * exit is what gets reported -- `pair=1` only decorates it. Emitting it separately
 	 * would print two lines per tick (pair-exempt then ok) for exactly the locomotive
 	 * under investigation. Read-only. */
-	auto tpr_note = [&](uint8_t state, const Vehicle *other, bool pair) {
-		if (!R3RDbgOn()) return;
-		static std::map<uint32_t, uint32_t> tpr_seen;
-		const uint32_t veh = (uint32_t)consist->index.base();
-		/* Key on the *chain* of the blocking train, not on the single car FollowTrainReservation
-		 * happened to report: within one chain that car is not stable, and a per-car key would
-		 * resurrect one line per tick. */
-		const uint32_t other_chain = (other != nullptr && other->type == VehicleType::Train &&
-				Train::From(other)->First() != nullptr) ? (uint32_t)Train::From(other)->First()->index.base() : 0u;
-		const uint32_t sig = (uint32_t)state | (pair ? 0x100u : 0u) | (other_chain << 9);
-		auto it = tpr_seen.find(veh);
-		if (it != tpr_seen.end() && it->second == sig) return;
-		if (tpr_seen.size() > 4096) tpr_seen.clear();
-		tpr_seen[veh] = sig;
-		static const char *const tpr_states[] = { "ok", "veto", "unused", "reach0", "choose" };
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg == nullptr) return;
-		const Train *const other_head = (other_chain != 0) ? Train::From(other)->First() : nullptr;
-		fprintf(dbg, "TPR-EXIT veh=%u state=%s pair=%d tile=%u,%u spd=%d other=%u otherTile=%u,%u otherSpd=%d otherOrder=%d origin=%u,%u okay=%d\n",
-				veh, tpr_states[state < 5 ? state : 0], pair ? 1 : 0,
-				(uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
-				other_chain,
-				other_head != nullptr ? (uint)TileX(other_head->tile) : 65535u,
-				other_head != nullptr ? (uint)TileY(other_head->tile) : 65535u,
-				other_head != nullptr ? other_head->cur_speed : 0,
-				other_head != nullptr ? (int)other_head->current_order.GetType() : -1,
-				(uint)TileX(origin.tile), (uint)TileY(origin.tile), origin.okay ? 1 : 0);
-		fclose(dbg);
-	};
 	/** Set when the veto below was waived because the "other train" is our own couple pair. */
 	bool tpr_pair_waived = false;
 	/* The path we are driving on is already blocked by some other train.
@@ -20412,27 +16967,7 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		 * after LOCO-AFTER-DECOUPLE). Log the exact origin / other-train geometry so
 		 * the fix can be scoped to the decouple seam without touching the genuine
 		 * "a train really is ahead on our path" case. */
-		const uint64_t tprblk_key = ((uint64_t)consist->index.base() << 32) | (uint64_t)other_train->index.base();
-		const uint64_t tprblk_payload = ((uint64_t)origin.tile.base() << 32) ^ (uint64_t)other_train->tile.base();
-		if (R3RDbgEdge(R3REDGE_TPRBLK, tprblk_key, tprblk_payload)) {
-			const Train *blk_mf = consist->GetMovingFront();
-			const Train *oth = Train::From(other_train);
-			const Train *oth_first = (oth != nullptr) ? oth->First() : nullptr;
-			const Train *oth_mf = (oth != nullptr) ? oth->GetMovingFront() : nullptr;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "TPR-BLOCKED veh=%u tile=%u,%u spd=%d mf=%u,%u origin=%u,%u okay=%d td=%d other=%u otherTile=%u,%u otherMf=%u,%u otherSpd=%d otherOrder=%d otherFirst=%u caronly=%d\n",
-						consist->index.base(), (uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
-						blk_mf != nullptr ? (uint)TileX(blk_mf->tile) : 65535u, blk_mf != nullptr ? (uint)TileY(blk_mf->tile) : 65535u,
-						(uint)TileX(origin.tile), (uint)TileY(origin.tile), origin.okay ? 1 : 0, (int)origin.trackdir,
-						other_train->index.base(), (uint)TileX(other_train->tile), (uint)TileY(other_train->tile),
-						oth_mf != nullptr ? (uint)TileX(oth_mf->tile) : 65535u, oth_mf != nullptr ? (uint)TileY(oth_mf->tile) : 65535u,
-						other_train->cur_speed, (int)other_train->current_order.GetType(),
-						oth_first != nullptr ? oth_first->index.base() : 0u,
-						(oth_first != nullptr && R3RIsCarOnlyFormation(oth_first)) ? 1 : 0);
-				fclose(dbg);
-			}
-		}
+		
 		/* R3R (KI-330, U-1 fix): decouple-seam exemption.
 		 *
 		 * On the 2026-10-06/07 T8701/2 runs all 8 TPR-BLOCKED hits satisfied
@@ -20486,7 +17021,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 				R3RChainTouchesTile(consist, other_train->tile) ||
 				R3RChainTouchesTile(tpr_other, consist->tile);
 		/* 只用于日志判读：1 = 链头格其实不同，靠"贴身"判据才认出这是解挂缝。 */
-		const bool tpr_touch_only = tpr_same_tile && (other_train->tile != consist->tile);
 		/* R3R（第 350 轮，KI-523）：同格豁免必须再问一句"另一半在哪一侧"。解挂后的两半
 		 * 各自朝背离方向走才是正常脱离；若另一半正压在我行走方向的前方（像素级判断，
 		 * 见 R3ROtherChainAheadOfMovingFront），那不是我该走的路 —— 这时不能给豁免，
@@ -20494,8 +17028,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		const bool tpr_same_tile_ahead = tpr_same_tile &&
 				R3ROtherChainAheadOfMovingFront(consist, Train::From(other_train));
 		if (tpr_pair_hit) {
-			/* Keep walking: the pair partner must not be reported as an immovable block.
-			 * The flag is only decoration on the exit line that follows -- see tpr_note. */
 			tpr_pair_waived = true;
 		} else if (tpr_same_tile && !tpr_same_tile_ahead) {
 			/* R3R (第 349 轮): 原来这里还要求 consist->cur_speed == 0，把"自己被同格车
@@ -20508,48 +17040,10 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 			 * 同格永远不可能是"前路被占"，所以按几何判、不按速度判。
 			 * 豁免不授予任何通行权：下面的 ChooseTrainTrack / TryReserveRailTrack 照常执行，
 			 * PBS 互斥仍然决定能不能真正进入那一格。 */
-			const uint64_t tprex_key = ((uint64_t)consist->index.base() << 32) | (uint64_t)other_train->index.base();
-			const uint64_t tprex_payload = ((uint64_t)origin.tile.base() << 32) ^ (uint64_t)other_train->index.base();
-			if (R3RDbgEdge(R3REDGE_TPREXEMPT, tprex_key, tprex_payload)) {
-				const Train *ex_first = Train::From(other_train)->First();
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					const Train *const ex_mf = consist->GetMovingFront();
-					fprintf(dbg, "TPR-SEAM-EXEMPT veh=%u tile=%u,%u spd=%d other=%u origin=%u,%u okay=%d td=%d otherOrder=%d caronly=%d touch=%d otherTile=%u,%u mf=%u,%u\n",
-							consist->index.base(), (uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
-							other_train->index.base(), (uint)TileX(origin.tile), (uint)TileY(origin.tile),
-							origin.okay ? 1 : 0, (int)origin.trackdir, (int)other_train->current_order.GetType(),
-							(ex_first != nullptr && R3RIsCarOnlyFormation(ex_first)) ? 1 : 0,
-							tpr_touch_only ? 1 : 0,
-							(uint)TileX(other_train->tile), (uint)TileY(other_train->tile),
-							(ex_mf != nullptr) ? (uint)TileX(ex_mf->tile) : 0u, (ex_mf != nullptr) ? (uint)TileY(ex_mf->tile) : 0u);
-					fclose(dbg);
-				}
-			}
+			
 		} else {
 			/* R3R（第 350 轮，KI-523）：同格但另一半在我行走方向前方 —— 拒绝预留，
 			 * 让车停住。这条日志就是"脱离方向被限制"的现场证据。 */
-			if (tpr_same_tile_ahead) {
-				const Train *const mf = consist->GetMovingFront();
-				const int dirblk_dir = (mf != nullptr) ? (int)mf->GetMovingDirection() : 0;
-				const uint64_t dirblk_key = ((uint64_t)consist->index.base() << 32) | (uint64_t)other_train->index.base();
-				const uint64_t dirblk_payload = ((uint64_t)(uint32_t)consist->cur_speed << 32) ^ (uint64_t)dirblk_dir;
-				if (R3RDbgEdge(R3REDGE_TPRDIRBLK, dirblk_key, dirblk_payload)) {
-					const Train *const other_first = Train::From(other_train)->First();
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "TPR-SEAM-DIR-BLOCK veh=%u other=%u tile=%u,%u spd=%d dir=%d db=%d real=%d order=%d otherOrder=%d caronly=%d\n",
-								consist->index.base(), other_train->index.base(),
-								(uint)TileX(consist->tile), (uint)TileY(consist->tile), consist->cur_speed,
-								dirblk_dir, consist->IsDrivingBackwards() ? 1 : 0,
-								(int)consist->cur_real_order_index,
-								(int)consist->current_order.GetType(), (int)other_train->current_order.GetType(),
-								(other_first != nullptr && R3RIsCarOnlyFormation(other_first)) ? 1 : 0);
-						fclose(dbg);
-					}
-				}
-			}
-			tpr_note(1, other_train, false);
 			if (mark_as_stuck) MarkTrainAsStuck(consist);
 			return TPRRF_NONE;
 		}
@@ -20569,22 +17063,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	 * itself. r3r_pending_replan is the one-shot flag armed by ReverseTrainDirection. */
 	const bool r3r_force_replan = r3r_zero_reach && !consist->current_order.IsType(OT_LOADING) &&
 			(consist->cur_speed != 0 || r3r_pending_replan);
-	if (r3r_force_replan) {
-		const uint64_t zero_key = (uint64_t)consist->index.base();
-		const uint64_t zero_payload = (uint64_t)origin.tile.base();
-		if (R3RDbgEdge(R3REDGE_TPRZERO, zero_key, zero_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "TPR-ZERO-REACH veh=%u mf=%u,%u origin=%u,%u td=%d okay=%d spd=%d real=%d order=%d look=%d turn=%d\n",
-						consist->index.base(), (uint)TileX(moving_front->tile), (uint)TileY(moving_front->tile),
-						(uint)TileX(origin.tile), (uint)TileY(origin.tile), (int)origin.trackdir,
-						origin.okay ? 1 : 0, consist->cur_speed, (int)consist->cur_real_order_index,
-						(int)consist->current_order.GetType(), consist->lookahead != nullptr ? 1 : 0,
-						r3r_pending_replan ? 1 : 0);
-				fclose(dbg);
-			}
-		}
-	}
 	if (!r3r_force_replan && origin.okay && (moving_front->tile != origin.tile || first_tile_okay)) {
 		/* Can't be stuck then. */
 		if (consist->flags.Test(VehicleRailFlag::Stuck)) SetWindowWidgetDirty(WindowClass::VehicleView, consist->index, WID_VV_START_STOP);
@@ -20595,7 +17073,6 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 		}
 		/* R3R (KI-179): the path is reserved, so the one-shot ability is used up. */
 		r3r_one_shot.reserved = true;
-		tpr_note(0, other_train, tpr_pair_waived);
 		return TPRRF_RESERVATION_OK;
 	}
 
@@ -20616,36 +17093,9 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 
 	if (Rail90DegTurnDisallowedTilesFromDiagDir(origin.tile, new_tile, exitdir, _settings_game.pf.forbid_90_deg)) reachable &= ~TrackCrossesTracks(TrackdirToTrack(origin.trackdir));
 
-	/* R3R (KI-330, U-1b): read-only diagnosis, zero behaviour change. When the
-	 * "blocked by another train" test above did *not* fire, only two exits remain
-	 * and neither is otherwise observable: (a) `reachable == TRACK_BIT_NONE`, the
-	 * tile the reservation would continue on carries no track we may use -- this
-	 * logs nothing at all, and (b) ChooseTrainTrack() is reached but cannot book
-	 * the path. Log the walked origin and the first step taken so that a single
-	 * reproduction separates them (the U-1 question left open in the KI-330 memo:
-	 * the old build had no probe here and the log ends right after the decouple). */
-	{
-		const uint64_t tprwalk_payload = (uint64_t)(uint32_t)reachable | ((uint64_t)(uint32_t)exitdir << 16);
-		if (R3RDbgEdge(R3REDGE_TPRWALK, (uint64_t)consist->index.base(), tprwalk_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				const Train *walk_mf = consist->GetMovingFront();
-				fprintf(dbg, "TPR-WALK veh=%u mf=%u,%u origin=%u,%u td=%u okay=%d exit=%u new=%u,%u reach=%u spd=%d one=%d look=%d\n",
-						consist->index.base(),
-						walk_mf != nullptr ? (uint)TileX(walk_mf->tile) : 65535u,
-						walk_mf != nullptr ? (uint)TileY(walk_mf->tile) : 65535u,
-						(uint)TileX(origin.tile), (uint)TileY(origin.tile), (unsigned)origin.trackdir, origin.okay ? 1 : 0,
-						(unsigned)exitdir, (uint)TileX(new_tile), (uint)TileY(new_tile), (uint)reachable,
-						consist->cur_speed, consist->HasForceReserveOnce() ? 1 : 0, consist->lookahead != nullptr ? 1 : 0);
-				fclose(dbg);
-			}
-		}
-	}
-
-	/* R3R (round 328, Q18-A): log which of the two remaining exits we take -- no usable
+		/* R3R (round 328, Q18-A): log which of the two remaining exits we take -- no usable
 	 * track on the continuation tile (reach0, ChooseTrainTrack is skipped entirely) or
 	 * an actual ChooseTrainTrack attempt. See the TPR-EXIT probe at the top. */
-	tpr_note(reachable == TRACK_BIT_NONE ? 3 : 4, other_train, tpr_pair_waived);
 	TryPathReserveResultFlags result_flags = TPRRF_NONE;
 	if (reachable != TRACK_BIT_NONE) {
 		ChooseTrainTrackResult result = ChooseTrainTrack(consist, new_tile, exitdir, reachable, CTTF_FORCE_RES | (mark_as_stuck ? CTTF_MARK_STUCK : CTTF_NONE));
@@ -20682,48 +17132,7 @@ static TryPathReserveResultFlags R3RTryPathReserveCore(Train *consist, bool mark
 	 * 真正的定性仍交给读日志的人 —— 探针不替玩家下结论。
 	 * lookahead 为空（非真实制动模型）时 endTile=-1，同样留一行，避免"没有"被
 	 * 误解成"没跑过本函数"。纯读，零行为改动。 */
-	if (R3RDbgOn()) {
-		const TrainReservationLookAhead *const r3r_re_la = consist->lookahead.get();
-		const TileIndex r3r_re_tile = (r3r_re_la != nullptr) ? r3r_re_la->reservation_end_tile : INVALID_TILE;
-		const Trackdir r3r_re_td = (r3r_re_la != nullptr) ? r3r_re_la->reservation_end_trackdir : INVALID_TRACKDIR;
-		const int r3r_re_pos = (r3r_re_la != nullptr) ? (int)r3r_re_la->reservation_end_position : -1;
-		const int r3r_re_cur = (r3r_re_la != nullptr) ? (int)r3r_re_la->current_position : -1;
-		const uint r3r_re_bits = IsValidTile(r3r_re_tile) ? (uint)GetTileTrackdirBits(r3r_re_tile, TransportType::Rail, 0) : 0u;
-		const TrackBits r3r_re_tb = TrackdirBitsToTrackBits((TrackdirBits)(r3r_re_bits & 0xFFFF));
-		const int r3r_re_junc = (KillFirstBit(r3r_re_tb) != TRACK_BIT_NONE) ? 1 : 0;
-		/* R3R（第 404 轮, REG-403-A/B）：把"预留终点在行进方向的前方还是后方"打出来。
-		 * `db=1` 的链是按 `GetMovingDirection()`（`direction` 的反向）行进的，若终点落在
-		 * 反方向，`j` 只会把车推离终点 —— 现场 `:1767 LOCO-MOVE ... j=256 spd=2 db=1`
-		 * 而 `tile` 恒 248,127、`x=15`（已顶格末），正是这一形态。
-		 * `fwd` = 沿行进方向的格数点积（正=在前方），`ahead` 是其符号（-9=无终点）。
-		 * 同时带出本次预留的结果位 `res` 与前进距离 `adv`，用于区分
-		 * "没订上"(res 无 OK) / "订上了但推不过去"(res 有 OK 且 ahead=+1)。
-		 * 纯读，零行为改动。 */
-		const Direction r3r_re_dir = consist->GetMovingDirection();
-		const TileIndexDiffC r3r_re_offs = TileIndexDiffCByDir(r3r_re_dir);
-		const int r3r_re_fwd = IsValidTile(r3r_re_tile)
-				? (((int)TileX(r3r_re_tile) - (int)TileX(consist->tile)) * (int)r3r_re_offs.x
-					+ ((int)TileY(r3r_re_tile) - (int)TileY(consist->tile)) * (int)r3r_re_offs.y)
-				: 0;
-		const int r3r_re_ahead = !IsValidTile(r3r_re_tile) ? -9 : (r3r_re_fwd > 0 ? 1 : (r3r_re_fwd < 0 ? -1 : 0));
-		const uint64_t r3r_re_pay = (uint64_t)r3r_re_tile.base() | ((uint64_t)(uint16_t)r3r_re_td << 24);
-		const uint64_t r3r_re_key = R3RDbgTagHash("RESV-END") | ((uint64_t)consist->index.base() << 32);
-		if (R3RDbgEdge(R3REDGE_RESVPROBE, r3r_re_key, r3r_re_pay)) {
-			FILE *const r3r_re = R3RFopenDbg("a");
-			if (r3r_re != nullptr) {
-				fprintf(r3r_re, "RESV-END veh=%d tick=%u from=%d,%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X junction=%d real=%d spd=%d movdir=%d dir=%d ahead=%d fwd=%d res=%d adv=%d\n",
-						(int)consist->index.base(), (uint)_tick_counter,
-						(int)TileX(consist->tile), (int)TileY(consist->tile),
-						IsValidTile(r3r_re_tile) ? (int)TileX(r3r_re_tile) : -1,
-						IsValidTile(r3r_re_tile) ? (int)TileY(r3r_re_tile) : -1,
-						(int)r3r_re_td, r3r_re_pos, r3r_re_cur, r3r_re_bits, r3r_re_junc,
-						(int)consist->cur_real_order_index, (int)consist->cur_speed,
-						(int)r3r_re_dir, (int)consist->direction, r3r_re_ahead, r3r_re_fwd,
-						(int)(uint8_t)result_flags, (int)consist->GetMovingFront()->GetAdvanceDistance());
-				fclose(r3r_re);
-			}
-		}
-	}
+	
 	return result_flags;
 }
 
@@ -20862,14 +17271,6 @@ static void R3RSettleStaleCargoPayment(Train *consist, const char *site)
 	consist->vehicle_flags.Reset(VehicleFlag::LoadingFinished);
 	consist->vehicle_flags.Reset(VehicleFlag::CargoUnloading);
 	consist->load_unload_ticks = 0;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "SETTLE-STALE-PAYMENT site=%s veh=%d co=%d tx=%d ty=%d\n",
-				site, (int)consist->index.base(), (int)consist->current_order.GetType(),
-				TileX(consist->tile), TileY(consist->tile));
-		fclose(dbg);
-	}
 }
 
 /**
@@ -20912,7 +17313,6 @@ static void TrainEnterStation(Train *consist, StationID station)
 		consist->current_order.MakeWaiting();
 		consist->current_order.SetNonStopType(ONSF_NO_STOP_AT_ANY_STATION);
 		if (r3r_stop_here) {
-			R3RSpdCtx(consist, "wp-arrive", consist->cur_speed, 0);
 			consist->cur_speed = 0;
 			consist->UpdateTrainSpeedAdaptationLimit(0);
 		}
@@ -20940,16 +17340,7 @@ static void TrainEnterStation(Train *consist, StationID station)
 	 * until the waiting consist is reached and the coupling handler fires. */
 	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
 		/* DEBUG (R3R — remove): log the station arrival of a GOTO_COUPLE train. */
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "SA-GOTO_COUPLE: veh=%d real_idx=%d implicit_idx=%d speed=%d\n",
-						(int)consist->index.base(), (int)consist->cur_real_order_index, (int)consist->cur_implicit_order_index, (int)consist->cur_speed);
-				fclose(dbg);
-			}
-		}
 		if (consist->cur_speed > 20) {
-			R3RSpdCtx(consist, "stn-gotocouple", consist->cur_speed, 20);
 			consist->cur_speed = 20;
 		}
 		consist->UpdateTrainSpeedAdaptationLimit(0);
@@ -20989,7 +17380,6 @@ static void TrainEnterStation(Train *consist, StationID station)
 	 *
 	 * 与「等待分配」在 UI 上是三选一互斥，故无需再判 wait_dispatch。 */
 	if (consist->current_order.IsType(OT_GOTO_STATION) && consist->current_order.HasR3RStopAtStation()) {
-		R3RSpdCtx(consist, "stn-stop-at-station", consist->cur_speed, 0);
 		consist->cur_speed = 0;
 		consist->UpdateTrainSpeedAdaptationLimit(0);
 		consist->force_proceed = TFP_NONE;
@@ -21003,9 +17393,6 @@ static void TrainEnterStation(Train *consist, StationID station)
 		const TileIndex stop_tile = consist->GetStationLoadingVehicle()->tile;
 		TriggerStationRandomisation(st, stop_tile, StationRandomTrigger::VehicleArrives);
 		TriggerStationAnimation(st, stop_tile, StationAnimationTrigger::VehicleArrives);
-		R3RDbgWrite("STOP-AT-STATION veh=%d st=%d real=%d tile=%d,%d stopped=1\n",
-				(int)consist->index.base(), (int)station.base(),
-				(int)consist->cur_real_order_index, (int)TileX(consist->tile), (int)TileY(consist->tile));
 		return;
 	}
 
@@ -21108,19 +17495,6 @@ static TrainMovedChangeSignalEnum TrainMovedChangeSignal(Train *consist, TileInd
  * value to TrackBitsToTrack() (which asserts exactly one track). Catches
  * broken per-vehicle track state (e.g. folded chains after couple/reverse).
  */
-static inline void R3RTrackBitsProbe(const char *where, TrackBits tb, int veh, TileIndex tile)
-{
-	if (tb != TRACK_BIT_NONE && KillFirstBit(tb & TRACK_BIT_MASK) == TRACK_BIT_NONE) return;
-	/* KI-14 (1): edge-triggered -- a per-vehicle track state that stays broken
-	 * would otherwise log once per tick per vehicle (seen as TTB-PROBE flood). */
-	const uint64_t ttb_key = ((uint64_t)(uint32_t)veh << 32) | (uint64_t)tile.base();
-	const uint64_t ttb_payload = ((uint64_t)(uint)tb << 32) | R3RDbgTagHash(where);
-	if (R3RDbgEdge(R3REDGE_TTB, ttb_key, ttb_payload)) {
-		R3RDbgWrite("TTB-PROBE %s FAIL tracks=0x%X veh=%d tile=%d,%d\n",
-				where, (uint)tb, veh, (int)TileX(tile), (int)TileY(tile));
-	}
-}
-
 /**
  * R3R (第 246 轮 / 第 5 项): the "when did this machine start counting" table for
  * decouple seams, written to the savegame as a sparse block.
@@ -21209,7 +17583,6 @@ void Train::ReserveTrackUnderConsist() const
 {
 	/* R3R (KI-207): name this entry point for the reservation-origin trace. */
 	R3RResvPhaseGuard r3r_phase("consist", R3RResvActorID(this));
-	R3RScopeTimer r3r_resv_timer(&r3r_resv_ns, &r3r_resv_calls);
 	for (const Train *u = this; u != nullptr; u = u->Next()) {
 		if (u->track & TRACK_BIT_WORMHOLE) {
 			if (IsRailCustomBridgeHeadTile(u->tile)) {
@@ -21224,72 +17597,15 @@ void Train::ReserveTrackUnderConsist() const
 			}
 		} else if (u->track != TRACK_BIT_DEPOT) {
 			TrackBits bits = u->track;
-			bool fallback = false;
 			if (bits == TRACK_BIT_NONE) {
 				/* R3R: an articulated part may not have its track bits synced
 				 * after a decouple/couple split; fall back to the tile's actual
 				 * rail bits so its platform track still gets reserved. */
 				bits = GetTrackBits(u->tile);
-				fallback = true;
-				if (bits == TRACK_BIT_NONE) {
-					/* KI-14 (1): edge-triggered. A consist parked on a platform
-					 * re-runs this whole function every tick via the R3R
-					 * platform-waiter gate; un-gated it produced 17118 of the
-					 * 28838 log lines written in 38 s. Payload bit 32 marks the
-					 * "no reservation bits at all" case. */
-					const uint64_t rk = ((uint64_t)u->index.base() << 32) | (uint64_t)u->tile.base();
-					if (R3RDbgEdge(R3REDGE_RESERVECONSIST, rk, 1ULL << 32)) {
-						R3RDbgWrite("RESERVECONSIST veh=%d tile=%d,%d track=0x%X fb=1 RES_NONE skip\n",
-							(int)u->index.base(), (int)TileX(u->tile), (int)TileY(u->tile), (uint)u->track);
-					}
-					continue;
-				}
+				if (bits == TRACK_BIT_NONE) continue;
 			}
-			R3RTrackBitsProbe("reserve-consist", bits, (int)u->index.base(), u->tile);
-			bool ok = TryReserveRailTrack(u->tile, TrackBitsToTrack(bits));
-			/* KI-14 (1): edge-triggered (see the skip branch above).
-			 * KI-207: a reservation that simply succeeded is not news -- with `ok`
-			 * in the payload every waiting consist re-logged its whole chain as the
-			 * reservation was refreshed (979 lines in one session). Only the anomaly
-			 * ("could not reserve" / "the bits are gone") reports a line now, and its
-			 * payload is still the bits/fallback pair so a changing state is seen. */
-			const uint64_t rk = ((uint64_t)u->index.base() << 32) | (uint64_t)u->tile.base();
-			const bool res_now = HasReservedTracks(u->tile, bits);
-			const bool anomaly = (!ok || !res_now);
-			const uint64_t rp = ((uint64_t)bits << 8) | ((uint64_t)fallback << 2) | ((uint64_t)anomaly << 1);
-			if (anomaly && R3RDbgEdge(R3REDGE_RESERVECONSIST, rk, rp)) {
-				R3RDbgWrite("RESERVECONSIST veh=%d tile=%d,%d track=0x%X fb=%d bits=0x%X ok=%d resNow=%d\n",
-					(int)u->index.base(), (int)TileX(u->tile), (int)TileY(u->tile), (uint)u->track,
-					(int)fallback, (uint)bits, (int)ok, (int)res_now);
-			}
-			/* R3R (KI-429 probe / U-429-A, 2026-10-22): a waiting consist parked on
-			 * the waypoint 265,231 showed *no* reservation on its own tile (no
-			 * SET-STN for it in the whole log) while an approaching train could
-			 * book the neighbouring 265,234 and drive through -- so the open
-			 * question is which booking this branch actually performs on a
-			 * station/waypoint tile, and whether it survives the call. On such a
-			 * tile TryReserveRailTrack() dispatches to the whole-tile station bit
-			 * (station_map.h, SetRailStationReservation / HasStationReservation),
-			 * not to the per-track rail bits, so `ok`/`resNow` above are not enough
-			 * to tell "booked the whole tile" from "booked nothing at all".
-			 * Read-only: one line per (vehicle, tile) state, edge-triggered on
-			 * kind/bits/fallback/ok/resNow/whole so a parked consist cannot flood
-			 * the log the way the un-gated KI-14 probes once did. */
-			if (IsRailWaypointTile(u->tile) || IsRailStationTile(u->tile)) {
-				const uint32_t kind = IsRailWaypointTile(u->tile) ? 2 : 1;
-				const bool whole = HasStationReservation(u->tile);
-				/* Bit 63 keeps this key disjoint from the RESERVECONSIST keys above
-				 * (same tag, different key, so the two probes never mask each other). */
-				const uint64_t rk_stn = (1ULL << 63) | ((uint64_t)u->index.base() << 32) | (uint64_t)u->tile.base();
-				const uint64_t rp_stn = ((uint64_t)kind << 8) | ((uint64_t)bits << 4) |
-						((uint64_t)ok << 3) | ((uint64_t)res_now << 2) | ((uint64_t)whole << 1) | (uint64_t)fallback;
-				if (R3RDbgEdge(R3REDGE_RVCSTN, rk_stn, rp_stn)) {
-					R3RDbgWrite("RVC-STN veh=%d tile=%d,%d kind=%s track=0x%X bits=0x%X fb=%d ok=%d resNow=%d whole=%d\n",
-						(int)u->index.base(), (int)TileX(u->tile), (int)TileY(u->tile),
-						(kind == 2) ? "waypoint" : "station", (uint)u->track, (uint)bits,
-						(int)fallback, (int)ok, (int)res_now, (int)whole);
-				}
-			}
+			
+			TryReserveRailTrack(u->tile, TrackBitsToTrack(bits));
 		}
 	}
 }
@@ -21457,14 +17773,6 @@ static uint TrainsCrashed(Train *v, Train *u)
  * Probe only - never asserts on a desynced index (KI-220 shows exactly such a
  * desync: cur_real_order_index says WAIT_COUPLE while current_order is a service
  * GOTO_DEPOT). */
-static int R3RDbgOrderTypeAt(const Train *t, uint idx)
-{
-	/* 修法 D: GetOrder() 读的是有效表，守卫也必须看有效表，否则跟随者恒返回 -1。 */
-	if (t->GetEffectiveOrders() == nullptr || idx >= t->GetNumOrders()) return -1;
-	const Order *o = t->GetOrder(idx);
-	return (o != nullptr) ? (int)o->GetType() : -1;
-}
-
 /**
  * Collision test function.
  * @param v The %Train vehicle we may have collided with.
@@ -21506,41 +17814,14 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 			 * movement code and couples from TrainCoupleHandler(), where the two
 			 * chains are aligned on the same depot track. */
 			if (!R3RChainFullyInDepot(loco)) {
-				if (R3RDbgEdge(R3REDGE_CPLDEPOTSKIP,
-						(uint64_t)loco->index.base(), (uint64_t)v->First()->index.base())) {
-					R3RDbgWrite("CPL-DEPOT-NOTIN veh=%d head=%d tile=%d,%d v=%d vtrack=%d\n",
-							(int)loco->index.base(), (int)v->First()->index.base(),
-							TileX(loco->tile), TileY(loco->tile), (int)v->index.base(), (int)v->track);
-				}
+				
 				return 0;
 			}
 			int x_diff = v->x_pos - moving_front->x_pos;
 			int y_diff = v->y_pos - moving_front->y_pos;
 			int min_diff = (v->gcache.cached_veh_length + 1) / 2 + (moving_front->gcache.cached_veh_length + 1) / 2 - 1;
 			if (x_diff * x_diff + y_diff * y_diff <= min_diff * min_diff) {
-				/* R3R 1px probe: the touch/overlap gate fired. min_diff is one pixel
-				 * short of the "boxes just touch" distance, so on axis-aligned track
-				 * the loco freezes already overlapping by 1px. */
-				{
-					const uint64_t g_key = ((uint64_t)loco->index.base() << 32) ^ (uint64_t)v->index.base();
-					const uint64_t g_payload = ((uint64_t)v->gcache.cached_veh_length << 32) ^ (uint64_t)moving_front->gcache.cached_veh_length;
-					if (R3RDbgEdge(R3REDGE_CPLHIT, g_key, g_payload)) {
-						FILE *dbg = R3RFopenDbg("a");
-						if (dbg != nullptr) {
-							const int len_v = v->gcache.cached_veh_length;
-							const int len_mf = moving_front->gcache.cached_veh_length;
-							const int fit = (len_v + len_mf) / 2;
-							const int maxd = std::max(std::abs(x_diff), std::abs(y_diff));
-							fprintf(dbg, "[R3R] CPL-HIT site=depot loco=%d v=%d len_v=%d len_mf=%d min_diff=%d need=%d fit=%d dx=%d dy=%d maxd=%d overlap=%d spd=%d dir=%d\n",
-									(int)loco->index.base(), (int)v->index.base(), len_v, len_mf,
-									min_diff, min_diff + 1, fit, x_diff, y_diff, maxd, fit - maxd,
-									(int)moving_front->cur_speed, (int)moving_front->direction);
-							fclose(dbg);
-						}
-					}
-				}
 				Couple(loco, v->First());
-				R3RSpdCtx(moving_front, "couple-hit-depot", moving_front->cur_speed, 0);
 				moving_front->cur_speed = 0;
 				moving_front->progress = 0;
 			}
@@ -21606,27 +17887,7 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 			/* R3R (KI-182): same pair flag as the depot branch and as the whole
 			 * pathfinder: touching "the wrong" waiting consist must not couple. */
 			R3RCouplePairMatches(loco, v->First())) {
-		/* R3R 1px probe: open-track touch/overlap gate (mirror of the depot one). */
-		{
-			const uint64_t g_key = ((uint64_t)loco->index.base() << 32) ^ (uint64_t)v->index.base();
-			const uint64_t g_payload = ((uint64_t)v->gcache.cached_veh_length << 32) ^ (uint64_t)moving_front->gcache.cached_veh_length;
-			if (R3RDbgEdge(R3REDGE_CPLHIT, g_key, g_payload)) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					const int len_v = v->gcache.cached_veh_length;
-					const int len_mf = moving_front->gcache.cached_veh_length;
-					const int fit = (len_v + len_mf) / 2;
-					const int maxd = std::max(std::abs(x_diff), std::abs(y_diff));
-					fprintf(dbg, "[R3R] CPL-HIT site=open loco=%d v=%d len_v=%d len_mf=%d min_diff=%d need=%d fit=%d dx=%d dy=%d maxd=%d overlap=%d spd=%d dir=%d\n",
-							(int)loco->index.base(), (int)v->index.base(), len_v, len_mf,
-							min_diff, min_diff + 1, fit, x_diff, y_diff, maxd, fit - maxd,
-							(int)moving_front->cur_speed, (int)moving_front->direction);
-					fclose(dbg);
-				}
-			}
-		}
 		Couple(loco, v->First());
-		R3RSpdCtx(moving_front, "couple-hit-open", moving_front->cur_speed, 0);
 		moving_front->cur_speed = 0;
 		moving_front->progress = 0;
 		return 0;
@@ -21670,52 +17931,12 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
 			(r3r_exact_touch || (std::max(moving_front->cur_speed, v->cur_speed) <= 32 &&
 			 (moving_front->First()->current_order.IsType(OT_WAIT_COUPLE) !=
 			  v->First()->current_order.IsType(OT_WAIT_COUPLE))))) {
-		const uint64_t s_key = ((uint64_t)moving_front->First()->index.base() << 32) ^ (uint64_t)v->First()->index.base();
-		if (R3RDbgOn() && R3RDbgEdge(R3REDGE_SEAMFREE, s_key, r3r_exact_touch ? 1ULL : 0ULL)) {
-			R3RDbgWrite("SEAM-FREE mf=%d v=%d exact=%d maxd=%d min_diff=%d mfspd=%d vspd=%d mforder=%d vorder=%d tile=%d,%d ahead=%d mfdir=%d\n",
-					(int)moving_front->First()->index.base(), (int)v->First()->index.base(),
-					r3r_exact_touch ? 1 : 0, (int)std::max(std::abs(x_diff), std::abs(y_diff)), min_diff,
-					(int)moving_front->cur_speed, (int)v->cur_speed,
-					(int)moving_front->First()->current_order.GetType(), (int)v->First()->current_order.GetType(),
-					(int)TileX(v->tile), (int)TileY(v->tile),
-					r3r_seam_ahead ? 1 : 0, (int)moving_front->GetMovingDirection());
-		}
+		
 		return 0;
 	}
 
 	/* DEBUG (R3R — remove after locating the crash): log the coupling-condition
 	 * failure to a file so it is always visible. Open R3R_debug.log after the crash. */
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "CRASH: movingFirst_order=%d v_order=%d vFirst_order=%d same_chain=%d speed=%d tile=%d\n",
-					(int)moving_front->First()->current_order.GetType(), (int)v->current_order.GetType(),
-					(int)v->First()->current_order.GetType(), moving_front->First() == v->First(),
-					(int)moving_front->cur_speed, (int)moving_front->tile.base());
-			/* R3R (KI-220): identify BOTH chains - index, tile, real order index
-			 * (and the type stored there), current_order type, dest_tile and speed.
-			 * Without this the log only said "order=2 vs order=2" and the two
-			 * colliding chains could not be told apart (that is how the wrong
-			 * 2026-09-27 root cause got recorded). */
-			const Train *const c_mf = moving_front->First();
-			const Train *const c_v = v->First();
-			fprintf(dbg, "CRASH-INFO mf=%d mftile=%d,%d mfreal=%d(%d) mfcur=%d mfdest=%d mfspd=%d mfdb=%d mfdestStn=%d | "
-					"v=%d vtile=%d,%d vreal=%d(%d) vcur=%d vdest=%d vspd=%d vdb=%d | "
-					"vhead=%d vheadreal=%d(%d) vheadcur=%d vheaddest=%d vheadspd=%d pair=%d\n",
-					(int)c_mf->index.base(), (int)TileX(c_mf->tile), (int)TileY(c_mf->tile),
-					(int)c_mf->cur_real_order_index, R3RDbgOrderTypeAt(c_mf, c_mf->cur_real_order_index),
-					(int)c_mf->current_order.GetType(), (int)c_mf->dest_tile.base(), (int)c_mf->cur_speed,
-					(int)c_mf->IsDrivingBackwards(), (int)c_mf->current_order.GetDestination().base(),
-					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-					(int)v->cur_real_order_index, R3RDbgOrderTypeAt(v, v->cur_real_order_index),
-					(int)v->current_order.GetType(), (int)v->dest_tile.base(), (int)v->cur_speed,
-					(int)v->IsDrivingBackwards(),
-					(int)c_v->index.base(), (int)c_v->cur_real_order_index, R3RDbgOrderTypeAt(c_v, c_v->cur_real_order_index),
-					(int)c_v->current_order.GetType(), (int)c_v->dest_tile.base(), (int)c_v->cur_speed,
-					R3RCouplePairMatches(c_mf, c_v) ? 1 : 0);
-			fclose(dbg);
-		}
-	}
 
 	/* Crash both trains (upstream helper keeps the crash order well defined). */
 	return TrainsCrashed(moving_front->First(), v->First());
@@ -21731,7 +17952,6 @@ static uint CheckTrainCollision(Train *v, Train *moving_front)
  */
 static bool CheckTrainCollision(Train *moving_front)
 {
-	R3RScopeTimer r3r_coll_timer(&r3r_coll_ns, &r3r_coll_calls);
 	/* can't collide in depot */
 	if (moving_front->track == TRACK_BIT_DEPOT) return false;
 
@@ -22166,7 +18386,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 	/* R3R (KI-207): the moving train re-books the track it enters from here, so
 	 * name the phase and the train for the reservation-origin trace. */
 	R3RResvPhaseGuard r3r_resv_phase_guard("controller", R3RResvActorID(v));
-	R3RScopeTimer r3r_ctrl_timer(&r3r_ctrl_ns, &r3r_ctrl_calls);
 	Train *first = v->First();
 	Train *prev = nullptr;
 	SCOPE_INFO_FMT([&], "TrainController: {}, {}, {}", VehicleInfoDumper(v), VehicleInfoDumper(prev), VehicleInfoDumper(nomove));
@@ -22192,7 +18411,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 
 	/* For every vehicle after and including the given vehicle */
 	for (prev = v->GetMovingPrev(); v != nomove; prev = v, v = v->GetMovingNext()) {
-		r3r_mov_iters++; // KI-14 (2): measure how many vehicles this call actually walks
 		old_direction = v->direction;
 		old_trackbits = v->track;
 		old_gv_flags = v->gv_flags;
@@ -22204,7 +18422,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 		 * one per-car function that runs on every iteration, so it stands for "how much
 		 * does deriving the position itself cost". */
 		GetNewVehiclePosResult gp = [&]() {
-			R3RScopeTimer r3r_gnvp_timer(&r3r_gnvp_ns, &r3r_gnvp_calls);
 			return GetNewVehiclePos(v);
 		}();
 		if (!(v->track & TRACK_BIT_WORMHOLE) && gp.old_tile != gp.new_tile &&
@@ -22239,7 +18456,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					if (v->IsMovingFront()) {
 						bool r3r_line_ends_ok;
 						{
-							R3RScopeTimer r3r_lend_timer(&r3r_lend_ns, &r3r_lend_calls);
 							r3r_line_ends_ok = TrainCheckIfLineEnds(v, reverse);
 						}
 						if (!r3r_line_ends_ok) return false;
@@ -22249,7 +18465,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					 * same-tile call that 99.5% of the loop iterations take; the bridge-head
 					 * call above and the cross-tile path stay in the residual. */
 					auto vets = [&]() {
-						R3RScopeTimer r3r_vent_timer(&r3r_vent_ns, &r3r_vent_calls);
 						return VehicleEnterTile(v, gp.new_tile, gp.x, gp.y);
 					}();
 					if (vets.Test(VehicleEnterTileState::CannotEnter)) {
@@ -22306,7 +18521,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					 * sub_ms. The lambda exists solely so the timer stops before the
 					 * signal / red-signal handling below. */
 					ChooseTrainTrackResult result = [&]() {
-						R3RScopeTimer r3r_astar_timer(&r3r_astar_ns, &r3r_astar_calls);
 						return ChooseTrainTrack(first, gp.new_tile, enterdir, bits, CTTF_MARK_STUCK | CTTF_NON_LOOKAHEAD);
 					}();
 					assert(IsValidTrack(result.track));
@@ -22335,80 +18549,7 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 						/* In front of a red signal */
 						Trackdir i = FindFirstTrackdir(trackdirbits);
 
-						if (R3RDbgOn()) {
-							/* R3R (KI-349): one-shot, read-only dump of the block behind the red
-							 * signal -- answers "who keeps it red?" (stray reservation vs. a real
-							 * neighbour) without touching any state. Edge-triggered, so one line
-							 * per (train, tile) unless the reservation picture changes. */
-							const DiagDirection beyond_dir = TrackdirToExitdir(i);
-							const TileIndex beyond = TileAddByDiagDir(gp.new_tile, beyond_dir);
-							const bool beyond_valid = IsValidTile(beyond);
-							const bool new_plain = IsPlainRailTile(gp.new_tile);
-							const bool beyond_plain = beyond_valid && IsPlainRailTile(beyond);
-							const TrackBits new_resv = new_plain ? GetReservedTrackbits(gp.new_tile) : TRACK_BIT_NONE;
-							const TrackBits beyond_resv = beyond_plain ? GetReservedTrackbits(beyond) : TRACK_BIT_NONE;
-							if (R3RDbgEdge(R3REDGE_REDSIG,
-									((uint64_t)first->index.base() << 32) ^ (uint64_t)gp.new_tile.base(),
-									((uint64_t)new_resv << 32) ^ (uint64_t)beyond_resv)) {
-								R3RDbgWrite("REDSIG veh=%d old=%d,%d new=%d,%d dir=%d chosen=0x%X i=%d prog=%d spd=%d wait=%d stuck=%d\n",
-										(int)first->index.base(), TileX(gp.old_tile), TileY(gp.old_tile),
-										TileX(gp.new_tile), TileY(gp.new_tile), (int)enterdir,
-										(int)chosen_track, (int)i, (int)first->progress,
-										(int)first->cur_speed, (int)first->wait_counter,
-										first->flags.Test(VehicleRailFlag::Stuck) ? 1 : 0);
-								R3RDbgWrite("REDSIG   tdbits=0x%X reach=0x%X sigs=0x%X red=0x%X bits=0x%X\n",
-										(int)trackdirbits, (int)reachable_trackdirs,
-										(int)ts.signals, (int)red_signals, (int)bits);
-								if (new_plain) {
-									R3RDbgWrite("REDSIG   new present=0x%X states=0x%X resv=0x%X veh=%d\n",
-											(int)GetPresentSignals(gp.new_tile), (int)GetSignalStates(gp.new_tile),
-											(int)new_resv,
-											HasVehicleOnTile<VehicleType::Train>(gp.new_tile, [](const Train *) { return true; }) ? 1 : 0);
-									/* R3R (round 243-b, REG-243-D): the old loop used k as both a 4-bit
-									 * signal slot (GetPresentSignals = GB(m3,4,4)) and a Track enum, so it
-									 * overran (k == 4,5 never match) and mislabelled the track. Walk only
-									 * the tracks this tile actually has, then test the signal on each. */
-									for (Track t = TRACK_BEGIN; t < TRACK_END; ++t) {
-										if (!HasBit(GetTrackBits(gp.new_tile), t)) continue;
-										if (!HasSignalOnTrack(gp.new_tile, t)) continue;
-										R3RDbgWrite("REDSIG     track=%d type=%d oneway=%d pbs=%d\n",
-												(int)t, (int)GetSignalType(gp.new_tile, t),
-												IsOnewaySignal(gp.new_tile, t) ? 1 : 0,
-												IsPbsSignal(GetSignalType(gp.new_tile, t)) ? 1 : 0);
-									}
-								}
-								R3RDbgWrite("REDSIG   beyond=%d,%d valid=%d plain=%d resv=0x%X veh=%d\n",
-										beyond_valid ? TileX(beyond) : -1, beyond_valid ? TileY(beyond) : -1,
-										beyond_valid ? 1 : 0, beyond_plain ? 1 : 0, (int)beyond_resv,
-										(beyond_plain && HasVehicleOnTile<VehicleType::Train>(beyond, [](const Train *) { return true; })) ? 1 : 0);
-								if (beyond_plain) {
-									for (uint k = 0; k < 6; k++) {
-										const Track t = (Track)k;
-										if (!HasBit(beyond_resv, t)) continue;
-										const Train *owner = GetTrainForReservation(beyond, t);
-										const Train *near = GetR3RReservationOwnerNearby(beyond, t);
-										R3RDbgWrite("REDSIG     beyond track=%d owner=%d near=%d\n",
-												(int)t, owner == nullptr ? -1 : (int)owner->index.base(),
-												near == nullptr ? -1 : (int)near->index.base());
-										/* R3R (KI-350): split the attribution above by direction.
-										 * near= is the *first* direction (TrackToTrackdir) that meets a
-										 * train, so on its own it cannot show that the other direction
-										 * also reaches one -- which is what decides "my own booking's
-										 * far end" (G-1: the block is held by the train asking) from "a
-										 * stale bit of the neighbour" (G-2: held by somebody else).
-										 * Same read-only walk the purge uses, one direction at a time. */
-										const Trackdir td_fwd = TrackToTrackdir(t);
-										const Trackdir td_rev = ReverseTrackdir(td_fwd);
-										const Train *hit_fwd = R3RReservationOwnerInDirection(beyond, td_fwd);
-										const Train *hit_rev = R3RReservationOwnerInDirection(beyond, td_rev);
-										R3RDbgWrite("REDSIG     beyond track=%d dir=%d hit=%d\n",
-												(int)t, (int)td_fwd, hit_fwd == nullptr ? -1 : (int)hit_fwd->index.base());
-										R3RDbgWrite("REDSIG     beyond track=%d dir=%d hit=%d\n",
-												(int)t, (int)td_rev, hit_rev == nullptr ? -1 : (int)hit_rev->index.base());
-									}
-								}
-							}
-						}
+						
 
 						if (reverse_at_signal) {
 							v->flags.Reset(VehicleRailFlag::Stuck);
@@ -22423,13 +18564,11 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 						}
 
 						if (!HasSignalOnTrackdir(gp.new_tile, ReverseTrackdir(i))) {
-							R3RSpdCtx(first, "red-signal", first->cur_speed, 0);
 							first->cur_speed = 0;
 							first->subspeed = 0;
 							first->progress = 255; // make sure that every bit of acceleration will hit the signal again, so speed stays 0.
 							if (!_settings_game.pf.reverse_at_signals || ++first->wait_counter < _settings_game.pf.wait_oneway_signal * DAY_TICKS * 2) return false;
 						} else if (HasSignalOnTrackdir(gp.new_tile, i)) {
-							R3RSpdCtx(first, "red-signal-two-way", first->cur_speed, 0);
 							first->cur_speed = 0;
 							first->subspeed = 0;
 							first->progress = 255; // make sure that every bit of acceleration will hit the signal again, so speed stays 0.
@@ -22468,7 +18607,7 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 							v->force_proceed == TFP_NONE) {
 						goto reverse_train_direction;
 					} else {
-						R3RTrackBitsProbe("reserve-chosen", chosen_track, (int)v->index.base(), gp.new_tile);
+						
 						TryReserveRailTrack(gp.new_tile, TrackBitsToTrack(chosen_track), false);
 
 						if (IsPlainRailTile(gp.new_tile) && HasSignals(gp.new_tile) && IsRestrictedSignal(gp.new_tile)) {
@@ -22541,41 +18680,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 
 				/* Update XY to reflect the entrance to the new tile, and select the direction to use */
 				if (chosen_track == TRACK_BIT_NONE) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "TTB-PROBE fold-geom veh=%d tile=%d,%d x=%d y=%d prev=%d ptile=%d,%d px=%d py=%d bits=0x%X prevtrack=0x%X ptype=%d first=%d mvfront=%d db=%d speed=%d\n",
-								(int)v->index.base(), (int)TileX(gp.new_tile), (int)TileY(gp.new_tile), (int)gp.x, (int)gp.y,
-								(prev != nullptr) ? (int)prev->index.base() : -1,
-								(prev != nullptr) ? (int)TileX(prev->tile) : -1, (prev != nullptr) ? (int)TileY(prev->tile) : -1,
-								(prev != nullptr) ? (int)prev->x_pos : -1, (prev != nullptr) ? (int)prev->y_pos : -1,
-								(uint)bits, (prev != nullptr) ? (uint)prev->track : 0, (prev != nullptr) ? (int)prev->type : -1,
-								(int)first->index.base(), (int)first->GetMovingFront()->index.base(),
-								(int)first->vehicle_flags.Test(VehicleFlag::DrivingBackwards), (int)first->cur_speed);
-						int dbg_i = 0;
-						for (const Train *w = first; w != nullptr && dbg_i < R3R_CHAIN_WALK_LIMIT; w = w->Next(), dbg_i++) {
-							fprintf(dbg, "  F%d idx=%d front=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X spd=%d prog=%d flags=0x%X segm=%d nxt=%d\n",
-									dbg_i, (int)w->index.base(), (int)w->IsFrontEngine(), (int)w->x_pos, (int)w->y_pos,
-									(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track,
-									(int)w->cur_speed, (int)w->progress,
-									(uint)w->flags.base(), (int)w->IsSegmentFront(), (w->Next() != nullptr) ? (int)w->Next()->index.base() : -1);
-						}
-						/* R3R (KI-217): the moving chain is walked through
-						 * GetMovingNext(), which reads the per-vehicle
-						 * DrivingBackwards flag. If that flag is ever mixed along
-						 * the chain this walk crosses the seam back and forth
-						 * forever -- on 2026-09-27 it ran 19M times, wrote a 1.1 GB
-						 * log and froze the game. Cap the dump and say so instead. */
-						int dbg_mi = 0;
-						for (const Train *w = first->GetMovingFront(); w != nullptr && dbg_mi < R3R_CHAIN_WALK_LIMIT; w = w->GetMovingNext(), dbg_mi++) {
-							fprintf(dbg, "  MV%d idx=%d x=%d y=%d tile=%d,%d dir=%d trk=0x%X\n",
-									dbg_mi, (int)w->index.base(), (int)w->x_pos, (int)w->y_pos,
-									(int)TileX(w->tile), (int)TileY(w->tile), (int)w->direction, (uint)w->track);
-						}
-						fprintf(dbg, "  MVEND count=%d capped=%d oldtile=%d,%d newtile=%d,%d\n",
-								dbg_mi, (dbg_mi >= R3R_CHAIN_WALK_LIMIT) ? 1 : 0,
-								(int)TileX(gp.old_tile), (int)TileY(gp.old_tile), (int)TileX(gp.new_tile), (int)TileY(gp.new_tile));
-						fclose(dbg);
-					}
 					/* R3R: a folded chain (see R3RCheckChainFoldedDirection /
 					 * TryTrainCouple) leaves a wagon with no legal track to follow
 					 * its predecessor once the train starts moving. Do not call
@@ -22597,14 +18701,12 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					/* If red signal stop. */
 					if (v->IsMovingFront() && first->force_proceed == 0) {
 						if (IsTunnelBridgeSignalSimulationEntrance(gp.new_tile) && GetTunnelBridgeEntranceSignalState(gp.new_tile) == SignalState::Red) {
-							R3RSpdCtx(first, "tb-red", first->cur_speed, 0);
 							first->cur_speed = 0;
 							first->vehstatus.Set(VehState::TrainSlowing);
 							return false;
 						}
 						if (IsTunnelBridgeSignalSimulationExitOnly(gp.new_tile) &&
 								TrackdirEntersTunnelBridge(gp.new_tile, TrackDirectionToTrackdir(FindFirstTrack(chosen_track), chosen_dir))) {
-							R3RSpdCtx(first, "tb-exit-only", first->cur_speed, 0);
 							first->cur_speed = 0;
 							goto invalid_rail;
 						}
@@ -22646,23 +18748,7 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					 * 交给调用方哪根轨"，这里说"真正写进 v->track 的是哪根"——两者不一致即说明
 					 * 中间被改写（例如 chosen_track 来自别的分支）。只在挂接单 + 该格 >=2 根轨
 					 * （岔道格）时打，(veh,tile) 签名去重，零行为改动。 */
-					if (R3RDbgOn() && first->current_order.IsType(OT_GOTO_COUPLE) && KillFirstBit(chosen_track) != TRACK_BIT_NONE) {
-						static std::map<uint32_t, uint64_t> r3r_trkset_seen;
-						const uint64_t ts_sig = ((uint64_t)(uint32_t)chosen_track << 40)
-								| ((uint64_t)(uint32_t)(v->track & TRACK_BIT_MASK) << 20)
-								| ((uint64_t)(uint32_t)enterdir << 12)
-								| (uint64_t)(uint32_t)gp.new_tile.base();
-						uint64_t &ts_prev = r3r_trkset_seen[v->index.base()];
-						if (ts_prev != ts_sig) {
-							ts_prev = ts_sig;
-							R3RDbgWrite("CPL-TRKSET veh=%d old=%d,%d new=%d,%d enterdir=%d chosen=0x%X vtrk=0x%X tdir=%d spd=%d real=%d db=%d order=%d\n",
-									(int)v->index.base(), (int)TileX(gp.old_tile), (int)TileY(gp.old_tile),
-									(int)TileX(gp.new_tile), (int)TileY(gp.new_tile), (int)enterdir,
-									(uint)chosen_track, (uint)(v->track & TRACK_BIT_MASK), (int)tdir,
-									(int)v->cur_speed, (int)first->cur_real_order_index,
-									v->IsDrivingBackwards() ? 1 : 0, (int)first->current_order.GetType());
-						}
-					}
+					
 
 					v->tile = gp.new_tile;
 					v->track = chosen_track;
@@ -22752,7 +18838,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					int z = GetSlopePixelZ(gp.x, gp.y, true) - v->z_pos;
 					if (IsTileType(gp.new_tile, TileType::TunnelBridge) && !(abs(z) > 2)) {
 						if (CheckTrainStayInWormHole(v, gp.new_tile)) {
-							R3RSpdCtx(first, "wormhole-block", first->cur_speed, 0);
 							first->cur_speed = 0;
 							return false;
 						}
@@ -22766,7 +18851,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 					} else {
 						if (IsTooCloseBehindTrain(v, gp.new_tile, TILE_SIZE * v->tunnel_bridge_tile_ctr, distance == 0)) {
 							if (distance == 0) v->tunnel_bridge_tile_ctr = 0;
-							R3RSpdCtx(first, "too-close-behind", first->cur_speed, 0);
 							first->cur_speed = 0;
 							first->vehstatus.Set(VehState::TrainSlowing);
 							return false;
@@ -22891,16 +18975,13 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 		 * tunnel-bridge update stay outside the timer. */
 		int old_z = 0;
 		{
-			R3RScopeTimer r3r_wr_timer(&r3r_wr_ns, &r3r_wr_calls);
 			/* update image of train, as well as delta XY */
 			{
-				R3RScopeTimer r3r_wrd_timer(&r3r_wrd_ns, &r3r_wrd_calls);
 				v->UpdateDeltaXY();
 			}
 
 			/* commit the new position */
 			{
-				R3RScopeTimer r3r_wru_timer(&r3r_wru_ns, &r3r_wru_calls);
 				v->x_pos = gp.x;
 				v->y_pos = gp.y;
 				v->UpdatePosition();
@@ -22908,7 +18989,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 			/* R3R (KI-574): the three bookkeeping calls that ride along with the position
 			 * write. They have never been timed on their own. */
 			{
-				R3RScopeTimer r3r_wrs_timer(&r3r_wrs_ns, &r3r_wrs_calls);
 				DecreaseReverseDistance(v);
 				if (v->lookahead != nullptr) AdvanceLookAheadPosition(v);
 				if (v->flags.Test(VehicleRailFlag::PendingSpeedRestriction)) DecrementPendingSpeedRestrictions(v);
@@ -22916,7 +18996,6 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 
 			/* update the Z position of the vehicle */
 			{
-				R3RScopeTimer r3r_wrz_timer(&r3r_wrz_ns, &r3r_wrz_calls);
 				old_z = v->UpdateInclination(gp.new_tile != gp.old_tile, false, v->track == TRACK_BIT_WORMHOLE);
 			}
 		}
@@ -23061,7 +19140,6 @@ reverse_train_direction:
 	}
 	if (reverse) {
 		first->wait_counter = 0;
-		R3RSpdCtx(first, "reverse", first->cur_speed, 0);
 		first->cur_speed = 0;
 		first->subspeed = 0;
 		ReverseTrainDirection(first);
@@ -23160,7 +19238,7 @@ static void DeleteLastWagon(Train *v)
 	delete v;
 	v = nullptr; // make sure nobody will try to read 'v' anymore
 
-	R3RTrackBitsProbe("crashed-del", trackbits, -1, tile);
+	
 	Track track = TrackBitsToTrack(trackbits);
 	if (HasReservedTracks(tile, trackbits)) {
 		/* R3R (第 243 轮, REG-243-O): name this release path. 'v' is already deleted
@@ -23295,34 +19373,6 @@ static const uint16_t _breakdown_speeds[16] = {
  * 节流：每列车每 tick 都可能走到这里，故按 (车号, sig|x|near|clamp|spd) 边沿
  * 触发 —— x 或速度一变各留一行，正好给出完整减速序列且不刷屏。
  */
-static void R3RProbeLineEnd(const Train *moving_front, const Train *consist,
-		bool signal, uint x, uint8_t rounding, Direction vdir)
-{
-	if (!R3RDbgOn()) return;
-
-	const uint16_t break_speed = _breakdown_speeds[x & 0xF];
-	/* 与 TrainApproachingLineEnd() 里的表达式逐字同构（对角方向不乘 2）。 */
-	const bool too_near = !signal &&
-			(x + (moving_front->gcache.cached_veh_length + rounding) / 2 * (IsDiagonalDirection(vdir) ? 1 : 2) >= TILE_SIZE);
-	const bool will_clamp = !too_near && break_speed < consist->cur_speed;
-	const uint64_t payload = ((uint64_t)signal << 42) | ((uint64_t)(x & 0xF) << 38) |
-			((uint64_t)too_near << 37) | ((uint64_t)will_clamp << 36) |
-			(uint64_t)(consist->cur_speed & 0xFFFFF);
-	if (!R3RDbgEdge(R3REDGE_LINEND, moving_front->index.base(), payload)) return;
-
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg == nullptr) return;
-	fprintf(dbg, "LINEND veh=%u tile=%u,%u x=%u sig=%d near=%d spd=%d brk=%d clamp=%d len=%d dir=%d db=%d\n",
-			(unsigned)moving_front->index.base(),
-			(unsigned)TileX(moving_front->tile), (unsigned)TileY(moving_front->tile),
-			x & 0xF, signal ? 1 : 0, too_near ? 1 : 0,
-			(int)consist->cur_speed, (int)break_speed, will_clamp ? 1 : 0,
-			(int)moving_front->gcache.cached_veh_length, (int)vdir,
-			moving_front->IsDrivingBackwards() ? 1 : 0);
-	fclose(dbg);
-}
-
-
 /**
  * Train is approaching line end, slow down and possibly reverse
  *
@@ -23361,10 +19411,9 @@ static bool TrainApproachingLineEnd(Train *moving_front, bool signal, bool rever
 	 * we only get odd x offsets there. */
 	uint8_t rounding = moving_front->IsDrivingBackwards() ? 0 : 1;
 	/* R3R（KI-442 REG-279-I）: 判定来源与钳位前读数（只读，边沿触发）。 */
-	R3RProbeLineEnd(moving_front, consist, signal, x, rounding, vdir);
+	
 	if (!signal && x + (moving_front->gcache.cached_veh_length + rounding) / 2 * (IsDiagonalDirection(vdir) ? 1 : 2) >= TILE_SIZE) {
 		/* we are too near the tile end, reverse now */
-		R3RSpdCtx(consist, "linend-stop", consist->cur_speed, 0);
 		consist->cur_speed = 0;
 		if (reverse) ReverseTrainDirection(consist);
 		return false;
@@ -23374,7 +19423,6 @@ static bool TrainApproachingLineEnd(Train *moving_front, bool signal, bool rever
 	consist->vehstatus.Set(VehState::TrainSlowing);
 	uint16_t break_speed = _breakdown_speeds[x & 0xF];
 	if (break_speed < consist->cur_speed) {
-		R3RSpdCtx(consist, "linend-table", consist->cur_speed, break_speed);
 		consist->cur_speed = break_speed;
 	}
 
@@ -23611,7 +19659,7 @@ static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)
 	/* R3R (第 206 轮探针, 只读): 无条件打一行 —— 连"链上根本没有真铰接、闸门
 	 * 直接放行"的情形也要留证。否则现场"日志里没有 ARTIC-SKIP-R3R"就无法区分
 	 * "从没进过闸门"和"进了闸门但因不是真铰接而早退"。 */
-	R3RWatchOrderIndex(consist, "skipgate-in");
+	
 
 	/* R3R (第 429 轮 / 玩家需求贰): 门槛从「含真铰接」扩到「含真铰接 **或** 含非段部分」。
 	 * 非段链跑 R3R 命令只会切出「车头被解出」这类错误结果，必须在订单一层直接跳过
@@ -23619,7 +19667,6 @@ static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)
 	const bool gate_real_artic = R3RChainHasRealArticPart(consist);
 	const bool gate_non_segment = !R3RChainAllWagonsSegmented(consist);
 	if (!gate_real_artic && !gate_non_segment) return false;
-	const char *const gate_reason = gate_non_segment ? "non-segment" : "real-artic";
 
 	const uint n = consist->GetNumOrders();
 	if (n == 0) return false;
@@ -23646,26 +19693,15 @@ static bool R3RSkipCoupleOrdersForRealArtic(Train *consist)
 			 * state for a chain that can never couple. */
 			consist->current_order.Free();
 			consist->SetDestTile(INVALID_TILE);
-			R3RDbgWrite("ARTIC-SKIP-R3R veh=%d tile=%d,%d from=%d all-r3r=1 type=%d reason=%s -> no normal order to jump to\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)idx, (int)consist->current_order.GetType(), gate_reason);
 			return true;
 		}
 	}
 
-	const VehicleOrderID from = consist->cur_real_order_index;
 	consist->cur_real_order_index = target;
 	consist->cur_implicit_order_index = target;
 	if (consist->cur_timetable_order_index != INVALID_VEH_ORDER_ID) consist->cur_timetable_order_index = target;
 	consist->current_order.Free();
 	consist->SetDestTile(INVALID_TILE);
-
-	R3RDbgWrite("ARTIC-SKIP-R3R veh=%d tile=%d,%d from=%d to=%d type_from=%d type_to=%d idx_r3r=%d cur_r3r=%d reason=%s\n",
-			(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-			(int)from, (int)target,
-			(int)(consist->GetOrder(from) != nullptr ? consist->GetOrder(from)->GetType() : -1),
-			(int)(consist->GetOrder(target) != nullptr ? consist->GetOrder(target)->GetType() : -1),
-			idx_is_couple ? 1 : 0, cur_is_couple ? 1 : 0, gate_reason);
 	return true;
 }
 
@@ -23687,25 +19723,6 @@ static btree::btree_map<VehicleID, R3RWaitProbeStamp> _r3r_wp_loco_wait_stamps;
  * 否则每 256 tick 至多一行。调用方负责把随 tick 单调变化的字段
  * （current_order_time、剩余 wait_time）排除在 state 之外。
  */
-static bool R3RWaitProbeDue(btree::btree_map<VehicleID, R3RWaitProbeStamp> &stamps, VehicleID vid, uint32_t state)
-{
-	auto it = stamps.find(vid);
-	if (it == stamps.end()) {
-		stamps[vid] = R3RWaitProbeStamp{state, _tick_counter};
-		return true;
-	}
-	if (it->second.state != state) {
-		it->second.state = state;
-		it->second.tick = _tick_counter;
-		return true;
-	}
-	if (_tick_counter - it->second.tick >= 256) {
-		it->second.tick = _tick_counter;
-		return true;
-	}
-	return false;
-}
-
 /**
  * R3R (KI-534, 第 370 轮补 2): 停在 OT_WAITING 上的机车，在进入等待块之前的快照。
  *
@@ -23716,29 +19733,6 @@ static bool R3RWaitProbeDue(btree::btree_map<VehicleID, R3RWaitProbeStamp> &stam
  *  - 全部正常     => 等待块每 tick 都在跑，问题在 HandleWaiting() 内部（见 WP-HANDLE）。
  * 只读，不改任何状态。
  */
-static void R3RWaypointLocoWaitProbe(const Train *consist, bool mode)
-{
-	if (!R3RDbgOn()) return;
-
-	uint32_t state = (uint32_t)consist->reverse_distance * 2654435761u;
-	state ^= ((uint32_t)consist->cur_real_order_index + 1) * 40503u;
-	state ^= ((uint32_t)consist->cur_implicit_order_index + 1) * 8191u;
-	state ^= (uint32_t)consist->current_order.GetDestination().ToStationID().base() * 131u;
-	state ^= (uint32_t)consist->current_order.GetTimetabledWait() * 7u;
-	state ^= mode ? 0x40000000u : 0u;
-	state ^= (uint32_t)consist->current_order.GetType() * 3u;
-	if (!R3RWaitProbeDue(_r3r_wp_loco_wait_stamps, consist->index, state)) return;
-
-	R3RDbgWrite("WP-LOCO-WAIT veh=%d mode=%d revdist=%d type=%d real=%d impl=%d n=%d dest=%d cot=%u waitT=%u spd=%d\n",
-			(int)consist->index.base(), mode ? 1 : 0, (int)consist->reverse_distance,
-			(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-			(int)consist->cur_implicit_order_index, (int)consist->GetNumOrders(),
-			(int)consist->current_order.GetDestination().ToStationID().base(),
-			(unsigned)consist->current_order_time,
-			(unsigned)consist->current_order.GetTimetabledWait(),
-			(int)consist->cur_speed);
-}
-
 /**
  * R3R (KI-534, 第 370 轮补 3): 停在 OT_WAITING 上的链究竟从哪个 return 离开了
  * TrainLocoHandler()。
@@ -23753,36 +19747,6 @@ static void R3RWaypointLocoWaitProbe(const Train *consist, bool mode)
  * 同一 (veh, why) 状态变化立即输出，否则每 256 tick 一行（与第 370 轮补 2 同款，
  * 刻意不用 v->tick_counter —— 它在停车时可能不前进）。
  */
-static void R3RWaypointExitProbe(const Train *consist, const char *why)
-{
-	if (!R3RDbgOn()) return;
-
-	struct R3RExitStamp {
-		const char *why; ///< 上一次记录的离开原因（字符串字面量指针，逐调用点唯一）。
-		uint64_t tick;   ///< 上一次输出时的 _tick_counter。
-	};
-	static btree::btree_map<VehicleID, R3RExitStamp> stamps;
-	auto it = stamps.find(consist->index);
-	if (it != stamps.end() && it->second.why == why && _tick_counter - it->second.tick < 256) return;
-	if (it == stamps.end()) {
-		stamps[consist->index] = R3RExitStamp{why, _tick_counter};
-	} else {
-		it->second.why = why;
-		it->second.tick = _tick_counter;
-	}
-
-	R3RDbgWrite("WP-EXIT why=%s veh=%d order=%d real=%d impl=%d n=%d spd=%d tile=%d,%d revdist=%d stop=%d parked=%d front=%d power=%d caronly=%d tileDepot=%d track=%02X prog=%d dtile=%u\n",
-			why, (int)consist->index.base(), (int)consist->current_order.GetType(),
-			(int)consist->cur_real_order_index, (int)consist->cur_implicit_order_index,
-			(int)consist->GetNumOrders(), (int)consist->cur_speed,
-			(int)TileX(consist->tile), (int)TileY(consist->tile),
-			(int)consist->reverse_distance,
-			(int)consist->vehstatus.Test(VehState::Stopped), (int)consist->r3r_parked,
-			(int)consist->IsFrontEngine(), (int)consist->gcache.cached_power,
-			(int)(R3RIsCarOnlyFormation(consist) ? 1 : 0), (int)IsRailDepotTile(consist->tile),
-			(unsigned)consist->track, (int)consist->progress, (unsigned)consist->dest_tile.base());
-}
-
 /**
  * Per-tick handler of each front engine.
  * @param consist The front engine we are working with.
@@ -23791,13 +19755,10 @@ static void R3RWaypointExitProbe(const Train *consist, const char *why)
  */
 static bool TrainLocoHandler(Train *consist, bool mode)
 {
-	R3RScopeTimer r3r_loco_timer(&r3r_loco_ns, &r3r_loco_calls);
 	/* R3R (第 281 轮, REG-280-A): entry snapshot for the SPDD-LOST fallback at
 	 * the end of this function. Read-only. */
-	const uint16_t r3r_spd_entry = (uint16_t)std::min<int>(consist->cur_speed, 0xFFFF);
 	/* R3R (KI-534, 第 370 轮补 3): "handler 到底有没有被调用" 的正面证据 —— 与下面
 	 * 各 why=<tag> 的出口行配对，才能区分"没被 tick"与"被 tick 但在某处早退"。 */
-	if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "entry");
 	/* R3R (KI-541, 第 376 轮): 自动记录已取消。占位命令改由玩家手写、包在
 	 * GOTO_COUPLE / COUPLE_END 之间，执行侧只做"跳过空气区间"。 */
 	R3RSkipCoupleAirRanges(consist);
@@ -23825,103 +19786,9 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * never retry. Pairing this line with the preceding one pinpoints *which*
 	 * commit point stopped the train. Read-only: it only keeps a per-vehicle
 	 * speed snapshot inside this TU and never touches vehicle state. */
-	if (R3RDbgOn()) {
-		/* R3R (第 280 轮, REG-279-M/N): 原探针只在"非零 -> 0"时打一行, 且走
-		 * R3RDbgWrite() —— 而第 274 轮的 tag 白名单 (R3RDbgTagAllowed) 默认只放
-		 * RESV-、UNRES-、EXTEND-、LOOP- 四族, 所以 "SPD-DROP 0 条" 既可能没触发,
-		 * 也可能被白名单吞掉, 不可判。玩家报的"2 km/h"对应 cur_speed == 4, 旧探针
-		 * 天然抓不到。现在:
-		 *   - SPD-DROP 格式原样保留 (KI-348 判据仍依赖它), 仅改走 R3RFopenDbg;
-		 *   - SPDD 对任意变化打行, 带"上一次硬写"的归因 tag; m=1 表示该 tag 已被
-		 *     后续写点覆盖, 不能用来解释这一行;
-		 *   - 快照保留 0 值 (原实现见 0 就 erase, 0 -> X 的起步也是盲区)。
-		 * 只读: 只在本 TU 内保存每车快照, 不碰任何车辆状态。 */
-		struct R3RSpdTrackEntry { uint16_t last; uint32_t last_tick; };
-		static std::unordered_map<uint32_t, R3RSpdTrackEntry> r3r_spd_snapshot;
-		const uint32_t r3r_spd_key = consist->index.base();
-		const uint16_t r3r_spd_now = (uint16_t)std::min<int>(consist->cur_speed, 0xFFFF);
-		const auto r3r_spd_it = r3r_spd_snapshot.find(r3r_spd_key);
-		if (r3r_spd_it == r3r_spd_snapshot.end()) {
-			r3r_spd_snapshot[r3r_spd_key] = R3RSpdTrackEntry{ r3r_spd_now, (uint32_t)_tick_counter };
-		} else {
-			const uint16_t r3r_spd_prev = r3r_spd_it->second.last;
-			const uint32_t r3r_spd_dt = (uint32_t)_tick_counter - r3r_spd_it->second.last_tick;
-			if (r3r_spd_now != r3r_spd_prev) {
-				/* 归零 / 高速 / 骤减 >= 10 立即打, 其余平滑变化每车每 64 tick 一行。 */
-				const bool r3r_spd_hard = (r3r_spd_now == 0) || (r3r_spd_prev >= 20) ||
-						(r3r_spd_prev > r3r_spd_now && (uint32_t)(r3r_spd_prev - r3r_spd_now) >= 10);
-				if (r3r_spd_hard || r3r_spd_dt >= 64) {
-					r3r_spd_it->second.last_tick = (uint32_t)_tick_counter;
-					/* R3R (第 281 轮, REG-280-A): only attribute when the record is
-					 * this vehicle's AND at most one tick old (cage 0 = written
-					 * earlier in this tick, 1 = written in the tail of the previous
-					 * tick, after this probe ran). Otherwise print ctx=stale/none
-					 * with m=1 so the line can never be mis-read as "this tag did
-					 * it" -- the previous global slot produced exactly that bug. */
-					const R3RSpdCtxRec *const r3r_ctx = ([&]() -> const R3RSpdCtxRec * {
-						const auto it = _r3r_spd_ctx_by_veh.find(r3r_spd_key);
-						return it == _r3r_spd_ctx_by_veh.end() ? nullptr : &it->second;
-					})();
-					const int r3r_ctx_age = (r3r_ctx != nullptr) ? (int)((uint32_t)_tick_counter - r3r_ctx->tick) : -1;
-					const bool r3r_ctx_fresh = (r3r_ctx_age == 0 || r3r_ctx_age == 1);
-					const char *const r3r_ctx_tag = r3r_ctx_fresh ? r3r_ctx->tag : (r3r_ctx != nullptr ? "stale" : "none");
-					const int r3r_ctx_from = r3r_ctx_fresh ? (int)r3r_ctx->from : 0;
-					const int r3r_ctx_to = r3r_ctx_fresh ? (int)r3r_ctx->to : 0;
-					const int r3r_ctx_m = r3r_ctx_fresh ? (int)(r3r_ctx->to != r3r_spd_now ? 1 : 0) : 1;
-					FILE *const r3r_dbg = R3RDbgBulkOn() ? R3RFopenDbg("a") : nullptr;
-					if (r3r_dbg != nullptr) {
-						fprintf(r3r_dbg, "SPDD veh=%d from=%d to=%d dt=%u ctx=%s cfrom=%d cto=%d cage=%d m=%d tile=%d,%d x=%d db=%d order=%d real=%d stuck=%d fp=%d one=%d prog=%d wait=%d track=%02X dtile=%u\n",
-								(int)consist->index.base(), (int)r3r_spd_prev, (int)r3r_spd_now,
-								(unsigned)r3r_spd_dt,
-								r3r_ctx_tag, r3r_ctx_from, r3r_ctx_to, r3r_ctx_age, r3r_ctx_m,
-								(int)TileX(consist->tile), (int)TileY(consist->tile), (int)consist->x_pos,
-								(int)(consist->IsDrivingBackwards() ? 1 : 0),
-								(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-								(int)consist->flags.Test(VehicleRailFlag::Stuck), (int)consist->force_proceed,
-								(int)consist->flags.Test(VehicleRailFlag::ForceReserveOnce),
-								(int)consist->progress, (int)consist->wait_counter,
-								(unsigned)consist->track, (unsigned)consist->dest_tile.base());
-						fclose(r3r_dbg);
-					}
-					if (r3r_spd_now == 0 && r3r_spd_prev != 0) {
-						R3RDbgWrite("SPD-DROP veh=%d tile=%d,%d prev=%d order=%d real=%d stuck=%d fp=%d prog=%d wait=%d parked=%d stop=%d track=%02X dtile=%u dt=%u\n",
-								(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-								(int)r3r_spd_prev, (int)consist->current_order.GetType(),
-								(int)consist->cur_real_order_index, (int)consist->flags.Test(VehicleRailFlag::Stuck),
-								(int)consist->force_proceed, (int)consist->progress, (int)consist->wait_counter,
-								(int)consist->r3r_parked, (int)consist->vehstatus.Test(VehState::Stopped),
-								(unsigned)consist->track, (unsigned)consist->dest_tile.base(),
-								(unsigned)r3r_spd_dt);
-					}
-				}
-			}
-			r3r_spd_it->second.last = r3r_spd_now;
-		}
-		/* R3R (第 280 轮, P-V3): stuck / force_proceed / parked 的任何变化留痕,
-		 * 用于解释"为什么这列车 suddenly 停在半路"(state = stuck | fp<<1 | parked<<3)。 */
-		static std::unordered_map<uint32_t, uint8_t> r3r_stuck_snapshot;
-		const uint8_t r3r_stuck_state = (uint8_t)((consist->flags.Test(VehicleRailFlag::Stuck) ? 1 : 0) |
-				(((int)consist->force_proceed & 0x3) << 1) | ((consist->r3r_parked ? 1 : 0) << 3));
-		const auto r3r_stuck_it = r3r_stuck_snapshot.find(r3r_spd_key);
-		if (r3r_stuck_it == r3r_stuck_snapshot.end()) {
-			r3r_stuck_snapshot[r3r_spd_key] = r3r_stuck_state;
-		} else if (r3r_stuck_it->second != r3r_stuck_state) {
-			r3r_stuck_it->second = r3r_stuck_state;
-			FILE *const r3r_dbg = R3RFopenDbg("a");
-			if (r3r_dbg != nullptr) {
-				fprintf(r3r_dbg, "STUCK veh=%d tile=%d,%d state=%d stuck=%d fp=%d parked=%d spd=%d order=%d real=%d prog=%d track=%02X dtile=%u\n",
-						(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-						(int)r3r_stuck_state, (int)consist->flags.Test(VehicleRailFlag::Stuck),
-						(int)consist->force_proceed, (int)consist->r3r_parked, (int)consist->cur_speed,
-						(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-						(int)consist->progress, (unsigned)consist->track, (unsigned)consist->dest_tile.base());
-				fclose(r3r_dbg);
-			}
-		}
-	}
+	
 	/* train has crashed? */
 	if (consist->vehstatus.Test(VehState::Crashed)) {
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "crashed");
 		return mode ? true : HandleCrashedTrain(consist); // 'this' can be deleted here
 	} else if (consist->crash_anim_pos > 0) {
 		/* Reduce realistic braking brake overheating */
@@ -23935,12 +19802,10 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 
 	/* train is broken down? */
 	if (consist->flags.Test(VehicleRailFlag::ConsistBreakdown) && HandlePossibleBreakdowns(consist)) {
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "breakdown");
 		return true;
 	}
 
 	if (consist->flags.Test(VehicleRailFlag::Reversing) && consist->cur_speed == 0) {
-		R3RScopeTimer r3r_rev_timer(&r3r_rev_ns, &r3r_rev_calls);
 		ReverseTrainDirection(consist);
 	}
 
@@ -23975,7 +19840,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	bool r3r_platform_waiter = consist->IsPrimaryVehicle() && consist->current_order.IsType(OT_WAIT_COUPLE);
 	if (r3r_platform_waiter && consist->cur_speed == 0 && IsTileType(consist->tile, TileType::Station)) {
 		R3RResvPhaseGuard r3r_phase("waiter-platform", R3RResvActorID(consist));
-		R3RScopeTimer r3r_plat_timer(&r3r_plat_ns, &r3r_plat_calls);
 
 		/* R3R (KI-206): the consist also still holds the *route* reservation that
 		 * brought it onto the platform (or that its schedule pointed at). It starts
@@ -24016,13 +19880,9 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		if (r3r_just_reversed && !r3r_first_wait_tick) {
 			/* The chain was reversed in this tick and is about to leave: stay out
 			 * of the way for this tick so the pathfinder sees a clean slate. */
-			R3RDbgWrite("RESV-WAITER-SKIP veh=%d tile=%d,%d reason=just-reversed\n",
-					(int)consist->index.base(), TileX(consist->tile), TileY(consist->tile));
+			
 		} else if (r3r_first_wait_tick || !R3RWaiterReservationIntact(consist)) {
-			if (!r3r_first_wait_tick) {
-				R3RDbgWrite("RESV-WAITER-REPAIR veh=%d tile=%d,%d reason=reservation-lost\n",
-						(int)consist->index.base(), TileX(consist->tile), TileY(consist->tile));
-			}
+			
 			consist->ReserveTrackUnderConsist();
 			const Axis axis = GetRailStationAxis(consist->tile);
 			const TileIndexDiff delta = TileOffsByAxis(axis);
@@ -24072,7 +19932,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * 所以"已进入 handler 但被下面任一道闸门挡回"的链也会留下基线；若本行
 	 * 已是 0->1，说明改动发生在进入 handler 之前（读档残余 / 车库拖动 / 上
 	 * 一 tick 的 ProcessOrders），不必再看本 tick 的后续站点。 */
-	R3RWatchOrderIndex(consist, "loco-entry");
+	
 
 	/* R3R (第 422 轮, KI-605): 领取调度池日程必须排在下面这道「列车被停住」的早退门
 	 * **之前**。等待分配的列车正是被停止（VehState::Stopped）的那一辆，放在门后
@@ -24084,49 +19944,8 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * couple: the player stopped it, so give control back for stop/skip/return
 	 * commands instead of parking it in the GOTO_COUPLE state forever). */
 	if (!r3r_pending_depot_couple && consist->vehstatus.Test(VehState::Stopped) && consist->cur_speed == 0) {
-		/* R3R DEBUG: log a stopped train bailing out here.
-		 * KI-14 (1): edge-triggered -- this gate is reached every tick while the
-		 * train stays stopped (4902 of the 28838 lines written in 38 s). Since
-		 * cur_speed is 0 the payload only changes with the order or the tile. */
-		const Order *r = (consist->GetEffectiveOrders() != nullptr) ? consist->GetOrder(consist->cur_real_order_index) : nullptr;
-		const uint64_t skip_key = (uint64_t)consist->index.base();
-		/* R3R 探针（第 355 轮）：blocked = 本链连续被这道门挡回的 tick 数；
-		 * wclr = 本链的 WAIT_COUPLE 曾被 R3RClearStaleWaitMarker() 清掉的次数。
-		 * 两者合起来才能回答"order=0 与 spd=0 谁先"：
-		 *   wclr>0            ⇒ 标记被清在先（先空后停），主因在清理路径；
-		 *   wclr=0 && blocked 很大 ⇒ 没人清过标记（先停后空），主因在这道门本身。 */
-		const uint32_t r3r_blocked = ++_r3r_skipstop_ticks[consist->index.base()];
-		const uint32_t r3r_wclr = _r3r_waitclear_count[consist->index.base()];
-		const uint64_t skip_payload = ((uint64_t)(uint)consist->current_order.GetType() << 40) |
-				((uint64_t)(uint)((r != nullptr) ? ((uint)r->GetType() + 1) : 0) << 32) |
-				((uint64_t)(uint)consist->r3r_parked << 31) |
-				/* 只有跨过 100 tick 这个坎时才额外打一行：既不刷屏，又不把"无限挡回"藏起来。 */
-				((uint64_t)(r3r_blocked >= 100 ? 1 : 0) << 30) |
-				(uint64_t)consist->tile.base();
-		if (R3RDbgEdge(R3REDGE_SKIPSTOPPED, skip_key, skip_payload)) {
-			/* R3R (item 3, "神秘跳命令"): this gate is by design -- a Stopped consist
-			 * with no in-depot couple pending must not process orders -- but that
-			 * also makes it the prime suspect whenever orders look like they are
-			 * silently skipped. Log every input that decides whether the train
-			 * *should* be stopped, so a field report can be traced to a cause
-			 * instead of guessed at: r3r_parked (a depot tool parked it), front
-			 * (a non-front chain can never leave), nord/index (no schedule, or an
-			 * index that no longer resolves), tt (timetable index). */
-			R3RDbgWrite("SKIP-STOPPED veh=%d order=%d real=%d spd=%d tile=%d,%d parked=%d front=%d nord=%d idx=%d tt=%d blocked=%u wclr=%u\n",
-					(int)consist->index.base(), (int)consist->current_order.GetType(),
-					(int)(r != nullptr ? r->GetType() : -1),
-					(int)consist->cur_speed, (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(int)consist->r3r_parked, (int)consist->IsFrontEngine(),
-					(int)(consist->GetEffectiveOrders() != nullptr ? consist->GetNumOrders() : -1),
-					(int)consist->cur_real_order_index, (int)consist->cur_timetable_order_index,
-					r3r_blocked, r3r_wclr);
-		}
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "stopped");
 		return true;
 	}
-
-	/* R3R 探针（第 355 轮）：本 tick 没被停驶门挡住 ⇒ 连续挡回计数归零。 */
-	_r3r_skipstop_ticks.erase(consist->index.base());
 
 	/* R3R（2026-09-30 玩家拍板「订单一层硬闸门」）: a chain holding a genuine
 	 * articulated part never runs a couple command. Done before the couple target
@@ -24137,7 +19956,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	/* R3R 探针（item 3）：真铰接硬闸门之后的快照。本行出现 0->1 就是闸门自己
 	 * 跳了命令（既有 ARTIC-SKIP-R3R 只记"跳了什么"，本行连同上一站的基线
 	 * 一起给出"跳掉的到底是哪一条"）。 */
-	R3RWatchOrderIndex(consist, "post-skipgate");
+	
 
 	/* R3R (KI-182): from the moment the "go to and couple" order starts running
 	 * the locomotive locks onto exactly one waiting consist, and both sides mark
@@ -24153,29 +19972,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * 本行把该判据的四个子条件连同 track/IsEngine/Stopped 一起打出来，用于区分
 	 * 「不在库里 / 不是引擎 / 目的地不是本库（GetCoupleIsDepot 或 depot id 不匹配）
 	 * / 其实判据成立而是下游 TrainCoupleHandler 静默失败」。 */
-	if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
-		const bool r3r_on_depot_tile = IsRailDepotTile(consist->tile);
-		const bool r3r_couple_is_depot = consist->current_order.GetCoupleIsDepot();
-		const uint r3r_dest_raw = (uint)consist->current_order.GetDestination().base();
-		const uint r3r_depot_idx = r3r_on_depot_tile ? (uint)GetDepotIndex(consist->tile).base() : UINT_MAX;
-		const bool r3r_id_match = r3r_couple_is_depot && r3r_on_depot_tile && (r3r_dest_raw == r3r_depot_idx);
-		const uint64_t r3r_blk_pay = ((uint64_t)(unsigned)consist->track << 40) |
-				((uint64_t)(uint)consist->IsEngine() << 32) |
-				((uint64_t)(uint)r3r_couple_is_depot << 4) |
-				((uint64_t)(uint)r3r_on_depot_tile << 3) |
-				((uint64_t)(uint)r3r_id_match << 2) |
-				((uint64_t)(uint)r3r_pending_depot_couple << 1) |
-				(uint64_t)(uint)consist->vehstatus.Test(VehState::Stopped);
-		if (R3RDbgEdge(R3REDGE_DEPOTBLK, (uint64_t)consist->index.base(), r3r_blk_pay)) {
-			R3RDbgWrite("DEPOTBLK veh=%d tile=%d,%d track=%02X eng=%d isdepot=%d ontile=%d idmatch=%d pend=%d stopped=%d parked=%d spd=%d destRaw=%u depotIdx=%u\n",
-					(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-					(unsigned)consist->track, (int)consist->IsEngine(), (int)r3r_couple_is_depot,
-					(int)r3r_on_depot_tile, (int)r3r_id_match, (int)r3r_pending_depot_couple,
-					(int)consist->vehstatus.Test(VehState::Stopped), (int)consist->r3r_parked,
-					(int)consist->cur_speed, r3r_dest_raw, r3r_depot_idx);
-		}
-	}
-
 	/* If a locomotive is about to leave the depot, automatically couple onto any
 	 * wagon chain (free wagon or independent consist) that waits inside the depot.
 	 * When executing a GOTO_COUPLE order, couple onto the depot's waiting consist directly.
@@ -24234,7 +20030,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			consist->vehstatus.Reset(VehState::Stopped);
 			const bool r3r_coupled = TrainCoupleHandler(consist);
 			if (r3r_coupled) {
-				R3RSpdCtx(consist, "couple-depot-ok", consist->cur_speed, 0);
 				consist->cur_speed = 0;
 				consist->progress = 0;
 				/* R3R KI-118 fix A: the couple this chain was parked for succeeded,
@@ -24245,7 +20040,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			 * parked inside it. On success the next ProcessOrders tick advances into
 			 * the consist's schedule; on failure it simply waits here and retries
 			 * coupling on the next tick instead of driving out again. */
-			R3RSpdCtx(consist, "couple-depot-park", consist->cur_speed, 0);
 			consist->cur_speed = 0;
 			consist->progress = 0;
 			if (!r3r_coupled && r3r_was_stopped && consist->IsFrontEngine()) consist->vehstatus.Set(VehState::Stopped);
@@ -24261,7 +20055,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			 * new head takes over from the next tick (TryTrainCouple already
 			 * invalidated the vehicle tick cache). */
 			if (!consist->IsFrontEngine()) {
-				if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "notfront");
 				return true;
 			}
 		} else if (!consist->current_order.IsType(OT_GOTO_COUPLE)) {
@@ -24271,7 +20064,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	/* R3R 探针（item 3）：车库挂车块之后的快照（含 TryTrainCouple 提交、
 	 * 身份迁移、r3r_parked 清除、NormalizeTrainVehInDepot）。这一段是"跳命令"
 	 * 的头号嫌疑区：提交失败/skip 分支会推进索引。 */
-	R3RWatchOrderIndex(consist, "post-depotblk");
+	
 
 	/* R3R: DECOUPLE triggers when the train is stopped AND has genuinely arrived
 	 * at the destination of its CURRENT travel order (a station or a depot) and
@@ -24293,7 +20086,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * 之后，推进与解挂就落在同一 tick 内。 */
 	auto r3r_try_decouple_arrival = [&]() {
 		if (consist->cur_speed != 0) return;
-		R3RScopeTimer r3r_dec_timer(&r3r_dec_ns, &r3r_dec_calls);
 		/* R3R: DECOUPLE triggers only when the train is genuinely parked at the
 		 * destination of its CURRENT REAL travel order. Read the real order by
 		 * INDEX (cur_real_order_index) rather than current_order, because
@@ -24307,73 +20099,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * stop (round 2: after coupling at East station the combined train's
 		 * real order is ⑤ OT_GOTO_DEPOT, which does NOT match a station tile →
 		 * must first travel to the depot before it may decouple there). */
-		/* R3R DEBUG (stable): universal arrival-state dump for EVERY stopped train,
-		 * not just OT_GOTO_DEPOT. This captures the moment a train sits ON a depot
-		 * tile even when its real order has already advanced to DECOUPLE (the old
-		 * DEPOT-only dump missed that case), and records the depot tile coordinates
-		 * + entry direction + locomotive heading so we can see why a train parks at
-		 * the depot door (7,36) and never reaches the depot tile itself.
-		 * SAFETY: every Railway-only accessor (HasDepotReservation /
-		 * GetRailDepotDirection) is guarded by IsRailDepotTile(dbg_dest) first, so
-		 * a station destination tile can never trip rail_map.h:39's assertion. */
-		{
-			/* KI-14 (2): gate FIRST. Compute the state signature (a handful of
-			 * integer ops on consist fields) and only open the log when the state
-			 * actually changed. Previously the fopen ran unconditionally, so every
-			 * parked train paid a syscall per tick and emitted a full ~16-line
-			 * CHAIN snapshot; this was the largest remaining log source after the
-			 * other edge gates (KI-18). The signature is unchanged from before. */
-			uint64_t dbg_sig = ((uint64_t)consist->tile.base() << 32) ^
-				((uint64_t)consist->cur_real_order_index * 0x9E3779B97F4A7C15ull) ^
-				((uint64_t)(consist->GetOrder(consist->cur_real_order_index) ? consist->GetOrder(consist->cur_real_order_index)->GetType() + 1 : 0) * 0xBF58476D1CE4E5B9ull) ^
-				((uint64_t)(consist->current_order.GetType() + 1) * 0x94D049BB133111EBull) ^
-				((uint64_t)consist->flags.Test(VehicleRailFlag::Stuck) * 0xDEADBEEFCAFEBABEull);
-			/* Per-vehicle last-signature store. With a single shared slot the
-			 * record gets clobbered when two parked vehicles alternate every
-			 * tick (seen in the 19:29 run: veh 0 and veh 3 both idling in
-			 * depot 42,28), so every tick kept logging. The dump is edge-triggered:
-			 * emit only when the stopped state differs from the previous tick. */
-			static std::vector<uint64_t> s_dbg_dump_sigs;
-			const uint32_t dbg_idx = consist->index.base();
-			if (s_dbg_dump_sigs.size() <= dbg_idx) s_dbg_dump_sigs.resize(dbg_idx + 1, 0);
-			if (s_dbg_dump_sigs[dbg_idx] != dbg_sig) {
-				s_dbg_dump_sigs[dbg_idx] = dbg_sig;
-
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					bool tile_is_depot = IsRailDepotTile(consist->tile);
-					TileIndex dbg_dest = consist->dest_tile;
-					bool dbg_destValid = dbg_dest != INVALID_TILE;
-					bool dbg_destDepot = dbg_destValid && IsRailDepotTile(dbg_dest);
-					bool dbg_destResv = dbg_destDepot && HasDepotReservation(dbg_dest);
-					bool dbg_tileEqDest = dbg_destValid && (consist->tile == dbg_dest);
-					int dbg_destTx = dbg_destValid ? (int)TileX(dbg_dest) : -1;
-					int dbg_destTy = dbg_destValid ? (int)TileY(dbg_dest) : -1;
-					int dbg_depotDir = dbg_destDepot ? (int)GetRailDepotDirection(dbg_dest) : -1;
-					/* R3R (KI-108): guard this probe as well - TrackdirToExitdir()
-					 * asserts on INVALID_TRACKDIR (track_func.h:396) and this line was
-					 * the actual crash site of 2026-09-18 21:05 (a chain end parked on
-					 * TRACK_BIT_Y while facing a direction not along that track). Log -1. */
-					const Trackdir dbg_td = consist->GetVehicleTrackdir();
-					int dbg_enterDir = (dbg_td == INVALID_TRACKDIR) ? -1 : (int)TrackdirToExitdir(dbg_td);
-
-					fprintf(dbg, "DEPOT-ARR veh=%d spd=%d real=%d(%d) curType=%d stuck=%d tileDepot=%d tx=%d ty=%d destTx=%d destTy=%d destDepot=%d destResv=%d tileEqDest=%d depotDir=%d enterDir=%d tt=%d impl=%d\n",
-						(int)consist->index.base(), (int)consist->cur_speed,
-						(int)consist->cur_real_order_index, (int)(consist->GetOrder(consist->cur_real_order_index) ? consist->GetOrder(consist->cur_real_order_index)->GetType() : -1),
-						(int)consist->current_order.GetType(),
-						(int)consist->flags.Test(VehicleRailFlag::Stuck),
-						(int)tile_is_depot, (int)TileX(consist->tile), (int)TileY(consist->tile),
-						dbg_destTx, dbg_destTy, (int)dbg_destDepot, (int)dbg_destResv, (int)dbg_tileEqDest,
-						dbg_depotDir, dbg_enterDir,
-						/* R3R: the timetable index is what UpdateVehicleTimetable asserts on.
-						 * Logging it here shows whether the desync (TT-DESYNC) already
-						 * existed when the depot arrival was handled, i.e. which R3R block
-						 * rewrote the order indices behind each other's back. */
-						(int)consist->cur_timetable_order_index, (int)consist->cur_implicit_order_index);
-					fclose(dbg);
-				}
-			}
-		}
 		const Order *cur_real = consist->GetOrder(consist->cur_real_order_index);
 		bool at_order_dest = false;
 		/* R3R (2026-10-01, 拍板 3 A「不跨」+ 拍板 1「同 tick 闭环」): 解挂现在是
@@ -24420,14 +20145,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						GetSegmentHeadFromRear(consist, 1) == nullptr &&
 						!(consist->IsEngine() && !R3RIsCarOnlyFormation(consist) && R3RHasWagonBehindEngine(consist));
 				if (nothing_to_release || non_segment_chain) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "DECOUPLE-SKIP consist=%d tx=%d ty=%d real=%d segs=%u reason=%s\n",
-							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-							(int)consist->cur_real_order_index, (uint)(R3RHasWagonBehindEngine(consist) ? 1 : 0),
-							non_segment_chain ? "non-segment" : "nothing-to-release");
-						fclose(dbg);
-					}
 					uint skipped = R3RSkipUnfireableDecoupleOrder(consist);
 					if (skipped == 0) {
 						/* Safety net: the gate fired on a shape the helper did not
@@ -24443,7 +20160,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						}
 					}
 					consist->cur_timetable_order_index = consist->cur_real_order_index;
-					R3RCheckTtSync(consist, "decouple-skip");
+					
 					consist->current_order.Free();
 					consist->SetDestTile(INVALID_TILE);
 					InvalidateVehicleOrder(consist, 0);
@@ -24459,12 +20176,10 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						if (consist->GetNumOrders() > 0 && next_real >= consist->GetNumOrders()) next_real = 0;
 						dc_order = consist->GetOrder(next_real);
 					}
-					const bool dc_valid = (dc_order != nullptr && dc_order->IsType(OT_DECOUPLE));
 					uint segs = 0;
 					for (Train *t = consist->GetNextVehicle(); t != nullptr; t = t->GetNextVehicle()) {
 						if (t->IsSegmentFront()) segs++;
 					}
-					const Train *eff = GetDecoupleVehicle(consist);
 					/* R3R (§十 R-1 现场复测, 2026-10-01): 站台内的车数与越界
 					 * （BeyondPlatformEnd）车数。车长 > 站台时链头并不在站台 tile
 					 * 上，这个计数是"位置合法性判据是否按预期命中"的唯一现场证据：
@@ -24476,18 +20191,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						} else if (IsTileType(t->tile, TileType::Station)) {
 							plat_in++;
 						}
-					}
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "DECOUPLE-FIRE consist=%d tx=%d ty=%d real=%d mode=%d num=%u segs=%u eff=%d plat=%u/%u\n",
-							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-							(int)consist->cur_real_order_index,
-							dc_valid ? (int)dc_order->GetDecoupleBoundaryMode() : -1,
-							dc_valid ? (uint)dc_order->GetNumDecouple() : 0,
-							segs,
-							(eff != nullptr) ? (int)eff->index.base() : -1,
-							plat_in, plat_beyond);
-						fclose(dbg);
 					}
 				}
 				/* R3R (§十 R-2, 2026-10-01, 第 186 轮补)：快照必须【拆前】拍。
@@ -24514,30 +20217,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				for (Train *r3r_w : r3r_pre_split_chain) {
 					r3r_w->flags.Reset(VehicleRailFlag::AdvanceInPlatform);
 				}
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						/* R3R (§十一 E): 落点索引与其订单类型 —— 拍板 3 A 之后，
-						 * "解挂执行完索引前进一格"必须能在这条日志上直接读出来。 */
-						const Order *const r3r_after = consist->GetNumOrders() > 0 ? consist->GetOrder(consist->cur_real_order_index) : nullptr;
-						fprintf(dbg, "LOCO-AFTER-DECOUPLE veh=%d curType=%d real=%d idxnext=%d tile=%d,%d\n",
-							(int)consist->index.base(), (int)consist->current_order.GetType(),
-							(int)consist->cur_real_order_index,
-							(r3r_after != nullptr) ? (int)r3r_after->GetType() : -1,
-							(int)TileX(consist->tile), (int)TileY(consist->tile));
-						if (consist->GetEffectiveOrders() != nullptr) {
-							for (VehicleOrderID i = 0; i < consist->GetNumOrders(); ++i) {
-								const Order *o = consist->GetOrder(i);
-								fprintf(dbg, "  L-ORD %d type=%d dest=%d", (int)i, (int)(o ? o->GetType() : -1), (int)(o ? o->GetDestination().base() : -1));
-							if (o != nullptr && o->IsType(OT_CONDITIONAL)) {
-								fprintf(dbg, " condVar=%d condCmp=%d condVal=%d skipTo=%d", (int)o->GetConditionVariable(), (int)o->GetConditionComparator(), (int)o->GetConditionValue(), (int)o->GetConditionSkipToOrder());
-							}
-							fprintf(dbg, "\n");
-							}
-						}
-						fclose(dbg);
-					}
-				}
 				}
 			}
 		}
@@ -24550,14 +20229,13 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * (timetable_cmd.cpp "real_timetable_order == real_current_order"). Trap the
 	 * state directly in front of the call so R3R_debug.log names the tick on which
 	 * the desync became visible, next to the DEPOT-ARR dump above. */
-	R3RCheckTtSync(consist, "pre-processorders");
+	
 	bool r3r_may_reverse;
 	{
-		R3RScopeTimer r3r_ord_timer(&r3r_ord_ns, &r3r_ord_calls);
 
 		/* R3R (第 206 轮探针, 只读): ProcessOrders 之前的基线，与下面的
 		 * post-processorders 配对，把"引擎订单处理"这一段单独框出来。 */
-		R3RWatchOrderIndex(consist, "pre-processorders");
+		
 
 		/* R3R (KI-149): a decouple leaves the released part standing seam to
 		 * seam behind us, inside the same signal block. Turning around here
@@ -24570,16 +20248,14 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	/* R3R 探针（item 3）：ProcessOrders 之后的快照。本行若出现 0->1，说明是
 	 * 引擎侧的订单处理（ProcessOrders / AdvanceOrdersFromVehiclePosition /
 	 * HandleLoading 内的推进）改了索引，而不是 R3R 的提交点。 */
-	R3RWatchOrderIndex(consist, "post-processorders");
+	
 
 	if (r3r_may_reverse) {
 		consist->wait_counter = 0;
-		R3RSpdCtx(consist, "may-reverse", consist->cur_speed, 0);
 		consist->cur_speed = 0;
 		consist->subspeed = 0;
 		consist->flags.Reset(VehicleRailFlag::LeavingStation);
 		ReverseTrainDirection(consist);
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "mayreverse");
 		return true;
 	} else if (consist->flags.Test(VehicleRailFlag::LeavingStation) &&
 			/* R3R (KI-149): mirror of the reversal veto above -- a waiting part
@@ -24595,7 +20271,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		if (IsRailDepotTile(moving_front->tile) || IsTileType(moving_front->tile, TileType::TunnelBridge)) dir = DiagDirection::Invalid;
 
 		{
-			R3RScopeTimer r3r_prv_timer(&r3r_prv_ns, &r3r_prv_calls);
 			if (UpdateSignalsOnSegment(moving_front->tile, dir, consist->owner) == SigSegState::Path || _settings_game.pf.reserve_paths) {
 				TryPathReserve(consist, true, true);
 			}
@@ -24604,7 +20279,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	}
 
 	{
-		R3RScopeTimer r3r_load_timer(&r3r_load_ns, &r3r_load_calls);
 		consist->HandleLoading(mode);
 	}
 
@@ -24631,10 +20305,8 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * WAIT_COUPLE 门 —— 这样"后车自己就是等待方"时由等待方门接管、互锁登记顺手
 	 * 撤销，互锁不会把一个本来就不动的等待车底锁住。 */
 	if (R3RDecoupleInterlockWait(consist)) {
-		R3RSpdCtx(consist, "decouple-interlock", consist->cur_speed, 0);
 		consist->cur_speed = 0;
 		consist->subspeed = 0;
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "interlock");
 		return true;
 	}
 
@@ -24675,29 +20347,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		/* Only worth a log line when the formation was really rolling -- i.e. the
 		 * "it drove itself" symptom in the field; a parked formation would
 		 * otherwise write once per tick. */
-		if (consist->cur_speed != 0) {
-			R3RDbgWrite("CARONLY-PARK head=%d ord=%d tile=%d,%d spd=%d\n",
-					(int)consist->index.base(), (int)consist->current_order.GetType(),
-					TileX(consist->tile), TileY(consist->tile), (int)consist->cur_speed);
-		}
-		R3RSpdCtx(consist, "caronly-park", consist->cur_speed, 0);
+		
 		consist->cur_speed = 0;
 		consist->subspeed = 0;
-		if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "caronly");
 		return true;
 	}
 
 	{
-		R3RScopeTimer r3r_dep_timer(&r3r_dep_ns, &r3r_dep_calls);
 		if (CheckTrainStayInDepot(consist)) {
-			if (consist->current_order.IsType(OT_WAITING)) R3RWaypointExitProbe(consist, "depot");
 			return true;
 		}
 	}
 
 	/* R3R (KI-534, 第 370 轮补 2): 停在 OT_WAITING 上时先留一行 —— 特别是
 	 * reverse_distance != 0 会把下面整块等待逻辑跳过，必须能看见。 */
-	if (consist->current_order.IsType(OT_WAITING)) R3RWaypointLocoWaitProbe(consist, mode);
 
 	if (consist->current_order.IsType(OT_WAITING) && consist->reverse_distance == 0) {
 		if (mode) return true;
@@ -24752,22 +20415,12 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		if (consist->current_order.IsType(OT_NOTHING) || consist->current_order.IsAnyLoadingType()) {
 			_r3r_couple_autoreserve.insert(consist->index);
 		} else {
-			const TryPathReserveResultFlags r3r_auto_res = TryPathReserveWithResultFlags(consist, true, false);
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "TRP-AUTO veh=%d real=%d type=%d dest=%u ok=%d res=%d stuck=%d wc=%u\n",
-						(int)consist->index.base(), (int)consist->cur_real_order_index,
-						(int)consist->current_order.GetType(), (unsigned)consist->dest_tile.base(),
-						(r3r_auto_res & TPRRF_RESERVATION_OK) ? 1 : 0, (int)(uint8_t)r3r_auto_res,
-						(int)consist->flags.Test(VehicleRailFlag::Stuck), (unsigned)consist->wait_counter);
-				fclose(dbg);
-			}
+			TryPathReserveWithResultFlags(consist, true, false);
 		}
 	}
 
 	/* Handle stuck trains. */
 	if (!mode && consist->flags.Test(VehicleRailFlag::Stuck)) {
-		R3RScopeTimer r3r_stk_timer(&r3r_stk_ns, &r3r_stk_calls);
 		++consist->wait_counter;
 
 		/* R3R (KI-289, round 188)：先看清这台车为什么 Stuck。若它只是"在等一个还
@@ -24798,19 +20451,10 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 					 * 只在第一次抑制时打一行，免得刷屏。 */
 					if (*r3r_heals == R3R_COUPLE_WAIT_HEAL_LIMIT) {
 						++*r3r_heals;
-						R3RDbgWrite("COUPLE-WAIT-NOHEAL veh=%d tile=%d,%d real=%d wc=%u heals=%u turn_around=%d sig=%d (self-heal exhausted, waiting in place)\n",
-								(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-								(int)consist->cur_real_order_index, (unsigned)consist->wait_counter,
-								(unsigned)*r3r_heals, (int)turn_around, (int)(r3r_rev_wanted && !turn_around));
 					}
 				} else {
 					if (r3r_heals != nullptr) {
 						++*r3r_heals;
-						R3RDbgWrite("COUPLE-WAIT-HEAL veh=%d tile=%d,%d real=%d n=%u limit=%u turn_around=%d sig=%d (engine self-heal, waiting for a coupling target)\n",
-								(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-								(int)consist->cur_real_order_index, (unsigned)*r3r_heals,
-								(unsigned)R3R_COUPLE_WAIT_HEAL_LIMIT, (int)turn_around,
-								(int)(r3r_rev_wanted && !turn_around));
 					}
 					ReverseTrainDirection(consist);
 				}
@@ -24841,12 +20485,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * OT_LEAVESTATION 一 tick，下一 tick 速度为 0 时再正常放行。
 		 * 必须先于 current_order.Free()：不能产出 OT_NOTHING 的中间态。 */
 		if (R3RStationOrderHoldsForCouple(consist)) {
-			if (R3RDbgEdge(R3REDGE_STOPGATE, ((uint64_t)consist->index.base() << 16) ^ (uint64_t)consist->cur_real_order_index, 2)) {
-				R3RDbgWrite("ORD-STOPGATE veh=%d site=leavestation order=%d real=%d num=%d spd=%d tile=%d,%d\n",
-						(int)consist->index.base(), (int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-						(int)consist->GetNumOrders(), (int)consist->cur_speed, TileX(consist->tile), TileY(consist->tile));
-			}
-			R3RSpdCtx(consist, "r307-station-couple-stop", consist->cur_speed, 0);
+			
 			consist->cur_speed = 0;
 			consist->subspeed = 0;
 			return true;
@@ -24857,7 +20496,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 
 		bool may_reverse;
 		{
-			R3RScopeTimer r3r_ord_timer(&r3r_ord_ns, &r3r_ord_calls);
 			may_reverse = ProcessOrders(consist);
 		}
 
@@ -24875,7 +20513,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 
 		if (may_reverse && CheckReverseTrain(consist)) {
 			consist->wait_counter = 0;
-			R3RSpdCtx(consist, "leave-reverse", consist->cur_speed, 0);
 			consist->cur_speed = 0;
 			consist->subspeed = 0;
 			consist->flags.Reset(VehicleRailFlag::LeavingStation);
@@ -24889,7 +20526,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	int j;
 	{
 		/* KI-14 (2): both of these walk the whole consist every tick. */
-		R3RScopeTimer r3r_spd_timer(&r3r_spd_ns, &r3r_spd_calls);
 		Train::MaxSpeedInfo max_speed_info = consist->GetCurrentMaxSpeedInfoAndUpdate();
 
 		/* R3R (C4-1', round 272; revised 2026-10-23 for KI-445 on the player's ruling):
@@ -24905,17 +20541,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			 * cannot cover this case -- the chain has not reached its destination yet, so
 			 * R3RCoupleOrderDestinationReached() stays false and that gate never opens.
 			 * Phase-gated like the destination heartbeat at :13257. */
-			if (((_tick_counter + consist->index.base()) % 500) == 0) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] CPL-HOLD tick=%u veh=%d tile=%d,%d real=%d num=%d spd=%d\n",
-							(uint)_tick_counter, (int)consist->index.base(),
-							TileX(consist->tile), TileY(consist->tile),
-							(int)consist->cur_real_order_index, (int)consist->GetNumOrders(),
-							(int)consist->cur_speed);
-					fclose(dbg);
-				}
-			}
 		}
 
 		/* R3R (第 321 轮, KI-499)：「配对锁建立之前不许起步」的手段落点。
@@ -24933,17 +20558,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * 调 UpdateSpeed 起步；此外 :14070 的 cur_speed == 0 ⇒ 主动订路那一脚仍在。
 		 */
 		if (R3RShouldWaitForCouplePair(consist)) {
-			if (R3RDbgMaxSpdHold(consist)) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "[R3R] CPL-HOLD-NATIVE tick=%llu veh=%d tile=%d,%d spd=%d track=0x%X real=%d braking=%d\n",
-							(unsigned long long)_tick_counter, (int)consist->index.base(),
-							TileX(consist->tile), TileY(consist->tile), (int)consist->cur_speed,
-							(uint)consist->track, (int)consist->cur_real_order_index,
-							consist->UsingRealisticBraking() ? 1 : 0);
-					fclose(dbg);
-				}
-			}
+			
 			/* R3R (第 523 轮续四, KI-684): 玩家口径 —— 「开了真实制动就走慢慢刹车，
 			 * 没开就走原版的反物理刹车」。
 			 *
@@ -24973,12 +20588,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				if (consist->cur_speed != 0) {
 					const Train::MaxSpeedInfo hold_info{0, 0};
 					j = consist->UpdateSpeed(hold_info);
-					if (R3RDbgEdge(R3REDGE_BRAKEHOLD, (uint64_t)consist->index.base(), (uint64_t)consist->cur_speed)) {
-						R3RDbgWrite("CPL-BRAKE-WAIT veh=%d tick=%llu spd=%d tile=%d,%d order=%d\n",
-								(int)consist->index.base(), (unsigned long long)_tick_counter,
-								(int)consist->cur_speed, TileX(consist->tile), TileY(consist->tile),
-								(int)consist->current_order.GetType());
-					}
+					
 					if (consist->cur_speed <= 2) {
 						consist->cur_speed = 0;
 						consist->subspeed = 0;
@@ -25033,21 +20643,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 				 * force_proceed / progress / wait_counter) plus the full state on
 				 * the printed line, so a standstill that never changes state is
 				 * visible at a glance. Still read-only. */
-				const uint64_t s0_pay = (uint64_t)consist->tile.base()
-						| ((uint64_t)(consist->flags.Test(VehicleRailFlag::Stuck) ? 1u : 0u) << 32)
-						| ((uint64_t)(consist->force_proceed != TFP_NONE ? 1u : 0u) << 33)
-						| ((uint64_t)std::min<uint>(consist->progress, 0x3FFu) << 34)
-						| ((uint64_t)std::min<uint>(consist->wait_counter, 0xFFu) << 44);
-				const uint64_t s0_key = R3RDbgTagHash("CPL-S0-CHK") | ((uint64_t)consist->index.base() << 32);
-				if (R3RDbgEdge(R3REDGE_CPLS0, s0_key, s0_pay)) {
-					R3RDbgWrite("CPL-S0-CHK veh=%d tile=%d,%d real=%d order=%d stuck=%d fp=%d prog=%d wait=%d parked=%d stop=%d track=%02X dtile=%u\n",
-							(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-							(int)consist->cur_real_order_index, (int)consist->current_order.GetType(),
-							(int)consist->flags.Test(VehicleRailFlag::Stuck), (int)consist->force_proceed,
-							(int)consist->progress, (int)consist->wait_counter, (int)consist->r3r_parked,
-							(int)consist->vehstatus.Test(VehState::Stopped), (unsigned)consist->track,
-							(unsigned)consist->dest_tile.base());
-				}
 				if (CheckTrainCollision(moving_front) || TrainCoupleHandler(consist)) return true;
 			}
 			/* R3R (第 416 轮 / 第 422 轮 KI-605): 「等待分配」到站领取调度池日程。
@@ -25064,111 +20659,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * locos only (one line per traversed tile), so that "LOCO-MOVE veh=23
 		 * never appears again after the standstill" is positive proof that the
 		 * consist left the movement branch for good. Never modifies state. */
-		if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
-			const uint64_t mv_key = R3RDbgTagHash("LOCO-MOVE") | ((uint64_t)consist->index.base() << 32);
-			if (R3RDbgEdge(R3REDGE_LOCOMOVE, mv_key, (uint64_t)consist->tile.base())) {
-				/* R3R (第 280 轮, E2): dir/db/dtile 用于"过岔改道"归因 —— 若 track
-				 * 换成另一支而 dtile 不变, 就证明走的是另一条路径、目标没变。
-				 * 改走 R3RFopenDbg: R3RDbgWrite 会被 tag 白名单吞掉, 旧版本
-				 * LOCO-MOVE 一行都写不出来, 不能拿"日志没有"当"没走这里"。 */
-				FILE *const r3r_dbg = R3RFopenDbg("a");
-				if (r3r_dbg != nullptr) {
-					/* R3R（第 357 轮, KI-533 / R48-2、R48-3）: 每跨一格同时给出"手上这条预留
-					 * 的终点格与剩余里程"。玩家主诉的四个环节由此可以逐格对齐:
-					 *   ① endBits 有多根轨 ⇒ 这次成功预留终止在道岔（R48-2）;
-					 *   ② 同一格上 endTile 先出现该岔、之后又被一条新预留覆盖
-					 *      ⇒ 该岔发生第二次预留（R48-3，配合 RESV-BEGIN.prevEnd）。
-					 * endBits 直接打 GetTileTrackStatus 的原始位图，不做"是不是道岔"的
-					 * 二次判断，避免探针自己给出可能错的定性。纯读，零行为改动。 */
-					const TrainReservationLookAhead *const r3r_la = consist->lookahead.get();
-					const TileIndex r3r_la_tile = (r3r_la != nullptr) ? r3r_la->reservation_end_tile : INVALID_TILE;
-					const int r3r_la_td = (r3r_la != nullptr) ? (int)r3r_la->reservation_end_trackdir : -1;
-					const int r3r_la_end = (r3r_la != nullptr) ? (int)r3r_la->reservation_end_position : -1;
-					const int r3r_la_cur = (r3r_la != nullptr) ? (int)r3r_la->current_position : -1;
-					const uint r3r_la_bits = IsValidTile(r3r_la_tile) ? (uint)GetTileTrackdirBits(r3r_la_tile, TransportType::Rail, 0) : 0u;
-					/* R3R（第 404 轮, REG-403-A/B）：与 RESV-END 同口径补"终点在行进方向的哪一侧"。
-					 * 现场 `:1767` 这一行是 `tile=248,127 j=256 spd=2 db=1 curPos=0` 且此后
-					 * 不再出现（payload 只用 tile 去重），无法判断是"方向反"还是"物理顶住"。
-					 * `xp/yp` 是像素坐标（x=15 即已顶到格末），`adv` 是 AdvanceDistance。纯读。 */
-					const Direction r3r_la_dir = consist->GetMovingDirection();
-					const TileIndexDiffC r3r_la_offs = TileIndexDiffCByDir(r3r_la_dir);
-					const int r3r_la_fwd = IsValidTile(r3r_la_tile)
-							? (((int)TileX(r3r_la_tile) - (int)TileX(consist->tile)) * (int)r3r_la_offs.x
-								+ ((int)TileY(r3r_la_tile) - (int)TileY(consist->tile)) * (int)r3r_la_offs.y)
-							: 0;
-					const int r3r_la_ahead = !IsValidTile(r3r_la_tile) ? -9 : (r3r_la_fwd > 0 ? 1 : (r3r_la_fwd < 0 ? -1 : 0));
-					fprintf(r3r_dbg, "LOCO-MOVE veh=%d tick=%u tile=%d,%d j=%d spd=%d track=%02X dir=%d db=%d stuck=%d dtile=%u look=%d endTile=%d,%d endTd=%d endPos=%d curPos=%d endBits=%04X movdir=%d ahead=%d fwd=%d xp=%d yp=%d adv=%d\n",
-							(int)consist->index.base(), (uint)_tick_counter, (int)TileX(consist->tile), (int)TileY(consist->tile),
-							j, (int)consist->cur_speed, (unsigned)consist->track,
-							(int)consist->direction, (int)(consist->IsDrivingBackwards() ? 1 : 0),
-							(int)consist->flags.Test(VehicleRailFlag::Stuck),
-							(unsigned)consist->dest_tile.base(),
-							(r3r_la != nullptr) ? 1 : 0,
-							IsValidTile(r3r_la_tile) ? (int)TileX(r3r_la_tile) : -1,
-							IsValidTile(r3r_la_tile) ? (int)TileY(r3r_la_tile) : -1,
-							r3r_la_td, r3r_la_end, r3r_la_cur, r3r_la_bits,
-							(int)r3r_la_dir, r3r_la_ahead, r3r_la_fwd,
-							(int)consist->x_pos, (int)consist->y_pos,
-							(int)consist->GetAdvanceDistance());
-					fclose(r3r_dbg);
-				}
-			}
-			/* R3R（第 404 轮, REG-403-B）：车自己"下一格"的真实状态。
-			 *
-			 * 现场（第 403 轮复测）：`TRP veh=0 ... => ok=1 res=1`（自身预留报成功）
-			 * 与 `curPos=0`、`tile` 恒 248,127 并存。两种解释无法用现有日志区分：
-			 *   (a) 方向反 —— 车朝远离终点的方向推（见 LOCO-MOVE 的 ahead=）；
-			 *   (b) 前方格进不去 —— 248,130/131/132 只被 `RESV-PAIR-AIR` 放行过
-			 *       （返回 true **不写地图位**），车自身寻路看的是"实际位"。
-			 * 本行直接给出车头所指下一格的原始事实：格类型、是否站台、站台整格位、
-			 * plain rail 的轨道位/预留位、以及整格位的归属车。判读方法：
-			 *   stn=1 且 stnRes=1 且 wholeOwner≠本车 ⇒ 自身被"自己人的整格位"挡住（b）；
-			 *   plain=1 且 bits 不含车头 trackdir 的去路 ⇒ 道岔方向不通（另一类 (b)）。
-			 * 每 32 tick 一行、仅 GOTO_COUPLE 车，纯读，零行为改动。 */
-			if (((_tick_counter + consist->index.base()) % 32) == 0) {
-				/* R3R (KI-108 家族, 必须先于 TrackdirToExitdir())：损毁中的车辆
-				 * GetVehicleTrackdir() 返回 INVALID_TRACKDIR，而 TrackdirToExitdir()
-				 * 对它断言（track_func.h:396）。本文件 :2819 与 :5639 已是同族防护
-				 * 口径，探针照抄：拿不到有效 trackdir 就一个铁路格查询都不做。 */
-				const Trackdir r3r_nb_td = moving_front->GetVehicleTrackdir();
-				const bool r3r_nb_td_ok = (r3r_nb_td != INVALID_TRACKDIR);
-				const DiagDirection r3r_nb_exit = r3r_nb_td_ok ? TrackdirToExitdir(r3r_nb_td) : DiagDirection::Invalid;
-				const TileIndex r3r_nb_to = r3r_nb_td_ok ? TileAdd(moving_front->tile, TileOffsByDiagDir(r3r_nb_exit)) : INVALID_TILE;
-				const bool r3r_nb_ok = r3r_nb_td_ok && IsValidTile(r3r_nb_to);
-				/* "下一格"只在隧道/桥梁口才有意义：车在洞内时 tile 是洞口，外推一格是洞外。
-				 * 打出 worm= 让读日志的人自己判断该行的语义，探针不替玩家下结论。 */
-				const bool r3r_nb_worm = (moving_front->track & TRACK_BIT_WORMHOLE) != TRACK_BIT_NONE;
-				const TileType r3r_nb_type = r3r_nb_ok ? GetTileType(r3r_nb_to) : TileType::Void;
-				/* 整格预留只可能出现在这四种格上（GetReservedTrackbits 的 switch
-				 * 分支，pbs.cpp:341 其余类型恒 TRACK_BIT_NONE）。收窄到它们既省一次
-				 * 哈希查询，也保证 GetTrainForWholeTileReservation() 只在有意义的格
-				 * 上被调用（该函数对任意格也安全，这里只是保守）。 */
-				const bool r3r_nb_rail = r3r_nb_ok &&
-						(r3r_nb_type == TileType::Railway || r3r_nb_type == TileType::Road ||
-						 r3r_nb_type == TileType::Station || r3r_nb_type == TileType::TunnelBridge);
-				const bool r3r_nb_stn = r3r_nb_ok && IsRailStationTile(r3r_nb_to);
-				const bool r3r_nb_stn_res = r3r_nb_stn && HasStationReservation(r3r_nb_to);
-				const bool r3r_nb_plain = r3r_nb_ok && IsPlainRailTile(r3r_nb_to);
-				const uint r3r_nb_bits = r3r_nb_plain ? (uint)GetTrackBits(r3r_nb_to) : 0u;
-				const uint r3r_nb_resv = r3r_nb_plain ? (uint)GetRailReservationTrackBits(r3r_nb_to) : 0u;
-				const Train *const r3r_nb_own = r3r_nb_rail ? GetTrainForWholeTileReservation(r3r_nb_to) : nullptr;
-				FILE *const r3r_nb = R3RFopenDbg("a");
-				if (r3r_nb != nullptr) {
-					fprintf(r3r_nb, "CPL-NEXT veh=%d tick=%u mf=%d,%d td=%d tdOk=%d exit=%d worm=%d to=%d,%d toType=%d rail=%d stn=%d stnRes=%d plain=%d bits=%04X resv=%04X wholeOwner=%d spd=%d xp=%d\n",
-							(int)consist->index.base(), (uint)_tick_counter,
-							(int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
-							(int)r3r_nb_td, (int)r3r_nb_td_ok, (int)r3r_nb_exit, (int)r3r_nb_worm,
-							r3r_nb_ok ? (int)TileX(r3r_nb_to) : -1,
-							r3r_nb_ok ? (int)TileY(r3r_nb_to) : -1,
-							r3r_nb_ok ? (int)r3r_nb_type : -1,
-							(int)r3r_nb_rail, (int)r3r_nb_stn, (int)r3r_nb_stn_res, (int)r3r_nb_plain,
-							r3r_nb_bits, r3r_nb_resv,
-							(r3r_nb_own != nullptr) ? (int)r3r_nb_own->index.base() : -1,
-							(int)consist->cur_speed, (int)consist->x_pos);
-					fclose(r3r_nb);
-				}
-			}
-		}
 		/* R3R (第 348 轮, KI-364): 挂接机车的"实时制动前瞻"自愈。
 		 *
 		 * 现场（build\R3R_debug.log:1521，第 347 轮 exe）：
@@ -25179,7 +20669,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		 * （:1853 LOCO-MOVE veh=57 tile=15,14 spd=30 track=08 逐格重复）。
 		 *
 		 * 前瞻为什么为空：挂接路径由 R3R 的 couple 寻路用低层 TryReserveRailTrack 订下
-		 * （CPL-RESERVE path=4），走的是 r3r_chosen_ret 提前 return，不经 ChooseTrainTrack
+		 * （CPL-RESERVE path=4），走的是提前 return，不经 ChooseTrainTrack
 		 * 末尾 `if (result_flags & CTTRF_RESERVATION_MADE)` 里的
 		 * FillTrainReservationLookAhead()；而 AdvanceLookAheadPosition()（:1447）一旦车头
 		 * 越过 reservation_end_position + 8 就 reset 掉 lookahead。于是"订 4 格 → 开完
@@ -25196,13 +20686,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			uint32_t &r3r_la_last = r3r_la_rebuild_tick[consist->index.base()];
 			if (r3r_la_last == 0 || (uint32_t)_tick_counter - r3r_la_last >= 32) {
 				r3r_la_last = (uint32_t)_tick_counter;
-				const bool r3r_la_had_res = GetReservedTrackbits(consist->tile) != TRACK_BIT_NONE;
 				FillTrainReservationLookAhead(consist);
-				R3RDbgWrite("RESV-LA-REBUILD veh=%d tile=%d,%d spd=%d order=%d own=%d look=%d end=%d\n",
-						(int)consist->index.base(), (int)TileX(consist->tile), (int)TileY(consist->tile),
-						(int)consist->cur_speed, (int)consist->current_order.GetType(),
-						(int)r3r_la_had_res, (int)(consist->lookahead != nullptr),
-						(consist->lookahead != nullptr) ? (int)consist->lookahead->reservation_end_position : -1);
 			}
 		}
 		/* Loop until the train has finished moving. */
@@ -25213,7 +20697,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 			/* Couple now? Try to couple onto the waiting consist when executing a GOTO_COUPLE order. */
 			if (consist->current_order.IsType(OT_GOTO_COUPLE)) {
 				if (TrainCoupleHandler(consist)) {
-					R3RSpdCtx(consist, "couple-in-loop", consist->cur_speed, 0);
 					consist->cur_speed = 0;
 					consist->progress = 0;
 					break;
@@ -25234,7 +20717,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 						IsTileType(moving_front->tile, TileType::Station) &&
 						consist->current_order.GetDestination() == GetStationIndex(moving_front->tile)) {
 				{
-					R3RScopeTimer r3r_ord_timer(&r3r_ord_ns, &r3r_ord_calls);
 					ProcessOrders(consist);
 				}
 			}
@@ -25245,7 +20727,6 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	{
 		/* KI-14 (2): O(chain length) per tick per front engine -- this is the
 		 * pass that an R3R-merged mega-chain amplifies. */
-		R3RScopeTimer r3r_vp_timer(&r3r_vp_ns, &r3r_vp_calls);
 		for (Train *u = consist; u != nullptr; u = u->Next()) {
 			if (!(u->IsDrawn())) continue;
 
@@ -25260,27 +20741,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	 * un-instrumented write point. Dump prev/now so it can be found directly.
 	 * Restricted to entry >= 20 (normal braking never drops that far in one
 	 * tick) so ordinary stops do not flood the log. Read-only. */
-	if (R3RDbgOn() && r3r_spd_entry >= 20 && consist->cur_speed == 0) {
-		bool r3r_ctx_this_tick = false;
-		const auto r3r_ctx_it = _r3r_spd_ctx_by_veh.find(consist->index.base());
-		if (r3r_ctx_it != _r3r_spd_ctx_by_veh.end() && r3r_ctx_it->second.tick == (uint32_t)_tick_counter) {
-			r3r_ctx_this_tick = true;
-		}
-		if (!r3r_ctx_this_tick) {
-			FILE *const r3r_dbg = R3RFopenDbg("a");
-			if (r3r_dbg != nullptr) {
-				fprintf(r3r_dbg, "SPDD-LOST veh=%d prev=%d now=%d tile=%d,%d x=%d db=%d order=%d real=%d stuck=%d fp=%d prog=%d wait=%d track=%02X dtile=%u\n",
-						(int)consist->index.base(), (int)r3r_spd_entry, (int)consist->cur_speed,
-						(int)TileX(consist->tile), (int)TileY(consist->tile), (int)consist->x_pos,
-						(int)(consist->IsDrivingBackwards() ? 1 : 0),
-						(int)consist->current_order.GetType(), (int)consist->cur_real_order_index,
-						(int)consist->flags.Test(VehicleRailFlag::Stuck), (int)consist->force_proceed,
-						(int)consist->progress, (int)consist->wait_counter,
-						(unsigned)consist->track, (unsigned)consist->dest_tile.base());
-				fclose(r3r_dbg);
-			}
-		}
-	}
+	
 
 	return true;
 }
@@ -25356,7 +20817,7 @@ bool Train::Tick()
 		 * "每个链头每 tick" 的边界。判定口径：上一 tick 的 tick-out 与本次
 		 * tick-in 之间的差 = 在 tick 之外（命令队列 / 读档末 / 其它子系统）
 		 * 被写出来的，与任何 handler 内的站点无关。 */
-		R3RWatchOrderIndex(this, "tick-in");
+		
 
 		if (!TrainLocoHandler(this, false)) return false;
 
@@ -25368,15 +20829,14 @@ bool Train::Tick()
 		 * 除零崩溃(C0000094)。跳过本次 tick,由下一 tick(缓存已重建)的新链头
 		 * 接管。 */
 		if (!this->IsFrontEngine()) {
-			R3RWatchOrderIndex(this, "tick-out-leftchain");
+			
 			return true;
 		}
 
 		/* R3R (第 206 轮探针, 只读): 本 tick 收尾的索引。第二次 handler 可能删车，
 		 * 故只在链头仍存活时打点（返回值语义与原来逐字相同）。 */
 		const bool r3r_tick_alive = TrainLocoHandler(this, true);
-		if (r3r_tick_alive) R3RWatchOrderIndex(this, "tick-out");
-		return r3r_tick_alive;
+			return r3r_tick_alive;
 	} else if (this->IsFreeWagon() && this->vehstatus.Test(VehState::Crashed)) {
 		/* Delete flooded standalone wagon chain */
 		if (++this->crash_anim_pos >= 4400) {
@@ -25398,7 +20858,7 @@ static void CheckIfTrainNeedsService(Train *v)
 	if (v->IsChainInDepot()) {
 		/* R3R (第 206 轮探针, 只读): 库内列车走这条自动检修分支。它本身不改订单
 		 * 索引，加点是把它变成"库里链头在 tick 之外被 OnPeriodic 触及过"的基线。 */
-		R3RWatchOrderIndex(v, "svc-in-depot");
+		
 		VehicleServiceInDepot(v);
 		return;
 	}
@@ -25418,14 +20878,6 @@ static void CheckIfTrainNeedsService(Train *v)
 		const Order *const real_order = (v->GetEffectiveOrders() != nullptr && v->cur_real_order_index < v->GetNumOrders()) ? v->GetOrder(v->cur_real_order_index) : nullptr;
 		if (v->current_order.IsType(OT_WAIT_COUPLE) || v->current_order.IsType(OT_GOTO_COUPLE) ||
 				(real_order != nullptr && (real_order->IsType(OT_WAIT_COUPLE) || real_order->IsType(OT_GOTO_COUPLE)))) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "[R3R] SVC-DEPOT-SKIP veh=%d cur=%d real=%d(%d) spd=%d tile=%d,%d tag=couple-protocol\n",
-						(int)v->index.base(), (int)v->current_order.GetType(),
-						(int)v->cur_real_order_index, R3RDbgOrderTypeAt(v, v->cur_real_order_index),
-						(int)v->cur_speed, (int)TileX(v->tile), (int)TileY(v->tile));
-				fclose(dbg);
-			}
 			return;
 		}
 	}
@@ -25569,18 +21021,7 @@ Trackdir Train::GetVehicleTrackdir() const
 	 * and record the state (edge triggered) so the origin of the mismatch can
 	 * be pinned down. */
 	if (unlikely(td == INVALID_TRACKDIR)) {
-		const uint64_t vehtd_payload = ((uint64_t)this->tile.base() << 32) |
-				((uint64_t)(uint)this->track << 16) | (uint64_t)(uint)this->direction;
-		if (R3RDbgEdge(R3REDGE_VEHTD, (uint64_t)this->index.base(), vehtd_payload)) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "VEHTD-MISMATCH veh=%d tile=%d,%d track=0x%X dir=%d mdir=%d -> coerced=%d\n",
-						(int)this->index.base(), (int)TileX(this->tile), (int)TileY(this->tile),
-						(uint)this->track, (int)this->direction, (int)this->GetMovingDirection(),
-						(int)TrackToTrackdir(track));
-				fclose(dbg);
-			}
-		}
+		
 		return TrackToTrackdir(track);
 	}
 	return td;
@@ -25624,7 +21065,7 @@ void DeleteVisibleTrain(Train *v)
 				SetSignalledBridgeTunnelGreenIfClear(tile, end);
 			}
 		} else {
-			R3RTrackBitsProbe("del-visible", trackbits, -1, tile);
+			
 			Track track = TrackBitsToTrack(trackbits);
 			/* R3R (第 243 轮, REG-243-O): name this release path. 'u' is already deleted
 			 * here, so no actor is set. Log only, no behaviour. */

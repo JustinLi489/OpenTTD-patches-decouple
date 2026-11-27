@@ -30,7 +30,6 @@
 #include "network/network.h"
 #include "core/alignment.hpp"
 #include "sl/saveload_common.h"
-#include "r3r_perf.h"
 #include <array>
 #include <vector>
 

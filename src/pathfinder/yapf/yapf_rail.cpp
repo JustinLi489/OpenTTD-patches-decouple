@@ -19,7 +19,6 @@
 #include "../../tracerestrict.h"
 #include "../../debug.h"
 #include "../../misc/dbg_helpers.h"
-#include "../../r3r_perf.h"
 #include "../../couple_group.h"
 #include "../../pbs.h"
 #include "../../rail_map.h" // R3R (KI-504 探针): GetRailReservationTrackBits, to log the reservation already on a tile
@@ -137,11 +136,6 @@ void R3RAnswerDrop(VehicleID veh, const char *reason)
 	_r3r_answer_store_count.erase(key);
 	_r3r_answer_hit_count.erase(key);
 	if (!had_answer) return;
-	FILE *dbg = R3RFopenDbg("a");
-	if (dbg != nullptr) {
-		fprintf(dbg, "ANSWER-DROP veh=%u reason=%s\n", (unsigned)key, reason != nullptr ? reason : "?");
-		fclose(dbg);
-	}
 }
 
 /** 本次 TryReservePath 逐格走过的 (tile, td)，成功后由 R3RAnswerCommit() 收进表。 */
@@ -160,18 +154,6 @@ static void R3RAnswerCommit(VehicleID veh, TileIndex order_dest)
 	_r3r_answer_origin[key] = PBSTileInfo(dst.front().tile, dst.front().td, true);
 	_r3r_answer_dest[key] = order_dest;
 	++_r3r_answer_store_count[key];
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "ANSWER-STORE veh=%u n=%u from=%d,%d to=%d,%d dest=%d,%d nth=%u\n",
-					(unsigned)key, (unsigned)dst.size(),
-					(int)TileX(dst.front().tile), (int)TileY(dst.front().tile),
-					(int)TileX(dst.back().tile), (int)TileY(dst.back().tile),
-					(int)TileX(order_dest), (int)TileY(order_dest),
-					(unsigned)_r3r_answer_store_count[key]);
-			fclose(dbg);
-		}
-	}
 }
 
 template <typename Tpf> void DumpState(Tpf &pf1, Tpf &pf2)
@@ -256,11 +238,6 @@ private:
 	bool FindSafeCouplePositionProc(TileIndex tile, Trackdir td)
 	{
 		if (IsRailDepotTile(tile)) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "FSCP tile=%d,%d fail=depot\n", (int)TileX(tile), (int)TileY(tile));
-			fclose(dbg);
-		}
 		return false;
 	}
 		TrackdirBits tdb = TrackdirToTrackdirBits(td);
@@ -337,14 +314,6 @@ private:
 				uint32_t key = (tile.base() << 8) ^ (tile_heads[0]->index.base() << 4) ^ tile_heads[1]->index.base();
 				if (key != last_key) {
 					last_key = key;
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d skip=multihead-blocked n=%u h=%d,%d hasT=%d\n",
-								(int)TileX(tile), (int)TileY(tile), (uint)n_tile_heads,
-								(int)tile_heads[0]->index.base(), (int)tile_heads[1]->index.base(),
-								(int)tile_heads_have_target);
-						fclose(dbg);
-					}
 				}
 				return false;
 			}
@@ -363,11 +332,6 @@ private:
 				 * its occupied tile is passable for the couple path. A loose wagon chain
 				 * ("散链") is an obstacle like any other train. */
 				if (!R3RIsCoupleTarget(best)) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d fail=notSeg best=%d ord=%d sf=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)best->current_order.GetType(), (int)best->IsSegmentFront());
-						fclose(dbg);
-					}
 					return false;
 				}
 				/* R3R: couple group whitelist (step 5). A waiting consist in a
@@ -378,11 +342,6 @@ private:
 				 * caller already reports CPL-SAFE-FAIL. */
 				if (!R3RCoupleAllowed(Train::From(Yapf().GetVehicle()), best)) return false;
 				if (second_best != nullptr) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d fail=2nd best=%d 2nd=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)second_best->index.base());
-						fclose(dbg);
-					}
 					return false;
 				}
 				Vehicle *other_train = nullptr;
@@ -402,11 +361,6 @@ private:
 				 * 结果就是"预留成功却走错道岔"。豁免本车与 :222 的既有豁免同源：
 				 * 自己手里的预留不是障碍。 */
 				if (other_train != nullptr && other_train != best && other_train->index != Yapf().GetVehicle()->index) {
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "FSCP tile=%d,%d fail=other best=%d other=%d\n", (int)TileX(tile), (int)TileY(tile), (int)best->index.base(), (int)other_train->index.base());
-						fclose(dbg);
-					}
 					return false;
 				}
 			}
@@ -435,13 +389,6 @@ private:
 					}
 					if (!on_tile) continue;
 					self_held = true;
-					FILE *sdbg = R3RFopenDbg("a");
-					if (sdbg != nullptr) {
-						fprintf(sdbg, "FSCP-SELFHELD tile=%d,%d veh=%d tk=%d want=%d res=0x%X\n",
-							(int)TileX(tile), (int)TileY(tile), (int)coupler->index.base(),
-							(int)tk, (int)TrackdirToTrack(td), (unsigned)reserved);
-						fclose(sdbg);
-					}
 					break;
 				}
 			}
@@ -456,141 +403,6 @@ private:
 				/* R3R (第 342 轮, 方案 ε-A): 只有"失败 + 占位者是本链"才是自锁。
 				 * 若 self_held 但 TryReserveRailTrack 成功（两位不交叉），不算自锁。 */
 				if (self_held) R3RNoteSelfLock(tile, coupler->index);
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					/* R3R (第 401 轮, KI-570): tile 来源不受控（可能是站台/车库格），
-					 * IsPlainRail()/GetTrackBits()/GetReservedTrackbits() 都会先在
-					 * rail_map.h:40 的 IsTileType(Railway) 前置断言上炸（同族 KI-207c
-					 * 附记 7b），必须先短路 tile 类型再谈 plain。 */
-					const bool plain = IsTileType(tile, TileType::Railway) && IsPlainRail(tile);
-					fprintf(dbg, "FSCP tile=%d,%d fail=tryReserve td=%d want=%d type=%d tbits=0x%X res=0x%X plain=%d depot=%d st=%d self=%d\n",
-						(int)TileX(tile), (int)TileY(tile), (int)td, (int)TrackdirToTrack(td),
-						(int)GetTileType(tile), plain ? (unsigned)GetTrackBits(tile) : 0u, plain ? (unsigned)GetReservedTrackbits(tile) : 0u,
-						(int)plain, (int)IsRailDepotTile(tile), (int)IsRailStationTile(tile),
-						(int)self_held);
-					const uint8_t rb = plain ? (uint8_t)(GetReservedTrackbits(tile) & TRACK_BIT_MASK) : (uint8_t)0;
-					for (Track tk = TRACK_BEGIN; tk != TRACK_END; tk++) {
-						if (!HasBit(rb, tk)) continue;
-						Train *owner = GetTrainForReservation(tile, tk);
-						if (owner == nullptr) {
-							fprintf(dbg, "FSCP-RES tile=%d,%d tk=%d owner=-1\n",
-								(int)TileX(tile), (int)TileY(tile), (int)tk);
-							continue;
-						}
-						/* R3R (KI-162 probe): the blocker is named, but not yet
-						 * classified. These columns decide whether the owner is
-						 * (a) still rolling / shrinking its reservation while it
-						 * clears the coupler's path, or (b) already standing still
-						 * and merely holding its own forward reservation.
-						 * ostop/ospd = parked?  oend = where the owner's own
-						 * reservation ends, othru = does it really pass through
-						 * this tile, octgt/ocplok = is the owner the coupler's
-						 * legitimate couple target at all. */
-						Train *oh = const_cast<Train *>(owner->First());
-						const PBSTileInfo oend = FollowTrainReservation(oh, nullptr);
-						fprintf(dbg, "FSCP-RES tile=%d,%d tk=%d owner=%d otile=%d,%d odir=%d ospd=%d ostop=%d ord=%d oroi=%d oend=%d,%d oendtd=%d othru=%d octgt=%d ocplok=%d cpl=%d,%d\n",
-							(int)TileX(tile), (int)TileY(tile), (int)tk, (int)oh->index.base(),
-							(int)TileX(oh->tile), (int)TileY(oh->tile), (int)oh->direction, (int)oh->cur_speed,
-							(int)oh->vehstatus.Test(VehState::Stopped), (int)oh->current_order.GetType(), (int)oh->cur_real_order_index,
-							(int)TileX(oend.tile), (int)TileY(oend.tile), (int)oend.trackdir,
-							(int)TrainReservationPassesThroughTile(oh, tile),
-							(int)R3RIsCoupleTarget(oh), (int)R3RCoupleAllowed(coupler, oh),
-							(int)TileX(coupler->tile), (int)TileY(coupler->tile));
-					}
-					/* R3R (KI-162 probe, round 2; SEMANTICS CORRECTED in round 91):
-					 * Neither API here can answer "who reserved this tile".
-					 *  - GetTrainForReservation() ("owner=" above) follows the
-					 *    reservation to one end and names the train standing there,
-					 *    and on station tiles it scans the whole platform (pbs.cpp
-					 *    CheckTrainsOnTrack), so it can even name a train on another
-					 *    track. See KI-162 round 90.
-					 *  - TrainReservationPassesThroughTile() (this block) walks the
-					 *    *contiguous* run of reserved trackbits starting at the
-					 *    train's moving front (pbs.cpp FollowReservationEnumerate;
-					 *    the reserved bits are global and carry no owner). A train
-					 *    parked on that run therefore "reaches" the tile *through
-					 *    someone else's* reservation and is listed as well. It means
-					 *    "this chain's reservation reaches the tile", NOT "this
-					 *    chain holds the reservation" -- do not read it as ownership.
-					 * Verified in round 91: at 60,53 the parked consist veh=1 was
-					 * listed next to the actually holding loco veh=0, while the
-					 * consist's own reservation only covered 60,48..60,51.
-					 * The reliable ownership evidence is the FSCP-VEH line below (a
-					 * train physically standing on the tile) plus the owner's
-					 * ord/dir/spd. REACH-NONE keeps its meaning: no chain can reach
-					 * this tile along a contiguous reservation at all, which would be
-					 * a genuinely stale/orphan reservation. */
-					{
-						static TileIndex s_fscp_reach_none_tile = INVALID_TILE;
-						uint reach_hits = 0;
-						for (Train *tr : Train::Iterate()) {
-							if (tr->First() != tr) continue;
-							if (!TrainReservationPassesThroughTile(tr, tile)) continue;
-							reach_hits++;
-							const PBSTileInfo tend = FollowTrainReservation(tr, nullptr);
-							Train *gtr = nullptr;
-							for (Track tk2 = TRACK_BEGIN; tk2 != TRACK_END; tk2++) {
-								if (!HasBit(rb, tk2)) continue;
-								Train *g = GetTrainForReservation(tile, tk2);
-								if (g != nullptr) { gtr = g->First(); break; }
-							}
-							fprintf(dbg, "FSCP-REACH tile=%d,%d veh=%d ord=%d roi=%d pos=%d,%d dir=%d spd=%d stopped=%d seg=%d cplok=%d ctgt=%d end=%d,%d endtd=%d isGtr=%d cpl=%d,%d\n",
-								(int)TileX(tile), (int)TileY(tile), (int)tr->index.base(),
-								(int)tr->current_order.GetType(), (int)tr->cur_real_order_index,
-								(int)TileX(tr->tile), (int)TileY(tr->tile), (int)tr->direction,
-								(int)tr->cur_speed, (int)tr->vehstatus.Test(VehState::Stopped),
-								(int)tr->IsSegmentFront(), (int)R3RCoupleAllowed(coupler, tr),
-								(int)R3RIsCoupleTarget(tr),
-								(int)TileX(tend.tile), (int)TileY(tend.tile), (int)tend.trackdir,
-								(int)(gtr == tr),
-								(int)TileX(coupler->tile), (int)TileY(coupler->tile));
-						}
-						if (reach_hits == 0) {
-							if (s_fscp_reach_none_tile != tile) {
-								s_fscp_reach_none_tile = tile;
-								fprintf(dbg, "FSCP-REACH-NONE tile=%d,%d (no chain reaches this tile along a contiguous reservation)\n",
-									(int)TileX(tile), (int)TileY(tile));
-							}
-						} else {
-							s_fscp_reach_none_tile = INVALID_TILE;
-						}
-					}
-					for (Train *tr : VehiclesOnTile<VehicleType::Train>(tile)) {
-						fprintf(dbg, "FSCP-VEH tile=%d,%d veh=%d track=0x%X dir=%d front=%d ord=%d\n",
-							(int)TileX(tile), (int)TileY(tile), (int)tr->index.base(),
-							(unsigned)tr->track, (int)tr->direction, (int)tr->IsFrontEngine(),
-							(int)tr->current_order.GetType());
-					}
-					/* R3R (第 339 轮, 疑点 R338-A): 上三条探针都答不出"这格的预留是谁的"
-					 * （FSCP-RES 顺预留找端点、FSCP-REACH 只在"预留可达"意义上成立、
-					 * FSCP-VEH 只报格上站着谁）。这里补一条能直接判定「自交叉」的读数：
-					 * 询路车**自己的链**上有哪一节压在这格上、它的 track 与被占位是否
-					 * 重叠。若 overlap != 0 ⇒ 是询路车自己的后半节占住了交叉轨，
-					 * TryReserveRailTrack 必然失败（PBS 铁律：交叉轨不能同时预留），
-					 * 与谁先订无关；此时 KI-510 方案 γ 的截断点会退化到 origin
-					 * （等于原地不动），修法必须改成"询路前先收缩本车预留"或
-					 * "禁止挂接寻路规划出自交叉机动"。overlap == 0 则说明占位者
-					 * 是别的车/别的链，γ 的截断路径成立。 */
-					{
-						Train *const cpl_first = coupler->First();
-						const PBSTileInfo cpl_end = FollowTrainReservation(cpl_first, nullptr);
-						fprintf(dbg, "FSCP-CPL tile=%d,%d veh=%d pos=%d,%d dir=%d spd=%d end=%d,%d endtd=%d look=%d real=%d\n",
-							(int)TileX(tile), (int)TileY(tile), (int)cpl_first->index.base(),
-							(int)TileX(cpl_first->tile), (int)TileY(cpl_first->tile),
-							(int)cpl_first->direction, (int)cpl_first->cur_speed,
-							(int)TileX(cpl_end.tile), (int)TileY(cpl_end.tile), (int)cpl_end.trackdir,
-							(cpl_first->lookahead != nullptr) ? 1 : 0,
-							(int)cpl_first->cur_real_order_index);
-						for (Train *c = cpl_first; c != nullptr; c = c->Next()) {
-							if (c->tile != tile) continue;
-							fprintf(dbg, "FSCP-SELF tile=%d,%d veh=%d track=0x%X dir=%d front=%d overlap=0x%X\n",
-								(int)TileX(tile), (int)TileY(tile), (int)c->index.base(),
-								(unsigned)c->track, (int)c->direction, (int)c->IsFrontEngine(),
-								(unsigned)((c->track & rb) & TRACK_BIT_MASK));
-						}
-					}
-					fclose(dbg);
-				}
 				return false;
 			}
 			/* R3R (第 243 轮, REG-243-O): name this release (the couple pathfinder's
@@ -639,16 +451,6 @@ private:
 			const TrackBits plat_tracks = TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, ::TransportType::Rail, 0));
 			if (plat_tracks == TRACK_BIT_NONE) return false;
 			const Track plat_track = FindFirstTrack(plat_tracks);
-			if (plat_track != TrackdirToTrack(td)) {
-				/* 只读探针：入口 track 与本站台格实际 track 不同（第 432 轮取数用，
-				 * 也为将来判断要不要改成逐格独立 track 语义留数据）。 */
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "RESV-PLAT-TRACK tile=%d,%d entry_track=%u actual_track=%u\n",
-							(int)TileX(tile), (int)TileY(tile), (unsigned)TrackdirToTrack(td), (unsigned)plat_track);
-					fclose(dbg);
-				}
-			}
 			if (!TryReserveRailTrack(tile, plat_track, false)) return false;
 			MarkTileDirtyByTile(tile, VMDF_NOT_MAP_MODE);
 			tile = TileAdd(tile, diff);
@@ -841,14 +643,6 @@ public:
 				if (!r3r_seen) {
 					for (int k = 0; k < 63; k++) r3r_noref_seen[k] = r3r_noref_seen[k + 1];
 					r3r_noref_seen[63] = r3r_vk;
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "EXT-NOREF veh=%d pair=%d steps=%u goal=%d,%d\n",
-								(int)r3r_coupler->index.base(), r3r_pair_idx, (unsigned)steps.size(),
-								steps.empty() ? -1 : (int)TileX(steps.back().first),
-								steps.empty() ? -1 : (int)TileY(steps.back().first));
-						fclose(dbg);
-					}
 				}
 			}
 		}
@@ -936,21 +730,6 @@ public:
 						&& (r3r_plat_seen_hi || r3r_plat_seen_lo)
 						&& r3r_axial >= r3r_plat_lo - 8 && r3r_axial <= r3r_plat_hi + 8;
 				if (r3r_leaped || r3r_off_piece || r3r_cross_row) {
-					const char *const r3r_why = r3r_cross_row ? "cross-row"
-							: (r3r_leaped ? "leaped" : "off-platform");
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						fprintf(dbg, "EXT-STOP veh=%d reason=%s nth=%u/%u tile=%d,%d td=%d plat=%d,%d axis=%d lo=%d hi=%d perp=%d platperp=%d entered=%d leaped=%d crossrow=%d booked=%u\n",
-								(int)r3r_coupler->index.base(), r3r_why,
-								(unsigned)i, (unsigned)steps.size(),
-								(int)TileX(stile), (int)TileY(stile), (int)stdir,
-								(int)TileX(r3r_plat_ref), (int)TileY(r3r_plat_ref),
-								r3r_plat_row_x ? (int)Axis::X : (int)Axis::Y,
-								r3r_plat_lo, r3r_plat_hi, r3r_perp, r3r_plat_perp,
-								(int)r3r_plat_entered, (int)r3r_leaped, (int)r3r_cross_row,
-								(unsigned)booked);
-						fclose(dbg);
-					}
 					/* 不订这一格，就地收尾：booked 里已经是站台内/站台前的格，调用方
 					 * （booked < steps.size()）会把预留终点收到最后一格已订。 */
 					break;
@@ -961,41 +740,6 @@ public:
 			}
 			this->ReserveSingleTrack(stile, stdir);
 			if (this->res_fail_tile != INVALID_TILE) {
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						Train *const coupler = const_cast<Train *>(Train::From(Yapf().GetVehicle()));
-						const TileIndex ftile = this->res_fail_tile;
-						const Track want = TrackdirToTrack(stdir);
-						Train *owner = IsRailStationTile(ftile)
-								? GetTrainForWholeTileReservationArbitrated(ftile)
-								: GetTrainForReservationArbitrated(ftile, want);
-						if (owner == nullptr && IsRailStationTile(ftile)) owner = GetTrainForReservationArbitrated(ftile, want);
-						const bool selfheld = (owner != nullptr && (owner == coupler || owner->First() == coupler->First()));
-						/* 位读数必须先自证 plain rail: GetTrackBits/GetReservedTrackbits
-						 * 在非 plain rail 上是 dbg_assert(KI-207c 附记 7b 的教训)。
-						 * R3R (第 401 轮, KI-570): ftile 由失败点回填，第 400 轮起可能是
-						 * 站台格（TileType::Station）——IsPlainRail() 第一句就是
-						 * GetRailTileType()，其入口 dbg_assert_tile(IsTileType(t,
-						 * TileType::Railway)) 正是 rail_map.h:40，比 GetTrackBits 更早炸。
-						 * 必须先短路 tile 类型，再谈 plain。 */
-						const bool plain = IsTileType(ftile, TileType::Railway) && IsPlainRail(ftile);
-						fprintf(dbg, "CPL-RES-FAIL veh=%d nth=%u/%u tile=%d,%d td=%d want=%d booked-before=%u failtd=%d type=%d tbits=%d res=%d plain=%d st=%d depot=%d owner=%d selfheld=%d otile=%d,%d ospd=%d ord=%d\n",
-								(int)coupler->index.base(), (unsigned)i, (unsigned)steps.size(),
-								(int)TileX(ftile), (int)TileY(ftile), (int)stdir, (int)want,
-								(unsigned)booked, (int)this->res_fail_td,
-								(int)GetTileType(ftile),
-								plain ? (int)GetTrackBits(ftile) : -1,
-								plain ? (int)GetReservedTrackbits(ftile) : -1,
-								(int)plain, (int)IsRailStationTile(ftile), (int)IsRailDepotTile(ftile),
-								(owner == nullptr) ? -1 : (int)owner->index.base(), (int)selfheld,
-								(owner == nullptr) ? -1 : (int)TileX(owner->tile),
-								(owner == nullptr) ? -1 : (int)TileY(owner->tile),
-								(owner == nullptr) ? -1 : (int)owner->cur_speed,
-								(owner == nullptr) ? -1 : (int)owner->current_order.GetType());
-						fclose(dbg);
-					}
-				}
 				/* KI-563（玩家拍板 A，2026-11-06 第 393 轮）：预留粒度完全按原生 PBS
 				 * ——订到第一个失败格即停，**保留**已订上的格，不再整批回滚。
 				 *
@@ -1005,27 +749,6 @@ public:
 				 * 有格可走就算成功，剩余部分由下一次 TryReservePath 重新摸路续订
 				 * （已订格对自己视为成功，见 pbs.cpp 的 KI-361 自订豁免）。 */
 				if (booked > 0) {
-					FILE *dbg2 = R3RFopenDbg("a");
-					if (dbg2 != nullptr) {
-						fprintf(dbg2, "CPL-RES-PARTIAL veh=%d booked=%u/%u stop=%d,%d td=%d\n",
-								(int)Train::From(Yapf().GetVehicle())->index.base(),
-								(unsigned)booked, (unsigned)steps.size(),
-								(int)TileX(this->res_fail_tile), (int)TileY(this->res_fail_tile),
-								(int)this->res_fail_td);
-						/* R3R (第 402 轮, KI-571): 补打实际订到的格清单 —— 只报 booked 的
-						 * 数字看不出"能否走到最后一格已订"，第 402 轮现场正卡在这里
-						 * （booked=2 却不知道是哪两格、能否贴住车底）。
-						 * 每格单独一行：本文件禁用 snprintf（SAFEGUARD 宏），也不包含
-						 * string_func.h 的 seprintf，所以不拼串，直接逐行 fprintf。 */
-						for (size_t k = 0; k < booked && k < steps.size(); k++) {
-							fprintf(dbg2, "  CPL-RES-PARTIAL-TILE veh=%d k=%u/%u tile=%d,%d td=%d\n",
-									(int)Train::From(Yapf().GetVehicle())->index.base(),
-									(unsigned)k, (unsigned)booked,
-									(int)TileX(steps[k].first), (int)TileY(steps[k].first),
-									(int)steps[k].second);
-						}
-						fclose(dbg2);
-					}
 					/* 与全成功路径一致：已订的轨道要让 YAPF 缓存失效，否则下一 tick
 					 * 的寻路仍看见"未预留"。 */
 					YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
@@ -1056,15 +779,6 @@ public:
 			 * `booked < steps.size()` 收缩分支不会触发，预留终点保持在会合点。 */
 			if (i + 1 == steps.size()) {
 				stopped_at_goal = true;
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-RES-SAFE-STOP veh=%d nth=%u/%u tile=%d,%d td=%d booked=%u goal=1\n",
-							(int)r3r_coupler->index.base(),
-							(unsigned)i, (unsigned)steps.size(),
-							(int)TileX(stile), (int)TileY(stile), (int)stdir,
-							(unsigned)booked);
-					fclose(dbg);
-				}
 				break;
 			}
 		}
@@ -1075,21 +789,6 @@ public:
 		 * 存在）。保留 `stop_safe=` 只为兼容既有判读，它与新的 `goal=` 现在
 		 * 同义 —— 都是"本轮预留是否在目的地收尾"。因为正常路径恒在最后一格
 		 * break，健康形态是 `total=N booked=N stop_safe=1 goal=1`。 */
-		if (!steps.empty()) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-RES-OK veh=%d total=%u booked=%u stop_safe=%d goal=%d tiles=",
-						(int)Train::From(Yapf().GetVehicle())->index.base(), (unsigned)steps.size(),
-						(unsigned)booked, (int)stopped_at_goal, (int)stopped_at_goal);
-				for (size_t i = 0; i < booked && i < 16; ++i) {
-					fprintf(dbg, "%s%d,%d/%d", (i == 0) ? "" : ";",
-							(int)TileX(steps[i].first), (int)TileY(steps[i].first), (int)TrackdirToTrack(steps[i].second));
-				}
-				if (steps.size() > 16) fprintf(dbg, ";...(truncated)");
-				fprintf(dbg, "\n");
-				fclose(dbg);
-			}
-		}
 		if (!steps.empty()) YapfNotifyTrackLayoutChange(INVALID_TILE, INVALID_TRACK);
 		/* 修法 D 起，"第一个安全位就被别人占着"会在**一格都没订**的情况下走到这里
 		 * （第 394 轮的写法总是先订再判，故 booked 必 >= 1）。此时必须如实报失败，
@@ -1287,15 +986,6 @@ public:
 					uint64_t &r3r_prev = r3r_rpf_seen[r3r_vid];
 					if (r3r_prev != r3r_sig) {
 						r3r_prev = r3r_sig;
-						FILE *dbg = R3RFopenDbg("a");
-						if (dbg != nullptr) {
-							fprintf(dbg, "RPFAIL veh=%d tick=%u origin=%d,%d tile=%d,%d td=%d unsafe=%d nTry=%d nOK=%d\n",
-									(int)r3r_vid, (uint)_tick_counter,
-									(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
-									(int)TileX(tile), (int)TileY(tile), (int)td,
-									(int)!atomic, r3r_ntry, r3r_nok);
-							fclose(dbg);
-						}
 					}
 				}
 				return r3r_tok;
@@ -1381,11 +1071,6 @@ public:
 			const int r3r_vty = (int)TileY(r3r_v->tile);
 			const int r3r_odx = (int)TileX(this->origin_tile);
 			const int r3r_ody = (int)TileY(this->origin_tile);
-			const int r3r_adx = (r3r_odx > r3r_vtx) ? (r3r_odx - r3r_vtx) : (r3r_vtx - r3r_odx);
-			const int r3r_ady = (r3r_ody > r3r_vty) ? (r3r_ody - r3r_vty) : (r3r_vty - r3r_ody);
-			const int r3r_ogap = (r3r_adx > r3r_ady) ? r3r_adx : r3r_ady;
-			const char *const r3r_osrc = (this->origin_tile == r3r_v->tile) ? "car"
-					: ((this->origin_tile == r3r_v->dest_tile) ? "dest" : "other");
 			const uint64_t r3r_cplres_sig = ((uint64_t)(uint32_t)r3r_node_tile.base() << 40)
 					^ ((uint64_t)(uint32_t)this->origin_tile.base() << 16)
 					^ ((uint64_t)(uint32_t)r3r_ntry << 8)
@@ -1394,20 +1079,6 @@ public:
 			uint64_t &r3r_cplres_prev = r3r_cplres_seen[r3r_vid];
 			if (r3r_cplres_prev != r3r_cplres_sig) {
 				r3r_cplres_prev = r3r_cplres_sig;
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPLRES veh=%d tick=%u origin=%d,%d destTile=%d,%d destTd=%d node=%d,%d root=%d unsafe=%d nTry=%d nOK=%d empty=%d vTile=%d,%d vDest=%d,%d gap=%d oSrc=%s\n",
-							(int)r3r_vid, (uint)_tick_counter,
-							(int)TileX(this->origin_tile), (int)TileY(this->origin_tile),
-							(int)TileX(this->res_dest_tile), (int)TileY(this->res_dest_tile), (int)this->res_dest_td,
-							(int)TileX(r3r_node_tile), (int)TileY(r3r_node_tile),
-							(this->res_dest_node->parent == nullptr) ? 1 : 0,
-							(int)!atomic, r3r_ntry, r3r_nok, (r3r_ntry == 0) ? 1 : 0,
-							r3r_vtx, r3r_vty,
-							(int)TileX(r3r_v->dest_tile), (int)TileY(r3r_v->dest_tile),
-							r3r_ogap, r3r_osrc);
-					fclose(dbg);
-				}
 			}
 		}
 
@@ -1518,16 +1189,6 @@ public:
 		 * trackdir），不是 origin 格自己的出口方向 —— 故取第一格抄到的步。 */
 		*first_td = steps[idx + 1].td;
 		++_r3r_answer_hit_count[key];
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "ANSWER-REPLAY veh=%u at=%u/%u booked=%u stop=%d,%d choice=%d hit=%u\n",
-						(unsigned)key, (unsigned)idx, (unsigned)steps.size(), (unsigned)booked,
-						(int)TileX(steps[last].tile), (int)TileY(steps[last].tile),
-						(int)hit_choice, (unsigned)_r3r_answer_hit_count[key]);
-				fclose(dbg);
-			}
-		}
 		return true;
 	}
 
@@ -1755,21 +1416,6 @@ public:
 		static bool r3r_pfx_geo_dumped = false;
 		if (probe_geo && !r3r_pfx_geo_dumped) {
 			r3r_pfx_geo_dumped = true;
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				for (uint x = 1436; x <= 1444; x++) {
-					const TileIndex t = TileXY(x, 1874);
-					const bool rail = IsTileType(t, TileType::Railway);
-					const uint rb = rail ? (uint)(uint8_t)GetRailTileType(t) : 0xFF;
-					const uint tb = rail ? (uint)(uint8_t)GetTrackBits(t) : 0;
-					const uint rs = rail ? (uint)(uint8_t)GetReservedTrackbits(t) : 0;
-					fprintf(dbg, "PFX-GEO t=%u,1874 rail=%d rtype=%u tb=0x%x tdb=0x%x res=0x%x stn=%d\n",
-							x, (int)rail, rb, tb,
-							(unsigned)GetTileTrackdirBits(t, ::TransportType::Rail, 0),
-							rs, (int)IsRailStationTile(t));
-				}
-				fclose(dbg);
-			}
 		}
 		const bool pfx_ok = F.Follow(old_node.GetLastTile(), old_node.GetLastTrackdir());
 		if (probe) {
@@ -1777,16 +1423,6 @@ public:
 			const uint px = TileX(kt) - 1436;
 			if (px < 16 && r3r_pfx_seen[px] < 3) {
 				++r3r_pfx_seen[px];
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "PFX-%s from=%d,%d last=%d,%d td=%d err=%d exitdir=%d new=%d,%d nbits=0x%x skip=%d stn=%d cost=%d est=%d\n",
-							pfx_ok ? "OK" : "FAIL", (int)TileX(kt), (int)TileY(kt), (int)TileX(ot), (int)TileY(ot),
-							(int)(uint8_t)old_node.GetLastTrackdir(), (int)(uint8_t)F.err, (int)(uint8_t)F.exitdir,
-							(int)TileX(F.new_tile), (int)TileY(F.new_tile),
-							(unsigned)F.new_td_bits, F.tiles_skipped, (int)F.is_station,
-							old_node.GetCost(), old_node.GetCostEstimate());
-					fclose(dbg);
-				}
 			}
 		}
 		if (pfx_ok) {
@@ -1813,48 +1449,7 @@ public:
 		/* R3R (KI-207): this is the GOTO_COUPLE pathfinder -- it books the route the
 		 * loco drives to the waiting consist. Name it for the reservation trace. */
 		R3RResvPhaseGuard r3r_phase("yapf-couple", R3RResvActorID(v));
-		/* R3R (第 236 轮, KI-344): 清零本次扫描的 census，结束时由 CPL-SCAN 无条件回放。 */
-		R3RCoupleScanReset();
 		PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-ORIGIN veh=%d origin=%d,%d td=%d vehDir=%d vehTd=%d dontReserve=%d\n",
-						(int)v->index.base(), (int)TileX(origin.tile), (int)TileY(origin.tile),
-						(int)origin.trackdir, (int)v->direction, (int)v->GetVehicleTrackdir(), (int)dont_reserve);
-				fclose(dbg);
-			}
-		}
-		/* R3R（第 330 轮取证，只读，KI-446）：起点格到底能往哪些方向走。
-		 *
-		 * 27-G 断言"YAPF 起点只用单一 trackdir、起点格不能换轨"，这需要先证明
-		 * 起点格的其它出口在地图上确实存在、且通向哪里。这里只 Follow 一步，
-		 * 不预订、不改列车状态。注意 tdb 打的是 GetTileTrackdirBits 原值
-		 * （REACH 里的 bits= 经 TrackdirBitsToTrackBits 压缩过，正是 REG-330-B
-		 * 里 16,14 显示 bits=0x1 与 CPL-TRACE tdb=0x101 对不上的来源）。 */
-		{
-			const TrackdirBits r3r_ob = GetTileTrackdirBits(v->tile, ::TransportType::Rail, 0);
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-ORIGIN-TD veh=%d tile=%d,%d tdb=0x%x tbits=0x%x\n",
-						(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-						(unsigned)r3r_ob, (unsigned)TrackdirBitsToTrackBits(r3r_ob));
-				fclose(dbg);
-			}
-			for (TrackdirBits tb = r3r_ob; tb != TRACKDIR_BIT_NONE; tb = KillFirstBit(tb)) {
-				const Trackdir d = (Trackdir)FindFirstBit(tb);
-				TrackFollower fx(v, Yapf().GetCompatibleRailTypes());
-				const bool ok = fx.Follow(v->tile, d);
-				dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-ORIGIN-FOLLOW veh=%d td=%d trk=%d ok=%d nt=%d,%d nbits=0x%x st=%d skip=%d\n",
-							(int)v->index.base(), (int)d, (int)TrackdirToTrack(d), (int)ok,
-							ok ? (int)TileX(fx.new_tile) : -1, ok ? (int)TileY(fx.new_tile) : -1,
-							(unsigned)fx.new_td_bits, (int)fx.is_station, (int)fx.tiles_skipped);
-					fclose(dbg);
-				}
-			}
-		}
 		/* Set origin and destination. */
 		Yapf().SetOrigin(origin.tile, origin.trackdir);
 
@@ -1875,20 +1470,7 @@ public:
 
 		Yapf().SetDestination(v);
 
-		bool path_found = Yapf().FindPath(v);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-PATHFOUND veh=%d found=%d\n", (int)v->index.base(), (int)path_found);
-				fclose(dbg);
-			}
-		}
-		/* R3R (第 236 轮, KI-344): 无条件清点回放 —— 这是回答"found=0 到底是等待链
-		 * 不在场还是被闸门拒掉"的唯一出口，与 CPL-PATHFOUND 同频（每次寻路一行）。 */
-		/* R3R (第 255 轮, P0): nodes = closed + enter，即本次搜索真正走过的节点数。 */
-		R3RCoupleScanDump((int)v->index.base(), path_found ? 1 : 0,
-				(uint)Yapf().nodes.ClosedCount(), (uint)Yapf().GetMaxSearchNodes(),
-				(uint)(Yapf().nodes.ClosedCount() + _r3r_cpl_scan_enter), (uint32_t)_tick_counter);
+		const bool path_found = Yapf().FindPath(v);
 		if (!path_found) return INVALID_TRACKDIR;
 
 		/* Found a destination, set as reservation target. */
@@ -1938,22 +1520,6 @@ public:
 				consist_head_tile = r3r_snap_far;
 			} else {
 				consist_head_tile = r3r_snap_tile;
-			}
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-HEAD-STATIC veh=%d best=%d,%d snap=%d,%d meetvalid=%d meet=%d,%d farvalid=%d head=%d,%d on=%d\n",
-							(int)v->index.base(),
-							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
-							(int)TileX(r3r_snap_tile), (int)TileY(r3r_snap_tile),
-							(int)(r3r_meet != INVALID_TILE),
-							(int)((r3r_meet != INVALID_TILE) ? TileX(r3r_meet) : 0),
-							(int)((r3r_meet != INVALID_TILE) ? TileY(r3r_meet) : 0),
-							(int)(r3r_snap_far != INVALID_TILE),
-							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile),
-							(int)best_on_consist);
-					fclose(dbg);
-				}
 			}
 		} else if (pNode != nullptr && IsRailStationTile(pNode->GetLastTile())) {
 			/* R3R (第 276 轮续, KI-432): 绝不能把"自己"认成等待车底。
@@ -2007,27 +1573,8 @@ public:
 					consist_head_tile = h->tile;
 				}
 			}
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-HEAD best=%d,%d head=%d,%d on=%d\n",
-							(int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
-							(int)TileX(consist_head_tile), (int)TileY(consist_head_tile),
-							(int)best_on_consist);
-					fclose(dbg);
-				}
-			}
 		}
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-BEST veh=%d tile=%d,%d td=%d cost=%d\n",
-						(int)v->index.base(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
-						(int)pNode->GetLastTrackdir(), (int)pNode->cost);
-				fclose(dbg);
-			}
-			}
-			if (pNode->parent == nullptr) {
+		if (pNode->parent == nullptr) {
 			/* R3R: zero-length couple path - the best node is the origin itself
 			 * (the locomotive already shares a tile with the waiting consist's
 			 * coupling end). There is no path segment to walk back or reserve;
@@ -2035,8 +1582,8 @@ public:
 			 * collision/couple handlers perform the physical join. Without this
 			 * guard pPrev stays nullptr and the walk-back below dereferences it. */
 			return INVALID_TRACKDIR;
-			}
-			/* R3R: reserve up to the consist's head car (the coupling point) instead of
+		}
+		/* R3R: reserve up to the consist's head car (the coupling point) instead of
 		 * the far end of the platform - reserving the far end routes the loco through
 		 * the consist and extends the reservation past the platform. */
 		const TileIndex res_target_tile = (consist_head_tile != INVALID_TILE) ? consist_head_tile : pNode->GetLastTile();
@@ -2102,13 +1649,6 @@ public:
 			pNode = pNode->parent;
 			++r3r_hops;
 
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-BACK pPrev=%d,%d td=%d parent=%d,%d ptd=%d\n", (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()), (int)pPrev->GetLastTrackdir(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()), (int)pNode->GetLastTrackdir());
-					fclose(dbg);
-				}
-			}
 			if (!r3r_goal_passed) {
 				/* 比行驶终点更深的节点（车底内部/站台另一侧）：不判、也不截断。 */
 				if (pPrev != r3r_goal_node) continue;
@@ -2117,19 +1657,6 @@ public:
 			/* 终点所在节点只判到会合点为止：会合点之后是车底自己的位置，与本次行驶无关。 */
 			TileIndex r3r_fail_tile = INVALID_TILE;
 			if (!this->CheckSafePositionOnNodeTo(pPrev, r3r_drive_end, &r3r_fail_tile)) {
-				{
-					FILE *dbg = R3RFopenDbg("a");
-					if (dbg != nullptr) {
-						/* R3R (第 525 轮续, KI-691)：老写法只打节点的 last tile（可能是整段站台跳格的
-						 * 远端，现场 1424），读起来像"判据在 1424 失败"，其实失败格是 segment 内的
-						 * 另一格。at= 是真正失败的那一格，node= 是节点的末格。 */
-						fprintf(dbg, "CPL-SAFE-FAIL veh=%d tile=%d,%d at=%d,%d\n",
-								(int)v->index.base(), (int)TileX(pPrev->GetLastTile()), (int)TileY(pPrev->GetLastTile()),
-								r3r_fail_tile != INVALID_TILE ? (int)TileX(r3r_fail_tile) : -1,
-								r3r_fail_tile != INVALID_TILE ? (int)TileY(r3r_fail_tile) : -1);
-						fclose(dbg);
-					}
-				}
 				/* R3R (第 525 轮, KI-690, 修法 2): 记下"这一段的上一格"作为截断位，继续回溯。
 				 * 回溯顺序是 目标→起点，所以更靠起点的失败会覆盖成更近的截断位 ——
 				 * 最终得到的就是"从起点往前走能走到的最后一格已验证位"。
@@ -2150,11 +1677,7 @@ public:
 			_r3r_couple_path_blocked = true;
 			return INVALID_TRACKDIR;
 		}
-		if (r3r_truncated) {
-			R3RDbgWrite("CPL-SAFE-TRUNC veh=%d from=%d,%d tile=%d,%d hops=%u\n",
-					(int)v->index.base(), (int)TileX(pNode->GetLastTile()), (int)TileY(pNode->GetLastTile()),
-					(int)TileX(r3r_trunc_tile), (int)TileY(r3r_trunc_tile), (unsigned)r3r_hops);
-		}
+		
 
 		next_trackdir = pPrev->GetTrackdir();
 	if (pNode->parent == nullptr && pPrev != nullptr) {
@@ -2177,13 +1700,7 @@ public:
 		 * 采纳 YAPF 首步时取首步格 —— 后者才是 new_tile。 */
 		TileIndex best_start = st;
 		std::function<bool(TileIndex, Trackdir, int)> reach = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
-			if (depth <= 15) {
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "REACH cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::Rail, 0)));
-					fclose(dbg);
-				}
-			}
+			
 			if (depth > 512) return false;
 			if (cur == tg) return true;
 			/* R3R: never route the couple loco through a depot - but allow the
@@ -2221,13 +1738,6 @@ public:
 		};
 		TrackdirBits tdb;
 		tdb = GetTileTrackdirBits(st, ::TransportType::Rail, 0);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-TRACE st=%d,%d tdb=0x%x\n", (int)TileX(st), (int)TileY(st), (unsigned)tdb);
-				fclose(dbg);
-			}
-		}
 
 		/* R3R (第 332/333 轮, KI-446 续): ChooseTrainTrack 要的是 new_tile 上的轨，
 		 * 也就是 YAPF 路径的**首步**。取首步必须按格配对 —— yapf_node_rail.hpp 的
@@ -2264,40 +1774,13 @@ public:
 				if (reach(st, td, 0)) { best_td = td; break; }
 			}
 		}
-		{
-			/* R3R (第 332 轮, 只读): 本次采纳的是 YAPF 首步还是贪婪扫描结果，
-			 * 以及该 trackdir 属于哪一格（应按 new_tile 解读）。 */
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-FIRST-TD st=%d,%d hops=%u yapf=%d at=%d,%d tdb=0x%x ok=%d best=%d start=%d,%d trk=%d\n",
-						(int)TileX(st), (int)TileY(st), (unsigned)r3r_hops,
-						(int)yapf_first_td, (int)TileX(first_tile), (int)TileY(first_tile),
-						(unsigned)first_tdb, yapf_first_ok ? 1 : 0, (int)best_td,
-						(int)TileX(best_start), (int)TileY(best_start),
-						(best_td == INVALID_TRACKDIR) ? -1 : (int)TrackdirToTrack(best_td));
-				fclose(dbg);
-			}
-		}
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CPL-TRACE-RESULT st=%d,%d best=%d\n", (int)TileX(st), (int)TileY(st), (int)best_td);
-				fclose(dbg);
-			}
-		}
 		if (best_td != INVALID_TRACKDIR) {
 			next_trackdir = best_td;
 			if (!dont_reserve) {
 				std::function<bool(TileIndex, Trackdir, int)> rp;
 				/* rp_impl = 原来的 rp() 本体；递归调用一律走 rp（带标记回滚的外壳）。 */
 				std::function<bool(TileIndex, Trackdir, int)> rp_impl = [&](TileIndex cur, Trackdir cur_td, int depth) -> bool {
-					if (depth <= 15) {
-						FILE *dbg = R3RFopenDbg("a");
-						if (dbg != nullptr) {
-							fprintf(dbg, "RP cur=%d,%d td=%d depth=%d trk=%d bits=0x%x\n", (int)TileX(cur), (int)TileY(cur), (int)cur_td, depth, (int)TrackdirToTrack(cur_td), (unsigned)TrackdirBitsToTrackBits(GetTileTrackdirBits(cur, ::TransportType::Rail, 0)));
-							fclose(dbg);
-						}
-					}
+					
 					/* R3R (KI-504, E1b): rp() is read-only - it deliberately books NOTHING.
 					 * Booking from inside the pathfinder turns the loco's own reservation
 					 * into its next obstacle: TrackFollower::CanEnterNewTile() removes every
@@ -2414,6 +1897,7 @@ public:
 			 * MarkTrainAsStuck）处置；绝不再出现 "reserved=1 而 nTry=0" 的空真。
 			 */
 			if (!r3r_resv_path.empty()) {
+				const PBSTileInfo origin = PBSTileInfo(v->tile, v->GetVehicleTrackdir(), false);
 				/* R3R (第 525 轮续, KI-692)：第一段预留必须铺到**机车脚下那一格**。
 				 *
 				 * 玩家 2026-11-27 原话：「veh15 的第一段预留应该到 1457,1874 截止，但它实际
@@ -2454,10 +1938,6 @@ public:
 						}
 					}
 					if (r3r_safe_len < r3r_resv_path.size()) {
-						R3RDbgWrite("CPL-SAFE-CUT veh=%d from=%u to=%u end=%d,%d\n",
-								(int)v->index.base(), (unsigned)r3r_resv_path.size(), (unsigned)r3r_safe_len,
-								r3r_safe_len > 0 ? (int)TileX(r3r_resv_path[r3r_safe_len - 1].first) : -1,
-								r3r_safe_len > 0 ? (int)TileY(r3r_resv_path[r3r_safe_len - 1].first) : -1);
 						r3r_resv_path.resize(r3r_safe_len);
 					}
 					if (r3r_resv_path.empty()) {
@@ -2487,14 +1967,6 @@ public:
 			reserved = this->TryReservePath(nullptr, pNode->GetLastTile(),
 					/*atomic*/ true, /*check_target_free*/ true, /*record_answer*/ false);
 		}
-			{
-				FILE *dbg = R3RFopenDbg("a");
-				if (dbg != nullptr) {
-					fprintf(dbg, "CPL-RESERVE veh=%d reserved=%d next=%d path=%d booked=%d\n",
-							(int)v->index.base(), (int)reserved, (int)next_trackdir, (int)r3r_resv_path.size(), (int)r3r_booked);
-							fclose(dbg);
-				}
-			}
 			return reserved ? next_trackdir : INVALID_TRACKDIR;
 		}
 
@@ -2697,15 +2169,6 @@ public:
 
 		/* find the best path */
 		path_found = Yapf().FindPath(v);
-		{
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CRT veh=%d order=%d dir=%d origin=%d,%d td=%d found=%d\n",
-						(int)v->index.base(), (int)v->current_order.GetType(), (int)v->direction,
-						(int)TileX(origin.tile), (int)TileY(origin.tile), (int)origin.trackdir, (int)path_found);
-				fclose(dbg);
-			}
-		}
 
 		/* if path not found - return INVALID_TRACKDIR */
 		Trackdir next_trackdir = INVALID_TRACKDIR;
@@ -2905,18 +2368,6 @@ bool YapfTrainCheckReverse(const Train *v)
 	 * trackdir, and log the state so the true source can be pinned down. */
 	if (unlikely(td == INVALID_TRACKDIR || td_back == INVALID_TRACKDIR ||
 			moving_front->track == TRACK_BIT_NONE || moving_back->track == TRACK_BIT_NONE)) {
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "CRT-NOTD veh=%d db=%d front(idx=%d tile=%d,%d trk=0x%X dir=%d crashed=%d td=%d) back(idx=%d tile=%d,%d trk=0x%X dir=%d crashed=%d td=%d)\n",
-					(int)v->index.base(), (int)v->vehicle_flags.Test(VehicleFlag::DrivingBackwards),
-					(int)moving_front->index.base(), (int)TileX(moving_front->tile), (int)TileY(moving_front->tile),
-					(uint)moving_front->track, (int)moving_front->direction,
-					(int)moving_front->vehstatus.Test(VehState::Crashed), (int)td,
-					(int)moving_back->index.base(), (int)TileX(moving_back->tile), (int)TileY(moving_back->tile),
-					(uint)moving_back->track, (int)moving_back->direction,
-					(int)moving_back->vehstatus.Test(VehState::Crashed), (int)td_back);
-			fclose(dbg);
-		}
 		return false;
 	}
 
@@ -2969,14 +2420,6 @@ bool YapfTrainCheckReverse(const Train *v)
 		const int rel_x = TileX(tile_rev) - TileX(tile);
 		const int rel_y = TileY(tile_rev) - TileY(tile);
 		if (rel_x * delta.x + rel_y * delta.y > 0) {
-			FILE *dbg = R3RFopenDbg("a");
-			if (dbg != nullptr) {
-				fprintf(dbg, "CRT-FOLD veh=%d tile=%d,%d dir=%d backTile=%d,%d rel=%d,%d dot=%d\n",
-						(int)v->index.base(), (int)TileX(tile), (int)TileY(tile), (int)front_dir,
-						(int)TileX(tile_rev), (int)TileY(tile_rev), rel_x, rel_y,
-						rel_x * delta.x + rel_y * delta.y);
-				fclose(dbg);
-			}
 			return false;
 		}
 	}
@@ -3097,11 +2540,6 @@ bool YapfTrainFindNearestSafeTile(const Train *v, TileIndex tile, Trackdir td, b
 struct R3RCoupleScanState {
 	uint64_t empty_tick = 0; ///< Tick of the last search that came back empty.
 	bool holding = false;    ///< Whether the retry throttle is currently armed.
-	bool logged = false;     ///< Whether the skipped-call probe was already written for this episode.
-	/** R3R (第 272 轮, C-6): which of the four destination gates (GROUP/FIT/TARGET/ORDER)
-	 * rejected at least one candidate during the last real search. Zero means "nothing was
-	 * rejected", i.e. the empty result came from an empty reachable area instead. */
-	uint32_t last_rej_mask = 0;
 };
 
 static std::map<int, R3RCoupleScanState> _r3r_couple_scan_state;
@@ -3134,20 +2572,6 @@ static uint R3RCoupleScanHold(const Train *v, bool dont_reserve)
 	if (age >= (uint64_t)R3R_COUPLE_SCAN_RETRY) {
 		st.holding = false;
 		return 0;
-	}
-	if (!st.logged) {
-		/* R3R probe: the full search was skipped by the throttle above. Logged
-		 * once per throttle episode so a waiting locomotive does not flood the
-		 * log it is supposed to stop flooding. */
-		st.logged = true;
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "CPL-SKIP veh=%d tile=%d,%d orderType=%d dontReserve=%d retryIn=%u holdAge=%u\n",
-					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-					(int)v->current_order.GetType(), (int)dont_reserve,
-					(uint)(R3R_COUPLE_SCAN_RETRY - age), (uint)age);
-			fclose(dbg);
-		}
 	}
 	return (uint)(R3R_COUPLE_SCAN_RETRY - age);
 }
@@ -3190,33 +2614,10 @@ static void R3RCoupleScanResult(const Train *v, bool found)
 	R3RCoupleScanState &st = _r3r_couple_scan_state[(int)v->index.base()];
 	if (found) {
 		st.holding = false;
-		st.last_rej_mask = 0;
 	} else {
 		st.holding = true;
 		st.empty_tick = (uint64_t)_tick_counter;
-		st.logged = false;
-		/* R3R (第 272 轮, C-6): the destination gates counted rejections during this
-		 * very search (R3RCoupleScanReset() clears them just before it starts), so an
-		 * empty result with a non-zero mask means candidates *were* seen and refused,
-		 * as opposed to "there is simply no consist within reach". */
-		st.last_rej_mask = 0;
-		for (uint i = 0; i < 4; i++) {
-			if (_r3r_cpl_scan_rej[i] != 0) st.last_rej_mask |= (1U << i);
-		}
 	}
-}
-
-/**
- * R3R (第 272 轮, C-6): how the destination gates rejected candidates in the last
- * real (non-throttled) couple search of @p v.
- * @param v The locomotive whose last search is in question (nullptr safe).
- * @return Bit mask, bit 0 = GROUP, 1 = FIT, 2 = TARGET, 3 = ORDER; 0 = nothing rejected.
- */
-uint32_t R3RCoupleSearchRejectMask(const Train *v)
-{
-	if (v == nullptr) return 0;
-	const auto it = _r3r_couple_scan_state.find((int)v->index.base());
-	return (it != _r3r_couple_scan_state.end()) ? it->second.last_rej_mask : 0;
 }
 
 /**
@@ -3237,15 +2638,6 @@ Track YapfTrainCoupleTrack(const Train *v, bool dont_reserve)
 	/* A real search ran this tick, so any stale "was skipped" stamp is gone. */
 	_r3r_couple_skipped_tick.erase((int)v->index.base());
 
-	{
-		FILE *dbg = R3RFopenDbg("a");
-		if (dbg != nullptr) {
-			fprintf(dbg, "CPL-ENTRY veh=%d tile=%d,%d orderType=%d dontReserve=%d\n",
-					(int)v->index.base(), (int)TileX(v->tile), (int)TileY(v->tile),
-					(int)v->current_order.GetType(), (int)dont_reserve);
-			fclose(dbg);
-		}
-	}
 	Trackdir ret = _settings_game.pf.forbid_90_deg
 		? CYapfCoupleRailNo90::stFindNearestCoupleTrain(v, dont_reserve)
 		: CYapfCoupleRail::stFindNearestCoupleTrain(v, dont_reserve);

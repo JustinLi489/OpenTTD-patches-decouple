@@ -40,7 +40,6 @@
 #include "couple_group.h"
 #include "couple_group_gui.h"
 #include "tbtr_template_vehicle_cmd.h"
-#include "r3r_perf.h"
 
 #include "widgets/depot_widget.h"
 
@@ -302,10 +301,6 @@ static bool TrainDepotRefuseSegLooseMix(const Vehicle *sel, const Vehicle *wagon
 	const bool drag_loose = TrainDepotSideIsLoose(drag_chain);
 	const bool dst_loose = TrainDepotSideIsLoose(dst_chain);
 	if (!drag_loose && !dst_loose) return false;
-
-	R3RDbgWrite("DEPOT-SEG-MIX-SKIP sel=%d dst=%d dragSeg=%d dstSeg=%d dragLoose=%d dstLoose=%d\n",
-			(int)v->index.base(), (int)dst_chain->index.base(), drag_is_segment ? 1 : 0,
-			dst_is_segment ? 1 : 0, drag_loose ? 1 : 0, dst_loose ? 1 : 0);
 	return true;
 }
 
@@ -405,10 +400,6 @@ static void TrainDepotRankDropTargetFirst(Train *target, Train *active)
 		t->r3r_priority = (uint16_t)(t->r3r_priority + shift);
 		if (t->r3r_priority < active_min) active_min = t->r3r_priority;
 	}
-
-	R3RDbgWrite("DEPOT-BEFORE-HEAD-RANK head=%d tmax=%u amin=%u\n",
-			(target != nullptr) ? (int)target->index.base() : -1,
-			(unsigned)target_max, (unsigned)active_min);
 }
 
 /**
@@ -451,8 +442,6 @@ static void TrainDepotMoveBeforeHead(VehicleID sel, const Vehicle *head)
 	/* The merged chain would start with the head of the block's chain; if that is
 	 * a wagon it is not a valid (drivable) head. */
 	if (!block->First()->IsEngine()) {
-		R3RDbgWrite("DEPOT-BEFORE-HEAD-SKIP sel=%d head=%d block=%d reason=chain-head-not-engine\n",
-				(int)sel.base(), (int)dst_head->index.base(), (int)block->index.base());
 		return;
 	}
 
@@ -464,9 +453,6 @@ static void TrainDepotMoveBeforeHead(VehicleID sel, const Vehicle *head)
 	 * own depot edit renumbers the priorities of the chains it touches. */
 	TrainDepotRankDropTargetFirst(Train::From(Vehicle::Get(dst_head->index)),
 			Train::From(Vehicle::Get(block->First()->index)));
-
-	R3RDbgWrite("DEPOT-BEFORE-HEAD sel=%d head=%d block=%d tail=%d\n",
-			(int)sel.base(), (int)dst_head->index.base(), (int)block->index.base(), (int)block_tail->index.base());
 
 	/* Move the whole target chain behind the dragged block. */
 	Command<Commands::MoveRailVehicle>::Post(STR_ERROR_CAN_T_MOVE_VEHICLE, block->tile,
@@ -492,7 +478,6 @@ static void TrainDepotMoveVehicle(const Vehicle *wagon, VehicleID sel, const Veh
 		 * The segment must not be spliced open from the outside either, so the
 		 * player gets the same answer as when the drop position does not exist. */
 		if (TrainDepotDropSplitsSegment(wagon)) {
-			R3RDbgWrite("DEPOT-INSEG-SKIP sel=%d before=%d\n", (int)sel.base(), (int)wagon->index.base());
 			return;
 		}
 		/* R3R: the vehicle the drag was dropped on is the head of its chain --
@@ -858,10 +843,6 @@ struct DepotWindow : Window {
 			static int r3r_degenerate_logged = 0;
 			if (r3r_degenerate_logged < 16) {
 				r3r_degenerate_logged++;
-				R3RDbgWrite("GUI-DEGEN-RECT depot type=%d cell=%d,%d,%d,%d image=%d,%d,%d,%d tag=%u header=%u count=%u cols=%u\n",
-						(int)this->type, r.left, r.top, r.right, r.bottom,
-						image.left, image.top, image.right, image.bottom,
-						(unsigned int)this->tag_width, (unsigned int)this->header_width, (unsigned int)this->count_width, (unsigned int)this->num_columns);
 			}
 		}
 

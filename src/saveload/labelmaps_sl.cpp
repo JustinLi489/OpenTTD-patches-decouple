@@ -16,7 +16,6 @@
 #include "../road.h"
 #include "../newgrf_railtype.h"
 #include "../newgrf_roadtype.h"
-#include "../r3r_perf.h"
 
 #include "../safeguards.h"
 
@@ -74,7 +73,7 @@ struct RAILChunkHandler : ChunkHandler {
 			_railtype_list.push_back(lo);
 		}
 
-		if (R3RDbgOn()) R3RDbgWrite("R3R-LABEL-REV kind=rail n=%u legacy=%d ver=%u\n", reversed, legacy_label_order ? 1 : 0, (uint)_sl_version);
+		
 	}
 };
 
@@ -120,7 +119,7 @@ struct ROTTChunkHandler : ChunkHandler {
 			_roadtype_list.push_back(lo);
 		}
 
-		if (R3RDbgOn()) R3RDbgWrite("R3R-LABEL-REV kind=road n=%u legacy=%d ver=%u\n", reversed, legacy_label_order ? 1 : 0, (uint)_sl_version);
+		
 	}
 };
 

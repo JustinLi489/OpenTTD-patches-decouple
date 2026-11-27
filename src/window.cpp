@@ -8,7 +8,6 @@
 /** @file window.cpp Windowing system, widgets and events. */
 
 #include "stdafx.h"
-#include "r3r_perf.h"
 #include "company_func.h"
 #include "gfx_func.h"
 #include "console_func.h"
@@ -3424,7 +3423,7 @@ void UpdateWindows()
 
 	/* R3R perf probe (KI-14): once per rendered frame, dumps an aggregate line
 	 * to R3R_perf.log every 128 frames. */
-	R3RPerfFrameTick(delta_ms);
+	
 
 	ProcessPendingPerformanceMeasurements();
 

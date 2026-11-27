@@ -13,7 +13,6 @@
 #include "company_func.h"
 #include "couple_group.h"
 #include "string_func.h"
-#include "r3r_perf.h"
 #include "train.h"
 #include "window_func.h"
 
@@ -148,10 +147,7 @@ CommandCost CmdDeleteCoupleGroup(DoCommandFlags flags, CoupleGroupID group)
 
 		for (const CoupleGroupID id : doomed) R3RUnassignCoupleGroup(id);
 		for (const CoupleGroupID id : doomed) delete CoupleGroup::GetIfValid(id);
-		const uint removed = (uint)doomed.size();
-		if (removed > 1) {
-			R3RDbgWrite("CGRP-DELETE-STREE root=%u groups=%u\n", (unsigned)group.base(), removed);
-		}
+		
 
 		/* R3R (KI-56): deliberately no CloseWindowById(WindowClass::CoupleGroup, ...)
 		 * here.  The couple group window is a single window registered with
@@ -226,10 +222,7 @@ CommandCost CmdSetCoupleGroup(DoCommandFlags flags, VehicleID vehicle, CoupleGro
 	if (flags.Test(DoCommandFlag::Execute)) {
 		/* D6-③: a segment joining the group of another company is the event
 		 * which makes the cross-company opt-in reachable at all, so log it. */
-		if (cg->owner != t->owner) {
-			R3RDbgWrite("[R3R] CG-JOIN-foreign veh=%u car_owner=%u group_owner=%u group=%u\n",
-					vehicle.base(), t->owner.base(), cg->owner.base(), group.base());
-		}
+		
 		R3RAddCoupleGroupToSegment(t, group);
 
 		SetWindowDirty(WindowClass::VehicleView, vehicle.base());
@@ -266,9 +259,7 @@ CommandCost CmdSetCoupleGroupAllowOthers(DoCommandFlags flags, CoupleGroupID gro
 	if (!R3RCoupleGroupIsManageable(cg, _current_company)) return CMD_ERROR;
 
 	if (flags.Test(DoCommandFlag::Execute)) {
-		const uint evicted = R3RSetCoupleGroupAllowOthers(group, allow_others);
-		R3RDbgWrite("[R3R] CG-OPEN group=%u allow_others=%u evicted=%u\n",
-				group.base(), allow_others ? 1 : 0, evicted);
+		R3RSetCoupleGroupAllowOthers(group, allow_others);
 		InvalidateWindowClassesData(WindowClass::CoupleGroup, 0);
 	}
 	return CommandCost();

@@ -50,11 +50,6 @@
 #include "../newgrf_railtype.h"
 #include "../newgrf_roadtype.h"
 #include "../3rdparty/cpp-ring-buffer/ring_buffer.hpp"
-/* R3R (release audit 2026-09-19): the R3R_slref.log probes in this file used a
- * plain fopen(), so they survived into a release build and littered the game
- * directory. Route them through R3RFopenDbg(), which is a null-returning inline
- * when R3R_PROBES=0 and therefore removes the call and its format string. */
-#include "../r3r_perf.h"
 #include "../timer/timer_game_tick.h"
 #include "../session_stats.h"
 #include <atomic>
@@ -499,14 +494,6 @@ struct ThreadSlErrorException {
  */
 [[noreturn]] void SlError(StringID string, std::string extra_msg)
 {
-	{
-		FILE *r3rf = R3RFopenDbg("a");
-		if (r3rf != nullptr) {
-			fprintf(r3rf, "SLERROR action=%d stringid=%u chunk=%u arr=%d msg=%s\n",
-					(int)_sl.action, (unsigned)string.base(), (unsigned)_sl.current_chunk_id, _sl.array_index, extra_msg.c_str());
-			fclose(r3rf);
-		}
-	}
 
 	if (IsNonMainThread() && IsNonGameThread() && _sl.action != SaveLoadAction::Save) {
 		throw ThreadSlErrorException{ string, std::move(extra_msg) };

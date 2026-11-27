@@ -18,7 +18,6 @@
 #include "train_speed_adaptation.h"
 #include "bridge_signal_map.h"
 #include "date_func.h"
-#include "r3r_perf.h"
 #include "train.h"
 #include "couple_group.h"
 #include "sl/saveload.h"
@@ -31,86 +30,21 @@
 #include "safeguards.h"
 
 /*
- * R3R (KI-207, 2026-09-25): reservation-origin tracing for ghost reservations.
+ * R3R (KI-207, 2026-09-25): reservation-origin context for ghost reservations.
  *
- * Both directions of every reservation change to a *watched* tile are logged with
- * the phase the game was in at that moment (see R3RResvPhaseGuard in pbs.h).
- *
- * The writes are reported by the six map-accessor setters that own the reservation
- * bits (see r3r_resv_probes.h), not by the call sites: that makes the trace complete
- * by construction, including paths nobody thought of (load-time clearing, depot
- * sell, track removal, tile conversion, ...).
- *
- * The watch list is loaded once, lazily:
- *   - the tiles the player reported as ghosts are compiled in as defaults, so a
- *     plain rebuild is already a usable trap;
- *   - "r3r_resv_watch.txt" in the game working directory (next to R3R_debug.log)
- *     adds more tiles without a rebuild: one "x y" per line, '#' comments out.
- *
- * R3R (KI-359, 2026-10-11): as of this revision the phase/actor context and the
- * hook itself are built unconditionally, because the *ledger* below is a real fix
- * and not a probe -- it is fed from the same hook. Only the watched-tile logging
- * stays behind R3R_PROBES.
+ * The phase names the code path a reservation change was made under (see
+ * R3RResvPhaseGuard in pbs.h) and the actor names the train that made it. The
+ * arbitration logic below uses the actor to decide ownership of a contended
+ * tile, so both are part of the game state, not diagnostics.
  */
 const char *r3r_resv_phase = "misc";
 
 /* R3R (KI-207): the train that is doing the reserving right now, if the caller knows
- * it (see R3RResvPhaseGuard). Logged together with the phase so a watched tile names
- * both the code path *and* the vehicle that booked it. Held as an ID, not a pointer:
- * this is reached from inside the map setters, where a raw pointer could name a train
- * that has already been deleted. */
+ * it (see R3RResvPhaseGuard). Held as an ID, not a pointer: this is read from deep
+ * inside the reservation code, where a raw pointer could name a train that has
+ * already been deleted. */
 VehicleID r3r_resv_actor = VehicleID::Invalid();
 
-#if R3R_PROBES
-static const std::vector<TileIndex> &R3RWatchedResvTiles()
-{
-	static const std::vector<TileIndex> tiles = []() {
-		std::vector<TileIndex> v;
-		/* Reported by the player (KI-205 "60,16" / KI-207 "57,49"). */
-		v.push_back(TileXY(60, 16));
-		v.push_back(TileXY(57, 49));
-		FILE *f = fopen("r3r_resv_watch.txt", "r");
-		if (f != nullptr) {
-			char line[128];
-			while (fgets(line, sizeof(line), f) != nullptr) {
-				for (char *p = line; *p != '\0'; p++) {
-					if (*p == '#' || *p == '\r' || *p == '\n') { *p = '\0'; break; }
-				}
-				int x = -1, y = -1;
-				if (sscanf(line, "%d %d", &x, &y) == 2 && x >= 0 && y >= 0 && x < (int)Map::SizeX() && y < (int)Map::SizeY()) {
-					v.push_back(TileXY(x, y));
-				}
-			}
-			fclose(f);
-		}
-		return v;
-	}();
-	return tiles;
-}
-
-/** R3R (KI-684, 第 517 轮, 2026-11-26, REG-517-B): the overrun band the player
- * reported. The platform's lo end is 1424,1874 and the ghost bits showed up on
- * 1423..1419, on both of the two parallel lines. Watched tiles take the direct
- * branch in R3RResvWatchLog(), so they are never folded into the per-(kind, phase)
- * aggregation -- which is the only way to learn *who* writes there (memo §28.8).
- * Expressed as a rectangle instead of ten list entries so the hot path stays one
- * arithmetic test per call. */
-static inline bool R3RIsOverrunBandTile(TileIndex tile)
-{
-	const int x = (int)TileX(tile);
-	const int y = (int)TileY(tile);
-	return x >= 1419 && x <= 1423 && (y == 1873 || y == 1874);
-}
-
-bool R3RIsWatchedResvTile(TileIndex tile)
-{
-	if (R3RIsOverrunBandTile(tile)) return true;
-	for (TileIndex t : R3RWatchedResvTiles()) {
-		if (t == tile) return true;
-	}
-	return false;
-}
-#endif /* R3R_PROBES */
 
 /** strcmp() == 0 without pulling in a header for it. */
 static inline bool R3RResvPhaseIs(const char *a, const char *b)
@@ -146,18 +80,14 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 	if (IsValidTile(tile) && GetTileType(tile) == TileType::Station && HasStationRail(tile)) {
 		if (!HasStationReservation(tile)) {
 			/* The whole-tile bit is gone: nothing to free, and the row is stale. */
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s-gone\n",
-					key, (int)TileX(tile), (int)TileY(tile),
-					IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
+			
 			return true;
 		}
 		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr ||
 				GetTrainForWholeTileReservation(tile) != nullptr) {
 			/* Still held by a train that stands there (or by a path whose far end is
 			 * somebody): the bit is doing its job, keep it booked. */
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s-hold\n",
-					key, (int)TileX(tile), (int)TileY(tile),
-					IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
+			
 			return false;
 		}
 		const TrackBits rail_bits = GetStationReservationTrackBits(tile);
@@ -165,9 +95,6 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 			R3RResvPhaseGuard phase_guard("gc-stn");
 			UnreserveRailTrack(tile, FindFirstTrack(rail_bits));
 		}
-		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=stn kind=%s why=%s\n",
-				key, (int)TileX(tile), (int)TileY(tile),
-				IsRailWaypointTile(tile) ? "WAYPOINT" : "STATION", why);
 		return true;
 	}
 
@@ -180,18 +107,13 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 			GetTunnelBridgeTransportType(tile) == TransportType::Rail) {
 		const TrackBits bits = GetTunnelBridgeReservationTrackBits(tile);
 		if (bits == TRACK_BIT_NONE) {
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s-gone\n",
-					key, (int)TileX(tile), (int)TileY(tile),
-					IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
 			return true;
 		}
 		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr) {
 			/* A train inside a tunnel has the portal as its tile, a train on a bridge
 			 * has the bridge head/middle as its tile: either way the bit is still
 			 * doing its job, so keep it booked. */
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s-hold\n",
-					key, (int)TileX(tile), (int)TileY(tile),
-					IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
+			
 			return false;
 		}
 		/* A bridge head only accepts the tracks that really exist on it, and
@@ -200,22 +122,15 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 		const Track free_track = (track != INVALID_TRACK && HasBit(bits, track)) ? track : FindFirstTrack(bits);
 		R3RResvPhaseGuard phase_guard("gc-tb");
 		UnreserveRailTrack(tile, free_track);
-		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=tb kind=%s why=%s\n",
-				key, (int)TileX(tile), (int)TileY(tile),
-				IsTunnel(tile) ? "TUNNEL" : "BRIDGE", why);
 		return true;
 	}
 
 	/* R3R (KI-425): same story for level crossings (SetCrossingReservation). */
 	if (IsValidTile(tile) && GetTileType(tile) == TileType::Road && IsLevelCrossing(tile)) {
 		if (!HasCrossingReservation(tile)) {
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s-gone\n",
-					key, (int)TileX(tile), (int)TileY(tile), why);
 			return true;
 		}
 		if (GetFirstVehicleOnTile(tile, VehicleType::Train) != nullptr) {
-			R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s-hold\n",
-					key, (int)TileX(tile), (int)TileY(tile), why);
 			return false;
 		}
 		const TrackBits cr_bits = GetCrossingReservationTrackBits(tile);
@@ -224,8 +139,6 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 			R3RResvPhaseGuard cr_phase_guard("gc-cr");
 			UnreserveRailTrack(tile, free_track);
 		}
-		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=cr why=%s\n",
-				key, (int)TileX(tile), (int)TileY(tile), why);
 		return true;
 	}
 
@@ -234,118 +147,13 @@ bool R3RReleaseReservationChecked(uint32_t key, TileIndex tile, Track track, con
 			HasBit(GetRailReservationTrackBits(tile), track);
 	if (ours) {
 		UnreserveTrack(tile, track);
-		R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s\n",
-				key, (int)TileX(tile), (int)TileY(tile), (uint)track, why);
 		return true;
 	}
 	/* Not plain rail anymore, track lifted, or the bit is already gone: the bit
 	 * cannot exist here, so the row is stale either way. */
-	R3RDbgWrite("RESV-GC veh=%u tile=%d,%d track=0x%X why=%s-gone\n",
-			key, (int)TileX(tile), (int)TileY(tile), (uint)track, why);
+	
 	return true;
 }
-
-/**
- * Log one reservation state change on a watched tile, tagged with the phase and the
- * acting train. Pure diagnostics: the reservation ledger it used to feed is gone
- * (第 303 轮, 2026-10-25).
- *
- * "actor" is the vehicle the caller was working on (a locomotive booking its path,
- * a consist sitting on its platform, the release sweep, ...). "head" is that
- * vehicle's chain head at that instant -- the ownership question is always asked
- * about the head, so seeing actor != head is itself a finding: a chain edit moved
- * the identity between booking the bit and freeing it.
- *
- * Called from the six map-accessor setters (see r3r_resv_probes.h), i.e. from the
- * hottest path in the game, so everything here is compiled out with the probes off.
- * Note that the "CHG-*" kinds report just the first track of the new trackbits, so
- * a multi-track tile only shows one bit.
- */
-void R3RResvWatchLog(const char *kind, TileIndex tile, Track track)
-{
-#if R3R_PROBES
-	if (!R3RDbgOn()) return;
-	/* R3R (第 274 轮, 2026-10-22, memo §7.10): the gate used to be "watched tile
-	 * only", which left every *non-native* booking on an unwatched tile silent --
-	 * that is why the bridge-head bits at 220/223/226/230,235 could never be traced
-	 * to a code path (KI-415's other half). A non-native change is one made under a
-	 * named phase; the native engine runs with the default phase "misc". So: log the
-	 * watched tiles exactly as before, plus every non-native change anywhere.
-	 *
-	 * The second half of the line budget rule: an unwatched tile can be written many
-	 * times per tick by a retrying caller, so those are aggregated per (kind, phase)
-	 * with a first-occurrence line and a periodic summary (see the block below). */
-	const bool watched = R3RIsWatchedResvTile(tile);
-	if (!watched && R3RResvPhaseIs(r3r_resv_phase, "misc")) return;
-	int actor = -1;
-	int head = -1;
-	if (const Vehicle *v = Vehicle::GetIfValid(r3r_resv_actor); v != nullptr) {
-		actor = (int)v->index.base();
-		if (const Vehicle *h = v->First(); h != nullptr) head = (int)h->index.base();
-	}
-	if (watched) {
-		R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
-				kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
-		return;
-	}
-	/* R3R (第 274 轮续, 2026-10-22, KI-419②): the per-key form below this comment used
-	 * to print the first change of every (tile, track, kind, phase) key plus a 1/64
-	 * repeat line. The rate limiter itself worked -- the busiest tile had 5 lines --
-	 * but the *unit* was wrong: one route booking walks a thousand tiles, so a single
-	 * session produced 6578 lines spread over 1300+ tiles, 54% of the log, with no
-	 * single line worth reading. The unit that matters is not the tile but the code
-	 * path, so aggregate per (kind, phase) and carry the distinct-tile count in the
-	 * summary: one full line for the first event of a pair, then one RESV-WATCH-SUM
-	 * per R3R_WATCH_SUM events. "A retry loop hammering three tiles" and "one long
-	 * path over a thousand tiles" stay distinguishable because the summary reports
-	 * both n and tiles.
-	 * The key uses the literal addresses of kind/phase, which are string literals at
-	 * every call site, so they are stable for the process lifetime. */
-	static const uint32_t R3R_WATCH_SUM = 256;
-	static const size_t R3R_WATCH_SEEN_MAX = 8192;
-	struct R3RWatchAgg {
-		uint32_t n = 0;
-		uint32_t tiles = 0;
-		uint32_t capped = 0;
-		TileIndex last = INVALID_TILE;
-		int actor = -1;
-		int head = -1;
-	};
-	static std::unordered_map<uint64_t, R3RWatchAgg> unwatched_agg;
-	static std::unordered_map<uint64_t, uint32_t> unwatched_seen;
-	const uint64_t pair = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kind)) ^
-			(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r3r_resv_phase)) << 3);
-	R3RWatchAgg &agg = unwatched_agg[pair];
-	agg.n++;
-	agg.last = tile;
-	agg.actor = actor;
-	agg.head = head;
-	/* Mixed rather than shifted: a hash collision here only makes "tiles" an
-	 * undercount, so a cheap mixing function is enough. The set is capped so a very
-	 * long session cannot grow it without bound; past the cap the summary says
-	 * capped=1 instead of lying about the count. */
-	const uint64_t seen_key = pair * 0x9E3779B97F4A7C15ULL ^
-			(static_cast<uint64_t>(tile.base()) << 8) ^
-			static_cast<uint64_t>(static_cast<uint8_t>(track));
-	if (unwatched_seen.find(seen_key) == unwatched_seen.end()) {
-		if (unwatched_seen.size() < R3R_WATCH_SEEN_MAX) {
-			unwatched_seen.emplace(seen_key, 1);
-			agg.tiles++;
-		} else {
-			agg.capped = 1;
-		}
-	}
-	if (agg.n == 1) {
-		R3RDbgWrite("RESV-WATCH %s tile=%d,%d track=%u phase=%s actor=%d head=%d\n",
-				kind, (int)TileX(tile), (int)TileY(tile), (unsigned)track, r3r_resv_phase, actor, head);
-	} else if (agg.n % R3R_WATCH_SUM == 0) {
-		R3RDbgWrite("RESV-WATCH-SUM %s phase=%s n=%u tiles=%u capped=%u last=%d,%d actor=%d head=%d\n",
-				kind, r3r_resv_phase, agg.n, agg.tiles, agg.capped,
-				(int)TileX(agg.last), (int)TileY(agg.last), agg.actor, agg.head);
-	}
-#endif
-}
-
 
 /**
  * Get the reserved trackbits for any tile, regardless of type.
@@ -619,11 +427,6 @@ static bool R3RReservationHeldByCouplePartner(TileIndex tile)
  * @param trigger_stations whether to call station randomisation trigger
  * @return \c true if reservation was successful, i.e. the track was
  *     free and didn't cross any other reserved tracks.
- *
- * R3R (KI-207): every branch below only writes through the map-accessor setters,
- * which report the change themselves -- no probe here on purpose, so that the trace
- * cannot go blind on paths that bypass this function (ReadSavegame, tile conversion,
- * track removal, ...). See r3r_resv_probes.h.
  */
 bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 {
@@ -638,8 +441,7 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 					/* R3R (第 345 轮): the bits belong to our pair partner -- air for us.
 					 * Nothing is written: the partner keeps owning them and releases them
 					 * itself (the two chains are joined right after the couple). */
-					R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=rail\n",
-							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
+					
 					return true;
 				}
 				if (!changed && R3RReservationHeldBySelf(tile, track)) {
@@ -648,8 +450,7 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 					 * tile right in front of it), so it is air for the couple path as well.
 					 * Nothing is written: we already own the bit, and the driving reservation
 					 * stays responsible for releasing it. */
-					R3RDbgWrite("RESV-SELF-AIR veh=%u tile=%d,%d track=%u kind=rail\n",
-							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
+					
 					return true;
 				}
 				if (changed && _settings_client.gui.show_track_reservation) MarkTileGroundDirtyByTile(tile, VMDF_NOT_MAP_MODE);
@@ -689,8 +490,6 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 				 * nothing is written -- the partner keeps the bit and releases it once the
 				 * two chains are joined (R2/R3 deliberately deferred). */
 				if (R3RReservationHeldByCouplePartner(tile)) {
-					R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=crossing\n",
-							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
 					return true;
 				}
 			}
@@ -709,16 +508,10 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 			}
 			/* R3R (第 345 轮): the whole-tile bit is held by our pair partner. */
 			if (R3RReservationHeldByCouplePartner(tile)) {
-				R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=%s\n",
-						(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track,
-						IsRailWaypointTile(tile) ? "wpt" : "stn");
 				return true;
 			}
 			/* R3R (第 368 轮, REG-359-L): ... or by ourselves (see the plain rail branch). */
 			if (R3RReservationHeldBySelf(tile, track)) {
-				R3RDbgWrite("RESV-SELF-AIR veh=%u tile=%d,%d track=%u kind=%s\n",
-						(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track,
-						IsRailWaypointTile(tile) ? "wpt" : "stn");
 				return true;
 			}
 			break;
@@ -739,8 +532,6 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 				 * resolves tiles that carry a train, so a tunnel's interior tiles stay a
 				 * conflict and the couple path waits at the mouth (conservative). */
 				if (R3RReservationHeldByCouplePartner(tile)) {
-					R3RDbgWrite("RESV-PAIR-AIR veh=%u tile=%d,%d track=%u kind=tunnelbridge\n",
-							(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track);
 					return true;
 				}
 			}
@@ -816,78 +607,13 @@ int R3RReapOrphanReservationBits(TileIndex tile)
 			continue;
 		}
 		if ((uint32_t)(_tick_counter - r3r_orphan_it->second) < 2) continue;
-		const uint32_t r3r_orphan_age = (uint32_t)_tick_counter - r3r_orphan_it->second;
 		r3r_orphan_seen.erase(r3r_orphan_it);
-		R3RDbgWrite("RESV-ORPHAN-CLEAR tile=%d,%d track=%u reason=ownerless age=%u\n",
-				(int)TileX(tile), (int)TileY(tile), (uint)t, (unsigned)r3r_orphan_age);
 		UnreserveRailTrack(tile, t);
 		++cleared;
 	}
 	return cleared;
 }
 
-#if R3R_PROBES
-/**
- * R3R (第 243 轮 REG-243-M / 第 274 轮续 KI-419②): log one real release.
- *
- * Called from UnreserveRailTrack() before the map setter fires, so the line lands
- * directly in front of the setter's CLEAR-* line and the two can be read as one
- * event. Watched tiles keep one line per release -- that is the KI-207 ghost trace.
- * Everything else is aggregated per phase: the first release of a phase prints in
- * full, then one UNRES-SUM per R3R_UNRES_SUM releases, carrying the distinct-tile
- * count so "a retry loop on three tiles" and "one long path over a thousand tiles"
- * stay distinguishable.
- */
-static void R3RUnresWatchLog(TileIndex tile, Track t)
-{
-	if (!R3RDbgOn()) return;
-
-	if (R3RIsWatchedResvTile(tile)) {
-		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
-				(int)TileX(tile), (int)TileY(tile), (int)t,
-				r3r_resv_phase, (uint)r3r_resv_actor.base());
-		return;
-	}
-
-	static const uint32_t R3R_UNRES_SUM = 256;
-	static const size_t R3R_UNRES_SEEN_MAX = 8192;
-	struct R3RUnresAgg {
-		uint32_t n = 0;
-		uint32_t tiles = 0;
-		uint32_t capped = 0;
-		TileIndex last = INVALID_TILE;
-		uint32_t actor = 0;
-	};
-	static std::unordered_map<uint64_t, R3RUnresAgg> unres_agg;
-	static std::unordered_map<uint64_t, uint32_t> unres_seen;
-	/* Phase literals are stable for the process lifetime, so the pointer is a key. */
-	const uint64_t pair = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r3r_resv_phase));
-	R3RUnresAgg &agg = unres_agg[pair];
-	agg.n++;
-	agg.last = tile;
-	agg.actor = (uint32_t)r3r_resv_actor.base();
-	const uint64_t seen_key = pair * 0x9E3779B97F4A7C15ULL ^
-			(static_cast<uint64_t>(tile.base()) << 8) ^
-			static_cast<uint64_t>(static_cast<uint8_t>(t));
-	if (unres_seen.find(seen_key) == unres_seen.end()) {
-		if (unres_seen.size() < R3R_UNRES_SEEN_MAX) {
-			unres_seen.emplace(seen_key, 1);
-			agg.tiles++;
-		} else {
-			agg.capped = 1;
-		}
-	}
-	if (agg.n == 1) {
-		R3RDbgWrite("UNRES-RAIL tile=%d,%d track=%d phase=%s actor=%u\n",
-				(int)TileX(tile), (int)TileY(tile), (int)t,
-				r3r_resv_phase, (uint)r3r_resv_actor.base());
-	} else if (agg.n % R3R_UNRES_SUM == 0) {
-		R3RDbgWrite("UNRES-SUM phase=%s n=%u tiles=%u capped=%u last=%d,%d actor=%u\n",
-				r3r_resv_phase, agg.n, agg.tiles, agg.capped,
-				(int)TileX(agg.last), (int)TileY(agg.last), agg.actor);
-	}
-}
-#endif /* R3R_PROBES */
 
 /**
  * Lift the reservation of a specific trackdir on a tile
@@ -901,9 +627,6 @@ void UnreserveRailTrackdir(TileIndex tile, Trackdir td)
 		SetSignalStateByTrackdir(tile, td, SignalState::Red);
 		MarkSingleSignalDirty(tile, td);
 	}
-	/* R3R (第 243 轮, REG-243-O): deliberately no guard here. Each caller of this
-	 * function names its own phase, so the UNRES-RAIL line tells the two apart. A guard
-	 * placed here would overwrite the caller's name and hide that information. */
 	UnreserveRailTrack(tile, TrackdirToTrack(td));
 }
 
@@ -919,23 +642,6 @@ void UnreserveRailTrackdir(TileIndex tile, Trackdir td)
 void UnreserveRailTrack(TileIndex tile, Track t)
 {
 	assert_msg_tile(TrackdirBitsToTrackBits(GetTileTrackdirBits(tile, TransportType::Rail, 0)) & TrackToTrackBits(t), tile, "track: {:X}", t);
-
-	/* R3R (第 243 轮, REG-243-M): tag every release at the *entry* of this function,
-	 * where the phase the caller named is still current, so the map-setter's
-	 * CLEAR-RAIL line (r3r_resv_probes.h) can be attributed to a code path. Printed
-	 * just before the setter fires, so the two lines are adjacent in the log.
-	 * Only logged when the tile really carries a reservation, which keeps the volume
-	 * at "one line per real release". */
-	if (GetReservedTrackbits(tile) != TRACK_BIT_NONE) {
-#if R3R_PROBES
-		/* R3R (第 274 轮续, 2026-10-22, KI-419②): per-tile lines for unwatched tiles are
-		 * now aggregated per phase. A back-out loop releases the same three tiles 400+
-		 * times in one session (1218 of 1225 extend-backout lines), which was 35% of
-		 * the log and said nothing new after the first pass; the watched tiles keep
-		 * their one-line-per-release trace because that is the KI-207 ghost trap. */
-		R3RUnresWatchLog(tile, t);
-#endif
-	}
 
 	switch (GetTileType(tile)) {
 		case TileType::Railway:
@@ -2103,53 +1809,12 @@ void FillTrainReservationLookAhead(Train *v)
  *
  * @return The train owning the path, or nullptr if the path is stray.
  */
-#if R3R_PROBES
-/**
- * R3R (KI-210, diagnosis): explain one direction of the ownership walk above.
- *
- * The bug it exists for: a reservation that a train booked *this tick* (a live
- * booking) got attributed to the parked consist whose stale route happened to
- * join it, and the waiter purge then released it -- the player sees the preview
- * blink on and off every tick. The walk itself is the engine's own and cannot be
- * instrumented without touching it, but every *answer* can be logged: which tile
- * the walk ended on and by which of the three ways the train was found.
- *
- * @param start     tile the walk started from (== the queried reservation bit).
- * @param start_td  trackdir of that first direction.
- * @param res_tile  tile FollowReservation() stopped on.
- * @param res_td    trackdir it stopped with.
- * @param how       "blocked" / "direct" / "platform" / "tunnel" / "none".
- * @param found     train that was accepted as the owner (nullptr if none).
- * @param found_on  tile that train was found on (only for "platform").
- */
-static void R3RResvWalkLog(TileIndex start, Trackdir start_td, TileIndex res_tile, Trackdir res_td,
-		const char *how, const Train *found, TileIndex found_on = INVALID_TILE)
-{
-	if (!R3RDbgOn()) return;
-	if (!R3RIsWatchedResvTile(start)) return;
-
-	int owner = -1;
-	int head  = -1;
-	if (found != nullptr) {
-		owner = (int)found->index.base();
-		const Train *const f = found->First();
-		head = f != nullptr ? (int)f->index.base() : -1;
-	}
-	R3RDbgWrite("RESV-WALK start=%d,%d td=%u phase=%s how=%s end=%d,%d/td%u found=%d,%d owner=veh%d head=veh%d\n",
-			(int)TileX(start), (int)TileY(start), (unsigned)start_td, r3r_resv_phase, how,
-			(int)TileX(res_tile), (int)TileY(res_tile), (unsigned)res_td,
-			(int)TileX(found_on), (int)TileY(found_on), owner, head);
-}
-#endif /* R3R_PROBES */
 
 static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, RailTypes rts, TileIndex *end_tile = nullptr)
 {
 	/* If the tile has a one-way block signal in the current trackdir, skip the
 	 * search in this direction as the reservation can't come from this side.*/
 	if (HasOnewaySignalBlockingTrackdir(tile, ReverseTrackdir(trackdir)) && !HasPbsSignalOnTrackdir(tile, trackdir)) {
-#if R3R_PROBES
-		R3RResvWalkLog(tile, trackdir, tile, trackdir, "blocked", nullptr);
-#endif
 		return nullptr;
 	}
 
@@ -2163,9 +1828,6 @@ static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, Rai
 
 	CheckTrainsOnTrack(ftoti, ftoti.res.tile);
 	if (ftoti.best != nullptr) {
-#if R3R_PROBES
-		R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "direct", ftoti.best);
-#endif
 		return ftoti.best;
 	}
 
@@ -2175,9 +1837,6 @@ static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, Rai
 		for (TileIndex st_tile = ftoti.res.tile + diff; IsCompatibleTrainStationTile(st_tile, ftoti.res.tile); st_tile += diff) {
 			CheckTrainsOnTrack(ftoti, st_tile);
 			if (ftoti.best != nullptr) {
-#if R3R_PROBES
-				R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "platform", ftoti.best, st_tile);
-#endif
 				return ftoti.best;
 			}
 		}
@@ -2194,17 +1853,10 @@ static Train *R3RFollowReservationToOwner(TileIndex tile, Trackdir trackdir, Rai
 			CheckTrainsOnTrack(ftoti, GetOtherTunnelBridgeEnd(ftoti.res.tile));
 		}
 		if (ftoti.best != nullptr) {
-#if R3R_PROBES
-			R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "tunnel", ftoti.best,
-					GetOtherTunnelBridgeEnd(ftoti.res.tile));
-#endif
 			return ftoti.best;
 		}
 	}
 
-#if R3R_PROBES
-	R3RResvWalkLog(tile, trackdir, ftoti.res.tile, ftoti.res.trackdir, "none", nullptr);
-#endif
 	return nullptr;
 }
 
@@ -2289,29 +1941,6 @@ static bool R3RIsWaitingCoupleTrain(const Train *t)
 	return head != nullptr && head->current_order.IsType(OT_WAIT_COUPLE);
 }
 
-#if R3R_PROBES
-/**
- * R3R (第 361 轮, REG-359-E): 仲裁真正改判时的证据行（边沿触发，同一格同一
- * 组合只打一行），用于回答"这条预留到底被判给了谁、为什么"。
- */
-static void R3RResvArbLog(TileIndex tile, const Train *a, const Train *b, bool wa, bool wb, const Train *picked)
-{
-	if (!R3RDbgOn()) return;
-
-	static std::unordered_map<uint32_t, uint64_t> r3r_resv_arb_seen;
-	const uint64_t sig = ((uint64_t)(a->index.base() & 0xFFFF) << 24)
-			| ((uint64_t)(b->index.base() & 0xFFFF) << 8)
-			| (uint64_t)((wa ? 2u : 0u) | (wb ? 1u : 0u) | (picked == a ? 4u : 0u));
-	uint64_t &seen = r3r_resv_arb_seen[tile.base()];
-	if (seen == sig) return;
-	seen = sig;
-
-	R3RDbgWrite("RESV-ARB tile=%d,%d station=%d a=veh%d wait=%d b=veh%d wait=%d picked=veh%d\n",
-			(int)TileX(tile), (int)TileY(tile), (int)(IsRailStationTile(tile) ? 1 : 0),
-			(int)a->index.base(), (int)(wa ? 1 : 0),
-			(int)b->index.base(), (int)(wb ? 1 : 0), (int)picked->index.base());
-}
-#endif /* R3R_PROBES */
 
 /**
  * R3R (第 361 轮, REG-359-E): 两端都压着车时的归属仲裁（玩家口径，原话见备忘 §十三）。
@@ -2340,9 +1969,6 @@ static Train *R3RArbitrateReservationOwner(TileIndex tile, Train *a, Train *b)
 
 	const bool station = IsRailStationTile(tile);
 	Train *const picked = station ? (wa ? a : b) : (wb ? a : b);
-#if R3R_PROBES
-	R3RResvArbLog(tile, a, b, wa, wb, picked);
-#endif
 	return picked;
 }
 
@@ -2521,10 +2147,6 @@ static bool R3RReservationHeldBySelf(TileIndex tile, Track track)
 				if (head->track == TRACK_BIT_DEPOT && IsRailDepotTile(head->tile)) {
 					const TileIndex mouth = head->tile + TileOffsByDiagDir(GetRailDepotDirection(head->tile));
 					if (end_a == mouth || end_b == mouth) {
-						R3RDbgWrite("RESV-SELF-DEPOT-MOUTH veh=%u tile=%d,%d track=%u mouth=%d,%d end_a=%d,%d end_b=%d,%d\n",
-								(uint)r3r_resv_actor.base(), (int)TileX(tile), (int)TileY(tile), (uint)track,
-								(int)TileX(mouth), (int)TileY(mouth),
-								(int)TileX(end_a), (int)TileY(end_a), (int)TileX(end_b), (int)TileY(end_b));
 						return true;
 					}
 				}
@@ -2695,8 +2317,6 @@ uint R3RPurgeStrayReservations()
 
 			UnreserveRailTrack(rec.tile, FindFirstTrack(rail_bits));
 			freed++;
-			R3RDbgWrite("RESV-PURGE tile=%d,%d track=stn kind=%s\n",
-					(int)TileX(rec.tile), (int)TileY(rec.tile), IsRailWaypointTile(rec.tile) ? "WAYPOINT" : "STATION");
 			continue;
 		}
 
@@ -2705,8 +2325,6 @@ uint R3RPurgeStrayReservations()
 
 		UnreserveRailTrack(rec.tile, rec.track);
 		freed++;
-		R3RDbgWrite("RESV-PURGE tile=%d,%d track=%u\n",
-				(int)TileX(rec.tile), (int)TileY(rec.tile), (uint)rec.track);
 	}
 	return freed;
 }

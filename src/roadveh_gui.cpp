@@ -16,7 +16,6 @@
 #include "vehicle_gui_base.h"
 #include "string_func.h"
 #include "zoom_func.h"
-#include "r3r_perf.h"
 
 #include "table/strings.h"
 
@@ -136,7 +135,6 @@ void DrawRoadVehImage(const Vehicle *v, const Rect &r, VehicleID selection, Engi
 		static int r3r_degenerate_logged = 0;
 		if (r3r_degenerate_logged < 16) {
 			r3r_degenerate_logged++;
-			R3RDbgWrite("GUI-DEGEN-RECT roadveh left=%d top=%d right=%d bottom=%d\n", (int)r.left, (int)r.top, (int)r.right, (int)r.bottom);
 		}
 		return;
 	}

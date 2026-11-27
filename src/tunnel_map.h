@@ -12,7 +12,6 @@
 
 #include "road_map.h"
 #include "transport_type.h"
-#include "r3r_resv_probes.h"
 #include "core/pool_id_type.hpp"
 
 struct TunnelIDTag : public PoolIDTraits<uint32_t, 0x8000000, 0xFFFFFFFF> {};
@@ -88,8 +87,6 @@ inline bool HasTunnelReservation(TileIndex t)
 inline void SetTunnelReservation(TileIndex t, bool b)
 {
 	dbg_assert_tile(IsRailTunnelTile(t), t);
-	/* R3R (KI-207, unconditional since KI-359): also feeds the reservation ledger. */
-	if (HasTunnelReservation(t) != b) R3RResvWatchLog(b ? "SET-TUNNEL" : "CLEAR-TUNNEL", t);
 	AssignBit(_m[t].m5, 4, b);
 }
 
