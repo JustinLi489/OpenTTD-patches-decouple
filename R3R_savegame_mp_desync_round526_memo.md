@@ -351,8 +351,9 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
 | 分支 | `feature/decouple` |
 | 提交 1 | `eca2e718db` R3R: savegame/desync hardening (round 526)（9 文件，+1159/−41） |
 | 提交 2 | `03fd851b04` R3R: drop two probe remnants left behind by the probe strip（2 文件，+12/−56） |
-| 版本标签 | `R3R-v1.0.7`（annotated，已用 `-f` 移到 `03fd851b04`；`git describe --tags` = `R3R-v1.0.7`） |
-| 工作区 | 干净 |
+| 提交 3 | `65164941b7` docs: record the v1.0.7 rebuild (git, release build, package) |
+| 版本标签 | `R3R-v1.0.7`（annotated，已用 `-f` 移到 `65164941b7`；`git describe --tags` = `R3R-v1.0.7`） |
+| 工作区 | 干净（本文件的最终数字修正见 §13.5 的后续提交，**标签不再移动**） |
 | push | **未执行**（沿用既有口径：玩家确认后再推） |
 
 > 标签被移动 ⇒ 推送到 GitHub 必须 `git push --force origin R3R-v1.0.7`，
@@ -364,11 +365,11 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
 | --- | --- |
 | 构建树 | `build-release/`（RelWithDebInfo，`R3R_PROBES_DEFAULT=0`） |
 | 环境 | 沙箱拦 `reg.exe` ⇒ `vcvars64` 取不到 SDK，手动设 `INCLUDE`/`LIB`/`PATH` 后直调 ninja（同第 12.4 节） |
-| 步数 | 增量：`[10/10] Linking`（首轮）→ 清死代码后 `[5/5] Linking` → 改标签后 `[4/4] Linking` |
+| 步数 | 增量：`[10/10] Linking`（首轮）→ 清死代码后 `[5/5] Linking` → 移到 `03fd851b04` 后 `[4/4]` → 最终标签提交后 `[3/3] Linking` |
 | 告警 | 首轮 1 条（`C4189 r3r_vty`，探针残留）→ 清理后 **0 条**；`error C` 0 |
-| 产物 | `build-release\openttd.exe` **2026-11-27 23:47:34**，**30 500 864 B** |
-| SHA-256（exe） | `337aec978a9f3daf319814f76db7c93023086b05be6a0b4105fa5f37bce14ef2` |
-| 版本串 | `rev.cpp`: `_openttd_revision[] = "R3R-v1.0.7"`、`_openttd_release_version[] = "0.73.5"`、`_openttd_revision_tagged = 1`、`_openttd_revision_hash = "03fd851b04…"` |
+| 产物 | `build-release\openttd.exe` **2026-11-27 23:56:39**，**30 500 864 B** |
+| SHA-256（exe） | `000b0ea4eb6befd05b2b2c93e6d3ddf8dcf625fb4376382292e709b37ef85d6e` |
+| 版本串 | `rev.cpp`: `_openttd_revision[] = "R3R-v1.0.7"`、`_openttd_release_version[] = "0.73.5"`、`_openttd_revision_tagged = 1`、`_openttd_revision_hash = "65164941b7…"`（= 标签提交，二者一致） |
 | exe 自证 | `R3R-v1.0.7` 命中 1 次；`R3R state:` / `session: seam=` 各 1 次；`R3R_debug.log` / `CPL-SCAN` / `FOLDCHK` / `LOCO-MOVE` / `CARGOWEIGHT` **全 0** |
 
 ### 13.3 打包
@@ -376,8 +377,8 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
 | 项 | 值 |
 | --- | --- |
 | 文件 | `R3R-v1.0.7-win64-2026-11-27.zip`（同名覆盖） |
-| 大小 | **18 221 137 B**（旧 17 687 933 B） |
-| SHA-256 | `2e26d99109f8633eee66d75f6e5d69f21cc53b21ea682bc83f97cd5cd07f9ebc` |
+| 大小 | **18 221 353 B**（旧 17 687 933 B） |
+| SHA-256 | `2dbba0374d87eb462e47ebd81f587d6adeb0c11e84b380721bdb00af56cd0001` |
 | 条目 | **142**（与旧包逐条同名，顺序一致） |
 | 顶层目录 | `R3R-OpenTTD-0.73.5-win64\` |
 | 完整性 | `ZipFile.testzip()` = None（OK） |
@@ -392,3 +393,15 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
 
 `build\openttd.exe` 重编为 **2026-11-27 23:51:57**（53 302 784 B），与发行版同源（`03fd851b04`），
 `warning C`/`error C` 均 0。
+
+### 13.5 本文件最终数字的落地方式（避免"改文档 → 改标签 → 重编"的死循环）
+
+发行二进制必须与标签提交一一对应，因此顺序只能是：**先定标签提交 → 再编 exe → 再打包 →
+最后才写数字**。写数字本身又是一次提交，会改变 HEAD：
+
+- 标签 `R3R-v1.0.7` **固定在 `65164941b7`**，就是 exe 内嵌的 `_openttd_revision_hash`，
+  两者一致；
+- §13.2/§13.3 的最终数字（exe `000b0ea4…`、zip `2dbba037…`）写在标签**之后**的一个文档提交里，
+  该提交不再移动标签，也不重新编译；
+- 因此在该文档提交上 `git describe --tags` 会显示 `R3R-v1.0.7-<n>-g…`，这是正常的：
+  **发布资产对应的是标签提交 `65164941b7`，不是 HEAD**。重编前请先 `git checkout R3R-v1.0.7`。
