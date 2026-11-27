@@ -60,6 +60,11 @@ const uint8_t _openttd_revision_tagged = 1;
 `generated/ottdres.rc` 的 `FileVersion` / `ProductVersion` 同为 `R3R-v1.0.7`，
 exe 内也检索到 `R3R-v1.0.7` 字面量 1 处。
 
+> 说明：exe 内嵌的 `_openttd_revision_hash` 是 `2067203b4b9d19c67f264b3cc9282a55ddebdee2`
+> （代码提交，即探针删除 + 备忘清理之后的那个提交）；发布备忘是它之后的第一个提交，
+> 版本标签 `R3R-v1.0.7` 最终指向备忘提交（`f1165c31b7`），以保证后续重编仍得到
+> 干净的 `R3R-v1.0.7` 而不是带 `-1-g…` 后缀。两者代码内容完全相同，只差这一份文档。
+
 ### 构建环境坑（本轮实测）
 
 `R3R_release_build.cmd` 的 `[4] call vcvars64.bat` 在本机**部分失败**：vcvars 内部调用的
