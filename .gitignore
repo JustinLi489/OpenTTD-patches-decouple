@@ -27,6 +27,10 @@ R3R_shot_ocr_out.txt
 
 # Release packages
 /*.zip
+/*.7z
+/*.tar.gz
+/dist/
+/R3R-v*/
 
 # Editor/build leftovers and file-level backups
 *.bak
@@ -51,7 +55,7 @@ R3R_KNOWN_ISSUES.damaged_*.bak
 /test_vcvars.ps1
 /vcvars_test.*
 /rebuild_R3R.cmd
-/ R3R_release_build.cmd
+/R3R_release_build.cmd
 
 # Local snapshot/archive folders
 /R3R_archive_*/
