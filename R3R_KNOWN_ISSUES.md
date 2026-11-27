@@ -27016,3 +27016,87 @@ R3R_fullbuild.cmd inc
 **疑点 REG-525-F**：`booked` 仍把 PAIR-AIR 计为已订，`CPL-RES-OK` 会高估，不能当"地图上真订了 N 格"。
 
 **构建**：`[2/4] pbs.cpp.obj` → `[3/4] yapf_rail.cpp.obj` → `[4/4] Linking`，无错无警；`build\openttd.exe` 02:03:59（54 425 088 B）；exe 命中 `RESV-ORPHAN-CLEAR` / `CPL-SAFE-CUT` / `age=%u`。
+
+---
+
+## 第 526 轮 · 存档模块联机不同步审计（只读检查，未改源码、未构建）
+
+**玩家原话（2026-11-27）**：「你在openttd R3R补丁包的源码目录。我需要你检查游戏的存档模块，主要防止游戏的联机游戏不同步问题」
+
+**判据（本轮唯一标准）**：联机不是帧同步状态，而是"服务端继续跑 + 中途加入的客户端从一份存档起跑"，每帧比对 `_random.state`（`src/network/network_client.cpp:324`）。因此**服务端内存里已累积、且影响模拟结果的状态必须完整入档**；单机存读档正常并不能证明这一点。
+
+完整取证与表见 `R3R_savegame_mp_desync_round526_memo.md`。已核对无误、下一轮不必重查：`_tick_counter` 入档（`src/sl/misc_sl.cpp:94`）；`R3VP` 14 个字段与 `R3RHasParkState()` 14 条判据一一对应；`R3SG` 在 `ResetSaveloadData()` 清表；5 个 R3R 块已在 `src/sl/saveload.cpp:413` 注册。
+
+### KI-693 R3DS 读档把"后车索引"当成"前车链头"（高，代码级已确认，未修）
+
+**证据**：写入端 `src/train_cmd.cpp:2950` 以**后车**为键（`_r3r_decomp_seams[follower->index]`，`seam.head = kept->index`）；`Save_R3DS()`（`:17541-17549`）把后车写进 `key`、前车写进 `a`；`Load_R3DS()`（`:17568-17571`）却写 `seam.head = VehicleID((uint16_t)rec.key)`，真正的前车 `rec.a` 读出后**未使用**。
+
+**后果**：`R3RDecoupleInterlockWait()`（`:3156`）的 `Train::GetIfValid(seam.head)` 读档后必然成功（拿到的是后车自己），于是"缝已过期"守卫（`:3169-3174`）永不触发；`R3RSeamBeyondSignalHeldByLeader()`（`:3080`）里 `leader_head` 变成后车自己 ⇒ 前车永不被认作持有下一格 ⇒ 后车被提前放行。服务端仍在等，客户端已开 ⇒ **联机 desync**；单机表现为"解挂后存档再读档，后车起步时机变了"。
+
+**修法（一行）**：`src/train_cmd.cpp:17569` 改为 `seam.head = VehicleID((uint16_t)rec.a);`。
+
+**复测判据**：解挂后立刻存档→读档，日志 `DECOUPLE-INTERLOCK head=` 必须与解挂前一致（等于前车链头，而不是后车索引）。
+
+### KI-694 只有 1 张会话累积表入档，另 10 张只活在内存里（高，结构性，未修）
+
+R3DS 的注释已经把危害写清（`:17498-17517`），但同族表远不止 `_r3r_decomp_seams` 一张：
+
+| 表 | 定义 | 消费点 | 影响 |
+|---|---|---|---|
+| `_r3r_waiter_purged` | `train_cmd.cpp:11248` | `:19859` → `R3RReleaseChainReservations()` | **改地图预留位（加入首 tick 即发）** |
+| `r3r_orphan_seen`（函数内 static） | `pbs.cpp:605` | `:606-614` 跨 2 tick 才 `UnreserveRailTrack()` | **改地图预留位（加入首 tick 即发）** |
+| `_r3r_wbar_state` | `:12771` | `:12838`；`:12888 if (bs.overshoot) return 0;` | 挂接预留是否在等待区路点截断 |
+| `_r3r_couple_enter_tick` | `:8388` | `:8402`→`:8432`→`:12607` | 抢车底的优先权 |
+| `_r3r_couple_commit_fail` | `:13130` | `:13459`/`:13467`（4 次放弃） | 是否跳过订单 |
+| `_r3r_couple_wait_heals` | `:13165` | `:20432-20436`（2 次上限） | 是否掉头 |
+| `_r3r_couple_autoreserve` | `:11230` | `:20414-20419`（可跨 tick） | 补预留请求 |
+| `_r3r_force_replan` | `:5260` | `:5278` | 一次性强制重规划 |
+| `_r3r_just_reversed` | `:11274` | `:19879` | 掉头当 tick 的让路门禁 |
+| `_r3r_depot_self_release` | `:13664`（256 tick 窗） | `:13673` | **能否出库** |
+| `_r3r_couple_partial_reserve` | `:13704`（512 tick 窗） | `:13714`/`:13724-13728` | **能否出库（自锁）** |
+
+其中 `:13659-13663` 与 `:13700-13703` 的注释明确以"不动存档格式、记录会自动失效"为由不存档——该理由只在单机成立，联机加入时服务端记录仍在窗内生效、客户端是空表。
+
+**修法方向（待玩家拍板）**：方案 A = 扩展 R3DS（`kind` 已存在，新增 2..11 类行，Load 先全清再回填；`pbs.cpp` 需加一对 Save/Load 导出函数，用 extern 前向声明避免动 `.h`）；方案 B = 把判据改成可从存档状态重算（回归面大）。短期不使用"发档后暂停 N tick"这类补丁。
+
+**复测判据**：双端 `-ddesync=2`，`sync_err` 出现在加入后 1~2 tick ⇒ 命中前两张表；几十 tick 后 ⇒ 命中其余。
+
+### KI-695 答案本缓存"命中 vs 未命中"是否逐格等价，未验证（中）
+
+`src/pathfinder/yapf/yapf_rail.cpp:100-145`，上一次 A* 的路径被直接照抄铺预留；注释称"纯运行时态、读档清空"即无害。联机要求更强：服务端命中缓存铺出的预留，必须与客户端重新 A* 铺出的**逐格相同**。同代价多解或缓存变陈旧时会分叉。**验证判据**：同 tick 打 `ANSWER hit=1/0` 与 `CPL-RES-OK tiles=` 清单；或同一存档上"允许命中/强制清空"各跑一遍比对预留位图。
+
+### KI-696 R3VP 三个指针字段缺池存活校验（低-中）
+
+`R3SG` 有 KI-647 的存活校验与越界清零（`src/sl/couple_group_sl.cpp:302-310`、`Ptrs_R3SG()`），`R3VP` 的 `orders_backup` / `r3r_follow_orders` / `r3r_pool_orders`（`_r3r_park_desc`，`:122-160`）没有对应校验：挂起表先死时保存会读悬空对象的 `index`，可能写入不存在的池索引导致读档 abort。
+
+**另记（非缺陷但危险）**：`Save_R3SG()` 在保存过程中原地改 `rec->orders = nullptr`（`:308-310`），保存应尽量只读；本轮未发现它改变模拟结果。
+
+**未确认**：U-1 `_r3r_pair_verdict`/`_r3r_pair_scan_tick` 是否每 tick 重算；U-2 `_r3r_loop_memo`（60 tick 窗）空表是否可能得出不同结论；U-3 各"news 节流表"是否确无模拟影响。
+
+### 第 526 轮续 · 四项全部落地 + 新增 KI-697（desync 可检出/可见）
+
+**玩家拍板（2026-11-27）**：「我认为，可以直接对你所述的所有问题都执行修复（先不编译发行版，而只编译内测版）。同时，我们都知道，原生的发行版在遇到不同步问题的时候，会产出崩溃日志在Docs/OpenTTD里面，我们要保证现阶段R3R的不同步问题也能产出崩溃日志」
+
+**KI-693 状态：已修**。`Load_R3DS()` 改为 `seam.head = VehicleID((uint16_t)rec.a)`（`src\train_cmd.cpp`）。`rec.key` 是后车（表键）、`rec.a` 才是前车链头。
+
+**KI-694 状态：已修**。`R3DS` 由"只存解挂缝"扩为 16 种 kind（0..15），覆盖：解挂缝、`_r3r_waiter_purged`、`_r3r_wbar_state`、`_r3r_couple_enter_tick`、`_r3r_pair_scan_tick`、`_r3r_pair_verdict`、`_r3r_couple_commit_fail`、`_r3r_couple_no_target`、`_r3r_couple_wait_heals`、`_r3r_couple_autoreserve`、`_r3r_force_replan`、`_r3r_just_reversed`、`_r3r_depot_self_release`、`_r3r_couple_partial_reserve`、`r3r_orphan_seen`。新增 `R3RSessionStateReset()` 并接入 `ResetSaveloadData()`；`Load_R3DS()` 开头也全清。`pbs.cpp` 的 `r3r_orphan_seen` 提为文件级 static 并加 `R3ROrphanSeenClear/Count/Get/Put`。旧档无这些 kind ⇒ 照常读入，不升 SLV。
+
+**KI-695 状态：已修（保守方案）**。`src\pathfinder\yapf\yapf_rail.cpp`：`_networking` 时 `R3RAnswerReplay()` 直接返回 false、`R3RAnswerCommit()` 直接丢弃。服务端与客户端都不使用答案本 ⇒ 两端都走原生 A*，序列必然一致。代价是联机时失去该优化（单机保留）。
+
+**KI-696 状态：已修**。`src\sl\couple_group_sl.cpp`：`Save_R3VP()` 对 `orders_backup` / `r3r_follow_orders` / `r3r_pool_orders` 做池存活校验（跟随指针失效时一并清 owner/pool/borrowed）；`Ptrs_R3VP()` 在指针解析前把越界索引清零（与 R3SG 的 KI-647 同构）。
+
+### KI-697 R3R 的 desync 无法被检出，因此不会有崩溃日志（高，已修待编译）
+
+**问题**：原生 desync 判定只有 `_random.state[0]` 与 `_state_checksum.state` 两条（`src\network\network_client.cpp:318`）。`_state_checksum` 在 `src\openttd.cpp:1644-1684` 只累加 tick/日期/公司资金/基础设施数量，车辆侧只有 `Train::Tick()` 的 `x_pos|y_pos|track`（`src\train_cmd.cpp` 末尾）和 `ChooseTrainTrack()` 的 `path_found|next_track`。R3R 的分叉常落在段表进度、挂起日程、会话计数上，**完全不体现**在这几项 ⇒ 校验和相同 ⇒ 判定"同步正常" ⇒ 不调用 `DesyncCrashLog()` ⇒ `Documents\OpenTTD` 里没有任何文件。
+
+**修法（两半，缺一不可）**：
+1. **能检出**：`src\train_cmd.cpp` 新增 `R3RUpdateStateChecksum()`，把 R3R 同步量并入同一个 `_state_checksum`：每车的 `r3r_segment_id`/`r3r_priority`/`r3r_follow_pool`/三条订单书签/三个挂起表的池索引/`r3r_follow_owner`/`unitnumber_backup`/`group_id_backup`/`couple_groups`/`r3r_orders_borrowed`；段表每行的 orders 索引与三索引/单位号/分组/borrowed；以及 11 张会话表。顺序确定性：`Vehicle::Iterate()` 与段表按索引升序、`btree_*` 天然有序、`unordered_*` 先收集 key 排序。**不收**日志节流字段（reported/logged/last_sig/last_log_age/candidates）与纯探针表，避免假阳性。调用点在 `src\openttd.cpp` 的 `if (_networking)` 段、公司统计之后（不打乱 `NSRE_PRE_COMPANY_STATE` 语义；帧末 `FRAME_DONE` 已含本贡献）。
+2. **检出后看得见**：`src\train_cmd.cpp` 新增 `R3RWriteDesyncSummary(std::string&)`，`src\crashlog.cpp` 在 `FillDesyncCrashLog()` 的 CheckCaches 段之后追加 `R3R state:` 段（每台有 R3R 状态的车、段身份表、11 张会话表的规模与关键行、解挂缝明细），输出有界（各段最多 60 行）、只读。
+
+**复测判据**：①双端 `-ddesync=2` 联机时人为让 R3R 状态分叉（例如只在客户端改一段的 `r3r_priority`），应出现 `sync_err` 日志；②`Documents\OpenTTD\desync-client-*.log` 内含 `R3R state:` 段；③正常联机 ≥ 30 分钟不得出现 R3R 引起的假 `sync_err`（若出现，说明收进校验和的某项其实允许两端不同，需按日志里的 R3R 段回退该项）。
+
+**未收录（有意）**：`_r3r_couple_fail_news_shown` / `_r3r_couple_depot_news` / `_r3r_waiter_nobook_logged` / `_r3r_dispatch_no_slot` / `_r3r_dispatch_empty_notified` / `_r3r_loop_memo` / `_r3r_wp_*` / `_r3r_lr_*` —— 纯日志/提示/探针/性能缓存，不入档也不进校验和，但 `R3RSessionStateReset()` 会把它们一并清掉。
+
+**构建**：`R3R_fullbuild.cmd inc`（`src\*.h` 比 obj 新 ⇒ 护栏升级全量）。发行版按玩家要求不编。
+
+**KI-697 构建自证（已编译，内测树）**：沙箱拦 `reg.exe` ⇒ `vcvars64` 取不到 SDK ⇒ 首次 `R3R_fullbuild.cmd inc` 报 `crtdbg.h` 缺失（`EXIT_CODE=1`，23:10:57）。改用手动 `INCLUDE`/`LIB`/`PATH` + 直调 ninja：`[11/11] Linking CXX executable openttd.exe`（rc=0），修掉一处 `C4189` 未使用变量后 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking`，无告警；`build\openttd.exe` **2026-11-27 23:34:12**，晚于全部改动源码（23:07~23:09、train_cmd 23:33）。exe 命中 `R3R state:` / `session: seam=` / `seg id=` / `couple_enter veh=` / `commit_fail veh=` / `seam follower=`。`build\build.ninja` 无 `R3R_PROBES_DEFAULT=0` ⇒ 内测树；发布树未编。

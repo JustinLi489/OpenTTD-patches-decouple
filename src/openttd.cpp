@@ -1675,6 +1675,20 @@ void StateGameLoop()
 				UpdateStateChecksum(c->infrastructure.station);
 				UpdateStateChecksum(c->infrastructure.airport);
 			}
+
+			/* R3R (第 526 轮, KI-697): R3R 的同步状态并入同一个校验和。
+			 *
+			 * 原生这里只累加 tick/日期/公司资金/基础设施数量，车辆侧只有
+			 * Train::Tick() 的一格坐标与 ChooseTrainTrack 的一格路径结论。
+			 * R3R 的段表、挂起日程、以及 11 张会话态表都不会反映到那几项上 ——
+			 * 两端在这些量上分叉时，坐标/资金/随机数可以逐字相同，原生判据于是
+			 * 认为"同步正常"，desync 永远不会被发现，也就不会有 desync 崩溃日志。
+			 *
+			 * 放在公司块之后：不改变 NSRE_PRE_COMPANY_STATE 快照的含义，而帧末的
+			 * FRAME_DONE 记录（src\network\network_client.cpp:311）已经包含本贡献。
+			 * 函数自身只在联机时做任何事，单机零开销。 */
+			extern void R3RUpdateStateChecksum();
+			R3RUpdateStateChecksum();
 		}
 	}
 	if (_extra_aspects > 0) FlushDeferredAspectUpdates();

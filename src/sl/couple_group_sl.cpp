@@ -190,12 +190,40 @@ static void Load_R3VP()
 	}
 }
 
+/**
+ * R3R (第 526 轮, KI-696): is \a ol still a live member of the OrderList pool?
+ *
+ * 见下方 R3ROrderListIsLive() 的实现说明：只做指针身份比较，绝不解引用。
+ * 这里前置声明，是因为 R3VP 的两个函数在本文件里排在 R3SG 之前。
+ */
+static bool R3ROrderListIsLive(const OrderList *ol);
+
 static void Save_R3VP()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_park_desc);
 
 	for (Vehicle *v : Vehicle::Iterate()) {
 		if (!R3RHasParkState(v)) continue;
+		/* R3R (第 526 轮, KI-696): 与 R3SG 的 KI-647 同族。
+		 *
+		 * R3VP 存了三个"挂起订单表"指针（orders_backup / r3r_follow_orders /
+		 * r3r_pool_orders）。其中任何一个都可能先于本车被销毁（表的主人被卖掉、
+		 * 池条目被清理），而 R3RFindOrderListReferrer() 只看车辆，不会通知本车。
+		 * 悬空指针一旦被写进存档，ReferenceToInt() 会去读已释放对象的 `index`，
+		 * 轻则写入一个不存在的池索引（读档 "Referencing invalid OrderList" abort），
+		 * 重则把垃圾值当索引写出去。
+		 *
+		 * 与 R3SG 一样只清死指针：那张表的内容本来就不可恢复，不能为了它让整份
+		 * 存档变得读不进来。 */
+		if (v->orders_backup != nullptr && !R3ROrderListIsLive(v->orders_backup)) v->orders_backup = nullptr;
+		if (v->r3r_follow_orders != nullptr && !R3ROrderListIsLive(v->r3r_follow_orders)) {
+			v->r3r_follow_orders = nullptr;
+			/* 跟随指针没了，"我在跑别人的表"这一层借用事实也就不存在了。 */
+			v->r3r_follow_owner = VehicleID::Invalid();
+			v->r3r_follow_pool = false;
+			v->r3r_orders_borrowed = false;
+		}
+		if (v->r3r_pool_orders != nullptr && !R3ROrderListIsLive(v->r3r_pool_orders)) v->r3r_pool_orders = nullptr;
 		SlSetArrayIndex(v->index);
 		SlObjectSaveFiltered(v, slt);
 	}
@@ -206,6 +234,14 @@ static void Ptrs_R3VP()
 	SaveLoadTableData slt = SlPrepareNamedSaveLoadTableForPtrOrNull(_r3r_park_desc);
 
 	for (Vehicle *v : Vehicle::Iterate()) {
+		/* R3R (第 526 轮, KI-696): 与 Ptrs_R3SG() 同一条防线 —— 存档里可能带着
+		 * 一个已经不存在的池索引（挂起表先于本车被销毁）。IntToReference() 遇到
+		 * 这种值会 abort 整个读档，所以要在指针解析**之前**清掉。
+		 * 此刻字段里还是原始整数 "索引 + 1"（见 ReferenceToInt()）。 */
+		for (OrderList **slot : { &v->orders_backup, &v->r3r_follow_orders, &v->r3r_pool_orders }) {
+			const size_t raw = (size_t)*slot;
+			if (raw != 0 && !OrderList::IsValidID(raw - 1)) *slot = nullptr;
+		}
 		SlObjectPtrOrNullFiltered(v, slt);
 
 		/* R3R (第 144 轮 / 需求伍): 没有哪个段会"把自己借给自己"——备份与当前分组相同时

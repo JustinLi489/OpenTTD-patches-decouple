@@ -17496,32 +17496,69 @@ static TrainMovedChangeSignalEnum TrainMovedChangeSignal(Train *consist, TileInd
  * broken per-vehicle track state (e.g. folded chains after couple/reverse).
  */
 /**
- * R3R (第 246 轮 / 第 5 项): the "when did this machine start counting" table for
- * decouple seams, written to the savegame as a sparse block.
+ * R3R (第 246 轮 / 第 5 项): the session state of the couple/decouple machinery,
+ * written to the savegame as a sparse block.
  *
- * Why it has to be saved at all: the table holds an age measured against
- * `_tick_counter`, which is synchronized, but the moment the counting *started* is
- * not. A client joining a running session mid-game loads a savegame and starts with
- * an empty table, while the server has been counting for a while -- the server then
- * releases a decouple interlock several ticks earlier than the joiner, and from that
- * tick onwards the two ends disagree about the map. Writing the stamps makes both
- * ends derive the same age from the same start.
+ * Why it has to be saved at all: every table here holds an age or a counter measured
+ * against `_tick_counter`, which is synchronized, but the moment the counting
+ * *started* -- and whether a row exists at all -- is not part of any other chunk. A
+ * client joining a running session mid-game loads a savegame and starts with empty
+ * tables, while the server has been counting for a while. The two ends then take
+ * different branches on the very next tick (fire a decouple interlock earlier, skip
+ * the first "purge the waiter" pass, heal a stuck couple once more, treat a depot
+ * tile reservation as somebody else's, ...) and from that tick onwards their maps
+ * disagree. Writing the rows makes both ends derive the same answer from the same
+ * state.
+ *
+ * 第 526 轮 (KI-694): this block used to carry the decouple seam only; the other
+ * eleven session tables were left runtime-only ("the record expires by itself, no
+ * savegame change needed" -- true for single player, false for a late joiner). They
+ * are all covered now, see the `kind` values on R3RDesyncStateRec.
  *
  * The block is a CH_SPARSE_TABLE with a named table header, so an old savegame simply
- * has no R3DS chunk and the table starts empty -- exactly today's behaviour, no SLV
+ * has no R3DS chunk and the tables start empty -- exactly today's behaviour, no SLV
  * bump. It is registered from couple_group_sl.cpp while these two functions live here,
  * so no header has to grow an accessor (which would force a full rebuild, KI-183).
  *
  * 第 304 轮：`kind == 1`（孤儿预留时间戳）随周期性孤儿审计一并删除；读到旧档里的
- * kind 1 行按"未知种类"忽略，旧档因此照常能进，不升 SLV。
+ * kind 1 行按"未知种类"忽略，旧档因此照常能进，不升 SLV。第 526 轮把孤儿观察表
+ * 以 kind 15 重新引入（它现在只记"这个位从哪一 tick 起无主"，不是回收判据本身）。
  */
 struct R3RDesyncStateRec {
-	uint8_t  kind; ///< 0 = decouple seam (1 used to be an orphan reservation stamp, now ignored)
-	uint32_t key;  ///< follower vehicle index
-	uint32_t a;    ///< the leader half
-	uint32_t b;    ///< the leader's seam car
-	uint32_t tile; ///< that car's tile right after the split
-	uint64_t tick; ///< `_tick_counter` when the row was created
+	uint8_t  kind; ///< row kind, see the #R3RDesyncStateKind list below
+	uint32_t key;  ///< primary key: vehicle index (0 when the row is not keyed by a vehicle)
+	uint32_t a;    ///< kind specific payload 1
+	uint32_t b;    ///< kind specific payload 2
+	uint32_t tile; ///< kind specific tile payload
+	uint64_t tick; ///< `_tick_counter` when the row was created / last refreshed
+};
+
+/**
+ * R3R (第 526 轮, KI-694): the row kinds written to the R3DS chunk.
+ *
+ * Everything listed here is read by a *game logic* predicate on a later tick, so a
+ * joiner which starts without the row takes a different branch than the server.
+ * Log throttling tables (`_r3r_couple_fail_news_shown`, `_r3r_couple_depot_news`,
+ * `_r3r_waiter_nobook_logged`, `_r3r_dispatch_no_slot`, `_r3r_dispatch_empty_notified`)
+ * and pure probe state are deliberately absent: they cannot change the simulation.
+ */
+enum R3RDesyncStateKind : uint8_t {
+	R3RDSK_SEAM                   = 0,  ///< key = follower, a = leader head, b = seam car, tile, tick
+	R3RDSK_RETIRED_ORPHAN_STAMP   = 1,  ///< retired in round 304, ignored on load
+	R3RDSK_WAITER_PURGED          = 2,  ///< key = vehicle; "first parked-waiter tick already handled"
+	R3RDSK_WAIT_BARRIER           = 3,  ///< key = vehicle, a = order index, b = (seen | overshoot<<1 | released<<2)
+	R3RDSK_COUPLE_ENTER           = 4,  ///< key = vehicle, a = owner index, tick = entry stamp
+	R3RDSK_PAIR_SCAN              = 5,  ///< key = vehicle, tick = last full pair scan
+	R3RDSK_PAIR_VERDICT           = 6,  ///< key = vehicle, a = has_candidate, b = candidates, tick
+	R3RDSK_COMMIT_FAIL            = 7,  ///< key = vehicle, a = candidate index, b = failures
+	R3RDSK_NO_TARGET              = 8,  ///< key = vehicle, a = marker value
+	R3RDSK_WAIT_HEALS             = 9,  ///< key = vehicle, a = heals used
+	R3RDSK_COUPLE_AUTORESERVE     = 10, ///< key = vehicle
+	R3RDSK_FORCE_REPLAN           = 11, ///< key = vehicle
+	R3RDSK_JUST_REVERSED          = 12, ///< key = vehicle
+	R3RDSK_DEPOT_SELF_RELEASE     = 13, ///< key = vehicle, tile, tick
+	R3RDSK_COUPLE_PARTIAL_RESERVE = 14, ///< key = vehicle, tile, tick, b = logged flag
+	R3RDSK_ORPHAN_SEEN            = 15, ///< tile, a = track, tick (table lives in pbs.cpp)
 };
 
 static const NamedSaveLoad _r3r_desync_state_desc[] = {
@@ -17533,21 +17570,184 @@ static const NamedSaveLoad _r3r_desync_state_desc[] = {
 	NSL("tick", SLE_VAR(R3RDesyncStateRec, tick, SLE_UINT64)),
 };
 
+/* R3R (第 526 轮, KI-694): 孤儿观察表的读写端在 pbs.cpp（表本身是那里的文件级
+ * static）。用 extern 前向声明而不是加头文件，避免一次不必要的全量重编。 */
+extern void R3ROrphanSeenClear();
+extern size_t R3ROrphanSeenCount();
+extern bool R3ROrphanSeenGet(size_t index, uint32_t *tile, uint8_t *track, uint32_t *tick);
+extern void R3ROrphanSeenPut(uint32_t tile, uint8_t track, uint32_t tick);
+
+/**
+ * R3R (第 526 轮, KI-694): 清空**全部** R3R 会话态表。
+ *
+ * 两个调用点，缺一不可：
+ *  1. `ResetSaveloadData()`（src\sl\saveload.cpp）—— 读档之前。存档是唯一真相，
+ *     上一局（或同一进程里上一份存档）的残留行不能活到新局；否则 VehicleID 被
+ *     回收复用后，本该发生的"首次"会被这些残留行**抑制**，而服务端没有抑制。
+ *  2. 这里导出的 `Load_R3DS()` 开头 —— 双保险，且能覆盖"读档失败/中途放弃"的路径。
+ *
+ * 日志/提示类表也一并清掉（它们不入档，但残留会让新会话的第一条提示不出现）。
+ */
+void R3RSessionStateReset()
+{
+	_r3r_decomp_seams.clear();
+	_r3r_waiter_purged.clear();
+	_r3r_wbar_state.clear();
+	_r3r_couple_enter_tick.clear();
+	_r3r_pair_scan_tick.clear();
+	_r3r_pair_verdict.clear();
+	_r3r_couple_commit_fail.clear();
+	_r3r_couple_no_target.clear();
+	_r3r_couple_wait_heals.clear();
+	_r3r_couple_autoreserve.clear();
+	_r3r_force_replan.clear();
+	_r3r_just_reversed.clear();
+	_r3r_depot_self_release.clear();
+	_r3r_couple_partial_reserve.clear();
+	_r3r_loop_memo.clear();
+	/* 提示 / 探针表：不入档，但跨档残留会造成"这一局的一次性提示不出现"。 */
+	_r3r_couple_fail_news_shown.clear();
+	_r3r_couple_depot_news.clear();
+	_r3r_waiter_nobook_logged.clear();
+	_r3r_dispatch_no_slot.clear();
+	_r3r_dispatch_empty_notified.clear();
+	R3ROrphanSeenClear();
+}
+
+/** R3R (第 526 轮, KI-694): 往稀疏块里追加一行。 */
+static void R3RAppendDesyncRow(SaveLoadTableData &slt, uint &index, uint8_t kind, uint32_t key,
+		uint32_t a = 0, uint32_t b = 0, uint32_t tile = 0, uint64_t tick = 0)
+{
+	R3RDesyncStateRec rec{};
+	rec.kind = kind;
+	rec.key  = key;
+	rec.a    = a;
+	rec.b    = b;
+	rec.tile = tile;
+	rec.tick = tick;
+	SlSetArrayIndex(index++);
+	SlObjectSaveFiltered(&rec, slt);
+}
+
 void Save_R3DS()
 {
 	SaveLoadTableData slt = SlTableHeader(_r3r_desync_state_desc);
 	uint i = 0;
 
+	/* kind 0. 解挂缝：键是后车（见 R3RRecordDecoupleSeam），a 是前车链头。 */
 	for (const auto &kv : _r3r_decomp_seams) {
-		R3RDesyncStateRec rec{};
-		rec.kind = 0;
-		rec.key  = kv.first.base();
-		rec.a    = kv.second.head.base();
-		rec.b    = kv.second.seam_car.base();
-		rec.tile = kv.second.seam_tile.base();
-		rec.tick = kv.second.tick;
-		SlSetArrayIndex(i++);
-		SlObjectSaveFiltered(&rec, slt);
+		R3RAppendDesyncRow(slt, i, R3RDSK_SEAM, kv.first.base(),
+				kv.second.head.base(), kv.second.seam_car.base(),
+				kv.second.seam_tile.base(), kv.second.tick);
+	}
+
+	/* kind 2：已做过"首次停驻清理"的链。 */
+	for (const VehicleID id : _r3r_waiter_purged) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_WAITER_PURGED, id.base());
+	}
+
+	/* kind 3：等待区路点栅栏的"已越过"状态（std::unordered_map，排序后写，
+	 * 让"存→读→再存"逐字可复现）。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_wbar_state.size());
+		for (const auto &kv : _r3r_wbar_state) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RWaitBarrierState &bs = _r3r_wbar_state[k];
+			const uint32_t flags = (bs.seen_on_wp ? 1u : 0u) | (bs.overshoot ? 2u : 0u) | (bs.released ? 4u : 0u);
+			R3RAppendDesyncRow(slt, i, R3RDSK_WAIT_BARRIER, k, (uint32_t)bs.order_index, flags);
+		}
+	}
+
+	/* kind 4：进入挂接命令的时刻戳（决定抢车底优先权）。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_couple_enter_tick.size());
+		for (const auto &kv : _r3r_couple_enter_tick) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RCoupleEnterStamp &st = _r3r_couple_enter_tick[k];
+			R3RAppendDesyncRow(slt, i, R3RDSK_COUPLE_ENTER, k, st.owner.base(), 0, 0, st.tick);
+		}
+	}
+
+	/* kind 5：配对扫描退避窗。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_pair_scan_tick.size());
+		for (const auto &kv : _r3r_pair_scan_tick) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			R3RAppendDesyncRow(slt, i, R3RDSK_PAIR_SCAN, k, 0, 0, 0, _r3r_pair_scan_tick[k]);
+		}
+	}
+
+	/* kind 6：配对扫描结论（玩家口径「退避期按上一帧走」，所以它跨 tick 生效）。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_pair_verdict.size());
+		for (const auto &kv : _r3r_pair_verdict) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RPairVerdict &pv = _r3r_pair_verdict[k];
+			R3RAppendDesyncRow(slt, i, R3RDSK_PAIR_VERDICT, k, pv.has_candidate ? 1u : 0u, pv.candidates, 0, pv.tick);
+		}
+	}
+
+	/* kind 7..12：有序容器，直接按键序写。 */
+	for (const auto &kv : _r3r_couple_commit_fail) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_COMMIT_FAIL, kv.first.base(),
+				kv.second.candidate.base(), kv.second.failures);
+	}
+	for (const auto &kv : _r3r_couple_no_target) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_NO_TARGET, kv.first.base(), (uint32_t)kv.second);
+	}
+	for (const auto &kv : _r3r_couple_wait_heals) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_WAIT_HEALS, kv.first.base(), kv.second);
+	}
+	for (const VehicleID id : _r3r_couple_autoreserve) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_COUPLE_AUTORESERVE, id.base());
+	}
+	for (const VehicleID id : _r3r_force_replan) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_FORCE_REPLAN, id.base());
+	}
+	for (const VehicleID id : _r3r_just_reversed) {
+		R3RAppendDesyncRow(slt, i, R3RDSK_JUST_REVERSED, id.base());
+	}
+
+	/* kind 13/14：带时间窗的"自订预留"记账（决定能不能出库）。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_depot_self_release.size());
+		for (const auto &kv : _r3r_depot_self_release) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RDepotSelfReleaseRecord &rec = _r3r_depot_self_release[k];
+			R3RAppendDesyncRow(slt, i, R3RDSK_DEPOT_SELF_RELEASE, k, 0, 0, rec.tile.base(), rec.tick);
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_couple_partial_reserve.size());
+		for (const auto &kv : _r3r_couple_partial_reserve) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RCouplePartialReserveRecord &rec = _r3r_couple_partial_reserve[k];
+			R3RAppendDesyncRow(slt, i, R3RDSK_COUPLE_PARTIAL_RESERVE, k,
+					0, rec.logged ? 1u : 0u, rec.mf_tile.base(), rec.tick);
+		}
+	}
+
+	/* kind 15：孤儿观察表（pbs.cpp）。std::map 本身有序，按序号取即可。 */
+	{
+		const size_t n = R3ROrphanSeenCount();
+		for (size_t j = 0; j < n; j++) {
+			uint32_t tile = 0, tick = 0;
+			uint8_t track = 0;
+			if (!R3ROrphanSeenGet(j, &tile, &track, &tick)) break;
+			R3RAppendDesyncRow(slt, i, R3RDSK_ORPHAN_SEEN, 0, (uint32_t)track, 0, tile, tick);
+		}
 	}
 }
 
@@ -17557,25 +17757,387 @@ void Load_R3DS()
 
 	/* The savegame is the whole truth: nothing from an earlier load (or a previous game
 	 * in the same process) may survive into this one. */
-	_r3r_decomp_seams.clear();
+	R3RSessionStateReset();
 
 	int index;
 	while ((index = SlIterateArray()) != -1) {
 		R3RDesyncStateRec rec{};
 		SlObjectLoadFiltered(&rec, slt);
 
-		if (rec.kind == 0) {
-			R3RDecompSeam seam{};
-			seam.head      = VehicleID((uint16_t)rec.key);
-			seam.seam_car  = VehicleID((uint16_t)rec.b);
-			seam.seam_tile = TileIndex(rec.tile);
-			seam.tick      = rec.tick;
-			/* The "wait" line is per session, never remembered across one. */
-			seam.reported  = false;
-			_r3r_decomp_seams[VehicleID((uint16_t)rec.key)] = seam;
+		switch (rec.kind) {
+			case R3RDSK_SEAM: {
+				R3RDecompSeam seam{};
+				/* R3R (第 526 轮, KI-693): 存档里的 `key` 是**后车**（表的键），
+				 * `a` 才是前车链头。这里原先写 `seam.head = rec.key`，于是读档后
+				 * 前车指向后车自己：`Train::GetIfValid(seam.head)` 必然成功、"这条缝
+				 * 已过期"的守卫永不触发，而放行判据里的 leader_head 也变成了后车 ⇒
+				 * 后车被提前放行。单机表现为"解挂后存档再读档，后车起步时机变了"，
+				 * 联机则是服务端还在等、客户端已开 ⇒ desync。 */
+				seam.head      = VehicleID((uint16_t)rec.a);
+				seam.seam_car  = VehicleID((uint16_t)rec.b);
+				seam.seam_tile = TileIndex(rec.tile);
+				seam.tick      = rec.tick;
+				/* The "wait" line is per session, never remembered across one. */
+				seam.reported  = false;
+				_r3r_decomp_seams[VehicleID((uint16_t)rec.key)] = seam;
+				break;
+			}
+
+			case R3RDSK_WAITER_PURGED:
+				_r3r_waiter_purged.insert(VehicleID((uint16_t)rec.key));
+				break;
+
+			case R3RDSK_WAIT_BARRIER:
+				_r3r_wbar_state[rec.key] = R3RWaitBarrierState{
+						(VehicleOrderID)rec.a,
+						(rec.b & 1u) != 0,
+						(rec.b & 2u) != 0,
+						(rec.b & 4u) != 0 };
+				break;
+
+			case R3RDSK_COUPLE_ENTER:
+				_r3r_couple_enter_tick[rec.key] = R3RCoupleEnterStamp{
+						VehicleID((uint16_t)rec.a), rec.tick };
+				break;
+
+			case R3RDSK_PAIR_SCAN:
+				_r3r_pair_scan_tick[rec.key] = rec.tick;
+				break;
+
+			case R3RDSK_PAIR_VERDICT:
+				_r3r_pair_verdict[rec.key] = R3RPairVerdict{
+						rec.a != 0, rec.b, rec.tick };
+				break;
+
+			case R3RDSK_COMMIT_FAIL: {
+				R3RCoupleCommitFailEpisode ep{};
+				ep.candidate = VehicleID((uint16_t)rec.a);
+				ep.failures  = rec.b;
+				_r3r_couple_commit_fail[VehicleID((uint16_t)rec.key)] = ep;
+				break;
+			}
+
+			case R3RDSK_NO_TARGET:
+				_r3r_couple_no_target[VehicleID((uint16_t)rec.key)] = (uint8_t)rec.a;
+				break;
+
+			case R3RDSK_WAIT_HEALS:
+				_r3r_couple_wait_heals[VehicleID((uint16_t)rec.key)] = rec.a;
+				break;
+
+			case R3RDSK_COUPLE_AUTORESERVE:
+				_r3r_couple_autoreserve.insert(VehicleID((uint16_t)rec.key));
+				break;
+
+			case R3RDSK_FORCE_REPLAN:
+				_r3r_force_replan.insert(VehicleID((uint16_t)rec.key));
+				break;
+
+			case R3RDSK_JUST_REVERSED:
+				_r3r_just_reversed.insert(VehicleID((uint16_t)rec.key));
+				break;
+
+			case R3RDSK_DEPOT_SELF_RELEASE:
+				_r3r_depot_self_release[rec.key] = R3RDepotSelfReleaseRecord{
+						TileIndex(rec.tile), (uint32_t)rec.tick };
+				break;
+
+			case R3RDSK_COUPLE_PARTIAL_RESERVE:
+				_r3r_couple_partial_reserve[rec.key] = R3RCouplePartialReserveRecord{
+						TileIndex(rec.tile), (uint32_t)rec.tick, rec.b != 0 };
+				break;
+
+			case R3RDSK_ORPHAN_SEEN:
+				R3ROrphanSeenPut(rec.tile, (uint8_t)rec.a, (uint32_t)rec.tick);
+				break;
+
+			default:
+				/* R3RDSK_RETIRED_ORPHAN_STAMP and any future kind are ignored on purpose:
+				 * a later version may add rows here and an older binary must still load. */
+				break;
 		}
-		/* Unknown kinds are ignored on purpose: a later version may add rows here. */
 	}
+}
+
+/**
+ * R3R (第 526 轮, KI-697): 把 R3R 的同步状态并入原生的 `_state_checksum`。
+ *
+ * 为什么必须这样做：原生的联机不同步检测只有两条判据 —— `_random.state[0]` 和
+ * `_state_checksum.state`（src\network\network_client.cpp:318）。而 `_state_checksum`
+ * 在 openttd.cpp 里只累加 tick/日期/公司资金/基础设施数量，车辆侧只有 `Train::Tick()`
+ * 打的一格 `x_pos|y_pos|track` 和 ChooseTrainTrack 的 `path_found|next_track`
+ * （src\openttd.cpp:1644-1684、src\train_cmd.cpp:20809 / :15985）。
+ *
+ * R3R 的状态里有相当一部分**不会**反映到这几项上：段表里"哪个段跑到第几条命令"、
+ * 挂起日程的指针、`r3r_segment_id`/`r3r_priority` 的归属、以及 11 张会话态表
+ * （解挂缝、等待栅栏、抢车底时刻戳、失败计数、自愈次数、出库自订预留……）。
+ * 两端在这些量上分叉时，车辆坐标、资金、随机数可以完全一致 —— 于是原生判据说
+ * "同步正常"，desync 不会被发现，也就不会产出任何 desync 崩溃日志。
+ *
+ * 把上述量并入同一个校验和后，R3R 的分叉会表现为一次普通的 state checksum 不符
+ * ⇒ 走原生的 `DesyncCrashLog()` 流程 ⇒ `Documents\OpenTTD\desync-client-<时间>.log`
+ * 照常产出（该文件里还有 CheckCaches 的 R3R 摘要，见 src\cachecheck.cpp）。
+ *
+ * 实现约束（三条，缺一就会把正常游戏判成 desync）：
+ *  1. **顺序必须确定**：`Vehicle::Iterate()` 与 `_r3r_segments` 按索引升序，
+ *     `btree_*` 天然有序，`unordered_*` 一律先收集 key 排序再遍历。
+ *  2. **只收同步数据**：日志节流字段（reported / logged / last_sig / last_log_age /
+ *     candidates）与纯探针表一律不参与，它们允许两端不同。
+ *  3. **指针只取池索引**：`r3r_follow_orders` 等是内存地址，两端必然不同；只有它指向
+ *     的那张表在订单池里的编号才是同步量。
+ *
+ * 调用点：src\openttd.cpp 的 `if (_networking)` 段（与日期/公司块同一位置），
+ * 两端在同一 tick 走同一序列，因此累计值可比。
+ */
+void R3RUpdateStateChecksum()
+{
+#if !defined(DEDICATED)
+	if (!_networking) return;
+#endif
+
+	/* 车辆上的 R3R 字段。按 `index` 打散，避免两列不同车互相抵消。 */
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->type != VehicleType::Train) continue;
+		const uint64_t idx = (uint64_t)v->index.base();
+
+		/* 段身份 + 优先级 + 池标记。 */
+		UpdateStateChecksum((idx << 40) ^ ((uint64_t)v->r3r_segment_id << 24) ^
+				((uint64_t)v->r3r_priority << 8) ^ (v->r3r_follow_pool ? 0x1 : 0x0));
+
+		/* 三条订单书签（挂起期间"我自己跑到第几条"）。 */
+		UpdateStateChecksum((idx << 48) ^ ((uint64_t)v->orders_backup_real_index << 32) ^
+				((uint64_t)v->orders_backup_implicit_index << 16) ^
+				(uint64_t)v->orders_backup_timetable_index);
+
+		/* 借用关系：只取被引用表/车的编号（指针本身两端必然不同）。 */
+		const uint64_t follow_orders = (v->r3r_follow_orders != nullptr) ? (uint64_t)v->r3r_follow_orders->index.base() + 1 : 0;
+		const uint64_t backup_orders = (v->orders_backup != nullptr) ? (uint64_t)v->orders_backup->index.base() + 1 : 0;
+		const uint64_t pool_orders   = (v->r3r_pool_orders != nullptr) ? (uint64_t)v->r3r_pool_orders->index.base() + 1 : 0;
+		UpdateStateChecksum((idx << 40) ^ (follow_orders << 20) ^ backup_orders ^ (pool_orders << 8));
+		UpdateStateChecksum((idx << 40) ^ ((uint64_t)v->r3r_follow_owner.base()) ^
+				((uint64_t)v->unitnumber_backup << 16) ^
+				((uint64_t)v->group_id_backup.base() << 32) ^
+				((uint64_t)v->couple_groups << 1) ^ (v->r3r_orders_borrowed ? 0x1 : 0x0));
+	}
+
+	/* 段身份表：id 升序遍历，`R3RSegmentGet()` 对空槽返回 nullptr。 */
+	for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
+		const R3RSegmentRecord *rec = R3RSegmentGet((uint16_t)id);
+		if (rec == nullptr) continue;
+		const uint64_t orders = (rec->orders != nullptr) ? (uint64_t)rec->orders->index.base() + 1 : 0;
+		UpdateStateChecksum(((uint64_t)id << 48) ^ (orders << 24) ^
+				((uint64_t)rec->real_index << 8) ^ (uint64_t)rec->implicit_index);
+		UpdateStateChecksum(((uint64_t)id << 48) ^ ((uint64_t)rec->timetable_index << 32) ^
+				((uint64_t)rec->unitnumber << 16) ^
+				((uint64_t)rec->group_id.base() << 1) ^ (rec->orders_borrowed ? 0x1 : 0x0));
+	}
+
+	/* 有序容器：直接遍历即为确定顺序。 */
+	for (const auto &kv : _r3r_decomp_seams) {
+		UpdateStateChecksum(((uint64_t)kv.first.base() << 48) ^ (0x0ULL << 32) ^
+				((uint64_t)kv.second.head.base() << 16) ^ (uint64_t)kv.second.seam_car.base());
+		UpdateStateChecksum(((uint64_t)kv.first.base() << 48) ^ ((uint64_t)kv.second.seam_tile.base() << 16) ^ kv.second.tick);
+	}
+	for (const VehicleID id : _r3r_waiter_purged)        UpdateStateChecksum(((uint64_t)id.base() << 8) ^ 0x11);
+	for (const VehicleID id : _r3r_force_replan)         UpdateStateChecksum(((uint64_t)id.base() << 8) ^ 0x12);
+	for (const VehicleID id : _r3r_just_reversed)        UpdateStateChecksum(((uint64_t)id.base() << 8) ^ 0x13);
+	for (const VehicleID id : _r3r_couple_autoreserve)   UpdateStateChecksum(((uint64_t)id.base() << 8) ^ 0x14);
+	for (const auto &kv : _r3r_couple_commit_fail) {
+		UpdateStateChecksum(((uint64_t)kv.first.base() << 40) ^ ((uint64_t)kv.second.candidate.base() << 8) ^ kv.second.failures);
+	}
+	for (const auto &kv : _r3r_couple_no_target) {
+		UpdateStateChecksum(((uint64_t)kv.first.base() << 40) ^ 0x15 ^ ((uint64_t)kv.second << 8));
+	}
+	for (const auto &kv : _r3r_couple_wait_heals) {
+		UpdateStateChecksum(((uint64_t)kv.first.base() << 40) ^ 0x16 ^ ((uint64_t)kv.second << 8));
+	}
+
+	/* 无序容器：先收集 key、排序，再遍历（见实现约束 1）。 */
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_wbar_state.size());
+		for (const auto &kv : _r3r_wbar_state) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RWaitBarrierState &bs = _r3r_wbar_state[k];
+			const uint64_t flags = (bs.seen_on_wp ? 1u : 0u) | (bs.overshoot ? 2u : 0u);
+			UpdateStateChecksum(((uint64_t)k << 40) ^ 0x17 ^ ((uint64_t)bs.order_index << 8) ^ (flags << 24));
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_couple_enter_tick.size());
+		for (const auto &kv : _r3r_couple_enter_tick) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RCoupleEnterStamp &st = _r3r_couple_enter_tick[k];
+			UpdateStateChecksum(((uint64_t)k << 48) ^ ((uint64_t)st.owner.base() << 16) ^ st.tick);
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_pair_scan_tick.size());
+		for (const auto &kv : _r3r_pair_scan_tick) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			UpdateStateChecksum(((uint64_t)k << 48) ^ 0x18 ^ _r3r_pair_scan_tick[k]);
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_pair_verdict.size());
+		for (const auto &kv : _r3r_pair_verdict) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RPairVerdict &pv = _r3r_pair_verdict[k];
+			UpdateStateChecksum(((uint64_t)k << 40) ^ 0x19 ^ ((pv.has_candidate ? 1ULL : 0ULL) << 8));
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_depot_self_release.size());
+		for (const auto &kv : _r3r_depot_self_release) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RDepotSelfReleaseRecord &rec = _r3r_depot_self_release[k];
+			UpdateStateChecksum(((uint64_t)k << 40) ^ 0x1A ^ ((uint64_t)rec.tile.base() << 8));
+		}
+	}
+	{
+		std::vector<uint32_t> keys;
+		keys.reserve(_r3r_couple_partial_reserve.size());
+		for (const auto &kv : _r3r_couple_partial_reserve) keys.push_back(kv.first);
+		std::sort(keys.begin(), keys.end());
+		for (const uint32_t k : keys) {
+			const R3RCouplePartialReserveRecord &rec = _r3r_couple_partial_reserve[k];
+			UpdateStateChecksum(((uint64_t)k << 40) ^ 0x1B ^ ((uint64_t)rec.mf_tile.base() << 8));
+		}
+	}
+
+	/* 孤儿观察表（pbs.cpp）：std::map，按序号取即为键序。 */
+	{
+		const size_t n = R3ROrphanSeenCount();
+		for (size_t j = 0; j < n; j++) {
+			uint32_t tile = 0, tick = 0;
+			uint8_t track = 0;
+			if (!R3ROrphanSeenGet(j, &tile, &track, &tick)) break;
+			UpdateStateChecksum(((uint64_t)tile << 16) ^ 0x1C ^ ((uint64_t)track << 8));
+		}
+	}
+}
+
+/**
+ * R3R (第 526 轮, KI-697): 与 `src\sl\couple_group_sl.cpp` 的 `R3RHasParkState()`
+ * 同一判据（那边是文件内 static，这里用不到）。只用于挑出"有 R3R 状态"的车辆，
+ * 让 desync 摘要不至于把每一列普通列车都列出来。
+ */
+static bool R3RVehicleHasSyncState(const Vehicle *v)
+{
+	return v->r3r_follow_orders != nullptr ||
+			v->r3r_follow_owner != VehicleID::Invalid() ||
+			v->r3r_pool_orders != nullptr ||
+			v->orders_backup != nullptr ||
+			v->orders_backup_real_index != INVALID_VEH_ORDER_ID ||
+			v->orders_backup_implicit_index != INVALID_VEH_ORDER_ID ||
+			v->orders_backup_timetable_index != INVALID_VEH_ORDER_ID ||
+			v->r3r_follow_pool ||
+			v->unitnumber_backup != 0 ||
+			!v->name_backup.empty() ||
+			v->r3r_orders_borrowed ||
+			v->group_id_backup != GroupID::Invalid() ||
+			v->r3r_priority != 1 ||
+			v->r3r_segment_id != R3R_SEGMENT_NONE;
+}
+
+/**
+ * R3R (第 526 轮, KI-697): 把 R3R 的同步状态写成文本，供 desync 崩溃日志使用。
+ *
+ * 校验和只能回答"两端不一样"，回答不了"哪里不一样"。原生的 desync 日志里
+ * CheckCaches 段能给出城镇/站台/车辆缓存的自洽性，但对 R3R 一无所知 ——
+ * 拿到日志的人无法判断是段表、挂起日程还是会话计数分叉。
+ *
+ * 本函数由 src\crashlog.cpp 的 FillDesyncCrashLog() 调用，输出有界（各段最多若干行），
+ * 只读、不改任何状态。字段名与 R3VP/R3SG 的存档键一致，便于与存档对照。
+ *
+ * @param out 追加文本的目标。
+ */
+void R3RWriteDesyncSummary(std::string &out)
+{
+	static const size_t MAX_ROWS = 60;
+
+	out.append("R3R state:\n");
+
+	/* 1. 带 R3R 状态的车辆：只列非默认值的，否则每辆车都占一行。 */
+	{
+		size_t rows = 0, total = 0;
+		for (const Vehicle *v : Vehicle::Iterate()) {
+			if (v->type != VehicleType::Train) continue;
+			if (!R3RVehicleHasSyncState(v)) continue;
+			++total;
+			if (rows >= MAX_ROWS) continue;
+			const uint64_t follow = (v->r3r_follow_orders != nullptr) ? (uint64_t)v->r3r_follow_orders->index.base() + 1 : 0;
+			const uint64_t backup = (v->orders_backup != nullptr) ? (uint64_t)v->orders_backup->index.base() + 1 : 0;
+			const uint64_t pool   = (v->r3r_pool_orders != nullptr) ? (uint64_t)v->r3r_pool_orders->index.base() + 1 : 0;
+			fmt::format_to(std::back_inserter(out),
+					"  veh={} seg={} pri={} fol={} bak={} bkr={} bki={} bkt={} pool={} own={} grp={} num={} borrowed={}\n",
+					v->index.base(), v->r3r_segment_id, v->r3r_priority, follow, backup,
+					(uint32_t)v->orders_backup_real_index, (uint32_t)v->orders_backup_implicit_index,
+					(uint32_t)v->orders_backup_timetable_index, pool,
+					v->r3r_follow_owner.base(), v->group_id_backup.base(), v->unitnumber_backup,
+					v->r3r_orders_borrowed ? 1 : 0);
+			++rows;
+		}
+		if (total > rows) fmt::format_to(std::back_inserter(out), "  ... {} more vehicles with R3R state\n", total - rows);
+	}
+
+	/* 2. 段身份表。 */
+	{
+		size_t rows = 0, total = 0;
+		for (size_t id = 1; id < R3RSegmentPoolSize(); id++) {
+			const R3RSegmentRecord *rec = R3RSegmentGet((uint16_t)id);
+			if (rec == nullptr) continue;
+			++total;
+			if (rows >= MAX_ROWS) continue;
+			const uint64_t orders = (rec->orders != nullptr) ? (uint64_t)rec->orders->index.base() + 1 : 0;
+			fmt::format_to(std::back_inserter(out),
+					"  seg id={} orders={} real={} impl={} tt={} num={} grp={} borrowed={}\n",
+					id, orders, (uint32_t)rec->real_index, (uint32_t)rec->implicit_index,
+					(uint32_t)rec->timetable_index, rec->unitnumber, rec->group_id.base(),
+					rec->orders_borrowed ? 1 : 0);
+			++rows;
+		}
+		if (total > rows) fmt::format_to(std::back_inserter(out), "  ... {} more segments\n", total - rows);
+	}
+
+	/* 3. 会话态表的规模，以及会影响判定的关键行。 */
+	fmt::format_to(std::back_inserter(out),
+			"  session: seam={} waiter_purged={} wbar={} couple_enter={} pair_scan={} pair_verdict={}\n",
+			_r3r_decomp_seams.size(), _r3r_waiter_purged.size(), _r3r_wbar_state.size(),
+			_r3r_couple_enter_tick.size(), _r3r_pair_scan_tick.size(), _r3r_pair_verdict.size());
+	fmt::format_to(std::back_inserter(out),
+			"  session: commit_fail={} no_target={} wait_heals={} autoreserve={} force_replan={} just_reversed={} depot_self_release={} partial_reserve={} orphan_seen={}\n",
+			_r3r_couple_commit_fail.size(), _r3r_couple_no_target.size(), _r3r_couple_wait_heals.size(),
+			_r3r_couple_autoreserve.size(), _r3r_force_replan.size(), _r3r_just_reversed.size(),
+			_r3r_depot_self_release.size(), _r3r_couple_partial_reserve.size(), R3ROrphanSeenCount());
+
+	for (const auto &kv : _r3r_decomp_seams) {
+		fmt::format_to(std::back_inserter(out),
+				"  seam follower={} leader={} seam_car={} tile={} tick={} hold={}\n",
+				kv.first.base(), kv.second.head.base(), kv.second.seam_car.base(),
+				kv.second.seam_tile.base(), kv.second.tick, kv.second.hold_calls);
+	}
+	for (const auto &kv : _r3r_couple_commit_fail) {
+		fmt::format_to(std::back_inserter(out), "  commit_fail veh={} cand={} n={}\n",
+				kv.first.base(), kv.second.candidate.base(), kv.second.failures);
+	}
+	for (const auto &kv : _r3r_couple_wait_heals) {
+		fmt::format_to(std::back_inserter(out), "  wait_heals veh={} n={}\n", kv.first.base(), kv.second);
+	}
+	for (const auto &kv : _r3r_couple_enter_tick) {
+		fmt::format_to(std::back_inserter(out), "  couple_enter veh={} owner={} tick={}\n",
+				kv.first, kv.second.owner.base(), kv.second.tick);
+	}
+	out.append("\n");
 }
 
 /** Tries to reserve track under whole train consist. */

@@ -756,6 +756,20 @@ void CrashLog::FillDesyncCrashLog(format_target_ctrl &buffer, const DesyncExtraI
 	});
 	if (have_cache_log) buffer.push_back('\n');
 
+	/* R3R (第 526 轮, KI-697): R3R 侧的状态摘要。
+	 *
+	 * 原生 desync 日志的 CheckCaches 段能说明城镇/站台/车辆缓存是否自洽，但对 R3R
+	 * 的段身份表、挂起日程与会话计数一无所知 —— 而 R3R 的分叉恰恰常出现在这些量上，
+	 * 而不是车辆坐标。校验和（src\openttd.cpp 的 R3RUpdateStateChecksum()）负责
+	 * "让分叉能被检出"，这里负责"检出之后看得见哪里不一样"，两者缺一不可。
+	 * 输出有界，只读。 */
+	{
+		extern void R3RWriteDesyncSummary(std::string &out);
+		std::string r3r_state;
+		R3RWriteDesyncSummary(r3r_state);
+		buffer.append(r3r_state);
+	}
+
 	buffer.format("*** End of OpenTTD Multiplayer {} Desync Report ***\n", _network_server ? "Server" : "Client");
 }
 

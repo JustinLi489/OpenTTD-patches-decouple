@@ -126,6 +126,22 @@ static std::map<uint32_t, TileIndex> _r3r_answer_dest;
 static std::map<uint32_t, uint32_t> _r3r_answer_store_count;
 static std::map<uint32_t, uint32_t> _r3r_answer_hit_count;
 
+/* R3R (第 526 轮, KI-695): 联机时整本答案作废。
+ *
+ * 答案本把上一次 A* 的结果直接照抄来铺预留。单机里这是纯性能优化：命中与重新寻路
+ * 得到的是"同一张地图上的同一条路"，偶尔抄到略不同的同代价解也无害，因为只有一台
+ * 机器在跑。
+ *
+ * 联机不成立：服务端命中缓存铺出的预留，必须与中途加入的客户端重新 A* 铺出的预留
+ * **逐格相同**，否则两端从那一 tick 起对地图的认知就分叉。同代价多解、
+ * 以及缓存条目在 R3RAnswerDrop() 之外变陈旧，都会让这条等式不成立。
+ *
+ * 收口的办法是让联机两端**都不使用**答案本（而不是"只让客户端不用"）：
+ * `_networking` 在服务端和客户端都为真，于是两端都走原生 A*，序列必然一致。
+ * 代价是联机时失去这项优化（单机保留），这是正确性优先的取舍。
+ * 与既有"开 desync/yapfdesync 调试时一律走原生寻路"同一处守卫。 */
+extern bool _networking;
+
 /** 丢弃某车的答案（卖车/解挂/掉头等链结构变化处显式调用；换单由回放里的目的地比对兜住）。reason 只用于探针。 */
 void R3RAnswerDrop(VehicleID veh, const char *reason)
 {
@@ -144,6 +160,11 @@ static std::vector<R3RAnswerStep> _r3r_answer_build;
 /** 把本次刚铺过的路径收进答案本。只在主寻路（非 unstafe_pos）路径上调用。 */
 static void R3RAnswerCommit(VehicleID veh, TileIndex order_dest)
 {
+	/* R3R (第 526 轮, KI-695): 联机时不写入（见上方 _networking 那段说明）。 */
+	if (_networking) {
+		_r3r_answer_build.clear();
+		return;
+	}
 	const uint32_t key = veh.base();
 	if (_r3r_answer_build.size() < 2) {
 		_r3r_answer_build.clear();
@@ -1111,8 +1132,9 @@ public:
 	bool R3RAnswerReplay(const Train *v, const PBSTileInfo &origin, PBSTileInfo *target, TileIndex *dest, Trackdir *first_td)
 	{
 		/* 开 desync/yapfdesync 调试时会同一场景跑两遍做逐节点比对，此时一律走原生
-		 * 寻路，保证两次调用的行为与改前逐字相同，不受答案本影响。 */
-		if (GetDebugLevel(DebugLevelID::yapfdesync) >= 1 || GetDebugLevel(DebugLevelID::desync) >= 2) return false;
+		 * 寻路，保证两次调用的行为与改前逐字相同，不受答案本影响。
+		 * R3R (第 526 轮, KI-695): 联机时同理走原生寻路，见上方 _networking 那段说明。 */
+		if (_networking || GetDebugLevel(DebugLevelID::yapfdesync) >= 1 || GetDebugLevel(DebugLevelID::desync) >= 2) return false;
 
 		/* 车必须由调用方传入，绝不能用 Yapf().GetVehicle()：本函数跑在 FindPath() 之前，
 		 * 基类的 vehicle 成员此刻还没赋值（yapf_base.hpp:163 只在 FindPath 里写），

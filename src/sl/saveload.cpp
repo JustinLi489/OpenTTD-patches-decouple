@@ -3922,6 +3922,17 @@ static void ResetSaveloadData()
 	 * R3SG chunk at all. */
 	extern void R3RSegmentTableReset();
 	R3RSegmentTableReset();
+
+	/* R3R (第 526 轮, KI-694): the session tables behind the couple/decouple
+	 * machinery (decouple seam, waiter-purged, wait barrier, couple entry stamps,
+	 * pair scan/verdict, commit failures, heal budget, autoreserve, force replan,
+	 * just-reversed, depot self-release, partial reserve, orphan-seen) are
+	 * file-statics in train_cmd.cpp / pbs.cpp as well. They are written by the
+	 * R3DS chunk, so a load must start from empty tables: a leftover row from the
+	 * previous game would suppress the very "first time" branch the new savegame
+	 * expects to run (VehicleIDs are recycled), while the server runs it. */
+	extern void R3RSessionStateReset();
+	R3RSessionStateReset();
 }
 
 /**

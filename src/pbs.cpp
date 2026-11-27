@@ -544,6 +544,53 @@ bool TryReserveRailTrack(TileIndex tile, Track track, bool trigger_stations)
 }
 
 /**
+ * R3R (第 526 轮, KI-694): "这个位已经连续无主几个 tick 了"的观察表。
+ *
+ * 键 = (tile << 3) | track，值 = 上一次被判无主的 `_tick_counter`。
+ *
+ * 第 525 轮续 (KI-692) 把它从函数内 static 提到文件级，只为了让存档块能读到它：
+ * 它的**唯一用途**是让回收动作跨 tick 生效（"同一根轨至少在上一 tick 也无主"），
+ * 于是一张空表会让 T 时刻刚成立的判据推迟到 T+1 —— 服务端已经清掉了孤儿位、
+ * 中途加入的客户端还在等一 tick，两端从那一 tick 起对地图的认知就分叉。
+ * 因此它和 `_r3r_decomp_seams` 一样属于"必须随存档走"的会话态。
+ */
+static std::map<uint64_t, uint32_t> r3r_orphan_seen;
+
+/** R3R (第 526 轮, KI-694): 读档前清空，见 R3RSessionStateReset()。 */
+void R3ROrphanSeenClear()
+{
+	r3r_orphan_seen.clear();
+}
+
+/** R3R (第 526 轮, KI-694): 存档写入端遍历用。 */
+size_t R3ROrphanSeenCount()
+{
+	return r3r_orphan_seen.size();
+}
+
+/**
+ * R3R (第 526 轮, KI-694): 按序号取第 @p index 行（`std::map` 遍历，顺序确定）。
+ * @return false 表示 index 越界。
+ */
+bool R3ROrphanSeenGet(size_t index, uint32_t *tile, uint8_t *track, uint32_t *tick)
+{
+	auto it = r3r_orphan_seen.begin();
+	std::advance(it, index);
+	if (it == r3r_orphan_seen.end()) return false;
+	if (tile != nullptr)  *tile  = (uint32_t)(it->first >> 3);
+	if (track != nullptr) *track = (uint8_t)(it->first & 0x7);
+	if (tick != nullptr)  *tick  = it->second;
+	return true;
+}
+
+/** R3R (第 526 轮, KI-694): 读档回填一行。 */
+void R3ROrphanSeenPut(uint32_t tile, uint8_t track, uint32_t tick)
+{
+	if (r3r_orphan_seen.size() > 8192) r3r_orphan_seen.clear();
+	r3r_orphan_seen[((uint64_t)tile << 3) | (uint64_t)(track & 0x7)] = tick;
+}
+
+/**
  * R3R (第 525 轮, KI-690): 回收"无主"的普通轨预留位。
  *
  * 预留位在地图上不记主人，归属只能靠 FollowReservation() 沿链走到末端再问"谁站在那儿"
@@ -598,7 +645,6 @@ int R3RReapOrphanReservationBits(TileIndex tile)
 		 * CPL-NORES-BLOCK / COUPLE-FAIL，机车钉死 100 tick。
 		 * 判据改成"同一位至少在**上一个 tick** 也被判无主"。真正的孤儿（车底开走留下的）
 		 * 天然满足；刚铺的位在下一 tick 一旦被正常归属就会把记录抹掉。 */
-		static std::map<uint64_t, uint32_t> r3r_orphan_seen;
 		const uint64_t r3r_orphan_key = ((uint64_t)tile.base() << 3) | (uint64_t)t;
 		const auto r3r_orphan_it = r3r_orphan_seen.find(r3r_orphan_key);
 		if (r3r_orphan_it == r3r_orphan_seen.end()) {
