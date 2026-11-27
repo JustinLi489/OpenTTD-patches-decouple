@@ -16,7 +16,7 @@
 | 分支 | `feature/decouple` |
 | 探针删除提交 | `f41dd84fa2` R3R: strip every debug probe from source for the release build (2026-11-27) |
 | 备忘清理提交 | `2067203b4b` chore: drop round memos older than two weeks; fix .gitignore patterns |
-| 版本标签 | `R3R-v1.0.7`（annotated，打在发布备忘提交上） |
+| 版本标签 | `R3R-v1.0.7`（annotated；`git describe --tags` 输出 `R3R-v1.0.7`） |
 | 回退点 | `r3r-pre-probe-strip-2026-11-27`（探针删除前的完整状态） |
 | 工作区 | 干净（`git status --porcelain` 无输出） |
 
