@@ -339,3 +339,56 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
 
 两处删除后行为逐字不变（返回值、回滚、答案本记录全保留），发行版编译告警从 1 条降为 0 条，
 并去掉一处按车辆索引无限增长的静态容器。
+
+---
+
+## 十三、提交 / 发行版编译 / 打包（玩家要求：版本号仍为 R3R-v1.0.7，替换既有 GitHub release）
+
+### 13.1 git
+
+| 项 | 值 |
+| --- | --- |
+| 分支 | `feature/decouple` |
+| 提交 1 | `eca2e718db` R3R: savegame/desync hardening (round 526)（9 文件，+1159/−41） |
+| 提交 2 | `03fd851b04` R3R: drop two probe remnants left behind by the probe strip（2 文件，+12/−56） |
+| 版本标签 | `R3R-v1.0.7`（annotated，已用 `-f` 移到 `03fd851b04`；`git describe --tags` = `R3R-v1.0.7`） |
+| 工作区 | 干净 |
+| push | **未执行**（沿用既有口径：玩家确认后再推） |
+
+> 标签被移动 ⇒ 推送到 GitHub 必须 `git push --force origin R3R-v1.0.7`，
+> 且要先删掉远端已存在的同名 release 资产再上传新包。
+
+### 13.2 发行版编译
+
+| 项 | 值 |
+| --- | --- |
+| 构建树 | `build-release/`（RelWithDebInfo，`R3R_PROBES_DEFAULT=0`） |
+| 环境 | 沙箱拦 `reg.exe` ⇒ `vcvars64` 取不到 SDK，手动设 `INCLUDE`/`LIB`/`PATH` 后直调 ninja（同第 12.4 节） |
+| 步数 | 增量：`[10/10] Linking`（首轮）→ 清死代码后 `[5/5] Linking` → 改标签后 `[4/4] Linking` |
+| 告警 | 首轮 1 条（`C4189 r3r_vty`，探针残留）→ 清理后 **0 条**；`error C` 0 |
+| 产物 | `build-release\openttd.exe` **2026-11-27 23:47:34**，**30 500 864 B** |
+| SHA-256（exe） | `337aec978a9f3daf319814f76db7c93023086b05be6a0b4105fa5f37bce14ef2` |
+| 版本串 | `rev.cpp`: `_openttd_revision[] = "R3R-v1.0.7"`、`_openttd_release_version[] = "0.73.5"`、`_openttd_revision_tagged = 1`、`_openttd_revision_hash = "03fd851b04…"` |
+| exe 自证 | `R3R-v1.0.7` 命中 1 次；`R3R state:` / `session: seam=` 各 1 次；`R3R_debug.log` / `CPL-SCAN` / `FOLDCHK` / `LOCO-MOVE` / `CARGOWEIGHT` **全 0** |
+
+### 13.3 打包
+
+| 项 | 值 |
+| --- | --- |
+| 文件 | `R3R-v1.0.7-win64-2026-11-27.zip`（同名覆盖） |
+| 大小 | **18 221 137 B**（旧 17 687 933 B） |
+| SHA-256 | `2e26d99109f8633eee66d75f6e5d69f21cc53b21ea682bc83f97cd5cd07f9ebc` |
+| 条目 | **142**（与旧包逐条同名，顺序一致） |
+| 顶层目录 | `R3R-OpenTTD-0.73.5-win64\` |
+| 完整性 | `ZipFile.testzip()` = None（OK） |
+| 与旧包唯一差异 | `openttd.exe`：30 470 656 B → **30 500 864 B** |
+| 旧包备份 | `build-release\R3R-v1.0.7-win64-2026-11-27.prev.zip` |
+
+打包方式：**以旧包为基底**逐条复制，只替换 `openttd.exe`。这样保留玩家自己后来加进包里的
+`R3R教程.pptx`（旧包 142 条 = 备忘里 135 条 + 该课件 + 目录项等），也保证 `lang/`、
+`scripts/` 与上一版逐字一致。
+
+### 13.4 内测树同步
+
+`build\openttd.exe` 重编为 **2026-11-27 23:51:57**（53 302 784 B），与发行版同源（`03fd851b04`），
+`warning C`/`error C` 均 0。

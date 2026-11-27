@@ -27100,3 +27100,14 @@ R3DS 的注释已经把危害写清（`:17498-17517`），但同族表远不止 
 **构建**：`R3R_fullbuild.cmd inc`（`src\*.h` 比 obj 新 ⇒ 护栏升级全量）。发行版按玩家要求不编。
 
 **KI-697 构建自证（已编译，内测树）**：沙箱拦 `reg.exe` ⇒ `vcvars64` 取不到 SDK ⇒ 首次 `R3R_fullbuild.cmd inc` 报 `crtdbg.h` 缺失（`EXIT_CODE=1`，23:10:57）。改用手动 `INCLUDE`/`LIB`/`PATH` + 直调 ninja：`[11/11] Linking CXX executable openttd.exe`（rc=0），修掉一处 `C4189` 未使用变量后 `[2/3] train_cmd.cpp.obj` → `[3/3] Linking`，无告警；`build\openttd.exe` **2026-11-27 23:34:12**，晚于全部改动源码（23:07~23:09、train_cmd 23:33）。exe 命中 `R3R state:` / `session: seam=` / `seg id=` / `couple_enter veh=` / `commit_fail veh=` / `seam follower=`。`build\build.ninja` 无 `R3R_PROBES_DEFAULT=0` ⇒ 内测树；发布树未编。
+
+### 第 526 轮 · 提交与 v1.0.7 重建（2026-11-27）
+
+**玩家要求**：「请把源码提交git，然后编译发行版，打包（版本号依然为R3R-v1.0.7，我要用这个替换既有的github上面的release）」
+
+- 提交：`eca2e718db`（存档/不同步加固，9 文件）、`03fd851b04`（清 yapf_rail.cpp 两处探针残留，2 文件）；工作区干净。
+- 标签：`R3R-v1.0.7` 已用 `-f` 移到 `03fd851b04`，`git describe --tags` = `R3R-v1.0.7`（无 `-dirty`、无 `-1-g` 后缀）。
+- 发行版：`build-release\openttd.exe` 23:47:34 / 30 500 864 B / sha256 `337aec97…`；`rev.cpp` 三个字段逐项正确；exe 内探针串全 0，`R3R state:` 与 `R3R-v1.0.7` 各命中 1；告警 0。
+- 包：`R3R-v1.0.7-win64-2026-11-27.zip` 18 221 137 B / sha256 `2e26d991…` / 142 条 / testzip OK，与旧包仅 `openttd.exe` 不同（旧包已备份为 `build-release\R3R-v1.0.7-win64-2026-11-27.prev.zip`）。以旧包为基底替换，保留玩家加的 `R3R教程.pptx`。
+- 内测树：`build\openttd.exe` 23:51:57 / 53 302 784 B，同源。
+- **未 push**：按既有口径留给玩家确认。替换 GitHub release 需：`git push --force origin R3R-v1.0.7`，删旧资产后上传新 zip。
