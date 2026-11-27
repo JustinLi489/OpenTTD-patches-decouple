@@ -963,15 +963,6 @@ public:
 		static std::vector<IntermediaryTraceRestrictSignalInfo> intermediary_restricted_signals;
 		intermediary_restricted_signals.clear();
 
-		/* R3R 探针 (第 343 轮, KI-505): 只数"真正置位成功了多少格"。
-		 * 动机：同一 tick 出现 CPL-RESERVE reserved=1 与 CPL-RET res=0x0 并存
-		 * （build\R3R_debug.log:1406-1407），而当时 unsafe_pos=true 的挂接路径
-		 * 在格级失败时既不回滚也不早退 ⇒ "reserved=1"可能是空心的。
-		 * 第 503 轮把 unsafe_pos 拆成 atomic/check_target_free/record_answer 三参，
-		 * 挂接也改走 atomic=true，空心成功已结构性不可能；计数器保留继续兜底。 */
-		int r3r_ntry = 0;
-		int r3r_nok = 0;
-
 		for (Node *node = this->res_dest_node; node->parent != nullptr; node = node->parent) {
 			const size_t intermediary_restricted_signals_current_size = intermediary_restricted_signals.size();
 			node->template IterateTiles<CYapfReserveTrack>(Yapf().GetVehicle(), Yapf(), [&](TileIndex tile, Trackdir td) -> bool {
@@ -995,20 +986,6 @@ public:
 				const bool r3r_tok = this->ReserveSingleTrack(tile, td);
 				/* R3R (答案本): 只记主寻路这条路径的格；挂接寻路(record_answer=false)不参与。 */
 				if (r3r_tok && record_answer) _r3r_answer_build.push_back(R3RAnswerStep{tile, td});
-				++r3r_ntry;
-				if (r3r_tok) {
-					++r3r_nok;
-				} else {
-					/* 失败格：(veh, tile, td, 已成功格数) 去重，避免每 tick 刷屏 */
-					static std::map<uint32_t, uint64_t> r3r_rpf_seen;
-					const uint32_t r3r_vid = Yapf().GetVehicle()->index.base();
-					const uint64_t r3r_sig = ((uint64_t)r3r_nok << 48) ^ ((uint64_t)tile.base() << 16)
-							^ ((uint64_t)td << 8) ^ (uint64_t)r3r_ntry;
-					uint64_t &r3r_prev = r3r_rpf_seen[r3r_vid];
-					if (r3r_prev != r3r_sig) {
-						r3r_prev = r3r_sig;
-					}
-				}
 				return r3r_tok;
 			});
 			if (atomic && this->res_fail_tile != INVALID_TILE) {
@@ -1069,39 +1046,6 @@ public:
 		TraceRestrictSlotTemporaryState::ClearChangeStackApplyAllTemporaryChanges(Yapf().GetVehicle());
 
 		restricted_signal_state.TraceRestrictExecuteResEndSlot(Yapf().GetVehicle());
-
-		/* R3R 探针 (第 344 轮, 修法第三档 S1): 无条件汇总，取代原先只在失败时
-		 * 打印的 RPSUM —— 探针总数不增。
-		 *
-		 * 目的：把「挂接订路是不是从一开头就 nTry==0」从推断变成可统计。nTry==0
-		 * 只有一种成因：:637 的循环体一次都没进，而循环门槛是 node->parent != nullptr，
-		 * 所以它等价于 **res_dest_node 就是根节点**。故直接打印 node 的格与 root 标志，
-		 * 一眼可判 —— 现场（build\R3R_debug.log:1757-1758）正是
-		 *   CPL-RESERVE reserved=1 与 CPL-RET res=0x0 并存。
-		 * 签名去重，零行为改动。 */
-		{
-			static std::map<uint32_t, uint64_t> r3r_cplres_seen;
-			const Vehicle *const r3r_v = Yapf().GetVehicle();
-			const uint32_t r3r_vid = r3r_v->index.base();
-			const TileIndex r3r_node_tile = this->res_dest_node->GetLastTile();
-			/* R3R (第 459 轮, REG-456-E): 原来只打 origin 的坐标，看不出这个 origin
-			 * 到底是「车脚下」「目的地」还是第三处（上一段预留终点 / 站台回扫 / 站台
-			 * 末端）。玩家报的现象是车在 211,116、订单去 221,129，而订路的入口却在
-			 * 218,122 —— 只有把 origin 归到类里才能判它是哪一种。纯读。 */
-			const int r3r_vtx = (int)TileX(r3r_v->tile);
-			const int r3r_vty = (int)TileY(r3r_v->tile);
-			const int r3r_odx = (int)TileX(this->origin_tile);
-			const int r3r_ody = (int)TileY(this->origin_tile);
-			const uint64_t r3r_cplres_sig = ((uint64_t)(uint32_t)r3r_node_tile.base() << 40)
-					^ ((uint64_t)(uint32_t)this->origin_tile.base() << 16)
-					^ ((uint64_t)(uint32_t)r3r_ntry << 8)
-					^ ((uint64_t)(uint32_t)r3r_nok << 4)
-					^ (uint64_t)(uint32_t)this->res_dest_td;
-			uint64_t &r3r_cplres_prev = r3r_cplres_seen[r3r_vid];
-			if (r3r_cplres_prev != r3r_cplres_sig) {
-				r3r_cplres_prev = r3r_cplres_sig;
-			}
-		}
 
 		if (target != nullptr) target->okay = true;
 

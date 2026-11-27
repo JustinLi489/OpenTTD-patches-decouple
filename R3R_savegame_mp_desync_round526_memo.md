@@ -327,3 +327,15 @@ R3R 的分叉常常**不体现**在这些量上（段表里谁跑到第几条、
   发布树 `build-release` 按玩家要求**未编**。
 - 注：直调 ninja 不写 `build\R3R_incbuild.done`，本轮以 rc=0 + `[11/11]`/`[3/3] Linking`
   + exe 时间戳三者为准；`R3R_incbuild.done` 仍是 23:10:57 那次失败的 `EXIT_CODE=1`。
+
+### 12.5 发行版编译时发现并清掉的探针残留（第 526 轮续）
+
+`src\pathfinder\yapf\yapf_rail.cpp` 有两处 `f41dd84fa2`（探针剥离提交）漏掉的死代码，
+它们没有任何输出，只维护**只增不减的 static map**，且都在预留热路径上：
+
+1. `ReservePath` 成功尾部：`r3r_cplres_seen`（键 = 车索引，值 = 签名）+ `r3r_vtx/vty/odx/ody`
+   （后两者未使用，发行版编译告警 C4189）；整个 if 分支恒为真但什么也不做。
+2. 预留循环内失败分支：`r3r_rpf_seen` + `r3r_ntry/r3r_nok` 计数器，同样只写 map。
+
+两处删除后行为逐字不变（返回值、回滚、答案本记录全保留），发行版编译告警从 1 条降为 0 条，
+并去掉一处按车辆索引无限增长的静态容器。
